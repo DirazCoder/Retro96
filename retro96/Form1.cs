@@ -1,0 +1,2177 @@
+namespace Retro96;
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using SkiaSharp;
+using Retro96.Engine;
+using Retro96.Engine.Css;
+using Retro96.Engine.Dom;
+using Retro96.Engine.Html;
+using Retro96.Engine.Js;
+using Retro96.Engine.Layout;
+using Retro96.Engine.Network;
+using Retro96.Engine.Render;
+using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
+
+/// <summary>
+/// Temporary diagnostic logger. Writes to retro96-debug.log next to the
+/// exe so we can see exactly what happened on a run where the UI itself
+/// gives no useful signal (blank page, stuck "loading", etc). Remove once
+/// the root cause is found — this is not meant to ship.
+/// </summary>
+public static class DebugLog
+{
+    private static readonly string Path =
+        System.IO.Path.Combine(AppContext.BaseDirectory, "retro96-debug.log");
+    private static readonly object Lock = new();
+
+    public static void Write(string message)
+    {
+        try
+        {
+            lock (Lock)
+            {
+                File.AppendAllText(Path,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // Logging must never be the thing that crashes the app.
+        }
+    }
+
+    public static void WriteException(string context, Exception ex) =>
+        Write($"{context} THREW: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+}
+
+public partial class Form1 : Form
+{
+    // Controls
+    private readonly ToolStrip _toolbar = new();
+    private readonly ToolStripDropDownButton _btnFile = new("File");
+    private readonly ToolStripButton _btnBack = new("←");
+    private readonly ToolStripButton _btnForward = new("→");
+    private readonly ToolStripButton _btnReload = new("⟳");
+    private readonly ToolStripButton _btnStop = new("■");
+    private readonly ToolStripButton _btnPrint = new("Print");
+    private readonly ToolStripTextBox _txtUrl = new();
+    private readonly ToolStripButton _btnGo = new("Go");
+    private readonly BrowserCanvas _canvas = new();
+    private readonly StatusStrip _statusStrip = new();
+    private readonly ToolStripStatusLabel _statusLabel = new();
+    private const bool ThrobberEnabled = false;
+    private readonly Panel _throbberBox = new() { BorderStyle = BorderStyle.Fixed3D };
+
+    // Throbber state
+    private DecodedImage? _throbberDecoded;
+    private int _throbberFrameIndex;
+    private System.Windows.Forms.Timer? _throbberTimer;
+    private Bitmap? _staticBitmap;
+    private string? _throbberDiag;   // why static.png is missing, drawn into the box
+    private bool _isLoading;
+
+    // Session state
+    private readonly NavigationHistory _history = new();
+
+    // Certificate-error recovery: the URL whose TLS failed, kept so the
+    // error page's window.acceptCertRisk() hook (registered while this is
+    // set) can re-navigate.  Capped to avoid a confirm-dialog retry loop.
+    private string? _pendingCertRetryUrl;
+    private int _certRetryCount;
+    private readonly HashSet<string> _visitedUrls = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<Form1> _childWindows = new();
+    private CancellationTokenSource? _loadCts;
+    private System.Windows.Forms.Timer? _metaRefreshTimer;
+    private string? _currentPageUrl;
+    private string? _referrerUrl;          // document.referrer for the next page
+
+    // User preferences (search engine etc.) — retro96.ini next to the exe
+    private readonly UserSettings _settings = UserSettings.Load();
+
+    // Guards against meta-refresh chains that loop forever
+    private string? _metaRefreshChainStartUrl;
+    private int _metaRefreshChainCount;
+    private bool _isMetaRefreshNav;
+    private const int MaxMetaRefreshChain = 10;
+
+    private long _navGeneration;
+
+    // Engine components
+    private readonly CookieStore _cookieStore = new();
+    private readonly ImageCache _imageCache = new();
+    private readonly FontCache _fontCache = new();
+    private ResourceLoader? _resourceLoader;
+    private readonly HttpClient _httpClient = new();
+
+    // Per-page JS
+    private JsScope? _globalScope;
+    private JsInterpreter? _jsInterpreter;
+    private DocumentBindingsState? _jsState;
+
+    public Form1()
+    {
+        InitializeComponent();
+        InitializeBrowser();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // UI setup
+    // ─────────────────────────────────────────────────────────────────────
+
+    private void InitializeComponent()
+    {
+        AutoScaleMode = AutoScaleMode.None;
+
+        Text = "Retro96";
+        Size = new Size(1024, 760);
+        MinimumSize = new Size(640, 480);
+        StartPosition = FormStartPosition.CenterScreen;
+        FormClosing += (s, e) =>
+        {
+            _loadCts?.Cancel();
+            _resourceLoader?.Dispose();
+            _imageCache?.Dispose();
+            _fontCache?.Dispose();
+            foreach (var child in _childWindows.ToArray())
+                child.Close();
+        };
+
+        _txtUrl.AutoSize = false;
+        _txtUrl.Width = 480;
+
+        _toolbar.Items.Add(_btnFile);
+        _toolbar.Items.Add(_btnBack);
+        _toolbar.Items.Add(_btnForward);
+        _toolbar.Items.Add(_btnReload);
+        _toolbar.Items.Add(_btnStop);
+        _toolbar.Items.Add(new ToolStripSeparator());
+        _toolbar.Items.Add(_txtUrl);
+        _toolbar.Items.Add(_btnGo);
+        _toolbar.Items.Add(new ToolStripSeparator());
+        _toolbar.Items.Add(_btnPrint);
+        _btnBack.Enabled = false;
+        _btnForward.Enabled = false;
+        _btnStop.Enabled = false;
+
+        _btnFile.DropDownItems.Add("Open Local HTML\u2026").Click += (s, e) => OpenHtmlFile();
+        _btnFile.DropDownItems.Add("Open New Window").Click += (s, e) => OpenNewBrowserWindow("about:blank");
+        _btnFile.DropDownItems.Add("Preferences\u2026").Click += (s, e) => ShowPreferencesDialog();
+
+        _throbberBox.BorderStyle = BorderStyle.None;
+        _throbberBox.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _throbberBox.Paint += (s, e) =>
+        {
+            // Draw into the full client rect so the image scales with the box.
+            var target = _throbberBox.ClientRectangle;
+            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+
+            if (_isLoading && _throbberDecoded != null && _throbberDecoded.Frames.Count > 0)
+            {
+                var frame = _throbberDecoded.Frames[_throbberFrameIndex % _throbberDecoded.Frames.Count];
+                if (frame != null)
+                {
+                    using var gdiFrame = SkiaWinForms.ToGdi(frame);
+                    if (gdiFrame != null)
+                        e.Graphics.DrawImage(gdiFrame, target);
+                }
+            }
+            else if (_staticBitmap != null)
+            {
+                e.Graphics.DrawImage(_staticBitmap, target);
+            }
+            else if (_throbberDiag != null)
+            {
+                // Loud on purpose: a blank box hid this bug for two rounds.
+                e.Graphics.Clear(Color.MistyRose);
+                using var f = new Font("Segoe UI", 7f);
+                e.Graphics.DrawString(_throbberDiag, f, Brushes.DarkRed, target);
+            }
+        };
+
+        _canvas.Dock = DockStyle.Fill;
+        _canvas.NavigateRequested += OnCanvasNavigateRequested;
+        _canvas.StatusChanged += OnCanvasStatusChanged;
+        _canvas.NewWindowRequested += OpenNewBrowserWindow;
+        _canvas.FrameNavigationRequested += OnFrameNavigationRequested;
+        _canvas.FormSubmitRequested += OnFormSubmitted;
+
+        // Context-menu navigation hooks
+        _canvas.BackRequested += NavigateBack;
+        _canvas.ForwardRequested += NavigateForward;
+        _canvas.ReloadRequested += Reload;
+
+        _statusStrip.Items.Add(_statusLabel);
+        _statusStrip.Dock = DockStyle.Bottom;
+        _statusStrip.AutoSize = false;
+        _statusStrip.Height = 24;
+        _statusStrip.Padding = Padding.Empty;
+        _statusStrip.Visible = true;
+        _statusStrip.SizingGrip = false;
+        _statusStrip.RenderMode = ToolStripRenderMode.System;
+        _statusLabel.AutoSize = false;
+        _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
+        _statusLabel.Text = "Ready";
+        _statusLabel.Spring = true;
+
+        Controls.Add(_canvas);
+        Controls.Add(_statusStrip);
+        Controls.Add(_toolbar);
+        Controls.Add(_throbberBox);
+        _throbberBox.Visible = ThrobberEnabled;
+
+        _btnBack.Click += (s, e) => NavigateBack();
+        _btnForward.Click += (s, e) => NavigateForward();
+        _btnReload.Click += (s, e) => Reload();
+        _btnStop.Click += (s, e) => _loadCts?.Cancel();
+        _btnPrint.Click += (s, e) => PrintPage();
+
+        _btnGo.Click += (s, e) => NavigateOrSearch(_txtUrl.Text);
+        _txtUrl.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                NavigateOrSearch(_txtUrl.Text);
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+        };
+
+        Load += (s, e) =>
+        {
+            float scale = DeviceDpi > 0 ? DeviceDpi / 96f : 1f;
+            if (scale > 1.01f)
+            {
+                Size = new Size((int)(Width * scale), (int)(Height * scale));
+                _txtUrl.Width = (int)(480 * scale);
+            }
+
+            // Land on the built-in home page instead of a blank canvas.
+            NavigateTo("retro96:home");
+            SetAppIcon();
+        };
+
+        Resize += (s, e) => PositionThrobber();
+    }
+
+    // Base size at 96 DPI; scaled by the monitor's DPI in PositionThrobber.
+    private const int ThrobberBaseSize = 56;
+
+    private void PositionThrobber()
+    {
+        if (!ThrobberEnabled || _throbberBox == null || _throbberBox.IsDisposed) return;
+
+        float scale = DeviceDpi > 0 ? DeviceDpi / 96f : 1f;
+        int size = (int)(ThrobberBaseSize * scale);
+        int margin = (int)(6 * scale);
+
+        _throbberBox.Size = new Size(size, size);
+        // ClientSize, not Width: Width includes the window frame and pushed
+        // the old 20px box off the right edge.
+        _throbberBox.Location = new Point(ClientSize.Width - size - margin, margin);
+        _throbberBox.BringToFront();
+    }
+
+    private void InitializeBrowser()
+    {
+        _resourceLoader = new ResourceLoader(_cookieStore);
+        _imageCache.CookieStore = _cookieStore;
+
+        // An image that failed transiently and later recovered (cooldown
+        // refetch triggered from a paint) has nobody awaiting it — repaint
+        // so it actually appears instead of waiting for an unrelated redraw.
+        _imageCache.ImageRecovered += _ =>
+        {
+            try
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke(() => _canvas.RequestRerender());
+            }
+            catch (ObjectDisposedException) { /* closing */ }
+            catch (InvalidOperationException) { /* handle gone */ }
+        };
+
+        _canvas.SetResourceLoader(_resourceLoader);
+
+        // THE measurement hookup: InlineLayout measures every text run,
+        // table column, button label and select width — and it was never
+        // given the FontCache, so every width fell back to the
+        // characters × 8px heuristic. The renderer, however, draws with
+        // REAL GDI fonts, so measured widths and drawn widths disagreed
+        // on every string: words drifted apart or collided ("texts too
+        // far or too close"), buttons never auto-sized because the
+        // hasFont guard in MeasureBox requires the cache (labels kept the
+        // 80px default and spilled outside the bevel), and table columns
+        // were sized from the same 8px-per-char overestimate, blowing
+        // tables wide past the viewport.
+        InlineLayout.SetFontCache(_fontCache);
+
+        // JS history.back()/forward()/go() actually navigates
+        _history.NavigationRequested += url => BeginInvoke(() => NavigateTo(url));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Address bar: URL or search
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Address-bar dispatch: URL-looking text navigates, anything else is
+    /// a web search through the configured engine (FrogFind by default,
+    /// user-changeable in File → Preferences… or retro96.ini).
+    /// </summary>
+    private void NavigateOrSearch(string text)
+    {
+        string t = (text ?? "").Trim();
+        if (t.Length == 0) return;
+
+        if (LooksLikeUrl(t))
+        {
+            NavigateTo(t);
+            return;
+        }
+
+        string template = _settings.SearchQueryUrl;
+        if (string.IsNullOrWhiteSpace(template) || !template.Contains("%s"))
+            template = UserSettings.DefaultSearchUrl;
+
+        NavigateTo(template.Replace("%s", ParsedUrl.PercentEncode(t)));
+    }
+
+    private static bool LooksLikeUrl(string t)
+    {
+        if (t.Contains(' ')) return false;
+        if (t.StartsWith("//")) return true;
+
+        // scheme:path — a letter first, then letters/digits/+/-/. up to ':'
+        int colon = t.IndexOf(':');
+        if (colon > 0 && char.IsLetter(t[0]) &&
+            t[..colon].All(c => char.IsLetterOrDigit(c) || c is '+' or '-' or '.'))
+            return true;
+
+        if (t.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) return true;
+        if (t.Contains('.')) return true;
+        if (t.StartsWith("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private void ShowPreferencesDialog()
+    {
+        using var form = new Form
+        {
+            Text = "Retro96 — Preferences",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(440, 150),
+            ShowInTaskbar = false,
+            Font = new Font("Microsoft Sans Serif", 8.25f)
+        };
+
+        var label = new Label
+        {
+            Text = "Search query URL — %s marks where the query goes:",
+            AutoSize = true,
+            Location = new Point(12, 14)
+        };
+        var box = new TextBox
+        {
+            Text = _settings.SearchQueryUrl,
+            Location = new Point(12, 38),
+            Width = 410
+        };
+        var hint = new Label
+        {
+            Text = "Default: " + UserSettings.DefaultSearchUrl + "  (FrogFind)",
+            AutoSize = true,
+            Location = new Point(12, 66),
+            ForeColor = SystemColors.GrayText
+        };
+        var ok = new Button
+        {
+            Text = "OK",
+            DialogResult = DialogResult.OK,
+            Location = new Point(260, 104),
+            Width = 75
+        };
+        var cancel = new Button
+        {
+            Text = "Cancel",
+            DialogResult = DialogResult.Cancel,
+            Location = new Point(345, 104),
+            Width = 75
+        };
+
+        form.Controls.AddRange(new Control[] { label, box, hint, ok, cancel });
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+
+        if (form.ShowDialog(this) == DialogResult.OK)
+        {
+            string v = box.Text.Trim();
+            _settings.SearchQueryUrl = v.Length > 0 ? v : UserSettings.DefaultSearchUrl;
+            _settings.Save();
+        }
+    }
+
+    private static string EscapeHtmlText(string? s) =>
+        (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;")
+                 .Replace(">", "&gt;").Replace("\"", "&quot;");
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Navigation
+    // ─────────────────────────────────────────────────────────────────────
+
+    public async void NavigateTo(string rawUrl) => await NavigateAsync(rawUrl);
+
+    public async Task NavigateAsync(string rawUrl, string? postData = null,
+                                     bool replaceHistory = false)
+    {
+        if (string.IsNullOrWhiteSpace(rawUrl)) return;
+
+        long myGeneration = ++_navGeneration;
+        _canvas.ClearForNavigation();
+        _pendingCertRetryUrl = null;   // a fresh navigation invalidates any stale acceptCertRisk hook
+        DebugLog.Write($"NavigateAsync ENTER gen={myGeneration} rawUrl='{rawUrl}' postData={(postData != null ? "yes" : "no")} replaceHistory={replaceHistory}");
+
+        bool isMetaRefreshNav = _isMetaRefreshNav;
+        _isMetaRefreshNav = false;
+        if (!isMetaRefreshNav)
+        {
+            _metaRefreshChainStartUrl = null;
+            _metaRefreshChainCount = 0;
+        }
+
+        try
+        {
+            var url = ParsedUrl.Parse(rawUrl.Trim());
+
+            switch (url.Scheme)
+            {
+                case "about":
+                    // about:home (and bare "about:") is the same page as
+                    // retro96://home; other about: URLs keep the stub below.
+                    string aboutTarget = (url.Path ?? "").Trim('/');
+                    if (aboutTarget.Equals("home", StringComparison.OrdinalIgnoreCase) ||
+                        aboutTarget.Length == 0)
+                    {
+                        await RenderHtmlAsync(Retro96HomePageHtml(), rawUrl, replaceHistory, myGeneration);
+                        return;
+                    }
+                    await RenderHtmlAsync(
+                        "<html><head><title>About Retro96</title></head>" +
+                        "<body bgcolor=\"#c0c0c0\">" +
+                        "<center><h2>Retro96 Browser</h2>" +
+                        "<p>Netscape Navigator 3.0-compatible rendering engine.</p>" +
+                        "<p><font size=\"-1\" color=\"#606060\">HTTP/1.0 · HTML 3.2 · " +
+                        "CSS1 · JavaScript 1.1/1.2 · GIF/JPEG/XBM</font></p>" +
+                        "</center></body></html>",
+                        rawUrl, replaceHistory, myGeneration);
+                    return;
+
+                case "mailto":
+                    {
+                        // Hand the link to the OS default mail app (ShellExecute).
+                        // Only if there is no handler, or the link is malformed,
+                        // fall back to telling the user what the page asked for.
+                        string mailTarget = url.Path ?? "";
+                        _statusLabel.Text = "Mail: " + mailTarget;
+
+                        if (TryBuildMailtoUri(mailTarget, out string mailUri))
+                        {
+                            try
+                            {
+                                System.Diagnostics.Process.Start(
+                                    new System.Diagnostics.ProcessStartInfo(mailUri)
+                                    { UseShellExecute = true })?.Dispose();
+                                return;
+                            }
+                            catch (Exception mailEx)   // no default mail app registered, or launch refused
+                            {
+                                DebugLog.WriteException("mailto launch", mailEx);
+                            }
+                        }
+
+                        MessageBox.Show(this,
+                            "Retro96 couldn't open a mail program.\n\n" +
+                            "The page requested:\n  " + mailTarget,
+                            "Retro96 — Mail",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+
+                case "ftp":
+                    await RenderErrorAsync(ErrorPage.ProtocolNotSupported(
+                        rawUrl, url.Scheme), myGeneration);
+                    return;
+
+                case "file":
+                    {
+                        // file:// links from locally-opened pages used to hit the
+                        // "protocol not supported" wall; now they load from disk
+                        // so a local page's relative links actually navigate.
+                        string? localPath = LocalPathFromFileUrl(url);
+                        if (localPath == null || !File.Exists(localPath))
+                        {
+                            await RenderErrorAsync(ErrorPage.LocalFileNotFound(
+                                localPath ?? url.Path), myGeneration);
+                            return;
+                        }
+
+                        try
+                        {
+                            string fileHtml = BodyDecoder.Decode(
+                                await File.ReadAllBytesAsync(localPath), null);
+                            await RenderHtmlAsync(fileHtml, CanonicalFileUrl(localPath),
+                                replaceHistory, myGeneration);
+                        }
+                        catch (Exception ex)
+                        {
+                            await RenderErrorAsync(ErrorPage.LocalFileNotFound(localPath),
+                                myGeneration);
+                            if (myGeneration == _navGeneration)
+                                _statusLabel.Text = ex.Message;
+                        }
+                        return;
+                    }
+
+                case "javascript":
+                    try { _jsInterpreter?.ExecuteString(url.Path); }
+                    catch (Exception ex) { _statusLabel.Text = $"Script error: {ex.Message}"; }
+                    return;
+
+                case "retro96":
+                    if (url.Path.Equals("home", StringComparison.OrdinalIgnoreCase) ||
+                        string.IsNullOrEmpty(url.Path))
+                    {
+                        await RenderHtmlAsync(Retro96HomePageHtml(), rawUrl, replaceHistory, myGeneration);
+                    }
+                    else
+                    {
+                        HandleInternalScheme(url.Path);
+                    }
+                    return;
+            }
+
+            if (!url.IsHttp)
+            {
+                await RenderErrorAsync(ErrorPage.MalformedUrl(rawUrl), myGeneration);
+                return;
+            }
+
+            _txtUrl.Text = url.ToAbsolute();
+            Text = "Loading… — Retro96";
+            _statusLabel.Text = "Connecting…";
+            Cursor = Cursors.WaitCursor;
+            _btnStop.Enabled = true;
+            _isLoading = true;
+            _throbberBox.Invalidate();
+            _metaRefreshTimer?.Stop();
+            _metaRefreshTimer?.Dispose();
+            _metaRefreshTimer = null;
+
+            _loadCts?.Cancel();
+            _loadCts = new CancellationTokenSource();
+            var ct = _loadCts.Token;
+            _referrerUrl = _currentPageUrl;
+
+            try
+            {
+                HttpResult result = postData != null
+                    ? await _httpClient.PostAsync(url, postData, _cookieStore, ct)
+                    : await _httpClient.GetAsync(url, _cookieStore, ct);
+
+                if (result is HttpSuccess unauthorized && unauthorized.StatusCode == 401)
+                {
+                    var creds = PromptForCredentials(url.Host);
+                    if (creds != null)
+                    {
+                        _httpClient.BasicAuthHeader =
+                            "Basic " + Convert.ToBase64String(
+                                Encoding.ASCII.GetBytes($"{creds.Value.User}:{creds.Value.Pass}"));
+                        result = await _httpClient.GetAsync(url, _cookieStore, ct);
+                        _httpClient.BasicAuthHeader = null;
+
+                        if (result is HttpSuccess ok2 && ok2.StatusCode == 401)
+                        {
+                            await RenderErrorAsync(ErrorPage.Unauthorized(
+                                url.ToAbsolute(),
+                                unauthorized.Headers.TryGetValue("www-authenticate", out var realm)
+                                    ? realm : null), myGeneration);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        await RenderErrorAsync(ErrorPage.Unauthorized(url.ToAbsolute()), myGeneration);
+                        return;
+                    }
+                }
+
+                switch (result)
+                {
+                    case HttpSuccess s:
+                        await ProcessSuccessAsync(s, url, ct, postData, replaceHistory, isMetaRefreshNav, myGeneration);
+                        break;
+                    case CertError ce:
+                        _pendingCertRetryUrl = url.ToAbsolute();
+                        _certRetryCount++;
+                        await RenderErrorAsync(ErrorPage.CertificateError(url.ToAbsolute(), ce.Message), myGeneration);
+                        break;
+                    case HttpError he:
+                        await RenderErrorAsync(he.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+                            ? ErrorPage.Timeout(url.ToAbsolute())
+                            : ErrorPage.NetworkError(url.ToAbsolute(), he.Message), myGeneration);
+                        break;
+                    case TooManyRedirects:
+                        await RenderErrorAsync(ErrorPage.TooManyRedirects(url.ToAbsolute()), myGeneration);
+                        break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                BeginInvoke(() =>
+                {
+                    if (myGeneration == _navGeneration)
+                        _statusLabel.Text = "Cancelled";
+                });
+            }
+            catch (Exception ex)
+            {
+                BeginInvoke(async () =>
+                    await RenderErrorAsync(ErrorPage.NetworkError(url.ToAbsolute(), ex.Message), myGeneration));
+            }
+            finally
+            {
+                BeginInvoke(() =>
+                {
+                    if (myGeneration != _navGeneration) return;
+                    Cursor = Cursors.Default;
+                    _btnStop.Enabled = false;
+                    _isLoading = false;
+                    _throbberBox.Invalidate();
+                });
+            }
+        }
+        catch (UnsafeUrlException)
+        {
+            await RenderErrorAsync(ErrorPage.MalformedUrl(rawUrl), myGeneration);
+        }
+        catch (Exception ex)
+        {
+            await RenderErrorAsync(ErrorPage.NetworkError(rawUrl, ex.Message), myGeneration);
+        }
+    }
+
+    private void HandleInternalScheme(string command)
+    {
+        switch (command.ToLowerInvariant())
+        {
+            case "home":
+                NavigateTo("retro96://home");
+                return;
+            case "back":
+                NavigateBack();
+                return;
+            case "reload":
+                Reload();
+                return;
+        }
+
+        if (command.ToLowerInvariant().StartsWith("home/"))
+        {
+            NavigateTo("retro96://home");
+            return;
+        }
+    }
+
+    // ── file:// helpers (shared with ImageCache's URL scheme) ────────────
+
+    /// <summary>Builds the string handed to the OS for a mailto: link.  The
+    /// scheme is always re-attached here (never trusted from the page), and
+    /// anything that could break out of the mail client's command line is
+    /// refused: ShellExecute substitutes the URL into the handler's
+    /// registered command template, so a raw quote or control character
+    /// from a hostile page must never reach it.  Spaces become %20 so
+    /// "?subject=Hi there" survives an unquoted template.</summary>
+    internal static bool TryBuildMailtoUri(string? target, out string uri)
+    {
+        uri = "";
+        string s = (target ?? "").Trim();
+        if (s.Length > 2000) return false;
+        foreach (char c in s)
+            if (c < ' ' || c == '"' || c == '\x7F') return false;
+
+        uri = "mailto:" + s.Replace(" ", "%20");
+        return true;
+    }
+
+    /// <summary>Local path behind a file: URL, accepting both
+    /// file:///C:/x and file://C:/x forms; null when unmappable.</summary>
+    internal static string? LocalPathFromFileUrl(ParsedUrl url) =>
+        FileUrls.LocalPathFromFileUrl(url);
+
+    /// <summary>Canonical file:/// URL for a local path (used as base URL
+    /// so every relative resolution downstream is well-formed).</summary>
+    internal static string CanonicalFileUrl(string localPath) =>
+        FileUrls.CanonicalFileUrl(localPath);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Response processing
+    // ─────────────────────────────────────────────────────────────────────
+
+    private async Task ProcessSuccessAsync(HttpSuccess success, ParsedUrl url,
+                                          CancellationToken ct,
+                                          string? postData, bool replaceHistory,
+                                          bool isMetaRefreshNav, long myGeneration)
+    {
+        // Redirects are followed inside HttpClient. Use the final response
+        // URL for the address bar, history, base URL, and relative resources.
+        if (!string.IsNullOrEmpty(success.EffectiveUrl))
+        {
+            try { url = ParsedUrl.Parse(success.EffectiveUrl); }
+            catch { }
+        }
+
+        if (success.StatusCode >= 400)
+        {
+            string errorHtml = success.StatusCode switch
+            {
+                400 => ErrorPage.BadRequest(url.ToAbsolute()),
+                401 => ErrorPage.Unauthorized(url.ToAbsolute()),
+                403 => ErrorPage.AccessDenied(url.ToAbsolute()),
+                404 => ErrorPage.NotFound(url.ToAbsolute()),
+                500 => ErrorPage.ServerError(url.ToAbsolute()),
+                503 => ErrorPage.ServiceUnavailable(url.ToAbsolute()),
+                _ => ErrorPage.GenericHttpError(success.StatusCode, url.ToAbsolute())
+            };
+            await RenderHtmlAsync(errorHtml, url.ToAbsolute(), replaceHistory, myGeneration);
+            return;
+        }
+
+        // ── Content-Type drives interpretation (checklist): standalone
+        //    images display in a page, plain text wraps in <pre> — the
+        //    era behaviours.  Everything else is parsed as HTML.
+        if (success.ContentType.StartsWith("image/", StringComparison.Ordinal))
+        {
+            string name = Path.GetFileName(url.Path);
+            string page =
+                "<html><head><title>" + EscapeHtmlText(name) + "</title></head>" +
+                "<body bgcolor=\"#c0c0c0\" text=\"#000000\"><p>&nbsp;</p>" +
+                "<img src=\"" + EscapeHtmlText(url.ToAbsolute()) + "\"" +
+                " alt=\"" + EscapeHtmlText(name) + "\"></body></html>";
+            await RenderHtmlAsync(page, url.ToAbsolute(), replaceHistory, myGeneration);
+            return;
+        }
+        if (success.ContentType == "text/plain")
+        {
+            string text = EscapeHtmlText(DecodeBody(success));
+            await RenderHtmlAsync(
+                "<html><head><title>" + EscapeHtmlText(url.ToAbsolute()) + "</title></head>" +
+                "<body bgcolor=\"#c0c0c0\"><pre>" + text + "</pre></body></html>",
+                url.ToAbsolute(), replaceHistory, myGeneration);
+            return;
+        }
+
+        string html = DecodeBody(success);
+        string metaCharset = ScanMetaCharset(html);
+        if (metaCharset.Length > 0 &&
+            !metaCharset.Equals(success.Charset ?? "iso-8859-1",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            html = DecodeBody(success, metaCharset);
+        }
+
+        BeginInvoke(() => _statusLabel.Text = "Parsing…");
+
+        var (document, interpreter, state) = PrepareScripting(url, html);
+
+        // document.lastModified / document.referrer (checklist)
+        if (success.Headers.TryGetValue("last-modified", out var lastMod))
+            state.LastModified = lastMod;
+        state.Referrer = _referrerUrl ?? "";
+
+        BeginInvoke(() => _statusLabel.Text = "Fetching stylesheets…");
+        await FetchStylesheetsAsync(document, url, ct);
+
+        BeginInvoke(() => _statusLabel.Text = "Laying out…");
+        _visitedUrls.Add(url.ToAbsolute());
+        document.VisitedUrls.UnionWith(_visitedUrls);
+        Size canvasSize = GetCanvasSize();
+        StyleResolver.Resolve(document, canvasSize.Width);
+
+        var rootBox = LayoutEngineApi.BuildLayoutTree(
+            document, canvasSize.Width, canvasSize.Height);
+
+        RegisterBindings(document, interpreter!, state!);
+
+        BeginInvoke(() =>
+        {
+            if (myGeneration != _navGeneration)
+            {
+                DebugLog.Write($"ProcessSuccessAsync gen={myGeneration} STALE (current={_navGeneration}) — UpdatePage dropped for {url.ToAbsolute()}");
+                return;
+            }
+            try
+            {
+                UpdatePage(document, rootBox, url.ToAbsolute(),
+                    new HistoryEntry(url.ToAbsolute(), postData));
+                var win = interpreter.WindowObject;
+                if (win != null && win.Get("onload") is { Type: JsType.Function } onload)
+                    interpreter.CallHandler(onload, JsValue.FromObject(win));
+                var body = document.ElementDescendants()
+                    .FirstOrDefault(e => e.TagName == "body");
+                if (body != null)
+                {
+                    DebugLog.Write($"BODY ONLOAD: found attrs={body.Attrs.Count} " +
+                                   $"handlers=[{string.Join(",", body.EventHandlers.Keys)}]");
+                    // Body attributes can pass through HTML recovery paths
+                    // that preserve Attrs but not the event-handler map.
+                    // Restore the canonical inline handler before dispatch.
+                    var bodyOnload = body.GetAttr("onload");
+                    DebugLog.Write($"BODY ONLOAD: source='{bodyOnload ?? "<null>"}'");
+                    if (!string.IsNullOrEmpty(bodyOnload))
+                        body.EventHandlers["onload"] = bodyOnload;
+                    try
+                    {
+                        interpreter.FireEvent(body, "onload");
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.WriteException("BODY ONLOAD FireEvent", ex);
+                    }
+
+                    // Some recovered body nodes can retain the attribute but
+                    // lose the normal event dispatch context. Verify the
+                    // page marker and run the preserved inline source once if
+                    // the standard dispatch did not update it.
+                    var loadMarker = document.ElementDescendants()
+                        .FirstOrDefault(e => e.GetAttr("id") == "loadMarker");
+                    DebugLog.Write($"BODY ONLOAD: marker before fallback='" +
+                                   (loadMarker?.InnerText ?? "<missing>") + "'");
+                    if (!string.IsNullOrEmpty(bodyOnload) &&
+                        loadMarker != null &&
+                        !(loadMarker.InnerText ?? "")
+                            .Contains("ONLOAD-OK", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            interpreter.ExecuteString(bodyOnload);
+                            DebugLog.Write("BODY ONLOAD: direct fallback executed");
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.WriteException("BODY ONLOAD direct fallback", ex);
+                        }
+                    }
+                    DebugLog.Write($"BODY ONLOAD: marker after='" +
+                                   (loadMarker?.InnerText ?? "<missing>") + "'");
+                }
+                else
+                    DebugLog.Write("BODY ONLOAD: body element not found");
+                foreach (var elem in document.ElementDescendants()
+                             .Where(e => !ReferenceEquals(e, body) &&
+                                        e.EventHandlers.ContainsKey("onload")))
+                    interpreter.FireEvent(elem, "onload");
+                // Start image loading after the initial page is live. Fast
+                // data-URI images otherwise queued natural-size reflow
+                // against the old page before UpdatePage installed it.
+                _ = PrefetchImagesAsync(document, url, ct,
+                    reflowWhenLoaded: true, myGeneration);
+                _ = LoadFramesAsync(document, rootBox);
+            }
+            catch (Exception ex)
+            {
+                // An exception escaping this BeginInvoke used to hit the
+                // bare message loop AFTER SetPage had already nulled the
+                // bitmap — the classic "completely blank page" with no
+                // explanation. Render an era-style error page instead.
+                DebugLog.WriteException($"UpdatePage gen={myGeneration}", ex);
+                _ = RenderErrorAsync(ErrorPage.NetworkError(url.ToAbsolute(),
+                    $"Layout error: {ex.Message}"), myGeneration);
+            }
+        });
+
+        if (!string.IsNullOrEmpty(document.MetaRefresh))
+        {
+            var (delay, refreshUrl) = ParseMetaRefresh(document.MetaRefresh, url);
+            if (refreshUrl != null)
+            {
+                BeginInvoke(() =>
+                {
+                    if (myGeneration != _navGeneration)
+                        return;
+
+                    if (_metaRefreshChainStartUrl == null || !isMetaRefreshNav)
+                    {
+                        _metaRefreshChainStartUrl = url.ToAbsolute();
+                        _metaRefreshChainCount = 0;
+                    }
+
+                    _metaRefreshChainCount++;
+
+                    if (_metaRefreshChainCount > MaxMetaRefreshChain)
+                    {
+                        _statusLabel.Text =
+                            $"Stopped an automatic refresh loop after {MaxMetaRefreshChain} redirects.";
+                        _metaRefreshChainStartUrl = null;
+                        _metaRefreshChainCount = 0;
+                        return;
+                    }
+
+                    _metaRefreshTimer = new System.Windows.Forms.Timer { Interval = Math.Max(100, delay) };
+                    _metaRefreshTimer.Tick += (s, e) =>
+                    {
+                        _metaRefreshTimer?.Stop();
+                        _isMetaRefreshNav = true;
+                        NavigateTo(refreshUrl);
+                    };
+                    _metaRefreshTimer.Start();
+                });
+            }
+        }
+    }
+
+    private static string DecodeBody(HttpSuccess success, string? overrideCharset = null) =>
+        BodyDecoder.Decode(success.Body, success.Charset, overrideCharset);
+
+    private static string ScanMetaCharset(string html) =>
+        BodyDecoder.ScanMetaCharset(html) ?? "";
+
+    private static (int DelayMs, string? Url) ParseMetaRefresh(string content, ParsedUrl baseUrl)
+    {
+        int semi = content.IndexOf(';');
+        if (semi < 0)
+        {
+            return (int.TryParse(content.Trim(), out var d) && d > 0 && d < 600
+                ? d * 1000 : -1, null);
+        }
+
+        string delayStr = content[..semi].Trim();
+        string urlPart = content[(semi + 1)..].Trim();
+        if (urlPart.StartsWith("url", StringComparison.OrdinalIgnoreCase))
+        {
+            int eq = urlPart.IndexOf('=');
+            if (eq > 0) urlPart = urlPart[(eq + 1)..].Trim().Trim('"', '\'');
+        }
+
+        if (!int.TryParse(delayStr, out int delay) || delay < 0 || delay > 600)
+            return (-1, null);
+
+        try
+        {
+            return (delay * 1000, baseUrl.Resolve(urlPart).ToAbsolute());
+        }
+        catch
+        {
+            return (-1, null);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scripting context
+    // ─────────────────────────────────────────────────────────────────────
+
+    private (DomDocument doc, JsInterpreter interp, DocumentBindingsState state)
+        PrepareScripting(ParsedUrl url, string html)
+    {
+        _globalScope = new JsScope();
+        JsRuntime.PopulateGlobalScope(_globalScope);
+        DomBindings.RegisterEarlyGlobals(_globalScope, _canvas);   // parse-time alert() etc.
+
+        // The certificate-error page's only button is a form whose
+        // onsubmit calls window.acceptCertRisk() — with nothing bound
+        // there, "Accept Risk and Continue" popped the confirm dialog and
+        // then did nothing at all.
+        if (_pendingCertRetryUrl != null)
+        {
+            string retryUrl = _pendingCertRetryUrl;
+            int attempt = _certRetryCount;
+            DomBindings.RegisterCertRiskHook(_globalScope, () =>
+            {
+                _pendingCertRetryUrl = null;
+                if (attempt < 3)
+                    BeginInvoke(() => NavigateTo(retryUrl));
+            });
+        }
+
+        _jsInterpreter = new JsInterpreter(
+            _globalScope,
+            null,
+            navUrl => BeginInvoke(() => NavigateTo(navUrl)),
+            msg => BeginInvoke(() => _statusLabel.Text = msg));
+
+        _jsInterpreter.ConsoleMessage += entry =>
+            PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);
+
+        _jsState = new DocumentBindingsState
+        {
+            Interpreter = _jsInterpreter,
+            Canvas = _canvas,
+            LastModified = "",
+            Referrer = ""
+        };
+        _jsInterpreter.ElementWrapperHook =
+            e => DomBindings.WrapElement(e, _jsState);
+
+        // Runtime builtins (setTimeout/setInterval/eval/call/apply) used to
+        // be installed only AFTER the parse (RegisterBindings), so a script
+        // that scheduled anything while the page streamed in got
+        // "'setTimeout' is not a function". Idempotent — re-registering
+        // later merely overwrites the same slots.
+        _jsInterpreter.RegisterRuntimeBuiltins();
+
+        var document = HtmlParser.Parse(html, url, _cookieStore,
+            (doc, src) => RunInlineScript(doc, src, _jsInterpreter, _jsState));
+
+        return (document, _jsInterpreter, _jsState);
+    }
+
+    private string RunInlineScript(DomDocument document, string scriptSource,
+                                  JsInterpreter interpreter,
+                                  DocumentBindingsState state)
+    {
+        state.Document = document;
+
+        // Full DOM-0 bindings at PARSE time. The old minimal document
+        // (write/writeln/title/URL only, no navigator!) meant the very
+        // first line of the era's standard sniffing preamble —
+        //     var ua = navigator.userAgent;
+        // — threw "'navigator' is not defined", the script aborted, the
+        // document.write() output never streamed, and pages like the
+        // 1996 Browser Detector sat forever on "Detecting...".
+        // Rebuilding the bindings before EVERY script also refreshes the
+        // live collections (forms/images/links) to include everything
+        // parsed so far — period-accurate: a script at the bottom of the
+        // body sees the form above it. document.write still routes to
+        // the shared state buffer the parser splices.
+        DomBindings.RegisterAll(_globalScope!, document, _history, _canvas, state);
+        interpreter.RegisterRuntimeBuiltins();
+
+        try
+        {
+            interpreter.ExecuteString(scriptSource);
+        }
+        catch (Exception ex)
+        {
+            BeginInvoke(() => _statusLabel.Text = $"Script error: {ex.Message}");
+        }
+
+        string written = state.WriteBuffer.ToString();
+        state.WriteBuffer.Clear();
+        return written;
+    }
+
+    private void RegisterBindings(DomDocument document, JsInterpreter interpreter,
+                                  DocumentBindingsState state)
+    {
+        state.Document = document;
+        DomBindings.RegisterAll(_globalScope!, document, _history, _canvas, state);
+        interpreter.RegisterRuntimeBuiltins();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Stylesheets & images
+    // ─────────────────────────────────────────────────────────────────────
+
+    private async Task FetchStylesheetsAsync(DomDocument document, ParsedUrl baseUrl,
+                                             CancellationToken ct)
+    {
+        var links = document.ElementDescendants()
+            .Where(e => e.TagName == "link" &&
+                        e.GetAttr("rel")?.Contains("stylesheet",
+                            StringComparison.OrdinalIgnoreCase) == true &&
+                        e.HasAttr("href"))
+            .ToList();
+
+        if (links.Count == 0) return;
+
+        foreach (var link in links)
+        {
+            string href = link.GetAttr("href")!;
+            try
+            {
+                // Local pages (file:// base) read their stylesheets from
+                // disk — the HTTP fetcher knows nothing about files.
+                if (baseUrl.Scheme == "file")
+                {
+                    string abs = ImageCache.ResolveUrl(href, baseUrl.ToAbsolute());
+                    var localParsed = ParsedUrl.Parse(abs);
+                    var localPath = LocalPathFromFileUrl(localParsed);
+                    if (localPath != null && File.Exists(localPath))
+                    {
+                        string cssText = await File.ReadAllTextAsync(localPath);
+                        var styleElem = new DomElement("style");
+                        styleElem.AppendChild(new DomText { Data = cssText });
+                        document.AppendChild(styleElem);
+                    }
+                    continue;
+                }
+
+                var res = await _resourceLoader!.FetchAsync(href, baseUrl, _cookieStore);
+                if (res is HttpSuccess css)
+                {
+                    string cssText = DecodeBody(css);
+                    var styleElem = new DomElement("style");
+                    styleElem.AppendChild(new DomText { Data = cssText });
+                    document.AppendChild(styleElem);
+                }
+            }
+            catch { }
+        }
+    }
+
+    private async Task PrefetchImagesAsync(DomDocument doc, ParsedUrl baseUrl,
+                                           CancellationToken ct, bool reflowWhenLoaded,
+                                           long myGeneration)
+    {
+        var urls = new List<string>();
+
+        foreach (var elem in doc.ElementDescendants())
+        {
+            string? raw = elem.TagName switch
+            {
+                "img" => elem.GetAttr("src") ?? elem.GetAttr("lowsrc"),
+                "body" => elem.GetAttr("background"),
+                _ => null
+            };
+            if (!string.IsNullOrEmpty(raw))
+            {
+                try
+                {
+                    urls.Add(ImageCache.ResolveUrl(raw, baseUrl.ToAbsolute()));
+                }
+                catch { }
+            }
+
+            var bgCss = elem.Style?.BackgroundImage;
+            if (!string.IsNullOrEmpty(bgCss) && bgCss != "none")
+            {
+                var bgUrl = Renderer.ParseCssUrl(bgCss);
+                if (!string.IsNullOrEmpty(bgUrl))
+                {
+                    try { urls.Add(baseUrl.Resolve(bgUrl).ToAbsolute()); } catch { }
+                }
+            }
+        }
+
+        var distinct = urls.Distinct().ToList();
+
+        // PARALLEL fetching — the old sequential loop let one slow/hung
+        // image block every image after it (the "middle images don't
+        // load" symptom: background + first image arrive, the queue
+        // stalls, everything after shows the broken icon).
+        var fetches = new List<Task>();
+        foreach (var absoluteUrl in distinct)
+        {
+            fetches.Add(FetchOneImageAsync(absoluteUrl, ct, myGeneration));
+        }
+        await Task.WhenAll(fetches);
+
+        if (reflowWhenLoaded && distinct.Count > 0)
+        {
+            foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
+            {
+                string? src = elem.GetAttr("src");
+                if (string.IsNullOrEmpty(src)) continue;
+                string abs;
+                try { abs = ImageCache.ResolveUrl(src, baseUrl.ToAbsolute()); }
+                catch { continue; }
+
+                if (!elem.HasAttr("width") && !elem.HasAttr("height"))
+                {
+                    try
+                    {
+                        if (_imageCache.IsLoaded(abs) && !_imageCache.IsBroken(abs))
+                        {
+                            var frame = _imageCache.GetCurrentFrame(abs);
+                            if (frame != null)
+                            {
+                                elem.SetAttr("width", frame.Width.ToString());
+                                elem.SetAttr("height", frame.Height.ToString());
+                            }
+                        }
+                        else if (_imageCache.IsLoaded(abs))
+                        {
+                            // Failed to load.  Leaving the 32x32 placeholder in
+                            // place made ONE bad bullet.gif inflate every row of
+                            // a ~150-row link table (802px vs 527px) — the
+                            // "too much space between the links" bug.  Collapse
+                            // to the broken-icon size so layout stays compact;
+                            // the renderer still paints the icon + ALT text.
+                            elem.SetAttr("width", "16");
+                            elem.SetAttr("height", "16");
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            Size canvasSize = GetCanvasSize();
+            var newRoot = LayoutEngineApi.BuildLayoutTree(doc, canvasSize.Width, canvasSize.Height);
+
+            BeginInvoke(() =>
+            {
+                if (myGeneration != _navGeneration) return;
+                _canvas.ApplyRelayout(doc, newRoot);
+            });
+        }
+    }
+
+    private async Task FetchOneImageAsync(string absoluteUrl, CancellationToken ct, long myGeneration)
+    {
+        try
+        {
+            await _imageCache.GetAsync(absoluteUrl, _resourceLoader!, ct);
+            BeginInvoke(() =>
+            {
+                if (myGeneration != _navGeneration) return;
+                _canvas.RequestRerender();
+            });
+        }
+        catch { }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Frames
+    // ─────────────────────────────────────────────────────────────────────
+
+    private async Task LoadFramesAsync(DomDocument document, LayoutBox rootBox)
+    {
+        long gen = _navGeneration;
+        await LoadFrameLevelAsync(document, rootBox, parentView: null, gen);
+    }
+
+    /// <summary>
+    /// Loads every frame/iframe of one document level.  Recurses into each
+    /// loaded frame's own document, so nested frames (an iframe inside a
+    /// frame's page) load too — they used to show only the sunken
+    /// placeholder forever because only the TOP document's frames were
+    /// ever walked.
+    /// </summary>
+    private async Task LoadFrameLevelAsync(DomDocument document, LayoutBox rootBox,
+                                           BrowserCanvas.FrameView? parentView, long gen)
+    {
+        var frameBoxes = rootBox.Descendants()
+            .Where(b => b.BoxType == BoxType.Frame && b.Element != null)
+            .ToList();
+        if (frameBoxes.Count == 0) return;
+
+        string baseUrl = document.BaseUrl?.ToAbsolute() ?? "";
+
+        foreach (var frameBox in frameBoxes)
+        {
+            var frameElem = frameBox.Element!;
+            string? src = frameElem.GetAttr("src");
+            if (string.IsNullOrEmpty(src)) continue;
+
+            var blankDoc = HtmlParser.Parse("<html><body></body></html>",
+                ParsedUrl.Parse("about:blank"), _cookieStore);
+            var view = new BrowserCanvas.FrameView
+            {
+                Document = blankDoc,
+                RootBox = LayoutEngineApi.BuildLayoutTree(
+                    blankDoc, (int)frameBox.Width, (int)frameBox.Height),
+                Name = frameElem.GetAttr("name") ?? "",
+                Url = "",
+                ScrollingEnabled = frameElem.GetAttrOrDefault("scrolling", "auto")
+                    .ToLowerInvariant() != "no"
+            };
+
+            // Per-frame scripting context, created BEFORE the load so
+            // parse-time scripts (the document.write streaming pattern)
+            // execute exactly like they do for the top-level document —
+            // frames used to be parsed with NO scripting at all.
+            var (frameInterpreter, frameState) = CreateFrameContext(view);
+
+            try
+            {
+                // Show the sunken frame immediately — the chat-style pages
+                // (IRC #theoldnet: <iframe src="https://webchat.oftc.net/…">)
+                // used to paint NOTHING here: the frame only appeared after
+                // the fetch returned, and a modern TLS endpoint that hangs
+                // left the centred chat area blank forever ("that centre
+                // thing doesn't load at all").  A frame nested inside
+                // another frame's document registers against its PARENT
+                // frame (its box coordinates are frame-local).
+                if (parentView == null)
+                    _canvas.SetFrame(frameBox, view);
+                else
+                    _canvas.AddChildFrame(parentView, frameBox, view);
+
+                // A hard deadline on the whole frame fetch — the socket
+                // timeouts only cover connect/read, not a stalled TLS
+                // handshake against a modern CDN.
+                using var frameCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                var content = await FrameLoader.LoadAsync(
+                    baseUrl, src,
+                    (int)frameBox.Width, (int)frameBox.Height,
+                    _httpClient, _cookieStore, frameCts.Token,
+                    (fdoc, scriptSrc) => RunFrameScript(
+                        fdoc, scriptSrc, frameInterpreter, frameState));
+                if (gen != _navGeneration) return;
+
+                if (content != null)
+                {
+                    ApplyFrameContent(view, content, frameInterpreter, frameState);
+                    if (parentView == null)
+                        SetFrameOnLiveBox(frameElem, frameBox, view);
+                    else
+                        _canvas.RefreshChildFrame(parentView, frameBox, view);
+
+                    // Fetch the frame's images, then reflow the frame layout
+                    // at real image sizes — frame images used to stay at the
+                    // 32×32 placeholder size forever because only the MAIN
+                    // page reflowed after its prefetch.
+                    _ = LoadFrameImagesThenReflowAsync(view, content, gen,
+                        parentView, frameElem, frameBox);
+
+                    // Frames nested inside THIS frame's document.
+                    await LoadFrameLevelAsync(content.Document, content.RootBox,
+                        view, gen);
+                }
+                else
+                {
+                    // about:blank — the blank view is already correct.
+                    if (parentView == null)
+                        SetFrameOnLiveBox(frameElem, frameBox, view);
+                }
+            }
+            catch
+            {
+                // FrameLoader never throws, but a failure between SetFrame
+                // calls must not kill the remaining frames of the page.
+                if (gen != _navGeneration) return;
+                if (parentView == null)
+                    SetFrameOnLiveBox(frameElem, frameBox, view);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates the per-frame JS context (scope, interpreter, DOM state).
+    /// JS navigation inside a frame targets the frame itself, through the
+    /// existing frame-navigation path.
+    /// </summary>
+    private (JsInterpreter interpreter, DocumentBindingsState state)
+        CreateFrameContext(BrowserCanvas.FrameView view)
+    {
+        var frameScope = new JsScope();
+        JsRuntime.PopulateGlobalScope(frameScope);
+        DomBindings.RegisterEarlyGlobals(frameScope, _canvas);
+
+        var interpreter = new JsInterpreter(
+            frameScope,
+            null,
+            navUrl => BeginInvoke(() => _ = LoadFrameAsync(view, navUrl)),
+            msg => BeginInvoke(() => _statusLabel.Text = msg));
+
+        var state = new DocumentBindingsState
+        {
+            Interpreter = interpreter,
+            Canvas = _canvas,
+            LastModified = "",
+            Referrer = ""
+        };
+        interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, state);
+        interpreter.RegisterRuntimeBuiltins();
+
+        return (interpreter, state);
+    }
+
+    /// <summary>
+    /// Parse-time script executor for frame documents — the frame twin of
+    /// RunInlineScript: full DOM-0 bindings refreshed before EVERY script
+    /// (period-accurate: a script at the bottom of the frame sees the form
+    /// above it), document.write routed to the shared state buffer the
+    /// parser splices.
+    /// </summary>
+    private string RunFrameScript(DomDocument document, string scriptSource,
+                                  JsInterpreter interpreter,
+                                  DocumentBindingsState state)
+    {
+        state.Document = document;
+        DomBindings.RegisterAll((JsScope)interpreter.GlobalScope!, document,
+            new NavigationHistory(), _canvas, state);
+        interpreter.RegisterRuntimeBuiltins();
+
+        try { interpreter.ExecuteString(scriptSource); }
+        catch (Exception ex)
+        {
+            BeginInvoke(() => _statusLabel.Text = $"Script error: {ex.Message}");
+        }
+
+        string written = state.WriteBuffer.ToString();
+        state.WriteBuffer.Clear();
+        return written;
+    }
+
+    /// <summary>
+    /// Installs loaded content into a frame view: visited-link colours,
+    /// the frame's interpreter hookup (timers), and the window/element
+    /// onload pass — the same pass the headless rig runs for frames.
+    /// </summary>
+    private void ApplyFrameContent(BrowserCanvas.FrameView view, FrameContent content,
+                                   JsInterpreter frameInterpreter,
+                                   DocumentBindingsState frameState)
+    {
+        content.Document.VisitedUrls.UnionWith(_visitedUrls);
+        view.Document = content.Document;
+        view.RootBox = content.RootBox;
+        view.Url = content.AbsoluteUrl;
+
+        // Full DOM-0 bindings for the frame document.
+        frameState.Document = content.Document;
+        DomBindings.RegisterAll((JsScope)frameInterpreter.GlobalScope!,
+            content.Document, new NavigationHistory(), _canvas, frameState);
+        frameInterpreter.RegisterRuntimeBuiltins();
+
+        // Timers scheduled by frame scripts are driven by the canvas's
+        // JS timer tick.
+        view.Interpreter = frameInterpreter;
+
+        // window.onload + element onload.
+        try
+        {
+            var fwin = frameState.WindowObject;
+            if (fwin != null && fwin.Get("onload") is { Type: JsType.Function } fol)
+                frameInterpreter.CallHandler(fol, JsValue.FromObject(fwin));
+            foreach (var elem in content.Document.ElementDescendants()
+                         .Where(e => e.EventHandlers.ContainsKey("onload")))
+                frameInterpreter.FireEvent(elem, "onload");
+        }
+        catch (Exception ex)
+        {
+            BeginInvoke(() => _statusLabel.Text = $"Script error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Re-finds the frame's CURRENT layout box before painting content: an
+    /// image-load relayout between the fetch starting and finishing can
+    /// have replaced the tree the box came from, and SetFrame keyed on the
+    /// dead box would paint the frame at a stale rect.
+    /// </summary>
+    private void SetFrameOnLiveBox(DomElement frameElem, LayoutBox originalBox,
+                                   BrowserCanvas.FrameView view)
+    {
+        var live = _canvas.FindFrameBox(frameElem) ?? originalBox;
+        _canvas.SetFrame(live, view);
+    }
+
+    /// <summary>The layout box currently displaying a frame view.</summary>
+    private LayoutBox? FindBoxForView(BrowserCanvas.FrameView view) =>
+        _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+
+    /// <summary>
+    /// Fetches a frame's images, then rebuilds the frame layout with real
+    /// image sizes — the per-frame twin of the main page's post-prefetch
+    /// reflow (images without WIDTH/HEIGHT used to stay 32×32 in frames
+    /// forever; broken ones collapsed instead to the compact 16×16 icon).
+    /// Works for top-level frames (page frame map) and frames nested inside
+    /// another frame's document (parent-relative composition).
+    /// </summary>
+    private async Task LoadFrameImagesThenReflowAsync(
+        BrowserCanvas.FrameView view, FrameContent content, long gen,
+        BrowserCanvas.FrameView? parentView, DomElement frameElem, LayoutBox originalBox)
+    {
+        var baseUrl = ParsedUrl.Parse(content.AbsoluteUrl);
+
+        await PrefetchImagesAsync(content.Document, baseUrl,
+            CancellationToken.None, reflowWhenLoaded: false, gen);
+        if (gen != _navGeneration) return;
+
+        bool changed = false;
+        foreach (var elem in content.Document.ElementDescendants()
+                     .Where(e => e.TagName == "img"))
+        {
+            string? src = elem.GetAttr("src");
+            if (string.IsNullOrEmpty(src)) continue;
+            string abs;
+            try { abs = ImageCache.ResolveUrl(src, baseUrl.ToAbsolute()); }
+            catch { continue; }
+
+            if (elem.HasAttr("width") || elem.HasAttr("height")) continue;
+
+            try
+            {
+                if (_imageCache.IsLoaded(abs) && !_imageCache.IsBroken(abs))
+                {
+                    var frame = _imageCache.GetCurrentFrame(abs);
+                    if (frame != null)
+                    {
+                        elem.SetAttr("width", frame.Width.ToString());
+                        elem.SetAttr("height", frame.Height.ToString());
+                        changed = true;
+                    }
+                }
+                else if (_imageCache.IsLoaded(abs))
+                {
+                    // Broken image — collapse to the broken-icon size so
+                    // layout stays compact (same rule as the main page).
+                    elem.SetAttr("width", "16");
+                    elem.SetAttr("height", "16");
+                    changed = true;
+                }
+            }
+            catch { }
+        }
+
+        if (!changed) return;
+
+        // Rebuild the frame layout at its CURRENT box size and repaint.
+        if (parentView != null)
+        {
+            // Nested frame: re-find its current box inside the parent's
+            // (possibly re-laid-out) tree, then recompose into the parent.
+            var liveChild = parentView.ChildFrames
+                .FirstOrDefault(f => f.Box.Element == frameElem);
+            if (liveChild.Box == null) return;
+            view.RootBox = LayoutEngineApi.BuildLayoutTree(content.Document,
+                (int)liveChild.Box.Width, (int)liveChild.Box.Height);
+            _canvas.RefreshChildFrame(parentView, liveChild.Box, view);
+        }
+        else
+        {
+            var live = _canvas.FindFrameBox(frameElem) ?? originalBox;
+            view.RootBox = LayoutEngineApi.BuildLayoutTree(content.Document,
+                (int)live.Width, (int)live.Height);
+            _canvas.SetFrame(live, view);
+        }
+    }
+
+    private async Task LoadFrameAsync(BrowserCanvas.FrameView view, string url,
+                                      string? postData = null)
+    {
+        long gen = _navGeneration;
+        try
+        {
+            // A fresh scripting context per navigation, exactly like the
+            // initial load (link-navigated frames used to arrive with NO
+            // scripting — the frame went dead after the first click).
+            var (interpreter, state) = CreateFrameContext(view);
+
+            // The frame's own current URL is the resolution base (JS may
+            // assign a relative location.href).
+            FrameContent? content = null;
+            if (postData == null)
+            {
+                // Same loader the initial page load uses — full scheme
+                // support (http/file), era error pages rendered INSIDE the
+                // frame.  (The old code navigated the WHOLE top-level
+                // window on any non-200, blowing away the frameset page
+                // over one dead link.)
+                var sizeBox = _canvas.Frames
+                    .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+                int w = (int)(sizeBox?.Width ?? 300f);
+                int h = (int)(sizeBox?.Height ?? 150f);
+                content = await FrameLoader.LoadAsync(
+                    view.Url, url, w, h,
+                    _httpClient, _cookieStore, CancellationToken.None,
+                    (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state));
+            }
+            else
+            {
+                var parsed = ParsedUrl.Parse(url);
+                var result = await _httpClient.PostAsync(parsed, postData,
+                    _cookieStore, CancellationToken.None);
+                if (gen != _navGeneration) return;
+
+                if (result is HttpSuccess s && s.StatusCode == 200)
+                {
+                    string html = DecodeBody(s);
+                    var doc = HtmlParser.Parse(html, parsed, _cookieStore,
+                        (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state));
+                    StyleResolver.Resolve(doc);
+
+                    var frameBox = _canvas.Frames
+                        .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+                    if (frameBox == null) return;
+
+                    var root = LayoutEngineApi.BuildLayoutTree(doc,
+                        (int)frameBox.Width, (int)frameBox.Height);
+                    content = new FrameContent(doc, root, url);
+                }
+            }
+
+            if (gen != _navGeneration) return;
+            if (content != null)
+            {
+                view.Scroll = default;
+                ApplyFrameContent(view, content, interpreter, state);
+
+                var frameBox = _canvas.Frames
+                    .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+                if (frameBox == null) return;
+                _canvas.SetFrame(frameBox, view);
+
+                _ = LoadFrameImagesThenReflowAsync(view, content, gen,
+                    parentView: null, frameElem: frameBox.Element!,
+                    originalBox: frameBox);
+                return;
+            }
+        }
+        catch { }
+
+        if (gen == _navGeneration)
+            NavigateTo(url);
+    }
+
+    private void OnFrameNavigationRequested(
+        (BrowserCanvas Canvas, BrowserCanvas.FrameView Frame, string Url) nav)
+        => _ = LoadFrameAsync(nav.Frame, nav.Url);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Page display / history
+    // ─────────────────────────────────────────────────────────────────────
+
+    private Size GetCanvasSize() =>
+        InvokeRequired ? (Size)Invoke(() => _canvas.GetViewportSize())
+                       : _canvas.GetViewportSize();
+
+    private void UpdatePage(DomDocument document, LayoutBox rootBox, string url,
+                            HistoryEntry entry)
+    {
+        DebugLog.Write($"UpdatePage APPLIED gen={_navGeneration} url='{url}' title='{document.Title}' rootBoxChildren={rootBox.Children?.Count ?? -1}");
+        _currentPageUrl = url;
+
+        if (_history.Current != url)
+            _history.Push(entry);
+
+        UpdateNavigationButtons();
+
+        _canvas.SetPage(document, rootBox, _jsInterpreter!, _fontCache, _imageCache);
+        _canvas.ReRenderPage(_fontCache, _imageCache, _resourceLoader!);
+
+        Text = (document.Title.Length > 0 ? document.Title : "Untitled") + " — Retro96";
+        _txtUrl.Text = url;
+        _statusLabel.Text = "Done";
+        Cursor = Cursors.Default;
+        _btnStop.Enabled = false;
+        _isLoading = false;
+        _throbberBox.Invalidate();
+
+        int hash = url.IndexOf('#');
+        if (hash >= 0 && hash + 1 < url.Length)
+            _canvas.ScrollToAnchor(url[(hash + 1)..]);
+    }
+
+    public void NavigateBack()
+    {
+        if (_history.NextBackwardIsPost &&
+            MessageBox.Show(
+                "This page was produced by a form submission.  Going back " +
+                "will send the form data again.",
+                "Retro96",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning) != DialogResult.OK)
+            return;
+
+        var entry = _history.Peek(-1);
+        if (entry != null)
+            _ = NavigateAsync(entry.Url, entry.PostData);
+    }
+
+    public void NavigateForward()
+    {
+        if (_history.NextForwardIsPost &&
+            MessageBox.Show(
+                "This page was produced by a form submission.  Going forward " +
+                "will send the form data again.",
+                "Retro96",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning) != DialogResult.OK)
+            return;
+
+        var entry = _history.Peek(1);
+        if (entry != null)
+            _ = NavigateAsync(entry.Url, entry.PostData);
+    }
+
+    public void Reload()
+    {
+        var entry = _history.CurrentEntry;
+        if (entry != null)
+            _ = NavigateAsync(entry.Url, entry.PostData);
+    }
+
+    private void UpdateNavigationButtons()
+    {
+        _btnBack.Enabled = _history.CanGoBack;
+        _btnForward.Enabled = _history.CanGoForward;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Errors (rendered as era pages)
+    // ─────────────────────────────────────────────────────────────────────
+
+    private async Task RenderErrorAsync(string html, long? generation = null)
+    {
+        await RenderHtmlAsync(html, _txtUrl.Text, replaceHistory: false, generation);
+    }
+
+    private async Task RenderHtmlAsync(string html, string url, bool replaceHistory,
+                                       long? generation = null)
+    {
+        long myGeneration = generation ?? ++_navGeneration;
+
+        DebugLog.Write($"RenderHtmlAsync ENTER gen={myGeneration} url='{url}' htmlLen={html.Length}");
+        try
+        {
+            var baseUrl = ParsedUrl.Parse(url);
+
+            var (document, interpreter, state) = PrepareScripting(baseUrl, html);
+
+            // Local pages (file:// base) load their <link rel=stylesheet>
+            // stylesheets here — the fetcher's own file:// branch used to
+            // be unreachable from this render path (only the HTTP success
+            // path called it), so a local page's CSS silently vanished.
+            await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
+
+            StyleResolver.Resolve(document);
+            document.VisitedUrls.UnionWith(_visitedUrls);
+
+            Size sz = GetCanvasSize();
+            var root = LayoutEngineApi.BuildLayoutTree(document, sz.Width, sz.Height);
+            RegisterBindings(document, interpreter, state);
+
+            BeginInvoke(() =>
+            {
+                if (myGeneration != _navGeneration)
+                {
+                    DebugLog.Write($"RenderHtmlAsync gen={myGeneration} STALE (current={_navGeneration}) — dropped");
+                    return;
+                }
+                try
+                {
+                    UpdatePage(document, root, url, new HistoryEntry(url));
+
+                    // Local file/about pages use RenderHtmlAsync rather than
+                    // the HTTP success path, so they need the same post-load
+                    // event dispatch explicitly.
+                    var win = interpreter.WindowObject;
+                    if (win != null && win.Get("onload") is { Type: JsType.Function } onload)
+                        interpreter.CallHandler(onload, JsValue.FromObject(win));
+
+                    var body = document.ElementDescendants()
+                        .FirstOrDefault(e => e.TagName == "body");
+                    DebugLog.Write($"BODY ONLOAD(local): found={body != null} " +
+                                   $"source='{body?.GetAttr("onload") ?? "<null>"}'");
+                    if (body != null)
+                    {
+                        var bodyOnload = body.GetAttr("onload");
+                        if (!string.IsNullOrEmpty(bodyOnload))
+                        {
+                            body.EventHandlers["onload"] = bodyOnload;
+                            interpreter.FireEvent(body, "onload");
+                        }
+                    }
+
+                    // file://, about: and error pages render through this
+                    // path — their frames/iframes must load too.  The
+                    // HTTP-only success path used to be the ONLY caller of
+                    // LoadFramesAsync, so an iframe on a locally-opened
+                    // page never even attempted to load ("iframe don't
+                    // work").
+                    _ = LoadFramesAsync(document, root);
+                }
+                catch (Exception ex)
+                {
+                    // See ProcessSuccessAsync: never let a render exception
+                    // leave the canvas blank and unexplained.
+                    DebugLog.WriteException($"RenderHtmlAsync/UpdatePage gen={myGeneration}", ex);
+                    _ = RenderErrorAsync(ErrorPage.NetworkError(url,
+                        $"Layout error: {ex.Message}"), myGeneration);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException($"RenderHtmlAsync gen={myGeneration}", ex);
+            BeginInvoke(() =>
+            {
+                if (myGeneration == _navGeneration)
+                    _statusLabel.Text = $"Render error: {ex.Message}";
+            });
+        }
+        await Task.CompletedTask;
+    }
+
+    private void OnCanvasNavigateRequested(string url)
+    {
+        if (_currentPageUrl != null && url.StartsWith('#'))
+        {
+            _history.PushAnchor(_currentPageUrl + url);
+            _canvas.ScrollToAnchor(url[1..]);
+            _txtUrl.Text = _currentPageUrl + url;
+            return;
+        }
+        if (_currentPageUrl != null && url.StartsWith(_currentPageUrl + "#"))
+        {
+            _history.PushAnchor(url);
+            _canvas.ScrollToAnchor(url[(_currentPageUrl.Length + 1)..]);
+            _txtUrl.Text = url;
+            return;
+        }
+
+        NavigateTo(url);
+    }
+
+    private void OnCanvasStatusChanged(string status) =>
+        BeginInvoke(() => _statusLabel.Text = status);
+
+    private void OnFormSubmitted((string Url, string Body, string? Target,
+                                  BrowserCanvas.FrameView? Frame) submit)
+    {
+        if (submit.Frame != null &&
+            (string.IsNullOrEmpty(submit.Target) || submit.Target == "_self"))
+        {
+            _ = LoadFrameAsync(submit.Frame, submit.Url, submit.Body);
+            return;
+        }
+
+        if (submit.Target == "_top" || submit.Target == "_parent" ||
+            string.IsNullOrEmpty(submit.Target))
+        {
+            _ = NavigateAsync(submit.Url, submit.Body);
+        }
+        else if (submit.Target == "_blank")
+        {
+            OpenNewBrowserWindow(submit.Url);
+        }
+        else
+        {
+            var named = _canvas.Frames.FirstOrDefault(f =>
+                string.Equals(f.View.Name, submit.Target, StringComparison.OrdinalIgnoreCase));
+            if (named.View != null)
+                _ = LoadFrameAsync(named.View, submit.Url, submit.Body);
+            else
+                _ = NavigateAsync(submit.Url, submit.Body);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Dialogs
+    // ─────────────────────────────────────────────────────────────────────
+
+    private (string User, string Pass)? PromptForCredentials(string host)
+    {
+        using var form = new Form
+        {
+            Text = $"Enter username and password for {host}",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(340, 130),
+            ShowInTaskbar = false
+        };
+
+        var lblUser = new Label { Text = "Username:", AutoSize = true, Location = new Point(12, 15) };
+        var txtUser = new TextBox { Location = new Point(100, 12), Width = 220 };
+        var lblPass = new Label { Text = "Password:", AutoSize = true, Location = new Point(12, 45) };
+        var txtPass = new TextBox { Location = new Point(100, 42), Width = 220, UseSystemPasswordChar = true };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(160, 84) };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(244, 84) };
+
+        form.Controls.AddRange(new Control[] { lblUser, txtUser, lblPass, txtPass, ok, cancel });
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+
+        if (form.ShowDialog(this) == DialogResult.OK && txtUser.Text.Length > 0)
+            return (txtUser.Text, txtPass.Text);
+        return null;
+    }
+
+    private void OpenNewBrowserWindow(string url)
+    {
+        var window = new Form1();
+        _childWindows.Add(window);
+        window.FormClosed += (s, e) => _childWindows.Remove(window);
+        window.Show();
+        window.NavigateTo(url);
+    }
+
+    private async void OpenHtmlFile()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "HTML files (*.html;*.htm)|*.html;*.htm|All files (*.*)|*.*",
+            Title = "Open HTML File"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+        long myGeneration = ++_navGeneration;
+        DebugLog.Write($"OpenHtmlFile gen={myGeneration} file='{dialog.FileName}'");
+
+        try
+        {
+            string html = BodyDecoder.Decode(
+                await File.ReadAllBytesAsync(dialog.FileName), null);
+            // Canonical file:/// base (three slashes, empty authority) so
+            // every relative link/image on the page resolves cleanly —
+            // the old two-slash form produced malformed file:////C:/…
+            // resolved URLs downstream.
+            string url = CanonicalFileUrl(Path.GetFullPath(dialog.FileName));
+            await RenderHtmlAsync(html, url, replaceHistory: false, myGeneration);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException($"OpenHtmlFile gen={myGeneration}", ex);
+            await RenderErrorAsync(ErrorPage.LocalFileNotFound(dialog.FileName), myGeneration);
+            if (myGeneration == _navGeneration)
+                _statusLabel.Text = ex.Message;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Printing
+    // ─────────────────────────────────────────────────────────────────────
+
+    private void PrintPage()
+    {
+        var bitmap = _canvas.RenderedBitmap;
+        if (bitmap == null)
+        {
+            _statusLabel.Text = "Nothing to print";
+            return;
+        }
+
+        _statusLabel.Text = "Printing…";
+
+        using var printDoc = new System.Drawing.Printing.PrintDocument();
+        using var dialog = new PrintDialog { Document = printDoc };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            _statusLabel.Text = "Ready";
+            return;
+        }
+
+        // The engine renders on SkiaSharp; printing runs on GDI — convert
+        // the page to a GDI twin ONCE (ShellPaint) and print from that.
+        using var gdiBitmap = SkiaWinForms.ToGdi(bitmap);
+        if (gdiBitmap == null)
+        {
+            _statusLabel.Text = "Nothing to print";
+            return;
+        }
+
+        float srcDpiX = SafeBitmapDpi(gdiBitmap, horizontal: true);
+        float srcDpiY = SafeBitmapDpi(gdiBitmap, horizontal: false);
+
+        float printableWidth = PageWidth(printDoc);
+        int pageIndex = 0;
+
+        printDoc.PrintPage += (s, e) =>
+        {
+            try
+            {
+                float srcWidthPx = printableWidth * srcDpiX / 100f;
+                float scale = srcWidthPx > 0 ? srcWidthPx / gdiBitmap.Width : 1f;
+
+                float pageHeightPx = e.MarginBounds.Height * srcDpiY / 100f / scale;
+
+                float srcY = pageIndex * pageHeightPx;
+                if (srcY >= gdiBitmap.Height)
+                {
+                    e.HasMorePages = false;
+                    return;
+                }
+
+                float srcH = Math.Min(pageHeightPx, gdiBitmap.Height - srcY);
+                var srcRect = new RectangleF(0f, srcY, gdiBitmap.Width, srcH);
+
+                var destRect = new RectangleF(
+                    e.MarginBounds.Left, e.MarginBounds.Top,
+                    srcRect.Width * scale * 100f / srcDpiX,
+                    srcRect.Height * scale * 100f / srcDpiY);
+
+                var graphics = e.Graphics;
+                if (graphics == null) return;
+
+                graphics.InterpolationMode =
+                    System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                graphics.PixelOffsetMode =
+                    System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                graphics.DrawImage(gdiBitmap, destRect, srcRect, GraphicsUnit.Pixel);
+
+                pageIndex++;
+                e.HasMorePages = srcY + srcH < gdiBitmap.Height - 1f;
+                if (!e.HasMorePages)
+                    _statusLabel.Text = "Printed.";
+            }
+            catch (Exception ex)
+            {
+                _statusLabel.Text = $"Print error: {ex.Message}";
+                e.HasMorePages = false;
+            }
+        };
+
+        try { printDoc.Print(); }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = $"Print error: {ex.Message}";
+        }
+    }
+
+    private static float PageWidth(System.Drawing.Printing.PrintDocument doc) =>
+        doc.PrinterSettings.DefaultPageSettings.PrintableArea.Width > 0
+            ? doc.PrinterSettings.DefaultPageSettings.PrintableArea.Width
+            : 650f;
+
+    private static float SafeBitmapDpi(System.Drawing.Bitmap bitmap, bool horizontal)
+    {
+        try
+        {
+            float dpi = horizontal ? bitmap.HorizontalResolution : bitmap.VerticalResolution;
+            return float.IsFinite(dpi) && dpi > 0f ? dpi : 96f;
+        }
+        catch (Exception)
+        {
+            return 96f;
+        }
+    }
+
+    private static string Retro96HomePageHtml()
+    {
+        return @"<!DOCTYPE HTML PUBLIC ""-//W3C//DTD HTML 3.2 Final//EN"">
+<HTML>
+<HEAD>
+<TITLE>Retro96 Home Page</TITLE>
+</HEAD>
+<BODY BGCOLOR=""#FFFFFF"" TEXT=""#000000"" LINK=""#0000EE"" VLINK=""#551A8B"" ALINK=""#FF0000"">
+<CENTER>
+<TABLE WIDTH=""560"" BORDER=""0"" CELLPADDING=""0"" CELLSPACING=""0"">
+<TR><TD ALIGN=""CENTER"" BGCOLOR=""#000080"">
+<FONT COLOR=""#FFFFFF"" SIZE=""6"" FACE=""Arial, Helvetica""><B>Retro96</B></FONT><BR>
+<FONT COLOR=""#FFFF00"" SIZE=""2"" FACE=""Arial, Helvetica"">Your window on the World Wide Web</FONT>
+</TD></TR>
+</TABLE>
+<BR>
+
+<TABLE WIDTH=""560"" BORDER=""2"" CELLPADDING=""8"" CELLSPACING=""0"" BGCOLOR=""#C0C0C0"">
+<TR><TD ALIGN=""CENTER"">
+<FORM ACTION=""http://frogfind.com"" METHOD=""GET"">
+<B>Search the Web</B><BR>
+<INPUT TYPE=""TEXT"" NAME=""q"" SIZE=""32"" MAXLENGTH=""128"">
+<INPUT TYPE=""SUBMIT"" VALUE=""Search"">
+<BR>
+<FONT SIZE=""1"">Powered by <A HREF=""http://frogfind.com"">FrogFind</A></FONT>
+</FORM>
+</TD></TR>
+</TABLE>
+<BR>
+<HR WIDTH=""560"" SIZE=""2"">
+
+<TABLE WIDTH=""560"" BORDER=""0"" CELLPADDING=""6"" CELLSPACING=""0"">
+<TR><TD COLSPAN=""2"" ALIGN=""LEFT""><B>Places to go</B></TD></TR>
+<TR VALIGN=""TOP"">
+<TD WIDTH=""50%"">
+<UL>
+<LI><A HREF=""http://frogfind.com"">FrogFind</A> - search engine for old browsers
+<LI><A HREF=""http://theoldnet.com/"">The Old Net</A> - browse the web as it was
+<LI><A HREF=""http://web.archive.org/"">Internet Archive</A>
+</UL>
+</TD>
+<TD WIDTH=""50%"">
+<UL>
+<LI><A HREF=""http://www.w3.org/"">W3C</A> - the Web standards folks
+<LI><A HREF=""http://info.cern.ch/"">CERN</A> - where the Web began
+<LI><A HREF=""http://textfiles.com/"">textfiles.com</A>
+</UL>
+</TD>
+</TR>
+</TABLE>
+
+<HR WIDTH=""560"" SIZE=""2"">
+<FONT SIZE=""2"">
+This page is best viewed with any browser at 640x480 or better.<BR>
+Type a web address or search words in the box at the top of the window.
+</FONT>
+<BR><BR>
+<FONT SIZE=""1"">Last updated 1996</FONT>
+</CENTER>
+</BODY>
+</HTML>";
+    }
+
+    private SKBitmap LoadEmbeddedAsset(string resourceName)
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        using (Stream? stream = assembly.GetManifestResourceStream(resourceName))
+        {
+            if (stream == null)
+                throw new FileNotFoundException($"Embedded asset not found: {resourceName}");
+            return SKBitmap.Decode(stream);
+        }
+    }
+
+    private void LoadThrobberGif()
+    {
+        try
+        {
+            using var staticSkia = LoadEmbeddedAsset("Retro96.assets.static.png");
+            using var staticMs = new MemoryStream();
+            staticSkia.Encode(SKEncodedImageFormat.Png, 100).SaveTo(staticMs);
+            staticMs.Position = 0;
+            using var raw = new Bitmap(staticMs);
+            _staticBitmap = new Bitmap(raw);
+
+            string resourceName = "Retro96.assets.throbber.gif";
+            var assembly = Assembly.GetExecutingAssembly();
+            using var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream != null)
+            {
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                byte[] data = ms.ToArray();
+                _throbberDecoded = ImageDecoder.Decode(data, "image/gif");
+
+                if (_throbberDecoded != null && _throbberDecoded.Frames.Count > 1)
+                {
+                    int interval = _throbberDecoded.DelaysMs.Count > 0
+                        ? Math.Max(20, _throbberDecoded.DelaysMs[0])
+                        : 100;
+
+                    _throbberTimer = new System.Windows.Forms.Timer { Interval = interval };
+                    _throbberTimer.Tick += (s, e) =>
+                    {
+                        if (!_isLoading) return;
+                        _throbberFrameIndex++;
+                        if (_throbberBox != null && !_throbberBox.IsDisposed)
+                            _throbberBox.Invalidate();
+                    };
+                    _throbberTimer.Start();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _throbberDiag = "load failed: " + ex.GetType().Name;
+            DebugLog.WriteException("LoadThrobberGif", ex);
+        }
+    }
+
+    private void SetAppIcon()
+    {
+        try
+        {
+            using var skiaBmp = LoadEmbeddedAsset("Retro96.assets.logo.png");
+            using var ms = new MemoryStream();
+            skiaBmp.Encode(SKEncodedImageFormat.Png, 100).SaveTo(ms);
+            ms.Position = 0;
+            using var bmp = new System.Drawing.Bitmap(ms);
+            IntPtr hIcon = bmp.GetHicon();
+            Icon = Icon.FromHandle(hIcon);
+        }
+        catch { }
+    }
+}

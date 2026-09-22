@@ -1,0 +1,233 @@
+<!-- ============================================================
+     javascript-nasty.html - Retro96 QA suite (batch C, task 4-c1)
+     Deliberately nasty 1996-style JavaScript (ES3-era): every
+     construct below must either work or fail WITHOUT taking the
+     browser down.  Target viewport 800x600.  All images are data:
+     URIs; no external URLs; NO dialogs on this page.
+
+     Every item writes a [marker] into the document - a missing
+     marker is a failure, a crash is a catastrophic failure.
+
+     Checks exercised:
+     JSN-01  script in head writes content before body starts
+     JSN-02  document.images[] and document.links[] live collection
+             lengths written into the page (3 imgs, 5 links above)
+     JSN-03  document.cookie write then read-back
+     JSN-04  parse-time uncaught exception - engine must survive
+     JSN-05  setTimeout(function(){ throw new Error("boom"); }, 1)
+             plus subsequent markers proving the engine survived
+     JSN-06  eval("2+3") (and a second expression)
+     JSN-07  recursive function, 10 levels (factorial + sum)
+     JSN-08  string concatenation of 1000 items (+= loop AND array
+             join) - result lengths written into the page
+     JSN-09  typeof: undefined, null, function, number, string,
+             boolean, object (all seven classic results)
+     JSN-10  instanceof (new Object() instanceof Object, plus a
+             constructor and an Array probe)
+     JSN-11  try / catch / finally - catch writes the error message
+             of try { null.x } (plus an ordering probe)
+     JSN-12  arguments object (length, indexing, callee)
+     JSN-13  with statement (with (Math) and a plain object)
+     JSN-14  void operator (void 0 result + javascript:void(0) href)
+     JSN-15  comma operator result
+     JSN-16  delete (var o = {x:1}; delete o.x; o.x written back)
+     JSN-17  in operator ("x" in o)
+     JSN-18  for..in loop over an object (writes the keys)
+     JSN-19  document.write AFTER parse, button-triggered (replaces
+             the document; harness captures the pre-state first)
+     JSN-20  document.write AFTER parse, automatic setTimeout variant
+     ============================================================ -->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>JavaScript Nasty Tests</title>
+<script language="JavaScript">
+    // JSN-01: writing from head, before body exists.
+    document.write('<h3><font color="#00FF00">HEAD-WRITE-MARKER:</font> this line was written by a script sitting in the head, before the body started.</h3>');
+</script>
+</head>
+
+<body bgcolor="#101010" text="#00FF00" link="#FFCC00" vlink="#CC9900" alink="#FFFFFF">
+
+<a name="top"></a>
+<h1><font color="#FF4444" size=5>JavaScript Nasty Tests</font></h1>
+<tt>Twenty ways to hurt a 1996 browser. No dialog is used on this
+page. Every construct below writes a <b>[marker]</b> into the document;
+missing markers are failures, crashes are catastrophic failures.</tt>
+<hr size=2>
+
+<h2>Pre-flight: three images and five links sit above the probes</h2>
+<p>
+<img src="data:image/gif;base64,R0lGODdhCgAKAIEAAP8AAAAAAAAAAAAAACwAAAAACgAKAAAIEgABCBxIsKDBgwgTKlzIsGHCgAA7" width=10 height=10 alt="img1">
+<img src="data:image/gif;base64,R0lGODlhDAAMAIEAAAAA/wAAAAAAAAAAACwAAAAADAAMAAAIFgABCBxIsKDBgwgTKlzIsKHDhxARBgQAOw==" width=12 height=12 alt="img2">
+<img src="data:image/gif;base64,R0lGODdhHAAMAIEAAP/IAAAAAAAAAAAAACwAAAAAHAAMAAAIOgADCBxIsKDBgwEAKFzIsKHDhgIfSpyoMCLFiwwtYsSocSPFjh4lggzpcCTJjAlPikypsiTClzADBAQAOw==" width=28 height=12 alt="img3">
+</p>
+<p>
+<a href="#top">Link-A (top)</a> |
+<a href="#nasty">Link-B (nasty)</a> |
+<a href="javascript-basic.html">Link-C (basic page)</a> |
+<a href="javascript:void(0)">Link-D (void href)</a> |
+<a href="#bottom">Link-E (bottom)</a>
+</p>
+<script language="JavaScript">
+    document.write('<p><b>[images]</b> document.images.length = ' + document.images.length + ' (three img tags appear above this line).</p>');
+</script>
+<script language="JavaScript">
+    document.write('<p><b>[links]</b> document.links.length = ' + document.links.length + ' (five anchor tags appear above this line).</p>');
+</script>
+
+<h2>Cookie</h2>
+<script language="JavaScript">
+    document.cookie = "nastyVisit=1";
+    document.cookie = "nastySecond=abc123";
+    document.write('<p><b>[cookie]</b> two cookies were assigned; document.cookie now reads back: "' + document.cookie + '".</p>');
+</script>
+
+<h2>Uncaught exceptions</h2>
+<script language="JavaScript">
+    document.write('<p><b>[throw-pre]</b> the NEXT script block throws an uncaught Error on purpose - nothing further in that one block should appear.</p>');
+</script>
+<script language="JavaScript">
+    throw new Error("deliberate uncaught exception for JSN-04");
+</script>
+<script language="JavaScript">
+    document.write('<p><b>[throw-post]</b> SYNCHRONOUS-MARKER-AFTER-THROW: parsing continued, the engine is alive.</p>');
+    // JSN-05: the spec-exact timer-borne uncaught exception.
+    setTimeout(function () { throw new Error("boom"); }, 1);
+    document.write('<p><b>[boom-timer]</b> a 1 ms setTimeout was registered that throws new Error("boom") - a later timer below proves the engine survived it.</p>');
+    setTimeout(function () {
+        document.write('<hr><p><b>[throw-settimeout]</b> POST-THROW-MARKER via setTimeout: the timer-borne "boom" throw was swallowed, this later timer still fired, and document.write keeps working - the engine is alive.</p>');
+    }, 400);
+</script>
+
+<h2>Language torture rack</h2>
+
+<script language="JavaScript">
+    var evalResult = eval("2+3");
+    var evalSecond = eval("(3 + 4) * 10");
+    document.write('<p><b>[eval]</b> eval("2+3") = ' + evalResult + ' (expect 5); eval("(3 + 4) * 10") = ' + evalSecond + ' (expect 70).</p>');
+</script>
+
+<script language="JavaScript">
+    function nastyRecurse(n) { if (n <= 0) { return 0; } return n + nastyRecurse(n - 1); }
+    function nastyFactorial(n) { if (n <= 1) { return 1; } return n * nastyFactorial(n - 1); }
+    document.write('<p><b>[recursion]</b> 10-level recursion: nastyRecurse sums 1..10 to ' + nastyRecurse(10) + ' (expect 55); factorial(10) = ' + nastyFactorial(10) + ' (expect 3628800).</p>');
+</script>
+
+<script language="JavaScript">
+    var bigString = "";
+    for (var i = 0; i < 1000; i = i + 1) { bigString = bigString + "x"; }
+    var parts = new Array();
+    for (var j = 0; j < 1000; j = j + 1) { parts[parts.length] = "x"; }
+    var joined = parts.join("");
+    var pushed = new Array();
+    for (var m = 0; m < 1000; m = m + 1) { pushed.push("x"); }
+    var pushedJoined = pushed.join("");
+    document.write('<p><b>[concat1000]</b> 1000 concatenations produce length ' + bigString.length + ' (expect 1000); join of 1000 index-assigned items gives length ' + joined.length + ', join of 1000 pushed items gives length ' + pushedJoined.length + ' (both expect 1000); first char "' + bigString.charAt(0) + '", last char "' + bigString.charAt(999) + '".</p>');
+</script>
+
+<script language="JavaScript">
+    function dummyFn() { return 1; }
+    document.write('<p><b>[typeof]</b> undefined=' + (typeof neverDeclaredAnywhere) + ' null=' + (typeof null) + ' function=' + (typeof dummyFn) + ' number=' + (typeof 42) + ' string=' + (typeof "retro") + ' boolean=' + (typeof true) + ' object=' + (typeof {}) + '.</p>');
+</script>
+
+<script language="JavaScript">
+    function Widget(name) { this.name = name; }
+    var wg = new Widget("acme");
+    var digitBox = new Array(1, 2, 3);
+    var plainObj = new Object();
+    document.write('<p><b>[instanceof]</b> new Object() instanceof Object = ' + (plainObj instanceof Object) + ' (expect true); new Widget instanceof Widget = ' + (wg instanceof Widget) + ', array instanceof Array = ' + (digitBox instanceof Array) + ', widget instanceof Array = ' + (wg instanceof Array) + ' (expect true true false).</p>');
+</script>
+
+<script language="JavaScript">
+    var caughtMsg = "null.x did NOT throw on this engine";
+    var finallyRan = "no";
+    try { null.x; caughtMsg = "null.x evaluated without throwing"; }
+    catch (e) { caughtMsg = "" + e; }
+    finally { finallyRan = "yes"; }
+    var order = "";
+    try { order = order + "try;"; throw "boom"; }
+    catch (e) { order = order + "catch(" + e + ");"; }
+    finally { order = order + "finally"; }
+    document.write('<p><b>[try-catch-finally]</b> try { null.x } catch (e) wrote: "' + caughtMsg + '" (finally ran: ' + finallyRan + '); classic execution order: ' + order + '.</p>');
+</script>
+
+<script language="JavaScript">
+    function argProbe() {
+        var s = "length=" + arguments.length;
+        if (arguments.length > 0) { s = s + " first=" + arguments[0]; }
+        if (arguments.callee) { s = s + " callee=present"; }
+        return s;
+    }
+    document.write('<p><b>[arguments]</b> argProbe("alpha", "beta") reports: ' + argProbe("alpha", "beta") + '.</p>');
+</script>
+
+<script language="JavaScript">
+    var withBox = { label: "Retro96", depth: 96 };
+    var withOut = "";
+    with (withBox) { withOut = label + " at depth " + depth; }
+    var withPi = 0;
+    with (Math) { withPi = round(PI * 100) / 100; }
+    document.write('<p><b>[with]</b> with (Math) rounded PI to ' + withPi + ' (expect 3.14); with (withBox) resolved members to: "' + withOut + '" (expect "Retro96 at depth 96").</p>');
+</script>
+
+<script language="JavaScript">
+    var voidProbe = void 0;
+    document.write('<p><b>[void]</b> typeof (void 0) = ' + (typeof voidProbe) + ' (expect undefined); Link-D above is a javascript:void(0) href.</p>');
+</script>
+
+<script language="JavaScript">
+    var commaVal = (1, 2, 3);
+    document.write('<p><b>[comma]</b> (1, 2, 3) evaluates to ' + commaVal + ' (expect 3).</p>');
+</script>
+
+<script language="JavaScript">
+    var o = {x: 1};
+    var beforeX = ("x" in o);
+    var delOk = delete o.x;
+    var afterVal = "" + o.x;
+    var afterX = ("x" in o);
+    var delObj = { keep: "yes", drop: "no" };
+    var delOk2 = delete delObj.drop;
+    document.write('<p><b>[delete]</b> var o = {x:1}: "x" in o before = ' + beforeX + ', delete o.x returned ' + delOk + ', o.x now = ' + afterVal + ', "x" in o after = ' + afterX + ' (expect true, true, undefined, false); delete delObj.drop returned ' + delOk2 + '.</p>');
+</script>
+
+<script language="JavaScript">
+    var inObj = { alpha: 1, beta: 2 };
+    var inLit = { x: 1 };
+    document.write('<p><b>[in]</b> "alpha" in inObj = ' + ("alpha" in inObj) + ', "gamma" in inObj = ' + ("gamma" in inObj) + ' (expect true false); fresh probe "x" in {x:1} = ' + ("x" in inLit) + ' (expect true).</p>');
+</script>
+
+<script language="JavaScript">
+    var forInObj = { one: "uno", two: "dos", three: "tres" };
+    var collected = "";
+    for (var k in forInObj) { collected = collected + k + "=" + forInObj[k] + "; "; }
+    document.write('<p><b>[forin]</b> for..in walked the keys: ' + collected + '</p>');
+</script>
+
+<a name="nasty"></a>
+<h2>document.write AFTER parse (closed document)</h2>
+<tt>Both variants write into a finished document - Navigator
+behaviour: the document gets replaced. The harness captures the
+pre-state first. The page above is the synchronous fallback.</tt>
+<form action="#" onsubmit="return false">
+<input type="button" value="CLICK ME: document.write after parse" onclick="lateWrite()">
+</form>
+<script language="JavaScript">
+    function lateWrite() {
+        document.write('<html><body bgcolor="#800000" text="#FFFFFF"><h1>REPLACED!</h1><p><b>[write-after-parse-button]</b> the button-triggered post-parse document.write ran and replaced the document.</p><p><a href="javascript-nasty.html">reload javascript-nasty.html</a></p></body></html>');
+        document.close();
+    }
+    // JSN-20: automatic variant, 1.5 s after load.
+    setTimeout(function () {
+        document.write('<hr><p><b>[write-after-parse-auto]</b> AUTOMATIC post-parse document.write fired from a setTimeout. If you can read this, late writes were allowed through.</p>');
+    }, 1500);
+</script>
+
+<hr size=2>
+<a name="bottom"></a>
+<p><font size=2>javascript-nasty.html - Retro96 QA suite, batch C -
+<a href="javascript-basic.html">back to the basic page</a></font></p>
+</body>
+</html>

@@ -1,0 +1,196 @@
+<!--
+  Retro96 QA suite -- css-box-model.html  (pages batch B)
+  Box model edge cases.  Every demo paints its boxes so the geometry is
+  measurable straight off a screenshot.
+  Checks exercised:
+    1.  margin-left/right: auto centring (longhand AND margin: 0 auto)
+    2.  Collapsing margins between adjacent blocks (40 + 40 -> 40, not 80)
+    3.  Collapse through an EMPTY block (margins pass through it)
+    4.  Negative margins (pull left out of container; overlap upward)
+    5.  padding on an INLINE element (background reveals the pad box)
+    6.  border on a table CELL (CSS cell borders with border=0 table)
+    7.  width: 100% on a block inside a padded container (must fit the
+        CONTENT width -- not 100% of the outer border box)
+    8.  overflow: hidden / scroll / auto on a too-tall block -- not
+        really 1996, but it must not crash the layout engine
+  All images are data: URIs (no network on this page).
+-->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML>
+<HEAD>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+<TITLE>Box Model Edge Cases -- Retro96 QA</TITLE>
+<STYLE TYPE="text/css">
+/* the stage: a 700px field with visible edges so every offset is measurable */
+.stage   { width: 700px; background-color: #F0F0F0;
+           border: 1px solid #333333; padding: 0; }
+
+/* --- 1: auto centring ----------------------------------------- */
+#auto1 { width: 400px; margin-left: auto; margin-right: auto;
+         background-color: #FFE4B5; border: 2px solid #8B4513; }
+#auto2 { width: 300px; margin: 0 auto 0 auto;      /* shorthand form */
+         background-color: #B0C4DE; border: 2px solid #4682B4; }
+
+/* --- 2: collapsing margins ------------------------------------ */
+.mA   { margin-bottom: 40px; background-color: #FFFFCC; border: 1px solid #999966; }
+.mB   { margin-top: 40px;    background-color: #FFCCFF; border: 1px solid #996699; }
+.mB2  { margin-top: 20px;    background-color: #CCFFCC; border: 1px solid #669966; }
+/* mA then mB2: gap must be max(40,20)=40, NOT 60 */
+
+/* --- 3: empty-block collapse ---------------------------------- */
+.pTop    { margin-bottom: 30px; background-color: #E6E6FA; border: 1px dashed #666699; }
+.pBottom { margin-top: 30px;    background-color: #E0FFFF; border: 1px dashed #669999; }
+.empty   { margin-top: 30px; margin-bottom: 30px;
+           background-color: #FFFFFF; border: 1px dotted #FF0000; }
+/* the empty block's own margins must collapse THROUGH it: total gap
+   between pTop and pBottom is 30px, not 90px */
+
+/* --- 4: negative margins -------------------------------------- */
+.negL  { margin-left: -80px; width: 340px;
+         background-color: #CCFFCC; border: 1px solid #006400; }
+.negT  { margin-top: -45px; width: 300px; margin-left: 220px;
+         background-color: #FFD700; border: 1px solid #8B8000; }
+.anchor-for-neg { background-color: #FAEBD7; border: 1px solid #8B4513;
+                  width: 500px; margin-left: 60px; padding: 4px; }
+
+/* --- 5: padding on an inline element -------------------------- */
+.ipad { padding: 12px 16px; background-color: #FFCCCC;
+        border: 1px solid #CC0000; }
+
+/* --- 6: CSS borders on table cells ----------------------------- */
+td.bcell  { border: 4px solid #CC0000; }
+td.bcell2 { border-width: 6px; border-style: double; border-color: #0000CC; }
+td.bcell3 { border: 2px dashed #008000; }
+th.bhead  { border: 3px inset #888888; }
+
+/* --- 7: width 100% inside padded container --------------------- */
+.pouter { padding: 30px; background-color: #FFFFCC;
+          border: 2px solid #996633; width: 500px; }
+.w100   { width: 100%; background-color: #CCCCFF;
+          border: 1px dashed #333333; }
+/* w100 must be 500 - 2*2 - 2*30 = 436px wide: flush with the INNER
+   content edge of pouter, never poking out the right side */
+
+/* --- 8: overflow ----------------------------------------------- */
+.ofh { width: 320px; height: 70px; overflow: hidden;
+       border: 1px solid #000000; background-color: #FFFFFF; }
+.ofs { width: 320px; height: 70px; overflow: scroll;
+       border: 1px solid #000000; background-color: #FFFFFF; }
+.ofa { width: 320px; height: 70px; overflow: auto;
+       border: 1px solid #000000; background-color: #FFFFFF; }
+</STYLE>
+</HEAD>
+
+<BODY BGCOLOR="#FFFFFF" TEXT="#000000" LINK="#0000EE" VLINK="#551A8B" ALINK="#FF0000">
+
+<CENTER><FONT SIZE="+2" COLOR="#8B0000">Box Model Edge Cases</FONT></CENTER>
+<HR>
+
+<H3>1. margin: auto centring</H3>
+<DIV CLASS="stage">
+<DIV ID="auto1">Centred the long way: width 400px with margin-left:auto and
+margin-right:auto.  The tan box must sit dead centre of the 700px grey
+stage -- 150px of grey on EACH side.  Nothing may tilt.</DIV>
+<BR>
+<DIV ID="auto2">Centred the shorthand way: width 300px, margin: 0 auto 0
+auto.  The blue box must also be dead centre: 200px of grey on each side.
+If either box hugs the left edge, "auto" is being treated as zero.</DIV>
+</DIV>
+
+<H3>2. Collapsing margins between adjacent blocks</H3>
+<P>The white gap between the yellow block and the pink block below must be
+exactly <B>40px</B> -- the larger of their two 40px margins -- and NOT 80px.
+If the gap is 80px, margins are being added instead of collapsed.</P>
+<DIV CLASS="mA">Block A -- margin-bottom: 40px (yellow).</DIV>
+<DIV CLASS="mB">Block B -- margin-top: 40px (pink).  Gap above must be 40px.</DIV>
+<P>Now yellow (40px bottom) against green with only a 20px top margin:
+the gap must still be <B>40px</B> (the maximum of the two), not 60px.</P>
+<DIV CLASS="mA">Block A again -- margin-bottom: 40px.</DIV>
+<DIV CLASS="mB2">Block B2 -- margin-top: 20px (green).  Gap above must be 40px.</DIV>
+
+<H3>3. Margin collapse through an empty block</H3>
+<P>Between the lavender block and the pale-cyan block sits an EMPTY block
+carrying 30px margins top and bottom.  The margins must collapse straight
+through it: the total white gap between the two coloured blocks must be
+<B>30px</B>, not 90px.  The dotted red outline of the empty block may be
+visible INSIDE that gap or collapsed to nothing -- but the gap may not
+triple.</P>
+<DIV CLASS="pTop">Upper block -- margin-bottom: 30px (lavender).</DIV>
+<DIV CLASS="empty"></DIV>
+<DIV CLASS="pBottom">Lower block -- margin-top: 30px (pale cyan).  The gap
+above must measure 30px in total.</DIV>
+
+<H3>4. Negative margins</H3>
+<DIV CLASS="stage">
+<DIV CLASS="anchor-for-neg">A 500px anchor block offset 60px from the left
+edge of the grey stage.  The green block below is pulled LEFT by a
+-80px margin and must poke out past the stage's left border, overlapping
+the page background.  The gold block after it is dragged UP by -45px and
+must OVERLAP the tail of the green block instead of stacking below it.</DIV>
+<DIV CLASS="negL">Negative margin-left: -80px (green).  I must bleed out of
+the left edge of the grey stage.</DIV>
+<DIV CLASS="negT">Negative margin-top: -45px (gold).  I must overlap the
+green block above me; we are not friends.</DIV>
+</DIV>
+<BR CLEAR=ALL>
+
+<H3>5. Padding on an inline element</H3>
+<P>This sentence contains an inline element with padding:
+<B CLASS="ipad">this bold run has 12px vertical and 16px horizontal
+padding</B> and the sentence continues after it.  The pink background must
+extend 12px above and below the text and 16px left and right of the bold
+words, wrapping with the line -- the padding must NOT push the surrounding
+words onto different baselines in a sane engine, but it must be VISIBLE.</P>
+
+<H3>6. Border on a table cell</H3>
+<TABLE BORDER=0 CELLSPACING=2 CELLPADDING=6>
+<TR>
+  <TH CLASS="bhead">header cell, 3px inset</TH>
+  <TH CLASS="bhead">another header</TH>
+</TR>
+<TR>
+  <TD CLASS="bcell">Cell with a 4px solid red CSS border.  The table itself
+  has BORDER=0, so every visible line here comes from CSS on the TD.</TD>
+  <TD CLASS="bcell2">Cell with a 6px double blue border set through the
+  three longhands: border-width, border-style, border-color.</TD>
+</TR>
+<TR>
+  <TD CLASS="bcell3">Cell with a 2px dashed green border.</TD>
+  <TD>No CSS border at all -- for contrast, this cell must be clean.</TD>
+</TR>
+</TABLE>
+
+<H3>7. width: 100% inside a padded container</H3>
+<DIV CLASS="pouter">
+<DIV CLASS="w100">This block is width:100% INSIDE a 500px container with
+30px padding and a 2px border.  I must fill the container's CONTENT width
+exactly (436px) -- flush against the inner edge of the yellow padding on
+BOTH sides.  If my dashed border crosses the yellow padding or pokes out
+past the brown frame on the right, width:100% is being resolved against
+the wrong box.</DIV>
+</DIV>
+
+<H3>8. overflow (must not crash)</H3>
+<P>Not really a 1996 property, but the engine has to survive it.  Each box
+below is 70px tall and holds far more text than fits.  No crash, no
+infinite layout, no zero-size box:</P>
+<DIV CLASS="ofh"><B>overflow: hidden</B> -- the text below this line is cut
+off stone dead at the 70px mark, with no scrollbar and no bleeding pixels
+past the border.  Line two.  Line three.  Line four.  Line five.  Line six.
+Line seven.  Line eight.  Line nine.  Line ten, well past the clip.</DIV>
+<BR>
+<DIV CLASS="ofs"><B>overflow: scroll</B> -- scrollbars appear (or the
+content is simply clipped on a limited engine), and the box never grows
+past 70px tall.  Line two.  Line three.  Line four.  Line five.  Line six.
+Line seven.  Line eight.  Line nine.  Line ten, well past the clip.</DIV>
+<BR>
+<DIV CLASS="ofa"><B>overflow: auto</B> -- same discipline as scroll but
+the engine decides whether bars are needed.  Line two.  Line three.  Line
+four.  Line five.  Line six.  Line seven.  Line eight.  Line nine.  Line
+ten, well past the clip.</DIV>
+
+<HR>
+<CENTER><FONT SIZE="-1">Retro96 QA suite -- css-box-model.html</FONT></CENTER>
+
+</BODY>
+</HTML>

@@ -1,0 +1,808 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace Retro96.Engine.Css;
+
+public record CssDeclaration(string Property, string Value, bool Important);
+
+public record CssRule(IReadOnlyList<CssSelector> Selectors,
+               IReadOnlyList<CssDeclaration> Declarations);
+
+public record CssImportRule(string Url);
+
+/// <summary>
+/// CSS1 parser.  Produces one CssRule per selector, with shorthands expanded
+/// into individual (property, value) declarations.  Unknown properties and
+/// malformed values are skipped without affecting the rest of the rule.
+/// </summary>
+public static class CssParser
+{
+    public static (List<CssRule> Rules, List<CssImportRule> ImportRules) Parse(string css)
+    {
+        var rules = new List<CssRule>();
+        var importRules = new List<CssImportRule>();
+        if (string.IsNullOrEmpty(css))
+            return (rules, importRules);
+
+        css = RemoveComments(css);
+
+        int pos = 0;
+        while (pos < css.Length)
+        {
+            SkipWhitespace(css, ref pos);
+            if (pos >= css.Length)
+                break;
+
+            if (css[pos] == '@')
+            {
+                HandleAtRule(css, ref pos, rules, importRules);
+                continue;
+            }
+
+            var selectors = ParseSelectorList(css, ref pos);
+            if (selectors == null || selectors.Count == 0)
+            {
+                // Nothing usable — make sure we still make progress.
+                if (pos < css.Length && css[pos] == '{')
+                {
+                    // Stray block (e.g. a leading '{' or a selector we
+                    // could not read anything from) — skip the whole block.
+                    // The old code left pos ON the '{' here and looped
+                    // forever on such input.
+                    SkipToMatchingBrace(css, ref pos);
+                }
+                else if (pos < css.Length)
+                {
+                    pos++;
+                }
+                continue;
+            }
+
+            var declarations = ParseDeclarationBlock(css, ref pos);
+            // Declarations may be empty (harmless); still register the rule so
+            // the selector count matches author expectations.
+
+            foreach (var selector in selectors)
+                rules.Add(new CssRule(new[] { selector }, declarations));
+        }
+
+        return (rules, importRules);
+    }
+
+    /// <summary>Parse an inline STYLE="…" attribute value.</summary>
+    public static List<CssDeclaration> ParseInlineStyle(string style)
+    {
+        var declarations = new List<CssDeclaration>();
+        if (string.IsNullOrWhiteSpace(style))
+            return declarations;
+
+        int pos = 0;
+        ParseDeclarations(RemoveComments(style), ref pos, declarations, requireBraces: false);
+        return declarations;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Lexical helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static string RemoveComments(string css)
+    {
+        var sb = new StringBuilder(css.Length);
+        int pos = 0;
+        while (pos < css.Length)
+        {
+            if (pos + 1 < css.Length && css[pos] == '/' && css[pos + 1] == '*')
+            {
+                pos += 2;
+                while (pos < css.Length)
+                {
+                    if (pos + 1 < css.Length && css[pos] == '*' && css[pos + 1] == '/')
+                    {
+                        pos += 2;
+                        break;
+                    }
+                    pos++;
+                }
+                // Unterminated comment: rest of the sheet is comment (rare).
+            }
+            else
+            {
+                sb.Append(css[pos]);
+                pos++;
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static void SkipWhitespace(string css, ref int pos)
+    {
+        while (pos < css.Length && char.IsWhiteSpace(css[pos]))
+            pos++;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // @-rules
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static void HandleAtRule(string css, ref int pos,
+        List<CssRule> rules, List<CssImportRule> importRules)
+    {
+        pos++; // skip '@'
+
+        var nameSb = new StringBuilder();
+        while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
+               css[pos] != '(' && css[pos] != ';' && css[pos] != '{')
+        {
+            nameSb.Append(char.ToLowerInvariant(css[pos]));
+            pos++;
+        }
+        string name = nameSb.ToString();
+
+        switch (name)
+        {
+            case "import":
+                {
+                    SkipWhitespace(css, ref pos);
+                    string url = ParseUrlOrString(css, ref pos);
+                    importRules.Add(new CssImportRule(url));
+                    SkipToSemicolonOrBrace(css, ref pos);
+                    break;
+                }
+
+            case "charset":
+                SkipToSemicolon(css, ref pos);
+                break;
+
+            case "media":
+                {
+                    // @media screen, all { … } — only screen/all blocks apply.
+                    SkipWhitespace(css, ref pos);
+                    bool apply = false;
+                    var mediaSb = new StringBuilder();
+                    while (pos < css.Length && css[pos] != '{')
+                    {
+                        char c = css[pos];
+                        if (!char.IsWhiteSpace(c) && c != ',')
+                            mediaSb.Append(char.ToLowerInvariant(c));
+                        else if (mediaSb.Length > 0)
+                        {
+                            if (mediaSb.ToString() is "screen" or "all")
+                                apply = true;
+                            mediaSb.Clear();
+                        }
+                        pos++;
+                    }
+                    if (mediaSb.Length > 0 && mediaSb.ToString() is "screen" or "all")
+                        apply = true;
+
+                    if (pos < css.Length && css[pos] == '{')
+                    {
+                        pos++;
+                        int braceDepth = 1;
+                        var mediaCss = new StringBuilder();
+                        while (pos < css.Length && braceDepth > 0)
+                        {
+                            if (css[pos] == '{') braceDepth++;
+                            else if (css[pos] == '}') braceDepth--;
+                            if (braceDepth > 0)
+                                mediaCss.Append(css[pos]);
+                            pos++;
+                        }
+
+                        if (apply)
+                        {
+                            var (innerRules, innerImports) = Parse(mediaCss.ToString());
+                            rules.AddRange(innerRules);
+                            importRules.AddRange(innerImports);
+                        }
+                    }
+                    break;
+                }
+
+            default:
+                // Unknown @rule (@font-face, @page, …) — skip its block if
+                // it has one.
+                SkipToMatchingBrace(css, ref pos);
+                break;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Selectors
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static List<CssSelector>? ParseSelectorList(string css, ref int pos)
+    {
+        var selectors = new List<CssSelector>();
+        var parts = new List<SelectorPart>();
+        bool inSelector = true;
+
+        while (pos < css.Length && inSelector)
+        {
+            SkipWhitespace(css, ref pos);
+            if (pos >= css.Length) break;
+
+            char c = css[pos];
+
+            if (c == '{')
+            {
+                if (parts.Count > 0)
+                    selectors.Add(new CssSelector(parts));
+                // Leave pos ON the '{' — ParseDeclarationBlock consumes it.
+                inSelector = false;
+            }
+            else if (c == ',')
+            {
+                if (parts.Count > 0)
+                {
+                    selectors.Add(new CssSelector(parts));
+                    parts = new List<SelectorPart>();
+                }
+                pos++;
+            }
+            else
+            {
+                var part = ParseSelectorPart(css, ref pos);
+                if (part != null)
+                    parts.Add(part);
+            }
+        }
+
+        return selectors.Count > 0 ? selectors : null;
+    }
+
+    private static SelectorPart? ParseSelectorPart(string css, ref int pos)
+    {
+        if (pos >= css.Length) return null;
+
+        char c = css[pos];
+
+        switch (c)
+        {
+            case '*':
+                pos++;
+                return new SelectorPart(PartType.Universal, null);
+
+            case '#':
+                {
+                    pos++;
+                    var sb = new StringBuilder();
+                    while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                    {
+                        sb.Append(css[pos]);
+                        pos++;
+                    }
+                    return new SelectorPart(PartType.Id, sb.ToString());
+                }
+
+            case '.':
+                {
+                    pos++;
+                    var sb = new StringBuilder();
+                    while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                    {
+                        sb.Append(css[pos]);
+                        pos++;
+                    }
+                    return new SelectorPart(PartType.Class, sb.ToString());
+                }
+
+            case ':':
+                {
+                    pos++;
+                    bool isElement = false;
+                    if (pos < css.Length && css[pos] == ':')
+                    {
+                        pos++;
+                        isElement = true;
+                    }
+                    var sb = new StringBuilder();
+                    while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                    {
+                        sb.Append(char.ToLowerInvariant(css[pos]));
+                        pos++;
+                    }
+                    string name = sb.ToString();
+                    // CSS1 spells pseudo-elements with one colon. Accept the
+                    // later double-colon spelling too, but classify first-line
+                    // and first-letter correctly so their declarations reach the
+                    // inline layout path.
+                    bool css1PseudoElement = name is "first-line" or "first-letter";
+                    return isElement || css1PseudoElement
+                        ? new SelectorPart(PartType.PseudoElement, name)
+                        : new SelectorPart(PartType.PseudoClass, name);
+                }
+
+            case '>':
+                pos++;
+                return new SelectorPart(PartType.Child, null);
+
+            case '+':
+                pos++;
+                return new SelectorPart(PartType.AdjacentSibling, null);
+
+            case '~':
+                pos++;
+                return new SelectorPart(PartType.GeneralSibling, null);
+
+            case '[':
+                {
+                    pos++;
+                    var sb = new StringBuilder();
+                    while (pos < css.Length && css[pos] != ']')
+                    {
+                        sb.Append(css[pos]);
+                        pos++;
+                    }
+                    if (pos < css.Length) pos++; // ']'
+                    return new SelectorPart(PartType.Attribute, sb.ToString().Trim());
+                }
+
+            default:
+                {
+                    if (!char.IsLetter(c))
+                    {
+                        pos++;
+                        return null;
+                    }
+                    var sb = new StringBuilder();
+                    while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                    {
+                        sb.Append(char.ToLowerInvariant(css[pos]));
+                        pos++;
+                    }
+                    return new SelectorPart(PartType.Type, sb.ToString());
+                }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Declarations
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static List<CssDeclaration> ParseDeclarationBlock(string css, ref int pos)
+    {
+        var declarations = new List<CssDeclaration>();
+        ParseDeclarations(css, ref pos, declarations, requireBraces: true);
+        return declarations;
+    }
+
+    private static void ParseDeclarations(string css, ref int pos,
+        List<CssDeclaration> declarations, bool requireBraces)
+    {
+        if (requireBraces)
+        {
+            SkipWhitespace(css, ref pos);
+            if (pos >= css.Length || css[pos] != '{')
+                return;
+            pos++;
+        }
+
+        while (pos < css.Length)
+        {
+            SkipWhitespace(css, ref pos);
+            if (pos >= css.Length)
+                break;
+
+            char c = css[pos];
+
+            if (c == ';')
+            {
+                pos++;
+                continue;
+            }
+
+            if (c == '}')
+            {
+                pos++;
+                break;
+            }
+
+            // Property name
+            int nameStart = pos;
+            while (pos < css.Length &&
+                   css[pos] != ':' && !char.IsWhiteSpace(css[pos]) &&
+                   css[pos] != ';' && css[pos] != '}')
+            {
+                pos++;
+            }
+            if (pos >= css.Length) break;
+
+            string property = css[nameStart..pos].ToLowerInvariant().Trim();
+            if (property.Length == 0)
+            {
+                pos++;
+                continue;
+            }
+
+            SkipWhitespace(css, ref pos);
+
+            if (pos >= css.Length || css[pos] != ':')
+            {
+                SkipToSemicolonOrBrace(css, ref pos);
+                continue;
+            }
+            pos++; // ':'
+
+            SkipWhitespace(css, ref pos);
+
+            // Value: up to ';' or '}' at paren-depth 0
+            var valueSb = new StringBuilder();
+            int parenDepth = 0;
+            while (pos < css.Length)
+            {
+                char v = css[pos];
+                if ((v == ';' || v == '}') && parenDepth == 0)
+                    break;
+                if (v == '(') parenDepth++;
+                else if (v == ')') parenDepth = Math.Max(0, parenDepth - 1);
+                valueSb.Append(v);
+                pos++;
+            }
+
+            if (pos < css.Length && css[pos] == ';')
+                pos++;
+
+            string value = valueSb.ToString().Trim();
+
+            // !important
+            bool important = false;
+            int bang = value.LastIndexOf('!');
+            if (bang >= 0)
+            {
+                var afterBang = value[(bang + 1)..].Trim();
+                if (afterBang.Equals("important", StringComparison.OrdinalIgnoreCase))
+                {
+                    important = true;
+                    value = value[..bang].Trim();
+                }
+            }
+
+            if (value.Length == 0)
+                continue;
+
+            // Shorthand expansion → individual declarations.  Unknown
+            // properties pass through unexpanded; ComputedStyle ignores them.
+            foreach (var (prop, val) in ExpandShorthand(property, value))
+                declarations.Add(new CssDeclaration(prop, val, important));
+        }
+    }
+
+    /// <summary>
+    /// Expand shorthand properties into (property, value) pairs.  Everything
+    /// else returns a single (property, value) entry.
+    /// </summary>
+    private static IEnumerable<(string Prop, string Val)> ExpandShorthand(string property, string value)
+    {
+        switch (property)
+        {
+            case "margin":
+                return ExpandBox(property, value);
+
+            case "padding":
+                return ExpandBox(property, value);
+
+            case "border":
+                {
+                    // border: [width] [style] [color] — any order, each optional.
+                    // Expands to ALL FOUR sides — the old expansion produced
+                    // only border-top-*, so `border: 1px solid red` in a
+                    // stylesheet or STYLE= attribute painted the top edge only.
+                    string width = "", style = "", color = "";
+                    foreach (var part in SplitTopLevel(value))
+                    {
+                        var lower = part.ToLowerInvariant();
+                        if (lower is "none" or "hidden" or "dotted" or "dashed" or "solid" or
+                                "double" or "groove" or "ridge" or "inset" or "outset")
+                            style = part;
+                        else if (lower is "thin" or "medium" or "thick" || IsLengthToken(lower))
+                            width = part;
+                        else
+                            color = part;
+                    }
+
+                    var result = new List<(string, string)>();
+                    foreach (var side in new[] { "top", "right", "bottom", "left" })
+                    {
+                        if (width.Length > 0)
+                            result.Add(($"border-{side}-width", width));
+                        result.Add(($"border-{side}-style", style.Length > 0 ? style : "none"));
+                        if (color.Length > 0)
+                            result.Add(($"border-{side}-color", color));
+                    }
+                    return result;
+                }
+
+            // Per-side border shorthands (CSS1 core): border-bottom: 2px
+            // solid #000080 — the "horizontal rule under a heading" idiom.
+            // These used to fall through to the default branch and VANISH
+            // entirely (no expansion, no longhands, nothing painted), so
+            // every CSS page that underlined its headings with a bottom
+            // border rendered without the rule.
+            case "border-top":
+            case "border-right":
+            case "border-bottom":
+            case "border-left":
+                {
+                    string side = property["border-".Length..];
+                    string width = "", style = "", color = "";
+                    foreach (var part in SplitTopLevel(value))
+                    {
+                        var lower = part.ToLowerInvariant();
+                        if (lower is "none" or "hidden" or "dotted" or "dashed" or "solid" or
+                                "double" or "groove" or "ridge" or "inset" or "outset")
+                            style = part;
+                        else if (lower is "thin" or "medium" or "thick" || IsLengthToken(lower))
+                            width = part;
+                        else
+                            color = part;
+                    }
+
+                    var result = new List<(string, string)>();
+                    if (width.Length > 0)
+                        result.Add(($"border-{side}-width", width));
+                    result.Add(($"border-{side}-style", style.Length > 0 ? style : "none"));
+                    if (color.Length > 0)
+                        result.Add(($"border-{side}-color", color));
+                    return result;
+                }
+
+            case "font":
+                return ExpandFont(value);
+
+            case "list-style":
+                {
+                    var result = new List<(string, string)>();
+                    foreach (var part in SplitTopLevel(value))
+                    {
+                        var lower = part.ToLowerInvariant();
+                        if (lower is "disc" or "circle" or "square" or "decimal" or
+                                "lower-alpha" or "upper-alpha" or "lower-roman" or "upper-roman" or "none")
+                            result.Add(("list-style-type", part));
+                        else if (lower is "inside" or "outside")
+                            result.Add(("list-style-position", part));
+                        else if (lower.StartsWith("url(") || lower == "none")
+                            result.Add(("list-style-image", part));
+                    }
+                    return result;
+                }
+
+            default:
+                // background and other multi-value properties are handled
+                // whole by ComputedStyle.Apply.
+                return new[] { (property, value) };
+        }
+    }
+
+    private static IEnumerable<(string, string)> ExpandBox(string property, string value)
+    {
+        var parts = SplitTopLevel(value);
+        string[] box = parts.Count switch
+        {
+            1 => new[] { parts[0], parts[0], parts[0], parts[0] },
+            2 => new[] { parts[0], parts[1], parts[0], parts[1] },
+            3 => new[] { parts[0], parts[1], parts[2], parts[1] },
+            _ when parts.Count >= 4 => new[] { parts[0], parts[1], parts[2], parts[3] },
+            _ => Array.Empty<string>()
+        };
+
+        if (box.Length == 0)
+            return new[] { (property, value) };
+
+        return new[]
+        {
+            (property + "-top",    box[0]),
+            (property + "-right",  box[1]),
+            (property + "-bottom", box[2]),
+            (property + "-left",   box[3])
+        };
+    }
+
+    private static IEnumerable<(string, string)> ExpandFont(string value)
+    {
+        var parts = SplitTopLevel(value);
+        string fontStyle = "normal", fontVariant = "normal", fontWeight = "normal";
+        string? size = null, lineHeight = null, family = null;
+
+        for (int i = 0; i < parts.Count; i++)
+        {
+            var part = parts[i];
+            var lower = part.ToLowerInvariant();
+
+            if (size != null)
+                break;
+
+            if (lower is "italic" or "oblique") { fontStyle = part; continue; }
+            if (lower == "small-caps") { fontVariant = part; continue; }
+            if (lower is "bold" or "bolder" or "lighter" ||
+                (lower.Length == 3 && int.TryParse(lower, out _)))
+            { fontWeight = part; continue; }
+
+            // "12px/1.5" — size and line-height glued together (no spaces).
+            // The old code only recognised a separate "/1.5" token, so the
+            // common glued form silently lost BOTH size and family.
+            if (part.Contains('/'))
+            {
+                var bits = part.Split('/', 2);
+                if (LooksLikeSize(bits[0].ToLowerInvariant()))
+                {
+                    size = bits[0];
+                    if (bits.Length > 1)
+                        lineHeight = bits[1];
+                    if (i + 1 < parts.Count)
+                        family = string.Join(" ", parts.Skip(i + 1));
+                    break;
+                }
+            }
+
+            if (LooksLikeSize(lower))
+            {
+                size = part;
+                if (i + 1 < parts.Count && parts[i + 1].StartsWith("/"))
+                {
+                    lineHeight = parts[i + 1][1..];
+                    i++;
+                }
+                if (i + 1 < parts.Count)
+                    family = string.Join(" ", parts.Skip(i + 1));
+                break;
+            }
+        }
+
+        var result = new List<(string, string)>
+        {
+            ("font-style", fontStyle),
+            ("font-variant", fontVariant),
+            ("font-weight", fontWeight)
+        };
+        if (size != null) result.Add(("font-size", size));
+        if (lineHeight != null) result.Add(("line-height", lineHeight));
+        if (family != null) result.Add(("font-family", family));
+        return result;
+
+        static bool LooksLikeSize(string p) =>
+            p.EndsWith("px") || p.EndsWith("pt") || p.EndsWith("em") || p.EndsWith("%") ||
+            p is "xx-small" or "x-small" or "small" or "medium"
+                   or "large" or "x-large" or "xx-large";
+    }
+
+    /// <summary>Any token usable as a length: px/pt/em or a bare number.</summary>
+    private static bool IsLengthToken(string s) =>
+        s.EndsWith("px") || s.EndsWith("pt") || s.EndsWith("em") ||
+        (s.Length > 0 && (char.IsDigit(s[0]) || s[0] == '.') && !s.Contains('('));
+
+    private static bool TryNum(string s) =>
+        double.TryParse(s, System.Globalization.NumberStyles.Float,
+            System.Globalization.NumberStyles.Float.ToString() == "" ? default : System.Globalization.CultureInfo.InvariantCulture, out _);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Shared utilities
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>Split on whitespace, keeping parenthesised groups intact.</summary>
+    internal static List<string> SplitTopLevel(string value)
+    {
+        var parts = new List<string>();
+        var sb = new StringBuilder();
+        int depth = 0;
+        foreach (char c in value)
+        {
+            if (c == '(') depth++;
+            else if (c == ')') depth = Math.Max(0, depth - 1);
+
+            if (depth == 0 && char.IsWhiteSpace(c))
+            {
+                if (sb.Length > 0) { parts.Add(sb.ToString()); sb.Clear(); }
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        if (sb.Length > 0) parts.Add(sb.ToString());
+        return parts;
+    }
+
+    private static string ParseUrlOrString(string css, ref int pos)
+    {
+        SkipWhitespace(css, ref pos);
+        if (pos >= css.Length)
+            return "";
+
+        // url(...)
+        if (pos + 3 < css.Length &&
+            (css[pos] is 'u' or 'U') && (css[pos + 1] is 'r' or 'R') &&
+            (css[pos + 2] is 'l' or 'L') && css[pos + 3] == '(')
+        {
+            pos += 4;
+            SkipWhitespace(css, ref pos);
+            var sb = new StringBuilder();
+            while (pos < css.Length && css[pos] != ')')
+            {
+                sb.Append(css[pos]);
+                pos++;
+            }
+            if (pos < css.Length) pos++; // ')'
+            return sb.ToString().Trim().Trim('\'', '"');
+        }
+
+        // Quoted string
+        if (css[pos] is '"' or '\'')
+        {
+            char quote = css[pos];
+            pos++;
+            var sb = new StringBuilder();
+            while (pos < css.Length && css[pos] != quote)
+            {
+                sb.Append(css[pos]);
+                pos++;
+            }
+            if (pos < css.Length) pos++;
+            return sb.ToString();
+        }
+
+        // Bare token
+        var bareSb = new StringBuilder();
+        while (pos < css.Length && !char.IsWhiteSpace(css[pos]) && css[pos] != ')' && css[pos] != ';')
+        {
+            bareSb.Append(css[pos]);
+            pos++;
+        }
+        return bareSb.ToString();
+    }
+
+    private static void SkipToSemicolon(string css, ref int pos)
+    {
+        while (pos < css.Length && css[pos] != ';')
+            pos++;
+        if (pos < css.Length) pos++;
+    }
+
+    private static void SkipToSemicolonOrBrace(string css, ref int pos)
+    {
+        while (pos < css.Length && css[pos] != ';' && css[pos] != '}')
+            pos++;
+        if (pos < css.Length && css[pos] == ';')
+            pos++;
+    }
+
+    /// <summary>
+    /// Skips a whole { … } block (or up to ';' for blockless rules).
+    /// The old version kept scanning after the closing brace until it met
+    /// ANOTHER '}' and then skipped that one too — so an unknown @rule
+    /// like @font-face consumed the closing brace of the rule after it,
+    /// turning that rule's declarations into garbage.
+    /// </summary>
+    private static void SkipToMatchingBrace(string css, ref int pos)
+    {
+        // Find the block (or a blockless terminator first)
+        while (pos < css.Length && css[pos] != '{' && css[pos] != ';')
+        {
+            if (char.IsWhiteSpace(css[pos])) { pos++; continue; }
+            // Some other construct — bail out; the caller's loop advances.
+            return;
+        }
+        if (pos >= css.Length)
+            return;
+        if (css[pos] == ';')
+        {
+            pos++;
+            return;
+        }
+
+        pos++; // consume '{'
+        int depth = 1;
+        while (pos < css.Length && depth > 0)
+        {
+            if (css[pos] == '{') depth++;
+            else if (css[pos] == '}') depth--;
+            pos++;
+        }
+    }
+}

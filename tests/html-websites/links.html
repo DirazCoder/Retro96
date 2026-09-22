@@ -1,0 +1,140 @@
+<!--
+  Retro96 QA suite -- links.html  (pages batch B)
+  Checks exercised:
+    1.  Unvisited link colour from <body link=...>
+    2.  Visited link colour from <body vlink=...> (click a link, reload)
+    3.  Active link colour from <body alink=...> (while the mouse is down)
+    4.  <a> wrapping across MULTIPLE LINES -- every line underlined
+    5.  <a> containing an image -- image gets a border, never an underline
+    6.  <a> inside <font> -- link colour vs. font colour fight
+    7.  <a name=...> anchor target -- renders as plain text, NO underline
+    8.  Bare href with no scheme (href="page2.html")
+    9.  mailto: link
+   10.  javascript: link (document.bgColor -- no dialog, visible effect)
+   11.  Link text with a TRAILING SPACE inside the tag -- no dangling
+        underline stub may trail the last word
+   12.  Long URL as link text -- must wrap, not blow out the page width
+   13.  Underline COLOUR must follow the link colour, not the text colour
+   14.  Mixed content link: image + text inside one <a>
+  All images are data: URIs (no network on this page).
+-->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML>
+<HEAD>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+<TITLE>Link Test -- Retro96 QA</TITLE>
+</HEAD>
+
+<BODY BGCOLOR="#FFFFFF" TEXT="#000000" LINK="#0000FF" VLINK="#800080" ALINK="#FF0000">
+
+<A NAME="top"></A>
+
+<CENTER>
+<FONT SIZE="+2" COLOR="#008080"><B>The Anchor Test Page</B></FONT>
+</CENTER>
+
+<HR>
+
+<!-- ===== 1/2/3: unvisited / visited / active colours ============ -->
+<H3><FONT COLOR="#800000">Colours</FONT></H3>
+<P>
+An <A HREF="page2.html">unvisited link (page2.html)</A> must be blue
+(#0000FF) with a blue underline.  After you follow it and come back, it must
+turn purple (#800080).  While the mouse button is held down on
+<A HREF="page2.html">this link</A> it must flash red (#FF0000).  Click
+<A HREF="#top">this same-page anchor</A> and scroll back to make it visited
+too.
+</P>
+
+<!-- ===== 4: multi-line anchor ================================== -->
+<H3><FONT COLOR="#800000">Multi-line underline</FONT></H3>
+<TABLE BORDER=0 WIDTH=260 CELLPADDING=6 BGCOLOR="#EEEEEE"><TR><TD>
+This narrow box forces wrapping.  <A HREF="page2.html">This entire anchor
+spans several consecutive lines of text, and every single line of it must
+carry the underline in the link colour, from the first word right through
+to the last one, with no ununderlined fragments hiding in the middle and no
+underline trailing off past the end.</A>  The box is 260px wide on purpose.
+</TD></TR></TABLE>
+
+<!-- ===== 5/14: image in anchor, mixed content ================== -->
+<H3><FONT COLOR="#800000">Images inside links</FONT></H3>
+<P>
+Image link with border:
+<A HREF="page2.html"><IMG SRC="data:image/gif;base64,R0lGODdhEAAQAIEAAP8AAAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=" WIDTH=16 HEIGHT=16 ALT="red16 link"></A>
+-- the red square gets a blue 2px border, no underline anywhere.<BR>
+Image link with BORDER=0:
+<A HREF="page2.html"><IMG SRC="data:image/gif;base64,R0lGODdhWAAfAIIAAP//////AAD///8AAAAAYAAAAAAAAAAAACwAAAAAWAAfAEAI/wABCBxIsKDBgwgTKlzIcCGBhxAFSBQAMeLEig8nUsSoESOBjhwvPhxAsqTJkyYrCvRYUeNGiyJhSgwZMyNImS9Z6oS4EifNmS1v2qz5UWjRmgGSKl3KdKlKAB5zctwptSXVqzuz7uzJ0ujRql7DEv2KsizKp12NuvwpdW1Qomubym2KVqvdu3jz6q27t6/fv1m5fm2rtjBcw0BHml08gO/bxEMhD2ZL+TFFxosdR0VM+LBnyW79Cv65WfLX0mDHapzLOqnm06RjP0ZN+2Fr1q+rRsTalXdUwDobCh9OvPhw4MiT7x2tvLlznlDfptU99uj06xUxm9Us1nT31N5ramwvm5tzZZ+WK48/C11n6MidQZu3vP7k69myZdbGz190dKqmWVcadjQR6F9W3+2nX36RAcccfOdBmN6EON02V3mfxadhhJMRYKFc3KkmYngkgpfTh3S1J92ALBbY4ooQocjUfc/V6OB/NuboYEAAOw==" WIDTH=88 HEIGHT=31 ALT="banner link" BORDER=0></A>
+-- banner is clean, still clickable.<BR>
+Mixed content -- image AND text in one anchor, underline only under the
+text part: <A HREF="page2.html"><IMG SRC="data:image/gif;base64,R0lGODdhEAAQAIEAAAAA/wAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=" WIDTH=16 HEIGHT=16 ALT="blue16" BORDER=0> Home page</A>
+followed by plain text.
+</P>
+
+<!-- ===== 6/13: <a> inside <font>, underline colour ============= -->
+<H3><FONT COLOR="#800000">Fonts and links</FONT></H3>
+<P>
+<FONT COLOR="#008000" SIZE="+1"><A HREF="page2.html">A green oversized link inside a font tag</A></FONT>
+-- in 1996 the underline follows the LINK colour here, not the font colour;
+either way the whole text must be underlined.<BR>
+<A HREF="page2.html"><FONT COLOR="#CC0000">Red text inside the link</FONT></A>
+-- same fight in the other nesting order; watch the underline colour.<BR>
+<FONT FACE="Courier"><A HREF="page2.html">monospace link</A></FONT>
+and <B><A HREF="page2.html">bold link</A></B> and
+<A HREF="page2.html"><B>bold inner link</B></A>.
+</P>
+
+<!-- ===== 7: named anchor, no underline ========================= -->
+<H3><FONT COLOR="#800000">Named anchors</FONT></H3>
+<P>
+<A NAME="middle">This sentence is a named anchor (A NAME="middle")</A>
+and must render exactly like the plain black body text around it: no
+underline, no link colour, no pointer-finger cursor.  The link
+<A HREF="#middle">jump to "middle"</A> targets it.
+</P>
+
+<!-- ===== 8/9/10: href schemes ================================== -->
+<H3><FONT COLOR="#800000">Schemes</FONT></H3>
+<P>
+Bare href, no scheme: <A HREF="page2.html">page2.html</A><BR>
+mailto: <A HREF="mailto:webmaster@example.com">webmaster@example.com</A><BR>
+mailto with subject: <A HREF="mailto:webmaster@example.com?subject=Hi%20there">mail with a subject</A><BR>
+javascript: <A HREF="javascript:document.bgColor='#CCFFCC'">click me to repaint the background</A>
+<BR>
+<SMALL>(If clicking does nothing, the javascript: URL handler is broken;
+if the page navigates away to an error page, that is also a bug.)</SMALL>
+</P>
+
+<!-- ===== 11: trailing space ==================================== -->
+<H3><FONT COLOR="#800000">Trailing space</FONT></H3>
+<P>
+Sentence one ends with a link that contains a trailing space:
+<A HREF="page2.html">this link ends with a space </A>and this text follows
+immediately after the closing tag.  The underline must stop at the last
+visible character -- a dangling underline stub reaching into the gap before
+"and" is a rendering bug.<BR>
+Control case, no trailing space:
+<A HREF="page2.html">no trailing space here</A>then a hard stop.
+</P>
+
+<!-- ===== 12: long URL text ===================================== -->
+<H3><FONT COLOR="#800000">Long URL as link text</FONT></H3>
+<BLOCKQUOTE>
+<A HREF="page2.html">http://www.geocities.com/SiliconValley/Pavilion/8432/~webmaster/index.html?session=1740266&amp;frame=left&amp;lang=en-us</A>
+</BLOCKQUOTE>
+<P>
+The URL above must wrap across lines inside the blockquote instead of
+pushing the page wider than 800 pixels.  Every wrapped line is underlined.
+</P>
+
+<HR>
+<CENTER>
+<FONT SIZE="-1">
+<A HREF="#top">Back to top</A> |
+<A HREF="images.html">Image tests</A> |
+<A HREF="links.html">Reload this page</A><BR>
+Retro96 QA suite -- links.html
+</FONT>
+</CENTER>
+
+</BODY>
+</HTML>

@@ -1,0 +1,200 @@
+<!-- ==================================================================
+     Retro96 QA Test Suite : lists.html  (batch A, 4 of 8)
+     LISTS : checks exercised:
+       [LI-01] ul with default disc bullets at the correct indent, with a
+               wrapping item proving the hanging indent alignment
+       [LI-02] ul type=disc / circle / square
+       [LI-03] ol with default arabic numerals
+       [LI-04] ol type=1 a A i I
+       [LI-05] ol start= (with and without a type)
+       [LI-06] li value= renumbers the sequence from that item on
+       [LI-07] ul nested three levels deep: each level indents further
+               and the bullet shape changes per level
+       [LI-08] mixed ordered/unordered nesting, three levels
+       [LI-09] dl with dt/dd; one very long dd that wraps, proving the
+               description hanging indent
+       [LI-10] li containing block level content (an image plus a paragraph)
+       [LI-11] a list inside a table cell (ul in one cell, ol in another)
+       [LI-12] menu and dir elements (period extras)
+       [LI-13] the compact attribute is accepted without crashing
+     Constraints: HTML 3.2, fully self contained, 800x600 target viewport.
+     ================================================================== -->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<title>Retro96 Test 5: Lists</title>
+</head>
+
+<body bgcolor="#FFFFCC" text="#000000" link="#0000CC" vlink="#660099" alink="#FF0000">
+
+<font face="Times New Roman, Times, serif">
+
+<h2>[LI-01] Unordered, Default Disc</h2>
+<ul>
+<li>First item in a default unordered list.</li>
+<li>Second item with enough words to wrap onto a second line, so the hanging indent of the bullet can be checked: continuation lines must align with the text of the first line, not with the bullet itself.</li>
+<li>Third item.</li>
+</ul>
+
+<h2>[LI-02] Bullet Shapes</h2>
+<ul type="disc">
+<li>explicit disc</li>
+<li>another disc</li>
+</ul>
+<ul type="circle">
+<li>hollow circle bullet</li>
+<li>another circle</li>
+</ul>
+<ul type="square">
+<li>filled square bullet</li>
+<li>another square</li>
+</ul>
+
+<h2>[LI-03] Ordered, Default Numerals</h2>
+<ol>
+<li>first</li>
+<li>second</li>
+<li>third</li>
+<li>fourth</li>
+</ol>
+
+<h2>[LI-04] Ordered List Types</h2>
+<ol type="1">
+<li>arabic one</li><li>arabic two</li><li>arabic three</li>
+</ol>
+<ol type="a">
+<li>lowercase a</li><li>lowercase b</li><li>lowercase c</li><li>lowercase d</li>
+</ol>
+<ol type="A">
+<li>UPPERCASE A</li><li>UPPERCASE B</li><li>UPPERCASE C</li>
+</ol>
+<ol type="i">
+<li>roman i</li><li>roman ii</li><li>roman iii</li><li>roman iv</li>
+</ol>
+<ol type="I">
+<li>ROMAN I</li><li>ROMAN II</li><li>ROMAN III</li>
+</ol>
+
+<h2>[LI-05] Start Attribute</h2>
+<ol start="5">
+<li>starts at five</li>
+<li>six</li>
+<li>seven</li>
+</ol>
+<ol start="7" type="i">
+<li>roman seven</li>
+<li>roman eight</li>
+</ol>
+<ol type="A" start="23">
+<li>starts at W (the 23rd letter)</li>
+<li>X</li>
+</ol>
+
+<h2>[LI-06] Value Attribute</h2>
+<ol>
+<li>one</li>
+<li value="10">ten (value=10)</li>
+<li>eleven (the count continues from ten)</li>
+<li value="3">back to three</li>
+<li>four</li>
+</ol>
+
+<h2>[LI-07] Three Levels Of Unordered Nesting</h2>
+<ul>
+<li>level one item
+<ul>
+<li>level two item
+<ul>
+<li>level three item one</li>
+<li>level three item two</li>
+</ul>
+</li>
+<li>level two sibling
+</ul>
+</li>
+<li>level one sibling
+</ul>
+<p><small>Each level must indent one bullet step further than its parent, and each level traditionally switches bullet shape (disc, circle, square).</small></p>
+
+<h2>[LI-08] Mixed Nesting</h2>
+<ol>
+<li>ordered top level
+<ul>
+<li>unordered second level
+<ol type="a">
+<li>ordered third level, lowercase letters</li>
+<li>another third level item</li>
+</ol>
+</li>
+<li>unordered second level sibling</li>
+</ul>
+</li>
+<li>ordered top level sibling</li>
+</ol>
+
+<h2>[LI-09] Definition List</h2>
+<dl>
+<dt>World Wide Web</dt>
+<dd>A distributed hypertext information system in which documents are linked together by uniform resource locators, served over the network by hypertext transfer protocol daemons, and rendered by browser applications such as the one currently under test; this definition is intentionally long enough to wrap across several lines so the hanging indent of the description can be compared against the term above it, because a definition description that wraps flush with its term is a classic layout bug.</dd>
+<dt>GIF</dt>
+<dd>Graphics Interchange Format, an eight-bit indexed image format introduced by CompuServe in 1987, supporting one transparent palette index and multi-frame animation.</dd>
+<dt>Tag Soup</dt>
+<dd>HTML that violates every rule of nesting while still somehow rendering.</dd>
+</dl>
+
+<h2>[LI-10] List Item With Block Content</h2>
+<ul>
+<li>An item whose content is block level:
+<img src="data:image/gif;base64,R0lGODdhKAAUAIYAAP/XAP7WAPrTAPjRAPTOAPPNAPLMAOjEAN67ANi2ANa0ANOyAMqqAMeoAManAMGjAL+hAL6gAL2fALueALqdALmcAKuQAKqPAKmOAKKJAKGIAJyEAJmBAJN8AI95AI13AIFtAIBsAHxpAHhlAHVjAHBeAG9eAG1cAGNTAGJTAF9QAFxOAFpMAFdJAEs/AEo+AEc8AEM4AEI4AEE3AEA2AD81AD40AD0zADwzADkwADgvADIqAC8oAC4nAB8aAA8NAAkIAAgHAAQDAMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAAAAKAAUAEAI4wCHCBxIsKDBgwgNAljIcGEQGgx/LARSo+IHFRcW9iix0IQFABIXEmxIsqTJkyVHolzJkqTKkhIh3AA5sWINBwBgJHhhYIOHDhoWhgTwsqXRk0WPKmWYNKIEG0KjMlwwAwAFETwGCOghlejAkyEf4Ag5dOGEGCcABNhRdSEBpgnjyp1Lt27dpXjhCsybtylfln5B4oAgtSwHEgAM7MixUMcBmiK/mpRoIwLksgF8BAhRIUUDBii6Bg5JQwJZkiAyVFXQYgUC0ZJhMpQRpGbFEQAKCMGw0AULhjD0Dvm71K5xuQEBADs=" width="40" height="20" alt="NEW!" border="0">
+<p>A paragraph inside the list item, following an image inside the same list item. Both belong to this one bullet, and the bullet marker must line up with the first line of the item, not with the paragraph.</p>
+</li>
+<li>A plain sibling item after the blocky one.</li>
+</ul>
+
+<h2>[LI-11] Lists Inside Table Cells</h2>
+<table border="1" cellpadding="6" cellspacing="2">
+<tr>
+<th>cell holds a ul</th>
+<th>cell holds an ol</th>
+</tr>
+<tr>
+<td>
+<ul>
+<li>bullet inside a cell</li>
+<li>another bullet, wrapping onto a second line to check the indent width inside the narrower cell</li>
+</ul>
+</td>
+<td>
+<ol type="I">
+<li>ROMAN ONE in a cell</li>
+<li>ROMAN TWO in a cell</li>
+</ol>
+</td>
+</tr>
+</table>
+
+<h2>[LI-12] Menu And Dir</h2>
+<menu>
+<li>menu item one</li>
+<li>menu item two</li>
+</menu>
+<dir>
+<li>directory entry</li>
+<li>another directory entry</li>
+</dir>
+
+<h2>[LI-13] Compact</h2>
+<ul compact>
+<li>compact list item one</li>
+<li>compact list item two</li>
+</ul>
+<ol compact type="a" start="3">
+<li>compact ordered c</li>
+<li>compact ordered d</li>
+</ol>
+
+<p><small>Retro96 QA suite : lists.html : end of page.</small></p>
+
+</font>
+</body>
+</html>

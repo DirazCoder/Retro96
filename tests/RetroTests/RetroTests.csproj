@@ -1,0 +1,83 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RetroTests</AssemblyName>
+    <RootNamespace>RetroTests</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="SkiaSharp" Version="3.116.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.116.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- headless stubs (same approach as JsPageTests) -->
+    <Compile Include="DebugLogStub.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Drawing/*.cs" />
+    <Compile Include="BrowserCanvasStub.cs" />
+    <!-- engine sources -->
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlTokenizer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlEntities.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Dom/DomNode.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/ComputedStyle.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/CssParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/CssSelector.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/StyleResolver.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/LayoutBox.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/ParsedUrl.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/CookieStore.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/ErrorPage.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/GlyphSubstitution.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsLexer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsAst.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsValue.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsScope.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsInterpreter.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsRuntime.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/DomBindings.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsDialogGeometry.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/NavigationHistory.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Forms/FormSubmitter.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Forms/HitTester.cs" />
+    <!-- test sources -->
+    <Compile Include="TestHelpers.cs" />
+    <Compile Include="EngineRegressionTests.cs" />
+    <Compile Include="HtmlParserTests.cs" />
+    <Compile Include="CssParserTests.cs" />
+    <Compile Include="JsEngineTests.cs" />
+    <Compile Include="FormDomTests.cs" />
+    <Compile Include="FrameLinkDomTests.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/InlineLayout.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/LayoutEngine.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/TableLayout.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/TextMeasurer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/LayoutDebug.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/FontCache.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/ImageCache.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/ImageDecoder.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/DataUriDecoder.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/Renderer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/TextareaOverlay.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/ResourceLoader.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/HttpClient.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/FrameLoader.cs" />
+    <Compile Include="NamedBugHeadlessTests.cs" />
+    <Compile Include="ExtendedCorpusRegressionTests.cs" />
+    <Compile Include="ScratchDiag.cs" />
+  </ItemGroup>
+</Project>

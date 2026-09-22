@@ -1,0 +1,239 @@
+<!--
+  Retro96 QA suite -- forms.html  (pages batch B)
+  Checks exercised:
+    1.  <input type=text> with size=, maxlength=, value=
+    2.  <input type=password>
+    3.  <input type=checkbox> -- checked, unchecked, disabled (greys out)
+    4.  <input type=radio> -- two groups sharing one name each; checked
+        state must be exclusive INSIDE a group; one disabled radio
+    5.  <input type=submit>, type=reset, type=button, type=hidden, type=file
+    6.  <textarea rows= cols= wrap=> with default content
+    7.  <select> single (with selected) and MULTIPLE size=4
+    8.  <option> with value= and without value= (label is the value)
+    9.  <label> -- wrapping style AND for=/id= style
+   10.  Controls inside a table (row heights must fit the controls)
+   11.  disabled controls must render greyed and inert
+   12.  readonly text field (visible but not editable)
+   13.  method=get form AND method=post form
+   14.  Submit button AND type=button with onclick -- both must be
+        clickable across their FULL rendered rectangles
+   15.  The theoldnet.com search pattern:
+        form > table > tr > [ http: | input text | select | Go button ]
+   16.  <input type=image> (bonus): a 60x22 data-URI image button, also
+        clickable across its whole rect
+  All images are data: URIs (no network on this page).
+-->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML>
+<HEAD>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+<TITLE>Form Control Torture -- Retro96 QA</TITLE>
+</HEAD>
+
+<BODY BGCOLOR="#E8E8FF" TEXT="#000000" LINK="#0000EE" VLINK="#551A8B" ALINK="#FF0000">
+
+<CENTER>
+<FONT SIZE="+2" COLOR="#000080"><B>Form Control Torture Page</B></FONT><BR>
+<FONT SIZE="-1">Every control a 1996 browser had to paint, in one place</FONT>
+</CENTER>
+
+<HR>
+
+<!-- =========================================================
+     THE theoldnet.com SEARCH PATTERN
+     form > table > tr > td(http:) + td(input) + td(select)
+     + td(submit "Go")
+     ========================================================= -->
+<H3><FONT COLOR="#800000">The theoldnet.com search pattern</FONT></H3>
+<FORM METHOD=GET ACTION="search.cgi">
+<TABLE BORDER=1 CELLPADDING=4 CELLSPACING=0 BGCOLOR="#FFFFFF">
+<TR>
+<TD><FONT FACE="Courier" SIZE="+1"><B>http:</B></FONT></TD>
+<TD><INPUT TYPE=TEXT NAME="url" SIZE=30 VALUE="www.theoldnet.com"></TD>
+<TD><SELECT NAME="when">
+    <OPTION VALUE="1996" SELECTED>1996</OPTION>
+    <OPTION VALUE="1997">1997</OPTION>
+    <OPTION VALUE="1998">1998</OPTION>
+    <OPTION>Any old year</OPTION>
+    </SELECT></TD>
+<TD><INPUT TYPE=SUBMIT VALUE="Go"></TD>
+</TR>
+</TABLE>
+</FORM>
+
+<!-- =========================================================
+     FORM 1 -- method=GET, the guestbook
+     ========================================================= -->
+<H3><FONT COLOR="#800000">Form 1 -- method=GET guestbook</FONT></H3>
+
+<FORM METHOD=GET ACTION="cgi-bin/guestbook.cgi">
+
+<TABLE BORDER=0 CELLPADDING=4>
+<TR>
+  <TD><LABEL>Your name:</LABEL></TD>
+  <TD><INPUT TYPE=TEXT NAME="name" SIZE=25 MAXLENGTH=40 VALUE="Type here"></TD>
+</TR>
+<TR>
+  <TD><LABEL FOR="em">E-mail:</LABEL></TD>
+  <TD><INPUT TYPE=TEXT NAME="email" ID="em" SIZE=25 MAXLENGTH=60></TD>
+</TR>
+<TR>
+  <TD>Secret word:</TD>
+  <TD><INPUT TYPE=PASSWORD NAME="pw" SIZE=12 MAXLENGTH=12 VALUE="hunter2"></TD>
+</TR>
+<TR>
+  <TD>Homepage:</TD>
+  <TD><INPUT TYPE=TEXT NAME="hp" SIZE=40 VALUE="http://www.geocities.com/SiliconValley/Pavilion/8432/"></TD>
+</TR>
+</TABLE>
+
+<P>
+<B>Checkboxes:</B><BR>
+<INPUT TYPE=CHECKBOX NAME="c1" VALUE="yes" CHECKED> Checked by default<BR>
+<INPUT TYPE=CHECKBOX NAME="c2" VALUE="yes"> Unchecked by default<BR>
+<INPUT TYPE=CHECKBOX NAME="c3" VALUE="yes" DISABLED> Disabled (must be greyed
+and inert)<BR>
+<LABEL><INPUT TYPE=CHECKBOX NAME="c4" VALUE="yes"> Checkbox wrapped in a
+label</LABEL>
+</P>
+
+<P>
+<B>Radio buttons -- group "flavour":</B><BR>
+<INPUT TYPE=RADIO NAME="flavour" VALUE="vanilla" CHECKED> Vanilla<BR>
+<INPUT TYPE=RADIO NAME="flavour" VALUE="chocolate"> Chocolate<BR>
+<INPUT TYPE=RADIO NAME="flavour" VALUE="strawberry"> Strawberry<BR>
+<B>Radio buttons -- group "sprinkles" (a second, independent group):</B><BR>
+<INPUT TYPE=RADIO NAME="sprinkles" VALUE="yes"> Yes<BR>
+<INPUT TYPE=RADIO NAME="sprinkles" VALUE="no" CHECKED> No<BR>
+<INPUT TYPE=RADIO NAME="sprinkles" VALUE="maybe" DISABLED> Maybe (disabled)<BR>
+Checking a box in one group must never uncheck the other group.
+</P>
+
+<P>
+<B>Textarea (rows=4 cols=40):</B><BR>
+<TEXTAREA NAME="comments" ROWS=4 COLS=40 WRAP=VIRTUAL>Sign my guestbook!
+Default content lives inside the tags, indented like 1996 hand-editing
+left it.</TEXTAREA>
+</P>
+
+<P>
+<INPUT TYPE=HIDDEN NAME="secret" VALUE="form1-hidden-field">
+<INPUT TYPE=SUBMIT VALUE="Sign the guestbook">
+<INPUT TYPE=RESET VALUE="Clear it all">
+</P>
+
+</FORM>
+
+<!-- =========================================================
+     FORM 2 -- method=POST, controls in a table
+     ========================================================= -->
+<H3><FONT COLOR="#800000">Form 2 -- method=POST registration</FONT></H3>
+
+<FORM METHOD=POST ACTION="cgi-bin/register.cgi">
+<INPUT TYPE=HIDDEN NAME="form" VALUE="2">
+
+<TABLE BORDER=2 CELLPADDING=6 CELLSPACING=1 BGCOLOR="#FFFFFF" WIDTH=620>
+<TR>
+  <TH BGCOLOR="#CCCCFF" COLSPAN=2><FONT SIZE="+1">New user registration</FONT></TH>
+</TR>
+<TR>
+  <TD><LABEL>Login:</LABEL></TD>
+  <TD><INPUT TYPE=TEXT NAME="login" SIZE=12 MAXLENGTH=8 VALUE="netizen"></TD>
+</TR>
+<TR>
+  <TD>Password:</TD>
+  <TD><INPUT TYPE=PASSWORD NAME="pass" SIZE=12 MAXLENGTH=8></TD>
+</TR>
+<TR>
+  <TD>Read-only field:</TD>
+  <TD><INPUT TYPE=TEXT NAME="serial" SIZE=20 VALUE="R96-000-1996" READONLY></TD>
+</TR>
+<TR>
+  <TD>Disabled text field:</TD>
+  <TD><INPUT TYPE=TEXT NAME="dead" SIZE=20 VALUE="grey me out" DISABLED></TD>
+</TR>
+<TR>
+  <TD>Upload a photo:</TD>
+  <TD><INPUT TYPE=FILE NAME="mugshot" SIZE=24></TD>
+</TR>
+<TR>
+  <TD>Connection speed:</TD>
+  <TD><SELECT NAME="speed">
+      <OPTION VALUE="14">14.4 kbps -- the classic</OPTION>
+      <OPTION VALUE="28" SELECTED>28.8 kbps -- luxury</OPTION>
+      <OPTION VALUE="33">33.6 kbps</OPTION>
+      <OPTION>ISDN (no value attribute)</OPTION>
+      </SELECT></TD>
+</TR>
+<TR>
+  <TD VALIGN=TOP>Interests<br>(multiple select, size=4):</TD>
+  <TD><SELECT NAME="interests" MULTIPLE SIZE=4>
+      <OPTION VALUE="html">Writing HTML by hand</OPTION>
+      <OPTION VALUE="gifs" SELECTED>Collecting animated GIFs</OPTION>
+      <OPTION VALUE="webring">Running a webring</OPTION>
+      <OPTION SELECTED>Guestbooks</OPTION>
+      <OPTION VALUE="midi">MIDI files on autoplay</OPTION>
+      <OPTION VALUE="frames">Frames everywhere</OPTION>
+      </SELECT><BR>
+      <FONT SIZE="-1">Hold Ctrl to pick several; two are pre-selected.</FONT></TD>
+</TR>
+<TR>
+  <TD COLSPAN=2>
+    <INPUT TYPE=CHECKBOX NAME="tos" VALUE="1" CHECKED> I have read the
+    acceptable-use policy (it was 40 pages of grey text)
+  </TD>
+</TR>
+<TR>
+  <TD COLSPAN=2 BGCOLOR="#EEEEEE">
+    <B>Action buttons -- click EVERYWHERE on them, corners included:</B>
+    <TABLE BORDER=0 CELLPADDING=4><TR>
+    <TD><INPUT TYPE=SUBMIT VALUE="Register me (POST)"></TD>
+    <TD><INPUT TYPE=BUTTON VALUE="Click me (onclick)"
+        ONCLICK="this.form.msg.value='The BUTTON was clicked'"></TD>
+    <TD><INPUT TYPE=IMAGE NAME="imgbtn" SRC="data:image/gif;base64,R0lGODdhPAAWAIEAAP///8zMzICAgAAAoCwAAAAAPAAWAEAIkAABCBxIsKDBgwgTKiQoQGCAhxAfDphIsaLFixgzVozIsSEAjiBDihxJsmQAjyZTqlwJEWVIjTBjwhzpkqXNmxFr4ty5UifPnyR9QpRJtOgAmg6BKkX6canTjgujSp2aUOhTpVav/syqdWdWo2A1MhUZtqzFsS/NqkXbdSnXtjbfwu0poK7du3jz6t3Lty/egAA7" WIDTH=60 HEIGHT=22 ALT="[GO]"></TD>
+    <TD>Status: <INPUT TYPE=TEXT NAME="msg" SIZE=22 VALUE="not clicked yet" READONLY></TD>
+    </TR></TABLE>
+    The submit posts the form; the plain BUTTON must fire its onclick and
+    write into the status field WITHOUT submitting; the IMAGE button draws a
+    60x22 grey GUI button and is clickable across its whole rectangle.
+  </TD>
+</TR>
+<TR>
+  <TD COLSPAN=2>
+    <INPUT TYPE=SUBMIT VALUE="Disabled submit" DISABLED>
+    <INPUT TYPE=RESET VALUE="Reset form 2">
+    <INPUT TYPE=BUTTON VALUE="Disabled button" DISABLED
+        ONCLICK="this.form.msg.value='this must never appear'">
+    Both disabled controls must be greyed out and refuse every click.
+  </TD>
+</TR>
+</TABLE>
+
+</FORM>
+
+<!-- =========================================================
+     FORM 3 -- GET, size extremes for control-size checks
+     ========================================================= -->
+<H3><FONT COLOR="#800000">Form 3 -- size extremes</FONT></H3>
+<FORM METHOD=GET ACTION="cgi-bin/sizes.cgi">
+<P>
+size=5: <INPUT TYPE=TEXT NAME="t5" SIZE=5 VALUE="tiny">
+size=10: <INPUT TYPE=TEXT NAME="t10" SIZE=10 VALUE="small">
+size=40: <INPUT TYPE=TEXT NAME="t40" SIZE=40 VALUE="a wide one, forty columns wide">
+maxlength=3 (type more than three letters, watch it stop):
+<INPUT TYPE=TEXT NAME="ml3" SIZE=8 MAXLENGTH=3 VALUE="abc">
+<BR>
+Bare text input, no size, no value:
+<INPUT TYPE=TEXT NAME="bare">
+<BR>
+<INPUT TYPE=SUBMIT VALUE="Send sizes">
+</P>
+</FORM>
+
+<HR>
+<CENTER><FONT SIZE="-1">Retro96 QA suite -- forms.html<BR>
+Submit AND button AND image-button must each be clickable across their
+FULL rendered rectangles.</FONT></CENTER>
+
+</BODY>
+</HTML>

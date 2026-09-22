@@ -1,0 +1,359 @@
+<html>
+<head>
+  <title>Acme CyberCorp Systems Inc. - Enterprise Internet Solutions (1996)</title>
+  <style type="text/css">
+    /* Early CSS 1 Specification (1996) styling rules */
+    body {
+      font-family: "Times New Roman", Times, serif;
+      background-color: #000033;
+      color: #333333;
+      margin: 10px;
+    }
+    a:link { color: #0000FF; text-decoration: underline; }
+    a:visited { color: #800080; text-decoration: underline; }
+    a:active { color: #FF0000; text-decoration: underline; }
+
+    /* CSS1 Classes for Retro Elements */
+    .header-text {
+      font-family: Arial, Helvetica, sans-serif;
+      font-weight: bold;
+      color: #FFFF00;
+    }
+    .nav-btn {
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 12px;
+      font-weight: bold;
+      color: #FFFFFF;
+      text-decoration: none;
+    }
+    .badge {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 11px;
+      background-color: #000000;
+      color: #00FF00;
+      border: 2px inset #999999;
+      padding: 3px;
+    }
+  </style>
+
+  <script language="JavaScript">
+    <!-- Hide JavaScript from old browsers
+
+    // Nav bar cell rollover — swaps the table cell's bgcolor,
+    // the standard 1996 trick before browsers cached fast enough
+    // for real image preloading to matter on a 28.8k line.
+    function navOver(cellId) {
+      if (document.layers) {
+        document.layers[cellId].bgColor = '#FFCC00';
+      } else if (document.all) {
+        document.all[cellId].style.backgroundColor = '#FFCC00';
+      }
+    }
+
+    function navOut(cellId) {
+      if (document.layers) {
+        document.layers[cellId].bgColor = '#000066';
+      } else if (document.all) {
+        document.all[cellId].style.backgroundColor = '#000066';
+      }
+    }
+
+    // Function for 1996 status bar text messages
+    function setStatus(msg) {
+      window.status = msg;
+      return true;
+    }
+
+    function clearStatus() {
+      window.status = '';
+      return true;
+    }
+
+    // Live JS Clock Function
+    function startClock() {
+      var now = new Date();
+      var hours = now.getHours();
+      var minutes = now.getMinutes();
+      var seconds = now.getSeconds();
+      var timeValue = "" + ((hours > 12) ? hours - 12 : hours);
+      if (timeValue == "0") timeValue = "12";
+      timeValue += ((minutes < 10) ? ":0" : ":") + minutes;
+      timeValue += ((seconds < 10) ? ":0" : ":") + seconds;
+      timeValue += (hours >= 12) ? " P.M." : " A.M.";
+      
+      if (document.clockForm && document.clockForm.digits) {
+        document.clockForm.digits.value = timeValue;
+      }
+      setTimeout("startClock()", 1000);
+    }
+
+    // Alert Message Box handler (No direct alert execution on load)
+    function showWelcomeMessage() {
+      var dialog = document.getElementById("welcomeDialog");
+      if (dialog) dialog.style.display = "block";
+    }
+
+    function closeWelcomeMessage() {
+      var dialog = document.getElementById("welcomeDialog");
+      if (dialog) dialog.style.display = "none";
+    }
+
+    // Stop hiding -->
+  </script>
+</head>
+
+<body bgcolor="#000033" text="#000000" link="#0000FF" vlink="#800080" alink="#FF0000" onLoad="startClock();">
+
+<center>
+  <!-- Outer Container Table with 3D Border styling -->
+  <table border="1" cellpadding="0" cellspacing="0" width="760" bgcolor="#ECECEC">
+    <tr>
+      <td>
+
+        <!-- Header Table -->
+        <table border="0" cellpadding="8" cellspacing="0" width="100%" bgcolor="#000066">
+          <tr>
+            <td align="left" valign="middle" width="70%">
+              <font face="Arial, Helvetica, sans-serif" color="#FFCC00" size="6">
+                <b>ACME CYBERCORP</b>
+              </font><br>
+              <font face="Geneva, Arial, sans-serif" color="#FFFFFF" size="2">
+                <i>"Connecting Corporate America to the Information Superhighway Since 1994"</i>
+              </font>
+            </td>
+            <td align="right" valign="middle" width="30%">
+              <!-- Dynamic JS Clock Widget -->
+              <form name="clockForm" style="margin:0;">
+                <font face="Courier New, Courier" size="1" color="#FFCC00"><b>SYSTEM TIME:</b></font><br>
+                <input type="text" name="digits" size="12" value="Loading..." style="background-color:#000000; color:#00FF00; font-family:'Courier New', monospace; font-size:12px; text-align:center; border:1px solid #999999;" readonly>
+              </form>
+            </td>
+          </tr>
+        </table>
+
+        <!-- Navigation Bar Table -->
+        <table border="1" cellpadding="2" cellspacing="1" width="100%" bgcolor="#000033">
+          <tr align="center">
+            <td id="navHome" bgcolor="#000066" width="25%">
+              <a class="nav-btn" href="#main"
+                 onMouseOver="navOver('navHome'); return setStatus('Go to Main Portal Home');"
+                 onMouseOut="navOut('navHome'); return clearStatus();">MAIN MENU</a>
+            </td>
+            <td id="navProducts" bgcolor="#000066" width="25%">
+              <a class="nav-btn" href="#products"
+                 onMouseOver="navOver('navProducts'); return setStatus('Explore Enterprise Internet Software');"
+                 onMouseOut="navOut('navProducts'); return clearStatus();">PRODUCTS</a>
+            </td>
+            <td id="navServices" bgcolor="#000066" width="25%">
+              <a class="nav-btn" href="#services"
+                 onMouseOver="navOver('navServices'); return setStatus('Consulting &amp; Web Hosting Services');"
+                 onMouseOut="navOut('navServices'); return clearStatus();">SERVICES</a>
+            </td>
+            <td id="navGuestbook" bgcolor="#000066" width="25%">
+              <a class="nav-btn" href="#guestbook"
+                 onMouseOver="navOver('navGuestbook'); return setStatus('Sign Our Digital Guestbook');"
+                 onMouseOut="navOut('navGuestbook'); return clearStatus();">GUESTBOOK</a>
+            </td>
+          </tr>
+        </table>
+
+        <!-- Main Body Columns Layout (2-Column Table) -->
+        <table border="0" cellpadding="10" cellspacing="0" width="100%">
+          <tr>
+            <!-- Left Sidebar -->
+            <td width="25%" valign="top" bgcolor="#DCDCDC">
+              <font face="Arial, Helvetica, sans-serif" size="2">
+                <b>QUICK LINKS</b>
+              </font>
+              <hr size="2" color="#000066" noshade>
+              
+              <font face="Geneva, Arial, sans-serif" size="2">
+                &#149; <a href="#news" onMouseOver="return setStatus('Read Corporate Announcements');" onMouseOut="return clearStatus();">Corporate News</a><br>
+                &#149; <a href="#intranet" onMouseOver="return setStatus('Secure Employee Access');" onMouseOut="return clearStatus();">Intranet Login</a><br>
+                &#149; <a href="#ftp" onMouseOver="return setStatus('FTP Software Downloads');" onMouseOut="return clearStatus();">FTP Archive</a><br>
+                &#149; <a href="#press" onMouseOver="return setStatus('Press Releases 1996');" onMouseOut="return clearStatus();">Press Releases</a><br>
+              </font>
+
+              <br><br>
+              <!-- Retro Web Hit Counter Simulation -->
+              <center>
+                <table border="1" cellpadding="3" cellspacing="0" bgcolor="#000000">
+                  <tr>
+                    <td align="center">
+                      <font face="Courier New, Courier" size="1" color="#FFFFFF"><b>VISITOR COUNT</b></font><br>
+                      <font face="Courier New, Courier" size="3" color="#00FF00"><b>[0][1][4][8][9][2]</b></font>
+                    </td>
+                  </tr>
+                </table>
+                <font face="Arial" size="1" color="#666666">Count active since Oct '95</font>
+              </center>
+
+              <br><br>
+              <!-- Interactive Modal Dialog Trigger -->
+              <center>
+                <table border="1" cellpadding="4" cellspacing="0" bgcolor="#FFFFCC">
+                  <tr>
+                    <td align="center">
+                      <font face="Arial, Helvetica, sans-serif" size="1" color="#000066">
+                        <b>ANNOUNCEMENT:</b><br>
+                        Netscape 3.0 Gold compatibility verified!
+                      </font><br><br>
+                      <input type="button" value="Read Notice" style="font-family:Arial; font-size:10px;" onClick="showWelcomeMessage();">
+                    </td>
+                  </tr>
+                </table>
+              </center>
+
+            </td>
+
+            <!-- Main Content Area -->
+            <td width="75%" valign="top" bgcolor="#FFFFFF">
+              <a name="main"></a>
+              <font face="Arial, Helvetica, sans-serif" color="#000066" size="4">
+                <b>Welcome to CyberCorp Enterprise Solutions</b>
+              </font>
+              <hr size="1" color="#999999">
+
+              <font face="Times New Roman, Times, serif" size="3">
+                <p>Acme CyberCorp Systems Inc. is proud to announce our complete line of turnkey <b>World Wide Web</b> integration tools designed explicitly for Fortune 500 corporations. As the global network expands at an unprecedented rate, your company requires robust client-server architectures and high-bandwidth dial-up infrastructure.</p>
+              </font>
+
+              <!-- Product Table Announcement -->
+              <a name="products"></a>
+              <table border="1" cellpadding="5" cellspacing="0" width="100%" bgcolor="#F4F4F4">
+                <tr bgcolor="#000066">
+                  <td colspan="2">
+                    <font face="Arial, Helvetica, sans-serif" color="#FFFFFF" size="2">
+                      <b>FEATURED SOFTWARE PACKAGES (RELEASE 2.1)</b>
+                    </font>
+                  </td>
+                </tr>
+                <tr>
+                  <td width="30%" valign="top">
+                    <font face="Arial" size="2"><b>CyberGate 96</b></font>
+                  </td>
+                  <td width="70%">
+                    <font face="Times New Roman" size="2">
+                      Next-generation Proxy and Firewall daemon offering secure 28.8k baud modem aggregation and HTTP protocol filtering.
+                    </font>
+                  </td>
+                </tr>
+                <tr>
+                  <td width="30%" valign="top">
+                    <font face="Arial" size="2"><b>WebMaster Pro</b></font>
+                  </td>
+                  <td width="70%">
+                    <font face="Times New Roman" size="2">
+                      HTML 3.2 authoring suite with CGI-BIN Perl script wizard and integrated FTP deployment engine.
+                    </font>
+                  </td>
+                </tr>
+              </table>
+
+              <br>
+
+              <a name="services"></a>
+              <font face="Arial, Helvetica, sans-serif" color="#000066" size="3">
+                <b>Corporate Services & Web Hosting</b>
+              </font>
+              <hr size="1" color="#999999">
+
+              <font face="Times New Roman, Times, serif" size="3">
+                <ul>
+                  <li><b>Dedicated T1 Line Connections</b> (1.544 Mbps throughput for enterprise backbones).</li>
+                  <li><b>Custom CGI-BIN Scripting</b> (Perl 5.0 and C++ backend form processing).</li>
+                  <li><b>Sun SPARCSafe Web Hosting</b> on high-reliability UNIX servers.</li>
+                </ul>
+              </font>
+
+              <a name="guestbook"></a>
+              <!-- 1996 Interactive Form Element -->
+              <table border="1" cellpadding="6" cellspacing="0" width="100%" bgcolor="#ECECEC">
+                <tr>
+                  <td>
+                    <font face="Arial, Helvetica, sans-serif" size="2" color="#000066">
+                      <b>SIGN OUR DIGITAL GUESTBOOK</b>
+                    </font>
+                    <hr size="1" color="#000066">
+                    <form name="guestbookForm" action="#" onSubmit="alert('Thank you for signing our guestbook!'); return false;">
+                      <table border="0" cellpadding="2" cellspacing="0">
+                        <tr>
+                          <td><font face="Arial" size="2">Your Name:</font></td>
+                          <td><input type="text" name="realname" size="25" style="font-family:Arial; font-size:11px;"></td>
+                        </tr>
+                        <tr>
+                          <td><font face="Arial" size="2">E-Mail Address:</font></td>
+                          <td><input type="text" name="email" size="25" style="font-family:Arial; font-size:11px;"></td>
+                        </tr>
+                        <tr>
+                          <td valign="top"><font face="Arial" size="2">Comments:</font></td>
+                          <td><textarea name="comments" rows="3" cols="30" style="font-family:Arial; font-size:11px;"></textarea></td>
+                        </tr>
+                        <tr>
+                          <td>&nbsp;</td>
+                          <td>
+                            <input type="submit" value="Submit Entry" style="font-family:Arial; font-size:11px;">
+                            <input type="reset" value="Clear Form" style="font-family:Arial; font-size:11px;">
+                          </td>
+                        </tr>
+                      </table>
+                    </form>
+                  </td>
+                </tr>
+              </table>
+
+            </td>
+          </tr>
+        </table>
+
+        <!-- Footer Section -->
+        <table border="0" cellpadding="6" cellspacing="0" width="100%" bgcolor="#000033">
+          <tr>
+            <td align="center">
+              <font face="Arial, Helvetica, sans-serif" size="1" color="#FFFFFF">
+                Copyright &copy; 1996 Acme CyberCorp Systems, Inc. All Rights Reserved.<br>
+                100 Cybernetic Way, Suite 400, Silicon Valley, CA 94025<br>
+                Optimized for resolution 800x600 with 256 Web-Safe Colors.
+              </font>
+              <br><br>
+
+              <!-- Retro Browser Compatibility Badges -->
+              <table border="0" cellpadding="2" cellspacing="0">
+                <tr>
+                  <td>
+                    <span class="badge">BEST VIEWED WITH<br><b>Netscape 3.0</b></span>
+                  </td>
+                  <td>&nbsp;&nbsp;</td>
+                  <td>
+                    <span class="badge">MICROSOFT<br><b>Internet Explorer</b></span>
+                  </td>
+                  <td>&nbsp;&nbsp;</td>
+                  <td>
+                    <span class="badge">JS 1.1<br><b>ENABLED</b></span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+
+      </td>
+    </tr>
+  </table>
+</center>
+
+<!-- Non-blocking custom modal replacing window.alert for strict UI guidelines -->
+<div id="welcomeDialog" style="display:none; position:absolute; top:30%; left:30%; width:40%; background-color:#C0C0C0; border:2px outset #FFFFFF; padding:10px; z-index:999;">
+  <table border="0" width="100%" bgcolor="#000080" cellpadding="2" cellspacing="0">
+    <tr>
+      <td><font face="Arial" size="2" color="#FFFFFF"><b>System Message - Notice 1996</b></font></td>
+    </tr>
+  </table>
+  <p><font face="Arial" size="2">Welcome to CyberCorp Enterprise Systems! Our site leverages JavaScript 1.1 client-side scripting and cascading stylesheets (CSS 1) for full 1996 browser compliance.</font></p>
+  <center>
+    <input type="button" value="  OK  " onClick="closeWelcomeMessage();" style="font-family:Arial; font-size:12px;">
+  </center>
+</div>
+
+</body>
+</html>

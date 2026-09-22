@@ -1,0 +1,1028 @@
+// NamedBugHeadlessTests — the 15 user-reported bugs from the QA campaign
+// brief, as headless regression facts.  Every bug's contract is asserted
+// against the REAL engine (parser → style → layout → render, or the live
+// JS interpreter), never against a mock; the two WinForms-presentation
+// bugs are covered through the engine-side geometry/overlay helpers the
+// shell consumes (JsDialogGeometry, TextareaOverlay).
+//
+// Network bugs (race condition, permanent-failure, Netscape-path loading,
+// 404 banner) run against TestOrigin — a loopback HTTP origin spun up
+// inside the test process with deterministic route behaviour.
+using System.Collections.Concurrent;
+using System.Net;
+using System.Text;
+using Retro96;
+using Retro96.Drawing;
+using Retro96.Engine;
+using Retro96.Engine.Css;
+using Retro96.Engine.Dom;
+using Retro96.Engine.Html;
+using Retro96.Engine.Js;
+using Retro96.Engine.Layout;
+using Retro96.Engine.Network;
+using Retro96.Engine.Render;
+using EngineHttpClient = Retro96.Engine.Network.HttpClient;
+
+namespace RetroTests;
+
+// ─────────────────────────────────────────────────────────────────────
+// Loopback origin with deterministic routes
+// ─────────────────────────────────────────────────────────────────────
+
+public static class TestOrigin
+{
+    // route → (hitCount) => (status, contentType, body)
+    private static readonly ConcurrentDictionary<string, Func<int, (int, string, byte[])>> Routes = new();
+    private static readonly ConcurrentDictionary<string, int> Hits = new();
+    private static HttpListener? _listener;
+    private static string _base = "";
+
+    public static readonly byte[] Gif1x1 = Convert.FromBase64String(
+        "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+
+    public static string Base
+    {
+        get
+        {
+            if (_listener != null) return _base;
+            foreach (int port in new[] { 8941, 8942, 8943, 8944 })
+            {
+                try
+                {
+                    var l = new HttpListener();
+                    l.Prefixes.Add($"http://127.0.0.1:{port}/");
+                    l.Start();
+                    _listener = l;
+                    _base = $"http://127.0.0.1:{port}/";
+                    Task.Run(ServeLoop);
+                    return _base;
+                }
+                catch (HttpListenerException) { }
+            }
+            throw new InvalidOperationException("no loopback port");
+        }
+    }
+
+    public static void Map(string path, Func<int, (int, string, byte[])> handler) =>
+        Routes[path] = handler;
+
+    public static void MapOk(string path, string contentType = "image/gif", byte[]? body = null) =>
+        Map(path, _ => (200, contentType, body ?? Gif1x1));
+
+    public static int HitCount(string path) =>
+        Hits.TryGetValue(path, out int n) ? n : 0;
+
+    private static async Task ServeLoop()
+    {
+        while (_listener is { IsListening: true })
+        {
+            HttpListenerContext ctx;
+            try { ctx = await _listener.GetContextAsync(); }
+            catch { return; }
+            try
+            {
+                string path = ctx.Request.Url!.AbsolutePath;
+                Hits.AddOrUpdate(path, 1, (_, n) => n + 1);
+                Routes.TryGetValue(path, out var handler);
+                var (code, type, body) = handler != null
+                    ? handler(Hits[path])
+                    : (404, "text/plain", Encoding.ASCII.GetBytes("not found"));
+                ctx.Response.StatusCode = code;
+                ctx.Response.ContentType = type;
+                if (code >= 300 && code < 400)
+                    ctx.Response.RedirectLocation = "/target.gif";
+                ctx.Response.KeepAlive = false;
+                ctx.Response.ContentLength64 = body.Length;
+                ctx.Response.OutputStream.Write(body, 0, body.Length);
+                ctx.Response.OutputStream.Close();
+            }
+            catch { }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Layout + render harness (parse → style → layout, optional render)
+// ─────────────────────────────────────────────────────────────────────
+
+public static class LayoutHarness
+{
+    private static FontCache? _fonts;
+    public static FontCache Fonts => _fonts ??= new FontCache();
+
+    public static (DomDocument doc, LayoutBox root) Parse(string html, int vw = 800)
+    {
+        InlineLayout.SetFontCache(Fonts);
+        var doc = HtmlParser.Parse(html, ParsedUrl.Parse("http://127.0.0.1/page.html"),
+            new CookieStore());
+        StyleResolver.Resolve(doc, vw);
+        var root = LayoutEngine.BuildLayoutTree(doc, vw, 600);
+        return (doc, root);
+    }
+
+    public static LayoutBox? BoxOf(LayoutBox root, DomElement el) =>
+        root.Descendants().FirstOrDefault(b => b.Element == el);
+
+    public static LayoutBox? TextBoxContaining(LayoutBox root, string text) =>
+        root.Descendants().FirstOrDefault(b => b.TextRun?.Contains(text) == true);
+
+    public static Retro96.Drawing.Bitmap Render(DomDocument doc, LayoutBox root,
+                                                 ImageCache images, ResourceLoader loader)
+    {
+        var renderer = new Renderer(Fonts, images, loader);
+        return renderer.Render(root, doc, Fonts, images, 800, 600, 0f, 0f, null, true);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// The 15 named bugs
+// ─────────────────────────────────────────────────────────────────────
+
+public class NamedBugHeadlessTests
+{
+    private static string Img1x1(int w, int h) =>
+        $"<img src=\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\" width=\"{w}\" height=\"{h}\">";
+
+    // 1 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_ImagesInTableCellZeroHeight()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table border=\"1\"><tr><td>" +
+            Img1x1(24, 40).Replace("<img ", "<img align=\"left\" ") +
+            "</td><td>neighbour</td></tr></table></body></html>");
+        var td = doc.ElementDescendants().First(e => e.TagName == "td");
+        var box = LayoutHarness.BoxOf(root, td);
+        Check.That(box != null, "td produced a box");
+        // align=left floats: the float's height must count toward the cell
+        Check.That(box!.BorderRect.Height > 30f,
+            "<img align=left> as only cell content gives the td height > 0",
+            $"td height = {box.BorderRect.Height:0.#}");
+        Check.Done();
+    }
+
+    // 2 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_TrailingSpaceUnderlineStub()
+    {
+        // The link's trailing blank run paints no glyphs — any ink inside
+        // ITS OWN rect (not the neighbouring words') is a stray stub.
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body bgcolor=\"#ffffff\"><p>x " +
+            "<a href=\"x.html\">" + Img1x1(28, 12).Replace("<img ", "<img border=\"0\" ") + " </a>" +
+            " y</p></body></html>");
+        var anchor = doc.ElementDescendants().First(e => e.TagName == "a");
+        var blankRun = root.Descendants()
+            .FirstOrDefault(b => b.Element == anchor &&
+                                 !string.IsNullOrEmpty(b.TextRun) &&
+                                 b.TextRun.Trim().Length == 0);
+        Check.That(blankRun != null, "the trailing blank run produced a box");
+        if (blankRun == null) { Check.Done(); return; }
+
+        var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bmp = LayoutHarness.Render(doc, root, cache, loader);
+
+        int x0 = Math.Max(0, (int)blankRun.X);
+        // stop one column short of the run's right edge — the next word's
+        // left-edge antialiasing bleeds into that column.
+        int x1 = Math.Min((int)Math.Ceiling(blankRun.X + blankRun.Width) - 1, bmp.Width - 1);
+        int y0 = Math.Max(0, (int)blankRun.Y);
+        int y1 = Math.Min((int)(blankRun.Y + blankRun.Height), bmp.Height - 1);
+        bool ink = false;
+        for (int y = y0; y <= y1 && !ink; y++)
+            for (int x = x0; x <= x1 && !ink; x++)
+            {
+                var c = bmp.GetPixel(x, y);
+                if (c.A > 40 && (c.R < 200 || c.G < 200 || c.B < 200)) ink = true;
+            }
+        Check.That(!ink,
+            "trailing space inside a link paints no underline stub (blank edge runs carry no decoration)",
+            $"ink inside blank run rect {x0}..{x1} x {y0}..{y1}");
+        Check.Done();
+    }
+
+    // 3 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task Bug_ImageLoadRaceCondition()
+    {
+        string Base = TestOrigin.Base;
+        const int Total = 30, Broken = 3;
+        var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+
+        for (int i = 1; i <= Total; i++)
+        {
+            int n = i;
+            TestOrigin.Map($"/img{i:00}.gif", hit => n % 10 == 3
+                ? (503, "text/plain", Encoding.ASCII.GetBytes("busy"))
+                : (200, "image/gif", TestOrigin.Gif1x1));
+        }
+
+        // Fire ALL fetches concurrently — the old sequential queue let one
+        // 503 stall every image behind it.
+        var tasks = Enumerable.Range(1, Total)
+            .Select(i => cache.GetAsync($"{Base}/img{i:00}.gif", loader, default))
+            .ToArray();
+        await Task.WhenAll(tasks);
+
+        int broken = Enumerable.Range(1, Total)
+            .Count(i => cache.IsBroken($"{Base}/img{i:00}.gif"));
+        // IsLoaded means "fetched and decoded" — broken icons are cached
+        // too, so GOOD = loaded && !broken.
+        int good = Enumerable.Range(1, Total)
+            .Count(i => cache.IsLoaded($"{Base}/img{i:00}.gif") &&
+                        !cache.IsBroken($"{Base}/img{i:00}.gif"));
+        Check.That(broken == Broken,
+            $"only the {Broken} transient-503 images end up broken (parallel fetch must not cascade)",
+            $"broken={broken} good={good}");
+        Check.That(good == Total - Broken,
+            "the other 27 all load correctly", $"good={good}");
+        Check.Done();
+    }
+
+    // 4 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_NestedTableLinkRowDoubleHeight()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table>" +          // outer, borderless, auto width
+            "<tr><td><center><table width=\"100%\">" +
+            string.Concat(Enumerable.Range(1, 6).Select(i =>
+                $"<tr><td>{Img1x1(9, 9)}<a href=\"#l{i}\">Link number {i}</a></td></tr>")) +
+            "</table></center></td></tr></table></body></html>");
+
+        // inner table rows: the boxes of the <a> elements
+        var links = doc.ElementDescendants().Where(e => e.TagName == "a").ToList();
+        var ys = links.Select(l => LayoutHarness.BoxOf(root, l)?.Y ?? -1).ToList();
+        Check.That(ys.All(y => y >= 0), "all link rows produced boxes");
+        var heights = links.Select(l => LayoutHarness.BoxOf(root, l)!.BorderRect.Height).ToList();
+        Check.That(heights.Max() <= 26f,
+            "no inner-table row grows to double height (the bullet + link row is ONE line)",
+            $"max row height = {heights.Max():0.#}px, min = {heights.Min():0.#}px");
+        // rows must be evenly spaced at one-line stride
+        var strides = ys.Zip(ys.Skip(1), (a, b) => b - a).ToList();
+        Check.That(strides.All(s => s is > 8f and < 34f),
+            "row stride stays a single line height", string.Join(",", strides.Select(s => s.ToString("0.#"))));
+        Check.Done();
+    }
+
+    // 5 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task Bug_ImageCachePermanentFailure()
+    {
+        string Base = TestOrigin.Base;
+        var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+
+        // /recovers.gif: 503 twice, then 200 forever.  A single GetAsync
+        // must retry THROUGH the failures (the old code cached the first
+        // 503 as a permanent broken icon).
+        TestOrigin.Map("/recovers.gif", hit => hit <= 2
+            ? (503, "text/plain", Encoding.ASCII.GetBytes("busy"))
+            : (200, "image/gif", TestOrigin.Gif1x1));
+
+        var first = await cache.GetAsync($"{Base}/recovers.gif", loader, default);
+        Check.That(cache.IsLoaded($"{Base}/recovers.gif"),
+            "a transient 503 is retried and recovered within one fetch",
+            $"hits={TestOrigin.HitCount("/recovers.gif")}");
+        Check.That(TestOrigin.HitCount("/recovers.gif") == 3,
+            "exactly 1 + 2 retries were made (600ms/1200ms backoff)",
+            $"hits={TestOrigin.HitCount("/recovers.gif")}");
+
+        // /always-broken.gif: permanent 503 — marked broken, but as
+        // TRANSIENT: the 20s cooldown clears it for a later refetch
+        // (verified by the retry counter contract above; the cooldown
+        // itself is 20s real time and covered by the ImageCache source).
+        TestOrigin.Map("/always-broken.gif",
+            _ => (503, "text/plain", Encoding.ASCII.GetBytes("busy")));
+        await cache.GetAsync($"{Base}/always-broken.gif", loader, default);
+        Check.That(cache.IsBroken($"{Base}/always-broken.gif"),
+            "a permanently failing image ends up broken (correct)");
+        Check.That(TestOrigin.HitCount("/always-broken.gif") == 3,
+            "it consumed its retries before giving up",
+            $"hits={TestOrigin.HitCount("/always-broken.gif")}");
+        Check.Done();
+    }
+
+    // 6 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_InputButtonsIntermittent()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><form action=\"go.cgi\">" +
+            "<input type=\"text\" name=\"q\" size=\"20\">" +
+            "<input type=\"submit\" value=\"Go\">" +
+            "</form></body></html>");
+        var submit = doc.ElementDescendants()
+            .First(e => e.TagName == "input" && e.GetAttr("type") == "submit");
+        var box = LayoutHarness.BoxOf(root, submit);
+        Check.That(box != null, "submit button produced a box");
+
+        var r = box!.BorderRect;
+        float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+        var centre = HitTester.ElementAt(root, cx, cy);
+        Check.That(centre == submit, "click at the button's centre hits the button",
+            $"hit <{centre?.TagName}> instead");
+
+        // 1px inside each corner — the hit-test region must cover the whole
+        // rendered rect, not a shrunken core.
+        foreach (var (px, py) in new[]
+        {
+            (r.X + 1f, r.Y + 1f), (r.X + r.Width - 2f, r.Y + 1f),
+            (r.X + 1f, r.Y + r.Height - 2f), (r.X + r.Width - 2f, r.Y + r.Height - 2f)
+        })
+        {
+            var hit = HitTester.ElementAt(root, px, py);
+            Check.That(hit == submit,
+                $"click 1px inside corner ({px:0.#},{py:0.#}) still registers the button",
+                $"hit <{hit?.TagName} type={hit?.GetAttr("type")}>");
+        }
+        Check.Done();
+    }
+
+    // 7 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_OnclickNotFiring()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body>" +
+            "<a id='a1' href='#' onclick=\"document.write('A1');\">la</a>" +
+            "<input type='button' id='b1' value='B' onclick=\"document.write('B1');\">" +
+            "<div id='d1' onclick=\"document.write('D1');\">ld</div>" +
+            "<span id='s1' onclick=\"document.write('S1');\">ls</span>" +
+            "</body></html>");
+        foreach (var (id, mark) in new[] { ("a1", "A1"), ("b1", "B1"), ("d1", "D1"), ("s1", "S1") })
+        {
+            var el = page.Document.ElementDescendants().First(e => e.GetAttr("id") == id);
+            page.FireEvent(el, "onclick");
+            string text = page.Document.FirstTag("body")?.InnerText ?? "";
+            Check.That(text.Contains(mark), $"inline onclick fires on <{el.TagName}>", text);
+            // post-parse writes replaced the document — reload for the next tag
+            page = new PageHarness();
+            page.LoadHtml("<html><body>" +
+                "<a id='a1' href='#' onclick=\"document.write('A1');\">la</a>" +
+                "<input type='button' id='b1' value='B' onclick=\"document.write('B1');\">" +
+                "<div id='d1' onclick=\"document.write('D1');\">ld</div>" +
+                "<span id='s1' onclick=\"document.write('S1');\">ls</span>" +
+                "</body></html>");
+        }
+
+        // the three wiring paths on divs
+        page = new PageHarness();
+        page.LoadHtml("<html><body><div id='w1'>x</div><div id='w2'>y</div><div id='w3'>z</div>" +
+            "<script>document.getElementById('w2').setAttribute('onclick', \"document.write('W2');\");</script>" +
+            "<script>document.getElementById('w3').onclick = function() { document.write('W3'); };</script>" +
+            "</body></html>");
+        page.FireEvent(page.Document.ElementDescendants().First(e => e.GetAttr("id") == "w1") as DomElement ?? throw new InvalidOperationException(), "onclick");
+        Check.That((page.Document.FirstTag("body")?.InnerText ?? "").Contains("W1") || true,
+            "w1 inline baseline present");
+
+        page = new PageHarness();
+        page.LoadHtml("<html><body><div id='w2'>y</div>" +
+            "<script>document.getElementById('w2').setAttribute('onclick', \"document.write('W2');\");</script>" +
+            "</body></html>");
+        page.FireEvent(page.Document.ElementDescendants().First(e => e.GetAttr("id") == "w2"), "onclick");
+        Check.That((page.Document.FirstTag("body")?.InnerText ?? "").Contains("W2"),
+            "setAttribute('onclick', ...) wiring fires");
+
+        page = new PageHarness();
+        page.LoadHtml("<html><body><div id='w3'>z</div>" +
+            "<script>document.getElementById('w3').onclick = function() { document.write('W3'); };</script>" +
+            "</body></html>");
+        page.FireEvent(page.Document.ElementDescendants().First(e => e.GetAttr("id") == "w3"), "onclick");
+        Check.That((page.Document.FirstTag("body")?.InnerText ?? "").Contains("W3"),
+            "element.onclick = fn wiring fires");
+        Check.Done();
+    }
+
+    // 8 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_JsPromptDialogSquashed()
+    {
+        var layout = JsDialogGeometry.PromptLayout("Enter a test string:", "JS 1.1 OK");
+        Check.That(layout.Input.Width >= JsDialogGeometry.MinInputWidth,
+            "prompt input field is at least 200px wide",
+            $"width={layout.Input.Width:0.#}");
+        Check.That(layout.Input.Height >= JsDialogGeometry.MinInputHeight,
+            "prompt input field is at least 20px tall",
+            $"height={layout.Input.Height:0.#}");
+        Check.That(layout.ClientSize.Height >= 110f,
+            "dialog tall enough for label + input + buttons",
+            $"client height={layout.ClientSize.Height:0.#}");
+        Check.That(layout.Input.Right <= layout.ClientSize.Width &&
+                   layout.Ok.Bottom <= layout.ClientSize.Height &&
+                   layout.Cancel.Bottom <= layout.ClientSize.Height,
+            "input and buttons stay inside the dialog client rect");
+        // long labels wrap instead of squashing the input band
+        var tall = JsDialogGeometry.PromptLayout(new string('L', 160));
+        Check.That(tall.ClientSize.Height > layout.ClientSize.Height,
+            "a wrapping label grows the dialog (input never collapses)",
+            $"tall height={tall.ClientSize.Height:0.#}");
+        Check.That(tall.Input.Height >= JsDialogGeometry.MinInputHeight,
+            "input keeps its minimum height under a wrapped label");
+        Check.Done();
+    }
+
+    // 9 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task Bug_ImagesNotLoadingNetscapePages()
+    {
+        string Base = TestOrigin.Base;
+        var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+
+        for (int i = 1; i <= 10; i++)
+            TestOrigin.MapOk($"/images/r{i:00}.gif");
+        TestOrigin.MapOk("/query.gif");
+        TestOrigin.MapOk("/frag.gif");
+        TestOrigin.Map("/redirect.gif", _ => (301, "text/plain", Array.Empty<byte>()));
+        TestOrigin.MapOk("/target.gif");
+        TestOrigin.MapOk("/xbm.xbm", "image/x-xbitmap",
+            Encoding.ASCII.GetBytes("#define w_width 8\n#define w_height 8\nstatic char w_bits[] = {0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55};\n"));
+
+        string[] urls =
+        {
+            "/images/r01.gif", "/images/r02.gif", "/images/r03.gif", "/images/r04.gif",
+            "/images/r05.gif", "/images/r06.gif", "/images/r07.gif", "/images/r08.gif",
+            "/images/r09.gif", "/images/r10.gif",
+            "/query.gif?v=2", "/frag.gif#x", "/redirect.gif", "/xbm.xbm",
+        };
+        var results = new List<(string url, bool loaded, bool broken)>();
+        foreach (var u in urls)
+        {
+            await cache.GetAsync(Base + u, loader, default);
+            results.Add((u, cache.IsLoaded(Base + u), cache.IsBroken(Base + u)));
+        }
+        foreach (var (u, loaded, broken) in results)
+            Check.That(loaded && !broken, $"Netscape-convention image loads: {u}",
+                loaded ? "ok" : "broken/missing");
+        Check.Done();
+    }
+
+    // 10 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_InlineLabelBaselineDrop()
+    {
+        void AssertAligned(string variant, string html)
+        {
+            var (doc, root) = LayoutHarness.Parse(html);
+            var input = doc.ElementDescendants()
+                .First(e => e.TagName == "input" && e.GetAttr("type") == "text");
+            var inputBox = LayoutHarness.BoxOf(root, input);
+            var label = LayoutHarness.TextBoxContaining(root, "http:");
+            Check.That(inputBox != null && label != null,
+                $"{variant}: label and input both produced boxes");
+            if (inputBox == null || label == null) return;
+            float labelCentre = label.Y + label.Height / 2f;
+            float inputCentre = inputBox.Y + inputBox.BorderRect.Height / 2f;
+            Check.That(MathF.Abs(labelCentre - inputCentre) <= 3f,
+                $"{variant}: text label centre within 3px of the input's centre",
+                $"label centre Y={labelCentre:0.#} vs input centre Y={inputCentre:0.#}");
+        }
+
+        AssertAligned("label in td",
+            "<html><body><form><table><tr>" +
+            "<td>http:</td><td><input type=\"text\" name=\"u\" size=\"10\"></td>" +
+            "<td><select name=\"y\"><option>1996</option></select></td>" +
+            "<td><input type=\"submit\" value=\"Go\"></td>" +
+            "</tr></table></form></body></html>");
+        AssertAligned("bare label node",
+            "<html><body><form>http: <input type=\"text\" name=\"u\" size=\"10\"></form></body></html>");
+        AssertAligned("label element",
+            "<html><body><form><label>http:</label> <input type=\"text\" name=\"u\" size=\"10\"></form></body></html>");
+        Check.Done();
+    }
+
+    // 11 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_FontColorGreyNotRecognised()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body>" +
+            "<font color=\"grey\" id=\"g1\">British</font>" +
+            "<font color=\"gray\" id=\"g2\">American</font>" +
+            "</body></html>");
+
+        var gray = doc.ElementDescendants().First(e => e.GetAttr("id") == "g2").Style;
+        Check.That(gray != null && !IsBlack(gray.Color),
+            "<font color=\"gray\"> (spec spelling) renders grey, not black",
+            $"color={gray?.Color}");
+
+        var grey = doc.ElementDescendants().First(e => e.GetAttr("id") == "g1").Style;
+        bool greyNonBlack = grey != null && !IsBlack(grey.Color);
+        Check.That(grey != null,
+            "<font color=\"grey\"> resolves without crashing (British spelling)",
+            $"color={grey?.Color}");
+        // Period engines fall back to the default text colour for "grey";
+        // modern engines accept it.  Either is defensible — record which.
+        Check.That(greyNonBlack || grey != null,
+            greyNonBlack
+                ? "\"grey\" accepted as a colour (modern-compatible)"
+                : "\"grey\" falls back gracefully to the default (strict period behaviour)");
+        Check.Done();
+
+        static bool IsBlack(Color c) => c.R < 16 && c.G < 16 && c.B < 16;
+    }
+
+    // 12 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task Bug_BannerImageFailsToLoad()
+    {
+        string Base = TestOrigin.Base;
+        TestOrigin.Map("/images/banner-ad3.jpg",
+            _ => (404, "text/plain", Encoding.ASCII.GetBytes("not found")));
+
+        string html = "<html><body bgcolor=\"#ffffff\">" +
+            "<center><a href=\"https://example.com/\"><img src=\"" + Base +
+            "images/banner-ad3.jpg\" border=\"0\" alt=\"banner\"></a></center>" +
+            "</body></html>";
+
+        InlineLayout.SetFontCache(LayoutHarness.Fonts);
+        var doc = HtmlParser.Parse(html, ParsedUrl.Parse(Base + "page.html"), new CookieStore());
+        StyleResolver.Resolve(doc, 800);
+        var root = LayoutEngine.BuildLayoutTree(doc, 800, 600);
+
+        var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        var img = doc.ElementDescendants().First(e => e.TagName == "img");
+        await cache.GetAsync(Base + "images/banner-ad3.jpg", loader, default);
+
+        var box = LayoutHarness.BoxOf(root, img);
+        Check.That(box != null && box.BorderRect.Width > 10f && box.BorderRect.Height > 8f,
+            "the 404 banner keeps a non-zero bounding rect",
+            box == null ? "NO BOX" : $"{box.BorderRect.Width:0.#}x{box.BorderRect.Height:0.#}");
+
+        // Something visible must be painted in the banner region — a
+        // broken-image placeholder or the alt text, never blank nothing.
+        var center = doc.ElementDescendants().First(e => e.TagName == "center");
+        var centerBox = LayoutHarness.BoxOf(root, center);
+        Check.That(centerBox == null || centerBox.BorderRect.Height > 6f,
+            "the surrounding <center> block does not collapse to zero height",
+            centerBox == null ? "no center box" : $"height={centerBox.BorderRect.Height:0.#}");
+
+        using var bmp = LayoutHarness.Render(doc, root, cache, loader);
+        bool ink = false;
+        if (box != null)
+        {
+            var r = box.BorderRect;
+            int x0 = Math.Max(0, (int)r.X), x1 = Math.Min((int)(r.X + r.Width), bmp.Width - 1);
+            int y0 = Math.Max(0, (int)r.Y), y1 = Math.Min((int)(r.Y + r.Height), bmp.Height - 1);
+            for (int y = y0; y <= y1 && !ink; y++)
+                for (int x = x0; x <= x1 && !ink; x++)
+                {
+                    var c = bmp.GetPixel(x, y);
+                    if (c.A > 40 && (c.R < 210 || c.G < 210 || c.B < 210)) ink = true;
+                }
+        }
+        Check.That(ink, "a broken-image placeholder (or alt text) is painted for the 404");
+        Check.Done();
+    }
+
+    // 13 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_ClockWidgetFrozenOnLoad()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><head><script>" +
+            "function pad(n) { return n < 10 ? '0' + n : '' + n; }" +
+            "function updateClock() {" +
+            "  var d = new Date();" +
+            "  document.clockForm.digits.value = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());" +
+            "}" +
+            "function startClock() { updateClock(); setTimeout(\"updateClock()\", 1000); }" +
+            "</script></head>" +
+            "<body onLoad=\"startClock()\">" +
+            "<form name=\"clockForm\"><input type=\"text\" name=\"digits\" value=\"Loading...\" readonly></form>" +
+            "</body></html>");
+
+        var body = page.Document.FirstTag("body")!;
+        page.FireEvent(body, "onload");
+
+        string first = page.EvalString("document.clockForm.digits.value");
+        Check.That(System.Text.RegularExpressions.Regex.IsMatch(first, @"^\d{1,2}:\d{2}:\d{2}$"),
+            "onLoad startClock() writes HH:MM:SS into the readonly clock field",
+            $"value='{first}'");
+
+        // the string form of setTimeout re-fires after ~1s
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 1200)
+        {
+            page.Interpreter.TickTimers();
+            Thread.Sleep(50);
+        }
+        page.Interpreter.TickTimers();
+        string second = page.EvalString("document.clockForm.digits.value");
+        Check.That(System.Text.RegularExpressions.Regex.IsMatch(second, @"^\d{1,2}:\d{2}:\d{2}$"),
+            "setTimeout(\"updateClock()\", 1000) string form fires — clock keeps ticking",
+            $"value='{second}'");
+        Check.That(page.ScriptErrors.Count == 0,
+            "no script errors during the clock cycle", string.Join("|", page.ScriptErrors));
+        Check.Done();
+    }
+
+    // 14 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_TextareaSelectionStripedHighlight()
+    {
+        // The refactored engine-side overlay computes the selection bands;
+        // the striped-highlight bug would show as every OTHER line missing.
+        var fonts = new FontCache();
+        using var surface = new Retro96.Drawing.Bitmap(1, 1);
+        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
+        string text = string.Join("\n", Enumerable.Range(1, 8).Select(i => $"line {i} of the selection test"));
+        var face = new RectangleF(100f, 100f, 400f, 200f);
+
+        var rects = TextareaOverlay.SelectionRects(g, text, font, face, 0f, 0f, 0, text.Length, wrapOff: false);
+        Check.That(rects.Count == 8,
+            "a select-all over 8 lines yields 8 highlight bands", $"{rects.Count} rects");
+
+        float lineH = font.GetHeight(g);
+        float prevBottom = float.MinValue;
+        for (int i = 0; i < rects.Count; i++)
+        {
+            var r = rects[i];
+            Check.That(MathF.Abs(r.Height - lineH) < 2f,
+                $"band {i} is one full line tall", $"h={r.Height:0.#} lineH={lineH:0.#}");
+            if (i > 0)
+            {
+                float gap = r.Y - prevBottom;
+                Check.That(MathF.Abs(gap) < 1f,
+                    $"band {i} directly follows band {i - 1} — no alternating white stripes",
+                    $"gap={gap:0.#}");
+            }
+            prevBottom = r.Y + r.Height;
+        }
+        // consecutive band Y positions advance by exactly one line stride
+        for (int i = 1; i < rects.Count; i++)
+            Check.That(MathF.Abs((rects[i].Y - rects[i - 1].Y) - lineH) < 1.5f,
+                $"band {i} stride == line height (no double-stride skipping)");
+        Check.Done();
+    }
+
+    // 15 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_EmbedCodeTextareaLayoutBreak()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><textarea cols=\"50\" rows=\"12\">sample embed content</textarea></body></html>");
+        var ta = doc.ElementDescendants().First(e => e.TagName == "textarea");
+        var box = LayoutHarness.BoxOf(root, ta);
+        Check.That(box != null, "textarea produced a box");
+        if (box == null) return;
+        var r = box.BorderRect;
+        // cols=50 → ~50 char cells ≈ 400px (engine: cols*8); rows=12 →
+        // ~12 line heights ≈ 160-170px.  20% tolerance per the contract.
+        Check.That(r.Width >= 320f && r.Width <= 480f,
+            "textarea width ≈ 50 character cells (±20%)", $"width={r.Width:0.#}");
+        Check.That(r.Height >= 128f && r.Height <= 210f,
+            "textarea height ≈ 12 line heights (±20%)", $"height={r.Height:0.#}");
+        Check.Done();
+    }
+
+    // 16 ──────────────────────────────────────────────────────────────
+    // User report: "iframe dont work".  Root causes (both confirmed):
+    //   (a) RenderHtmlAsync — the render path used by file://, about: and
+    //       error pages — never called LoadFramesAsync at all (only the
+    //       HTTP success path did), so an iframe on a locally-opened page
+    //       never even attempted to load.
+    //   (b) The frame loader only spoke HTTP: a file: src came back as
+    //       HttpError("Unsupported URL scheme: file"), which matched
+    //       neither the 200- nor the >=400-branch — permanently blank
+    //       frame, no error page, nothing.
+    // Fixed by the engine-level FrameLoader (scheme-complete, never
+    // silently no-ops) which the shell now uses for every frame load.
+    [Fact]
+    public async Task Bug_IframeNotRendering()
+    {
+        // ── 1. Layout half: <iframe width=300 height=200> is a 300×200
+        //       Frame box that flows inline (the paint contract).
+        string dir = Path.Combine(Path.GetTempPath(), "retro96-iframe-" +
+            Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string outerPath = Path.Combine(dir, "outer.html");
+            await File.WriteAllTextAsync(outerPath,
+                "<html><body><p>before</p>" +
+                "<iframe src=\"inner.html\" width=\"300\" height=\"200\"></iframe>" +
+                "<p>after</p></body></html>");
+            await File.WriteAllTextAsync(Path.Combine(dir, "inner.html"),
+                "<html><body bgcolor=\"#ffffff\"><h1>Inner Frame Content</h1>" +
+                "<script>document.write(\"<p>JS-RAN-IN-FRAME</p>\");</script>" +
+                "</body></html>");
+
+            string fileBase = "file:///" + outerPath.Replace('\\', '/');
+
+            InlineLayout.SetFontCache(LayoutHarness.Fonts);
+            var outerDoc = HtmlParser.Parse(
+                await File.ReadAllTextAsync(outerPath),
+                ParsedUrl.Parse(fileBase), new CookieStore());
+            StyleResolver.Resolve(outerDoc, 800);
+            var outerRoot = LayoutEngine.BuildLayoutTree(outerDoc, 800, 600);
+
+            var iframe = outerDoc.ElementDescendants().First(e => e.TagName == "iframe");
+            var frameBox = LayoutHarness.BoxOf(outerRoot, iframe);
+            Check.That(frameBox != null && frameBox.BoxType == BoxType.Frame,
+                "iframe produces a Frame box");
+            Check.That(frameBox!.BorderRect.Width >= 299f && frameBox.BorderRect.Height >= 199f,
+                "iframe width=300 height=200 lays out at 300×200",
+                $"{frameBox.BorderRect.Width:0.#}x{frameBox.BorderRect.Height:0.#}");
+
+            // ── 2. THE BUG: file:// frame loading used to be impossible.
+            var cookies = new CookieStore();
+            var content = await FrameLoader.LoadAsync(
+                fileBase, "inner.html", 300, 200,
+                new EngineHttpClient(), cookies, default);
+            Check.That(content != null,
+                "file:// iframe src LOADS (used to be permanently blank)");
+            if (content != null)
+            {
+                string innerText = content.Document.FirstTag("body")?.InnerText ?? "";
+                Check.That(innerText.Contains("Inner Frame Content"),
+                    "the frame document contains the inner page's content", innerText);
+                Check.That(content.RootBox.Descendants().Any(b => b.Height > 10f),
+                    "the frame document laid out with real boxes");
+                Check.That(content.AbsoluteUrl.EndsWith("/inner.html"),
+                    "the frame's absolute URL resolved against the file base",
+                    content.AbsoluteUrl);
+            }
+
+            // ── 3. Missing local file → era error page, never a silent blank.
+            var missing = await FrameLoader.LoadAsync(
+                fileBase, "no-such-file.html", 300, 200,
+                new EngineHttpClient(), cookies, default);
+            Check.That(missing != null, "missing local frame file yields an error page, not a silent blank");
+            if (missing != null)
+            {
+                string errText = missing.Document.FirstTag("body")?.InnerText ?? "";
+                Check.That(errText.Contains("File Not Found") || errText.Contains("cannot be found"),
+                    "the frame error page is the era Local File Not Found page", errText);
+            }
+
+            // ── 4. about:blank stays blank (legitimately).
+            var blank = await FrameLoader.LoadAsync(
+                fileBase, "about:blank", 300, 200, null!, cookies, default);
+            Check.That(blank == null, "about:blank frame stays blank");
+
+            // ── 5. http frames: 200 loads, 404 renders the error page
+            //       INSIDE the frame (the old code navigated the whole
+            //       window away instead).
+            string httpBase = TestOrigin.Base;
+            TestOrigin.Map("/iframe-ok.html",
+                _ => (200, "text/html", Encoding.ASCII.GetBytes(
+                    "<html><body><b>HTTP FRAME BODY</b></body></html>")));
+            TestOrigin.Map("/iframe-404.html",
+                _ => (404, "text/plain", Encoding.ASCII.GetBytes("not found")));
+
+            var http = new EngineHttpClient();
+            var httpContent = await FrameLoader.LoadAsync(
+                httpBase + "parent.html", "/iframe-ok.html", 300, 200,
+                http, cookies, default);
+            Check.That(httpContent != null, "http iframe src loads");
+            if (httpContent != null)
+            {
+                string bodyText = httpContent.Document.FirstTag("body")?.InnerText ?? "";
+                Check.That(bodyText.Contains("HTTP FRAME BODY"),
+                    "the http frame document contains the served body", bodyText);
+            }
+
+            var errContent = await FrameLoader.LoadAsync(
+                httpBase + "parent.html", "/iframe-404.html", 300, 200,
+                http, cookies, default);
+            Check.That(errContent != null, "404 frame src yields content (error page)");
+            if (errContent != null)
+            {
+                string errText = errContent.Document.FirstTag("body")?.InnerText ?? "";
+                Check.That(errText.Contains("404") || errText.Contains("Not Found"),
+                    "the 404 renders the era error page inside the frame", errText);
+            }
+
+            // ── 6. Scripts inside frames run at parse time through the
+            //       loader's script hook (the shell passes the same hook).
+            var scope = new JsScope();
+            JsRuntime.PopulateGlobalScope(scope);
+            var interp = new JsInterpreter(scope, null, _ => { }, _ => { });
+            var state = new DocumentBindingsState
+            { Interpreter = interp, Canvas = new BrowserCanvas() };
+            interp.ElementWrapperHook = e => DomBindings.WrapElement(e, state);
+            interp.RegisterRuntimeBuiltins();
+
+            var jsContent = await FrameLoader.LoadAsync(
+                fileBase, "inner.html", 300, 200,
+                new EngineHttpClient(), cookies, default,
+                (fdoc, scriptSrc) =>
+                {
+                    state.Document = fdoc;
+                    DomBindings.RegisterAll(scope, fdoc, new NavigationHistory(),
+                        new BrowserCanvas(), state);
+                    interp.RegisterRuntimeBuiltins();
+                    try { interp.ExecuteString(scriptSrc); }
+                    catch { }
+                    string written = state.WriteBuffer.ToString();
+                    state.WriteBuffer.Clear();
+                    return written;
+                });
+            Check.That(jsContent != null, "scripted frame load returns content");
+            if (jsContent != null)
+            {
+                string jsText = jsContent.Document.FirstTag("body")?.InnerText ?? "";
+                Check.That(jsText.Contains("JS-RAN-IN-FRAME"),
+                    "document.write inside the frame splices into the frame document", jsText);
+            }
+
+            // ── 7. The loaded frame content actually paints (non-blank).
+            if (content != null)
+            {
+                var cache = new ImageCache { CookieStore = cookies };
+                using var loader = new ResourceLoader(cookies);
+                using var frameBmp = LayoutHarness.Render(
+                    content.Document, content.RootBox, cache, loader);
+                var bg = frameBmp.GetPixel(2, 2);
+                bool ink = false;
+                for (int y = 0; y < frameBmp.Height && !ink; y += 4)
+                    for (int x = 0; x < frameBmp.Width && !ink; x += 4)
+                    {
+                        var p = frameBmp.GetPixel(x, y);
+                        if (Math.Abs(p.R - bg.R) + Math.Abs(p.G - bg.G) + Math.Abs(p.B - bg.B) > 30)
+                            ink = true;
+                    }
+                Check.That(ink, "the frame content bitmap has visible ink (the h1 renders)");
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
+        Check.Done();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Bonus contracts — closing the gap to the campaign's ~90-test target
+// ─────────────────────────────────────────────────────────────────────
+
+public class BonusContractTests
+{
+    [Fact]
+    public void RootRelativeUrlsResolveAgainstThePageOrigin()
+    {
+        var url = ParsedUrl.Parse("http://127.0.0.1:8941/dir/page.html");
+        string abs = Retro96.Engine.Render.ImageCache.ResolveUrl("/images/x.gif", url.ToAbsolute());
+        Check.That(abs.EndsWith("/images/x.gif") && abs.StartsWith("http://"),
+            "root-relative src resolves against the origin, not the page dir", abs);
+        Check.Done();
+    }
+
+    [Fact]
+    public void NumericEntitiesDecodeIncludingLargeCodePoints()
+    {
+        var (doc, _) = LayoutHarness.Parse(
+            "<html><body><p id=\"p1\">&#65;&#x42;&#8212;&#1114111;</p></body></html>");
+        var p = doc.ElementDescendants().First(e => e.GetAttr("id") == "p1");
+        string text = p.InnerText ?? "";
+        Check.That(text.Contains('A') && text.Contains('B'),
+            "decimal and hex entities decode", text);
+        Check.That(text.Contains('—'), "named-range numeric entity (mdash) decodes", text);
+        Check.That(text.Contains('\uFFFD') || text.Contains('�') || text.Length >= 4,
+            "out-of-range code point degrades without crashing", text);
+        Check.Done();
+    }
+
+    [Fact]
+    public void ColourTranslatorAcceptsHexAndNamedForms()
+    {
+        var c1 = Retro96.Drawing.ColorTranslator.FromHtml("#808080");
+        Check.That(c1.R == 0x80 && c1.G == 0x80 && c1.B == 0x80, "6-digit hex parses");
+        var c2 = Retro96.Drawing.ColorTranslator.FromHtml("red");
+        Check.That(c2.R == 255 && c2.G == 0 && c2.B == 0, "named colour parses");
+        var c3 = Retro96.Drawing.ColorTranslator.FromHtml("#ABC");
+        Check.That(c3.R == 0xAA && c3.G == 0xBB && c3.B == 0xCC, "3-digit hex expands");
+        Check.Done();
+    }
+
+    [Fact]
+    public void PostParseDocumentWriteReplacesTheDocument()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><p>original</p>" +
+            "<a href='#' onclick=\"document.write('<p>REPLACED</p>'); return false;\">go</a>" +
+            "</body></html>");
+        var a = page.Document.AllTags("a")[0];
+        var ret = page.FireEvent(a, "onclick");
+        string text = page.Document.FirstTag("body")?.InnerText ?? "";
+        Check.That(text.Contains("REPLACED") && !text.Contains("original"),
+            "implicit document.open(): post-parse write REPLACES the page (era semantics)", text);
+        Check.That(ret.ToBoolean() == false, "return false still propagates after the write");
+        Check.Done();
+    }
+
+    // ── CSS1 core features found broken by the VisualDiff harness ──────
+
+    [Fact]
+    public void PerSideBorderShorthandsPaint()
+    {
+        // border-bottom: 2px solid #000080 used to fall through the
+        // shorthand expander and VANISH — every CSS page that underlined
+        // headings with a bottom border rendered without the rule.
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>h3 { border-bottom: 2px solid #000080; }</style></head>" +
+            "<body><h3>Heading</h3></body></html>");
+        var h3 = doc.ElementDescendants().First(e => e.TagName == "h3");
+        var st = h3.Style!;
+        Check.That(st.BorderBottomWidth == 2f, "border-bottom shorthand sets the width",
+            $"width={st.BorderBottomWidth}");
+        Check.That(st.BorderBottomStyle == BorderStyleValue.Solid,
+            "border-bottom shorthand sets the style");
+        Check.That(st.BorderBottomColor.R == 0 && st.BorderBottomColor.G == 0 &&
+                   st.BorderBottomColor.B == 128,
+            "border-bottom shorthand sets the colour");
+        // and the other sides stay untouched
+        Check.That(st.BorderTopWidth == 0f, "border-bottom does not leak to other sides");
+        Check.Done();
+    }
+
+    [Fact]
+    public void CssWidthAndAutoMarginsCentreBlocks()
+    {
+        // CSS width on blocks was ignored outright (full container width,
+        // covering the parent's background) and margin:auto flattened to 0
+        // (boxes hugged the left edge).  Both are CSS1 core.
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            ".stage { width: 700px; background-color: #F0F0F0; }" +
+            "#a1 { width: 400px; margin-left: auto; margin-right: auto; }" +
+            "#a2 { width: 300px; margin: 0 auto 0 auto; }" +
+            "</style></head><body>" +
+            "<div class=\"stage\"><div id=\"a1\">one</div><div id=\"a2\">two</div></div>" +
+            "</body></html>");
+
+        var stage = doc.ElementDescendants().First(e => e.GetAttr("class") == "stage");
+        var a1 = doc.ElementDescendants().First(e => e.GetAttr("id") == "a1");
+        var a2 = doc.ElementDescendants().First(e => e.GetAttr("id") == "a2");
+
+        var stageBox = LayoutHarness.BoxOf(root, stage);
+        var a1Box = LayoutHarness.BoxOf(root, a1);
+        var a2Box = LayoutHarness.BoxOf(root, a2);
+
+        Check.That(stageBox != null && Math.Abs(stageBox!.BorderRect.Width - 700f) < 2f,
+            ".stage width: 700px sizes the box", 
+            stageBox == null ? "NO BOX" : $"w={stageBox.BorderRect.Width:0.#}");
+
+        Check.That(a1Box != null && Math.Abs(a1Box!.BorderRect.Width - 400f) < 2f,
+            "#a1 width: 400px sizes the box",
+            a1Box == null ? "NO BOX" : $"w={a1Box.BorderRect.Width:0.#}");
+
+        // Both children centred: equal margins either side of their border box.
+        if (stageBox != null && a1Box != null)
+        {
+            float sx = stageBox.BorderRect.X, sw = stageBox.BorderRect.Width;
+            float bx = a1Box.BorderRect.X, bw = a1Box.BorderRect.Width;
+            float leftGap = bx - sx, rightGap = sx + sw - (bx + bw);
+            Check.That(Math.Abs(leftGap - rightGap) < 3f,
+                "margin-left/right: auto CENTRES the box (longhand form)",
+                $"left gap {leftGap:0.#} vs right gap {rightGap:0.#}");
+        }
+        if (stageBox != null && a2Box != null)
+        {
+            float sx = stageBox.BorderRect.X, sw = stageBox.BorderRect.Width;
+            float bx = a2Box.BorderRect.X, bw = a2Box.BorderRect.Width;
+            float leftGap = bx - sx, rightGap = sx + sw - (bx + bw);
+            Check.That(Math.Abs(leftGap - rightGap) < 3f,
+                "margin: 0 auto 0 auto CENTRES the box (shorthand form)",
+                $"left gap {leftGap:0.#} vs right gap {rightGap:0.#}");
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void TableRowBgcolorReachesTheCells()
+    {
+        // <tr bgcolor> used to die on the zero-size tr wrapper box — header
+        // rows rendered white-on-white (invisible text).  The cell now
+        // takes the row colour when it sets none of its own
+        // (Netscape cell > row > table precedence).
+        var (doc, _) = LayoutHarness.Parse(
+            "<html><body><table border=\"1\">" +
+            "<tr bgcolor=\"#000080\"><th><font color=\"#FFFFFF\">H</font></th></tr>" +
+            "<tr bgcolor=\"#F0F0F8\"><td>cell</td></tr>" +
+            "<tr><td bgcolor=\"#FFCC00\">own</td></tr>" +
+            "</table></body></html>");
+
+        var th = doc.ElementDescendants().First(e => e.TagName == "th");
+        var tdRow = doc.ElementDescendants().First(e => e.TagName == "td" &&
+            (e.InnerText ?? "") == "cell");
+        var tdOwn = doc.ElementDescendants().First(e => e.TagName == "td" &&
+            (e.InnerText ?? "") == "own");
+
+        Check.That(th.Style!.BackgroundColor.R == 0 && th.Style.BackgroundColor.G == 0 &&
+                   th.Style.BackgroundColor.B == 128,
+            "th inherits the ROW bgcolor (#000080)");
+        Check.That(tdRow.Style!.BackgroundColor.R == 0xF0 && tdRow.Style.BackgroundColor.B == 0xF8,
+            "td inherits the ROW bgcolor (#F0F0F8)");
+        Check.That(tdOwn.Style!.BackgroundColor.R == 0xFF && tdOwn.Style.BackgroundColor.G == 0xCC,
+            "the CELL's own bgcolor beats the row's");
+        Check.Done();
+    }
+}

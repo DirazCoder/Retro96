@@ -1,0 +1,152 @@
+<!-- ==================================================================
+     Retro96 QA Test Suite : basic-text.html  (batch A, 1 of 8)
+     TYPOGRAPHY BASELINE : checks exercised:
+       [BT-01] h1 through h6 render at strictly decreasing sizes
+       [BT-02] heading align=left / center / right
+       [BT-03] <center> centers every wrapped line of its contents
+       [BT-04] long paragraphs wrap correctly at full page width
+       [BT-05] long paragraphs wrap inside narrower containers (blockquote)
+       [BT-06] <nobr> prevents wrapping: horizontal overflow, one line only
+       [BT-07] a <nobr> segment inside a wrapping paragraph stays unbroken
+       [BT-08] block elements: p, pre, blockquote (nested), address, hr
+       [BT-09] pre preserves multiple spaces, honors tabs, does not reflow
+       [BT-10] physical inline: b i u s tt big small sub sup
+       [BT-11] logical inline: em strong code samp kbd var cite dfn
+       [BT-12] font size 1..7 absolute ladder
+       [BT-13] font size relative +/ and clamping beyond 1 and 7
+       [BT-14] font color: #RRGGBB, named, and short hex (browser-specific)
+       [BT-15] font face lists with fallbacks, including a bogus font
+       [BT-16] hr variants: size, width in px and percent, align, noshade
+       [BT-17] animated two-frame GIF renders (16x16 blinker)
+       [BT-18] 1x1 transparent GIF stretched via width/height attributes
+       [BT-19] basefont changes the base size of the following text
+     Constraints: HTML 3.2, fully self contained, 800x600 target viewport.
+     ================================================================== -->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<title>Retro96 Test 1: Basic Text and Typography</title>
+</head>
+
+<body bgcolor="#FFFFFF" text="#000000" link="#0000EE" vlink="#551A8B" alink="#FF0000">
+
+<font face="Times New Roman, Times, serif">
+
+<!-- BT-01: the heading ladder -->
+<h1>Heading One: The Big Site Title</h1>
+<h2>Heading Two: A Major Section Header</h2>
+<h3>Heading Three: A Sub-Section Divider</h3>
+<h4>Heading Four: Getting Close To Body Text</h4>
+<h5>Heading Five: Smaller Than Four</h5>
+<h6>Heading Six: The Smallest Heading Of All</h6>
+
+<hr>
+
+<!-- BT-02 + BT-17 -->
+<h2 align="center">Centered Heading With Blinker <img src="data:image/gif;base64,R0lGODlhEAAQAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAFAAAACwAAAAAEAAQAAAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBACH5BAEUAAEALAAAAAAQABAAgQAA/wAAAAAAAAAAAAgdAAEIHEiwoMGDCBMqXMiwocOHECNKnEixosWBAQEAOw==" width="16" height="16" alt="*blink*" border="0"></h2>
+<h3 align="right">Right-Aligned Heading Three</h3>
+
+<!-- BT-04: full width wrapping -->
+<h3>Long Paragraphs At Full Width</h3>
+
+<p>This is the first deliberately long paragraph. It exists so that the layout engine must break it into several lines at the full eight hundred pixel page width. In nineteen ninety-six, webmasters wrote paragraphs exactly like this one: long, winding, generously punctuated, and stuffed with words of wildly different lengths such as antidisestablishmentarianism and cat. The quick brown fox jumps over the lazy dog while five boxing wizards jump quickly. A hyphenated-word or two, some ALL-CAPS SHOUTING, digits 0123456789, and trailing punctuation!"? all belong in a proper wrap test, because line breaking must happen between words and not inside them, and the punctuation must stay glued to the word it follows.</p>
+
+<p>Second paragraph, shorter but still wide enough to wrap two or three times: the markup for this paragraph contains no inline elements at all, so every line must be set in the same font, the same size, and the same color, and left aligned by default. Extra    spaces    between    some    words    must collapse to single spaces under the normal HTML whitespace rules.</p>
+
+<!-- BT-05: narrow container wrapping -->
+<h3>Wrapping Inside A Blockquote</h3>
+<blockquote>
+Here is a paragraph set inside a blockquote, so its available width is reduced by the indentation on both sides. Wrapping must therefore happen earlier than in the outer paragraphs. The text is intentionally long enough to require at least three lines even at the reduced width, and it mixes short words with considerablylongerunbreakablewords to stress the line breaker.
+<blockquote>
+And a second level of blockquote nesting narrows the measure further still; this text must wrap even sooner and indent another step on both margins, which is exactly how Netscape rendered nested quotations in the middle of the nineties.
+</blockquote>
+</blockquote>
+
+<!-- BT-08 + BT-09 -->
+<h3>Preformatted Text</h3>
+<pre>
+Here is preformatted text.     Multiple    spaces   survive.
+	Tab-indented line follows this one.
+    Indented    Columns    Should    Not    Reflow
+  +--------+--------+
+  |  box   |  art   |
+  +--------+--------+
+<b>bold inside pre</b> and <i>italic inside pre</i> are legal markup.
+</pre>
+
+<address>
+The Webmaster, webmaster@retro96.test<br>
+Last updated: January 14, 1997
+</address>
+
+<!-- BT-10, BT-11: inline elements -->
+<h3>Physical And Logical Inline Elements</h3>
+<p>Physical markup: <b>bold text</b>, <i>italic text</i>, <u>underlined text</u>, <s>strike-through text</s>, typewriter <tt>teletype text</tt>, <big>big text</big>, <small>small text</small>, superscripts x<sup>2</sup> + y<sup>2</sup> = r<sup>2</sup>, and subscripts H<sub>2</sub>O and a<sub>ij</sub> + b<sub>kl</sub>.</p>
+<p>Logical markup: <em>emphasized text</em>, <strong>strongly emphasized text</strong>, a <code>code fragment (x = x + 1)</code>, <samp>sample output text</samp>, <kbd>keyboard input</kbd>, a <var>variable name</var>, a <cite>citation of a book title</cite>, and a <dfn>definition of a term</dfn>.</p>
+<p>Combinations: <b><i>bold italic</i></b>, <u><b>bold underline</b></u>, <font color="#FF0000"><b>red bold</b></font>, <small><i>small italic</i></small>, <big><big>double big</big></big>, <small><small>double small</small></small>, <code><b>bold code</b></code>, and sup inside big: <big>V<sup>big</sup></big>.</p>
+
+<!-- BT-12 .. BT-15: font -->
+<h3>The Font Element</h3>
+<p>Absolute size ladder:
+<font size="1">size1</font>
+<font size="2">size2</font>
+<font size="3">size3 (base)</font>
+<font size="4">size4</font>
+<font size="5">size5</font>
+<font size="6">size6</font>
+<font size="7">size7</font>
+</p>
+<p>Unquoted size attributes: <font size=7>size7 unquoted</font> and <font size=1>size1 unquoted</font>.</p>
+<p>Relative sizes from base 3:
+<font size="-2">minus2</font>
+<font size="-1">minus1</font>
+plain base
+<font size="+1">plus1</font>
+<font size="+2">plus2</font>
+<font size="+4">plus4 clamps to 7</font>
+<font size="-5">minus5 clamps to 1</font>
+</p>
+<p>Colors: <font color="#FF0000">hex red</font>, <font color="blue">named blue</font>, <font color="#008000">hex green</font>, <font color="darkred">named darkred</font>, <font color="#ABC">short hex #ABC (browser-specific)</font>.</p>
+<p>Faces: <font face="Courier New, Courier, monospace">courier-ish face</font>, <font face="Arial, Helvetica, sans-serif">arial-ish face</font>, <font face="Georgia, Times, serif">georgia-first fallback</font>, <font face="NoSuchFontAnywhere, Times, serif">bogus font falls back</font>.</p>
+<p>Combined attributes: <font size="6" color="#800080" face="Times New Roman">size six purple times</font> and unquoted <font size=5 color=teal face="Courier New">size five teal courier</font>.</p>
+
+<!-- BT-06, BT-07: nobr -->
+<h3>No-Break Lines</h3>
+<nobr>This entire line is wrapped in nobr and must never break: Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliet Kilo Lima Mike November Oscar Papa Quebec Romeo Sierra Tango Uniform Victor Whiskey X-ray Yankee Zulu 0123456789 ... expect horizontal overflow past the right edge of the 800 pixel viewport, but only ONE text line.</nobr>
+<p>Normal wrapping paragraph with an embedded <nobr>never-break-this-exact-segment: Supercalifragilisticexpialidocious_Connection_String=Provider.SQLOLEDB.1;</nobr> plus more ordinary text after it so that the rest of the paragraph still wraps normally around the unbreakable core.</p>
+
+<!-- BT-03 -->
+<h3>Centered Blocks</h3>
+<center>
+<p>This paragraph sits inside a center element. Each of its wrapped lines must be centered on the page midline rather than left aligned. The paragraph is long enough to wrap onto three or four lines at the full page width, because centering must be verified for every line independently, not merely for short single-line content.</p>
+</center>
+<center>
+<h4>A Centered Heading Four</h4>
+A bare run of centered text with no paragraph tag at all, which the engines of the era centered line by line; this sentence is short.
+</center>
+<center><img src="data:image/gif;base64,R0lGODdhKAAUAIYAAP/XAP7WAPrTAPjRAPTOAPPNAPLMAOjEAN67ANi2ANa0ANOyAMqqAMeoAManAMGjAL+hAL6gAL2fALueALqdALmcAKuQAKqPAKmOAKKJAKGIAJyEAJmBAJN8AI95AI13AIFtAIBsAHxpAHhlAHVjAHBeAG9eAG1cAGNTAGJTAF9QAFxOAFpMAFdJAEs/AEo+AEc8AEM4AEI4AEE3AEA2AD81AD40AD0zADwzADkwADgvADIqAC8oAC4nAB8aAA8NAAkIAAgHAAQDAMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAAAAKAAUAEAI4wCHCBxIsKDBgwgNAljIcGEQGgx/LARSo+IHFRcW9iix0IQFABIXEmxIsqTJkyVHolzJkqTKkhIh3AA5sWINBwBgJHhhYIOHDhoWhgTwsqXRk0WPKmWYNKIEG0KjMlwwAwAFETwGCOghlejAkyEf4Ag5dOGEGCcABNhRdSEBpgnjyp1Lt27dpXjhCsybtylfln5B4oAgtSwHEgAM7MixUMcBmiK/mpRoIwLksgF8BAhRIUUDBii6Bg5JQwJZkiAyVFXQYgUC0ZJhMpQRpGbFEQAKCMGw0AULhjD0Dvm71K5xuQEBADs=" width="40" height="20" alt="NEW!" border="0"></center>
+
+<!-- BT-16: horizontal rules -->
+<h3>Horizontal Rules</h3>
+<hr>
+<hr size="1" width="100%">
+<hr size="8" width="50%" align="left">
+<hr size="6" width="75%" align="right" noshade>
+<hr size="12" width="200" align="center" noshade>
+<hr width="33%" align="left">
+
+<!-- BT-18 -->
+<h3>Stretched Transparent Spacer</h3>
+<p>Between these brackets is a 1x1 transparent GIF stretched to 120x12: [<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="120" height="12" alt="">] the brackets should end up 120 pixels apart with an invisible image between them.</p>
+
+<!-- BT-19 -->
+<h3>Basefont</h3>
+<basefont size="5">
+<p>This paragraph follows a basefont size=5 tag, so it should render at size five. Inside it, <font size="-1">minus one is relative to the new base</font> and <font size="3">absolute three stays three</font>.</p>
+<p>A second paragraph, still at base size five, proving that basefont persists across paragraph boundaries.</p>
+
+<p><small>Retro96 QA suite : basic-text.html : end of page.</small></p>
+
+</font>
+</body>
+</html>

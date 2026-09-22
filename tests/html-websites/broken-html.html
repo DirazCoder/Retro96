@@ -1,0 +1,129 @@
+<!-- ==================================================================
+     Retro96 QA Test Suite : broken-html.html  (batch A, 7 of 8)
+     TAG SOUP : checks exercised:
+       [BH-01] stray text before the html tag renders
+       [BH-02] stray text after the /html tag renders
+       [BH-03] unclosed p, li, td, tr, table, b, i, font auto-close sanely
+       [BH-04] wrongly nested inline tags: b/i opened and closed crossed
+       [BH-05] a block element inside an open paragraph (p containing div)
+       [BH-06] multiple body tags merge into one page
+       [BH-07] head-only elements (title, meta, style) after body starts
+       [BH-08] unknown elements still render their contents: blink,
+               marquee, layer, spacer, plus a made-up tag
+       [BH-09] self-closing syntax br/ img/ hr/ is tolerated (the slash
+               is ignored noise in HTML 3.2 / HTML 4)
+       [BH-10] unquoted attribute values parse
+       [BH-11] mismatched quotes in attribute values recover
+       [BH-12] stray closing tags with no open element are ignored
+       [BH-13] nested anchors do not crash the engine
+       [BH-14] a comment containing double hyphens still terminates
+       [BH-15] an unterminated comment swallows the rest of the file
+     Overall expectation: something reasonable renders and nothing crashes.
+     NOTE: this file is intentionally malformed. Do not fix it.
+     ================================================================== -->
+Stray text before the html tag: a strict parser drops this sentence, a 1996 parser paints it.
+<html>
+<head>
+<title>Retro96 Test 7: Broken HTML (Tag Soup)</title>
+</head>
+<body bgcolor="#C0C0C0" text="#000000" link="#0000EE" vlink="#551A8B" alink="#FF0000">
+
+<font face="Times New Roman, Times, serif">
+
+<h2>[BH-03] Unclosed Elements</h2>
+<p>First paragraph, never closed.
+<p>Second paragraph. <b>bold opens and never closes
+<p>Third paragraph: still bold? <i>italic opens here
+<p>Fourth paragraph: bold and italic both possibly still open. <font size="5" color="#800000">font size five maroon opens
+<p>Fifth paragraph: does this inherit size five maroon italic bold?
+
+<h2>[BH-04] Wrongly Nested Inline Tags</h2>
+<p><b><i>bold italic part one</b> italic part two?</i> plain part three.
+<p><u><s>underline strike one</u> strike two?</s> plain.
+<p><font color="#FF0000"><b>red bold</font> bold after font?</b> plain.
+
+<h2>[BH-05] Block Inside Inline</h2>
+<p>Paragraph opens, then a div appears inside it: <div>Div content inside an open paragraph.</div> and the paragraph continues after the div closes.</p>
+<p><center>Centered text inside an open paragraph.</center></p>
+<b>Bold opens, then a block: <blockquote>blockquote inside bold</blockquote> still bold?</b>
+
+<h2>[BH-03] Unclosed List Items</h2>
+<ul>
+<li>list item one, never closed
+<li>list item two, never closed
+<li>list item three, never closed
+</ul>
+
+<h2>[BH-03] Unclosed Table Cells And Rows</h2>
+<table border="1">
+<tr><td>cell one
+<tr><td>cell two<td>cell three
+</table>
+
+<h2>[BH-06] Multiple Body Tags</h2>
+<p>This paragraph lives in the first body.</p>
+</body>
+<body bgcolor="#FFFFCC">
+<p>This paragraph lives in the second body; the background may have turned pale yellow and none of the earlier content may vanish.</p>
+</body>
+<body text="#0000AA">
+<p>This paragraph lives in the third body; the text color may have turned dark blue. All three bodies must merge into one page.</p>
+
+<h2>[BH-07] Head Content After Body Started</h2>
+<title>A Second Title, Declared Mid Body</title>
+<meta name="generator" content="A meta tag that belongs in the head but appears here">
+<style type="text/css">
+p.latestyle { color: #008000; font-weight: bold; }
+</style>
+<p class="latestyle">This paragraph is styled by a style element that appeared after the body had already started (expect bold green if late style rules apply).</p>
+
+<h2>[BH-08] Unknown Elements</h2>
+<p><blink>This text blinks in Netscape 3; at minimum it must be visible.</blink></p>
+<marquee>This text scrolls in Internet Explorer; it must at least render as a line of text.</marquee>
+<layer name="a" top="10" left="10">A positioned layer with content.</layer>
+<p>A horizontal spacer follows: [<spacer type="horizontal" size="40">] and a block spacer sits under this line: <spacer type="block" width="200" height="30"> done.</p>
+<customtag attr="junk">A completely made up element; its text must still render.</customtag>
+
+<h2>[BH-09] Self-Closing Noise</h2>
+<p>Line one.<br/>Line two after a br written with a slash.<br />Line three after br with space slash.</p>
+<hr/>
+<p>An image written self closed: <img src="data:image/gif;base64,R0lGODdhCQAJAIEAAP8AAAAAAAAAAAAAACwAAAAACQAJAAAIEQABCBxIsKDBgwgTKlzIcGBAADs=" width="9" height="9" alt="dot"/> followed by text.</p>
+<p/><p>After a paragraph written as p-slash, is this a new paragraph?
+
+<h2>[BH-10] Unquoted Attributes</h2>
+<font size=6 color=red face="Arial, Helvetica">Unquoted size and color: size six red.</font>
+<table border=1 width=60% align=center>
+<tr><td bgcolor=ccffcc>Unquoted table attributes: border, width percent, align.</td></tr>
+</table>
+
+<h2>[BH-11] Mismatched Quotes</h2>
+<p><font color="#FF0000 face="Times New Roman">Color value quote runs long: the face attribute may be swallowed into the color value.</font></p>
+<p><img src="data:image/gif;base64,R0lGODdhCQAJAIEAAAAA/wAAAAAAAAAAACwAAAAACQAJAAAIEQABCBxIsKDBgwgTKlzIcGBAADs=" width="9" height="9 alt="oops">The alt quote swallowed the width and height; the image may be broken or oddly sized, but this following text must still appear.</p>
+<p><a href="#top title="oops">An anchor whose href quote swallowed the title.</a> Text after the anchor.</p>
+
+<h2>[BH-12] Stray Closing Tags</h2>
+</td></tr></table>
+<p>The three stray table closers above must be ignored without crashing.</p>
+</b></i></font>
+<p>Those three stray inline closers too.</p>
+
+<h2>[BH-13] Nested Anchors</h2>
+<p><a href="#outer">Outer link begins <a href="#inner">inner link</a> outer link resumes</a> and plain text follows.</p>
+
+<h2>[BH-14] Comment With Double Hyphens</h2>
+<!-- this comment contains -- double hyphens -- inside it, which strict SGML forbids, but the comment must still end here -->
+<p>The visible words inside the comment above must NOT render, and this sentence proves the comment terminated correctly.</p>
+
+<h2>[BH-03 / BH-15] Unclosed Table, Then The Footer</h2>
+<table border="1">
+<tr><td>this table never gets a closing table tag
+<tr><td>neither do these cells get closing td tags
+<p>This paragraph follows the unclosed table in the source; an engine typically parks it in the last open cell. It must be visible somewhere and nothing may crash at end of file.</p>
+
+</font>
+</body>
+</html>
+Stray text after the closing html tag: it should still render under 1996 rules.
+<!-- final unterminated comment: everything from here to end of file is comment
+<p>This paragraph is inside the unterminated comment and must NOT render.</p>
+<table><tr><td>not even this table</td></tr></table>

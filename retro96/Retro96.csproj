@@ -1,0 +1,81 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Retro96</AssemblyName>
+    <RootNamespace>Retro96</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <WarningLevel>5</WarningLevel>
+
+    <!-- ========================================== -->
+    <!-- FORCE BYPASS THE HARD WINFORMS TRIM GUARD  -->
+    <!-- ========================================== -->
+    <!-- The exact property needed to suppress error NETSDK1175 -->
+    <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <NoWarn>\$(NoWarn);IL2104;IL2026;IL3000;IL3002;IL3050;IL3053;NETSDK1175</NoWarn>
+
+    <!-- ========================================== -->
+    <!-- MAXIMUM HIGH-PERFORMANCE ENGINE TUNING     -->
+    <!-- ========================================== -->
+    <Configuration>Release</Configuration>
+    <PublishAot>true</PublishAot>
+    <OptimizationPreference>Speed</OptimizationPreference>
+
+    <!-- Partial trimming maintains critical WinForms drawing plumbing -->
+    <TrimMode>partial</TrimMode>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- ========================================== -->
+    <!-- CLOSED SOURCE & HARDENED AOT CONFIG        -->
+    <!-- ========================================== -->
+    <!-- 1. Kill all PDB generation and debug directories -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- 2. Strip Stack Trace information (Removes method names/strings from the binary) -->
+    <StackTraceSupport>false</StackTraceSupport>
+
+    <!-- 3. Instruct the native linker to strip symbols completely -->
+    <StripSymbols>true</StripSymbols>
+
+    <!-- 4. Erase local machine paths from the compiled binary -->
+    <PathMap>\$(MSBuildProjectDirectory)=/_/</PathMap>
+
+    <!-- 5. Remove exception messages (replaces them with generic system messages) -->
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+
+    <!-- 6. Optimize the native compiler to drop all non-essential reflection data -->
+    <IlcGenerateMetadataFromFullTypeHierarchy>false</IlcGenerateMetadataFromFullTypeHierarchy>
+    <IlcTrimMetadata>true</IlcTrimMetadata>
+  </PropertyGroup>
+
+  <!-- SkiaSharp replaced System.Drawing/GDI+ as the engine's rendering, 
+       text-measurement and image-decoding stack. -->
+  <ItemGroup>
+    <!-- The WinForms SDK injects a GLOBAL `using System.Drawing;` which 
+         would make every engine type (Color/Font/Bitmap/Graphics…) in 
+         Retro96.Drawing ambiguous inside this project. Drop the global 
+         import: engine files carry their own `using Retro96.Drawing;`, 
+         and shell files import System.Drawing explicitly where needed. -->
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.116.1" />
+  </ItemGroup>
+
+  <!-- ========================================== -->
+  <!-- SECURE EMBEDDED ASSETS                     -->
+  <!-- ========================================== -->
+  <!-- This compiles the files inside your single-file exe instead of copying them -->
+  <ItemGroup>
+    <EmbeddedResource Include="assets\**\*" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,60 @@
+<!-- ============================================================
+     frames-nav.html -- Retro96 QA suite (task 4-c2)
+     Sub-document of frames.html: the 30 percent left column (240px
+     wide at the 800x600 target viewport).
+     Checks exercised:
+     FN-01  the table-links pattern: borderless table, one bullet image
+            + one link per row
+     FN-02  twelve link rows with deliberately varied text lengths --
+            long labels must wrap inside the narrow 240px column
+     FN-03  mixed transparent data-URI bullets (red ball, blue diamond,
+            gold arrow, green square) align with the link text
+     FN-04  every link carries target="main" and loads into the named
+            main frame -- except one link that targets "banner"
+     FN-05  body bgcolor/text/link/vlink/alink on a frame sub-document
+     FN-06  link to a mailto: address inside a frame document
+     ============================================================ -->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>RetroNet Web Works -- Navigation Frame</title>
+</head>
+<body bgcolor="#C8C8D8" text="#000000" link="#0000CC" vlink="#660099" alink="#FF0000">
+
+<font size=3 color="#000060"><b>Site Index</b></font>
+<hr size=2>
+
+<table border=0 cellpadding=2 cellspacing=0>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDAAMAIEAAAAAAMwAAP///wAAACH5BAEAAAAALAAAAAAMAAwAAAgxAAEIBBCgYICBAw0qPCiwoAABCxkGePhwIcGJFCMarKixo8eIFzs29JhQI8KRBREGBAA7" width=12 height=12 alt="*"></td>
+    <td><a href="frames-main.html" target="main">Home</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhCgAKAIEAAAAAAAAAzAAAAAAAACH5BAEAAAAALAAAAAAKAAoAAAgkAAEIFBhgoEEAARIeRJhQ4cCGDR9CjDhxIsOKBi0ejLgQocGAADs=" width=10 height=10 alt="*"></td>
+    <td><a href="frames-main.html#new" target="main">What's New</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDQAJAIEAAAAAAP/IAAAAAAAAACH5BAEAAAAALAAAAAANAAkAAAgiAAEIHEiwYMEABg0GWDhwocOHDAFAnEhxYkKBDi9i1KgxIAA7" width=13 height=9 alt="*"></td>
+    <td><a href="frames-banner.html" target="banner">The Banner Doc</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDAAMAIEAAAAAAMwAAP///wAAACH5BAEAAAAALAAAAAAMAAwAAAgxAAEIBBCgYICBAw0qPCiwoAABCxkGePhwIcGJFCMarKixo8eIFzs29JhQI8KRBREGBAA7" width=12 height=12 alt="*"></td>
+    <td><a href="frames-main.html#about" target="main">About This Test</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhCgAKAIEAAAAAAAAAzAAAAAAAACH5BAEAAAAALAAAAAAKAAoAAAgkAAEIFBhgoEEAARIeRJhQ4cCGDR9CjDhxIsOKBi0ejLgQocGAADs=" width=10 height=10 alt="*"></td>
+    <td><a href="1996-homepage.html" target="main">A Real 1996 Personal Homepage</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDQAJAIEAAAAAAP/IAAAAAAAAACH5BAEAAAAALAAAAAANAAkAAAgiAAEIHEiwYMEABg0GWDhwocOHDAFAnEhxYkKBDi9i1KgxIAA7" width=13 height=9 alt="*"></td>
+    <td><a href="1996-corporate.html" target="main">Acme CyberCorp Corporate Frames Site</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDAAMAIEAAAAAAMwAAP///wAAACH5BAEAAAAALAAAAAAMAAwAAAgxAAEIBBCgYICBAw0qPCiwoAABCxkGePhwIcGJFCMarKixo8eIFzs29JhQI8KRBREGBAA7" width=12 height=12 alt="*"></td>
+    <td><a href="javascript-basic.html" target="main">JavaScript Basic</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhCgAKAIEAAAAAAAAAzAAAAAAAACH5BAEAAAAALAAAAAAKAAoAAAgkAAEIFBhgoEEAARIeRJhQ4cCGDR9CjDhxIsOKBi0ejLgQocGAADs=" width=10 height=10 alt="*"></td>
+    <td><a href="javascript-nasty.html" target="main">JavaScript Nasty (Handle With Care)</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDQAJAIEAAAAAAP/IAAAAAAAAACH5BAEAAAAALAAAAAANAAkAAAgiAAEIHEiwYMEABg0GWDhwocOHDAFAnEhxYkKBDi9i1KgxIAA7" width=13 height=9 alt="*"></td>
+    <td><a href="1996-homepage.html#guestbook" target="main">Sign The Guestbook</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhDAAMAIEAAAAAAMwAAP///wAAACH5BAEAAAAALAAAAAAMAAwAAAgxAAEIBBCgYICBAw0qPCiwoAABCxkGePhwIcGJFCMarKixo8eIFzs29JhQI8KRBREGBAA7" width=12 height=12 alt="*"></td>
+    <td><a href="frames-main.html#geometry" target="main">Frame Geometry Notes</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODlhCgAKAIEAAAAAAAAAzAAAAAAAACH5BAEAAAAALAAAAAAKAAoAAAgkAAEIFBhgoEEAARIeRJhQ4cCGDR9CjDhxIsOKBi0ejLgQocGAADs=" width=10 height=10 alt="*"></td>
+    <td><a href="mailto:webmaster@retronet-webworks.example" target="main">E-Mail The Webmaster</a></td></tr>
+<tr><td valign="top"><img src="data:image/gif;base64,R0lGODdhCQAJAIEAAACZAAAAAAAAAAAAACwAAAAACQAJAAAIEQABCBxIsKDBgwgTKlzIcGBAADs=" width=9 height=9 alt="*"></td>
+    <td><a href="frames-main.html#help" target="main">Help</a></td></tr>
+</table>
+
+<hr size=2>
+<font size=2 color="#333333">Twelve link rows.  All but one target the
+frame named <b>main</b>; "The Banner Doc" targets <b>banner</b> above.</font>
+
+</body>
+</html>

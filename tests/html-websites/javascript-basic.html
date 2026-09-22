@@ -1,0 +1,300 @@
+<!-- ============================================================
+     javascript-basic.html - Retro96 QA suite (batch C, task 4-c1)
+     Netscape-era basic JavaScript exercise page (JS 1.1/1.2 idioms:
+     var everywhere, language="JavaScript", document.write).
+     Target viewport 800x600.  All images are data: URIs; no external
+     URLs.  Dialogs (alert/confirm/prompt) are auto-dismissed by the
+     harness - the page layout never depends on their return values.
+
+     Checks exercised (key contract: document.write splice position,
+     all three onclick wiring paths fire, prompt returns its value):
+     JSB-01  several document.write() calls during parse, interleaved
+             with static lines so the splice position is checkable
+     JSB-02  document.title assignment from a head script
+     JSB-03  document.bgColor assignment, read-back, then restored to
+             the original colour so the page renders normally
+     JSB-04  window.location.href read and written into the page
+     JSB-05  navigator.appName / appVersion / userAgent / appCodeName
+             written into the page
+     JSB-06  document.getElementById probe - found / not-found marker
+     JSB-07  innerHTML mutation of a div through ONE function called
+             both immediately (parse time) and from an onclick
+     JSB-08  onmouseover / onmouseout on a link: window.status change
+             (read back into the page) plus a visible marker cell
+     JSB-09  body onload writes a marker
+     JSB-10  noscript fallback content (must NOT render when JS is on)
+     JSB-11  setTimeout callback marker + synchronous fallback marker
+     JSB-12  alert() dialog (harness auto-dismisses)
+     JSB-13  confirm() dialog; return value echoed, layout unchanged
+     JSB-14  prompt("Enter a test string:", "JS 1.1 OK"); the returned
+             value is echoed into the page, layout unchanged
+     JSB-15  form validation: onsubmit writes a marker, returns false
+     JSB-16  onclick wiring path 1: inline HTML attribute
+     JSB-17  onclick wiring path 2: setAttribute("onclick", ...)
+     JSB-18  onclick wiring path 3: element.onclick = function
+     ============================================================ -->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>JavaScript Basic Test Page</title>
+<script language="JavaScript">
+    // JSB-02: document.title assignment - the window title should end
+    // up as the string below, not the <title> text above.
+    document.title = "JS Basic Tests - title was assigned by script";
+</script>
+</head>
+
+<body bgcolor="#FFFFCC" text="#000000" link="#0000EE" vlink="#551A8B" alink="#FF0000" onload="bodyOnLoad()">
+
+<a name="top"></a>
+
+<h1><font color="#800000" size=5>JavaScript Basic Tests</font></h1>
+Static intro paragraph, plain HTML, written before any script output.
+This page exercises the DOM Level 0 basics every 1996 script relied on.
+<center>
+<font size=2>
+<img src="data:image/gif;base64,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" width=88 height=31 border=0 alt="JavaScript 1.1 TESTED PAGE badge">
+<img src="data:image/gif;base64,R0lGODlhEAAQAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAFAAAACwAAAAAEAAQAAAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBACH5BAEUAAEALAAAAAAQABAAgQAA/wAAAAAAAAAAAAgdAAEIHEiwoMGDCBMqXMiwocOHECNKnEixosWBAQEAOw==" width=16 height=16 border=0 alt="blinking dot">
+</font>
+</center>
+<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width=420 height=4 alt="spacer rule drawn with a stretched 1x1 GIF">
+<hr size=2>
+
+<!-- one early script defining every handler function used below -->
+<script language="JavaScript">
+var clickTotal = 0;
+var mutCount = 0;
+
+function setResult(id, html) {
+    var d = null;
+    if (document.getElementById) d = document.getElementById(id);
+    if (d && d.innerHTML != null) { d.innerHTML = html; return true; }
+    return false;
+}
+
+// Dual-channel mutation: era-authentic td bgColor flip (routed straight
+// onto the element attribute) PLUS the innerHTML rewrite.  If only one
+// channel works on a given engine, the other still shows the firing.
+function paint(id, color, html) {
+    var d = null;
+    if (document.getElementById) d = document.getElementById(id);
+    if (d && d.bgColor != null) { d.bgColor = color; }
+    return setResult(id, html);
+}
+
+function addClickMarker(label, cellId, color) {
+    clickTotal = clickTotal + 1;
+    var msg = "<b>" + label + "</b> fired - total clicks: " + clickTotal;
+    if (!paint(cellId, color, label + " FIRED") && !setResult("clickResults", msg)) alert(msg);
+}
+
+function clickInline()  { addClickMarker("PATH-1 inline HTML onclick attribute", "cell1", "#FF9090"); alert("PATH-1 inline onclick fired!"); }
+function clickSetAttr() { addClickMarker("PATH-2 setAttribute onclick wiring", "cell2", "#90FF90"); }
+
+// JSB-07: one function changes the innerHTML of the #mutable div and is
+// called BOTH immediately (parse time) and from an onclick handler.
+function setMutable(html) {
+    var d = null;
+    if (document.getElementById) d = document.getElementById("mutable");
+    if (d && d.innerHTML != null) { d.innerHTML = html; return true; }
+    return false;
+}
+
+function mutateAgain() {
+    mutCount = mutCount + 1;
+    var ok = setMutable('<b>MUTABLE-ONCLICK #' + mutCount + ':</b> the innerHTML of this div was rewritten from an onclick handler.');
+    var note = ok ? "setMutable() reported success" : "setMutable() reported failure (innerHTML unavailable)";
+    paint("mutateCell", ok ? "#C0FFC0" : "#FFC0C0", "MUTABLE-ONCALL #" + mutCount + ": " + note + ".");
+    return false;
+}
+
+// JSB-08: hover handlers on a LINK - the classic window.status change,
+// read back into the page so the harness can see it.
+function linkOver() {
+    window.status = "Retro96: the mouse is OVER the JavaScript link";
+    paint("hoverCell", "#FFFF80", '<b>MOUSE-OVER-LINK:</b> onmouseover fired on the anchor; window.status now reads: "' + window.status + '".');
+    return true;
+}
+function linkOut() {
+    window.status = "Retro96: the mouse left the JavaScript link";
+    paint("hoverCell", "#EEEEEE", 'mouse is out of the link - onmouseout fired; window.status now reads: "' + window.status + '".');
+    return true;
+}
+
+function hoverOn() {
+    paint("hoverCell", "#FFFF80", "<b>MOUSE IS OVER</b> the cell (onmouseover fired)");
+}
+function hoverOff() {
+    paint("hoverCell", "#EEEEEE", "mouse is out - park the pointer here (onmouseout restores this text)");
+}
+
+function bodyOnLoad() {
+    paint("loadMarker", "#90FF90", "<b>ONLOAD-OK:</b> the body onload handler fired after parse.");
+}
+
+function validateGuestbook(f) {
+    var msg;
+    var ok;
+    if (f.gbName.value == "" || f.gbEmail.value == "") {
+        ok = false;
+        msg = "<b>VALIDATION-BLOCKED:</b> both fields are required - onsubmit returned false and the submit was cancelled.";
+    } else {
+        ok = true;
+        msg = "<b>VALIDATION-PASS:</b> fields look filled in - onsubmit still returns false (this is a test page).";
+    }
+    if (!paint("validateResult", ok ? "#B0FFB0" : "#FFB0B0", msg)) alert(msg);
+    return false;
+}
+</script>
+
+<h2>1. document.write during parse</h2>
+<p>Static line A - appears before WRITE-1.</p>
+<script language="JavaScript">
+    document.write('<p><b>WRITE-1:</b> first document.write during parse - 6 * 7 = ' + (6 * 7) + '.</p>');
+</script>
+<p>Static line B - appears between WRITE-1 and WRITE-2.</p>
+<script language="JavaScript">
+    document.write('<p><b>WRITE-2:</b> second write, string concatenation: "retro" + "96" = ' + ("retro" + "96") + '.</p>');
+    document.write('<hr>');
+</script>
+<script language="JavaScript">
+    document.write('<table border=1 cellpadding=4><tr><td><b>WRITE-3:</b></td><td>this whole table was written by document.write #3</td></tr></table>');
+</script>
+<p>Static line C - appears after all three writes.</p>
+
+<h2>2. Environment reads</h2>
+<script language="JavaScript">
+    document.write('<dl>');
+    document.write('<dt><b>window.location.href</b></dt><dd>' + window.location.href + '</dd>');
+    document.write('<dt><b>navigator.appName</b></dt><dd>' + navigator.appName + '</dd>');
+    document.write('<dt><b>navigator.appVersion</b></dt><dd>' + navigator.appVersion + '</dd>');
+    document.write('<dt><b>navigator.userAgent</b></dt><dd>' + navigator.userAgent + '</dd>');
+    document.write('<dt><b>navigator.appCodeName</b></dt><dd>' + navigator.appCodeName + '</dd>');
+    document.write('</dl>');
+</script>
+
+<h2>3. document.bgColor assignment</h2>
+<script language="JavaScript">
+    document.bgColor = "#99CCFF";
+    var bgSeen = "" + document.bgColor;
+    document.bgColor = "#FFFFCC";
+    document.write('<p><b>BGCOLOR:</b> document.bgColor was assigned "#99CCFF" and read back as "' + bgSeen + '"; it was then set back to "#FFFFCC" (the original colour) so the page renders normally.</p>');
+</script>
+
+<h2>4. getElementById + innerHTML mutation</h2>
+<div id="mutable"><i>Static fallback: this line means the innerHTML mutation did not happen.</i></div>
+<script language="JavaScript">
+    // JSB-06: found / not-found marker for document.getElementById.
+    if (document.getElementById) {
+        var probe = document.getElementById("mutable");
+        if (probe) {
+            document.write('<p><b>GETELEMENTBYID-FOUND:</b> document.getElementById located the #mutable div - mutating it now.</p>');
+        } else {
+            document.write('<p><b>GETELEMENTBYID-NOTFOUND:</b> document.getElementById exists but the #mutable div was not found.</p>');
+        }
+    } else {
+        document.write('<p><b>GETELEMENTBYID-UNSUPPORTED:</b> document.getElementById is not supported on this engine.</p>');
+    }
+    // JSB-07, first call path: immediately, during parse.  The marker is
+    // written unconditionally so the call itself is visible even when the
+    // innerHTML channel is a no-op on the host engine.
+    mutCount = 1;
+    var immOk = setMutable('<b>MUTABLE-IMMEDIATE:</b> innerHTML of this div was replaced by setMutable() at parse time (call #' + mutCount + ').');
+    document.write('<p><b>MUTABLE-CALL-1:</b> setMutable() was called immediately during parse and reported ' + (immOk ? 'success - on a full browser the div above now reads MUTABLE-IMMEDIATE' : 'failure - the innerHTML assignment was unavailable on this engine') + '.</p>');
+</script>
+<p><a href="#mutable" onclick="mutateAgain(); return false"><b>Click this link to mutate the div again through onclick</b></a> - JSB-07, second call path.</p>
+<table border=1 cellpadding=4 cellspacing=0>
+<tr><td id="mutateCell" bgcolor="#EEEEEE">MUTATE: fallback - setMutable() has not been called from onclick yet.</td></tr>
+</table>
+
+<h2>5. onmouseover / onmouseout on a link (window.status)</h2>
+<p><a href="#top" onmouseover="linkOver()" onmouseout="linkOut()"><b>Park the pointer on this link</b></a> - the handler changes window.status (the era's status-bar trick) and repaints the marker cell below.</p>
+<table border=1 cellpadding=6 cellspacing=0>
+<tr><td id="hoverCell" bgcolor="#EEEEEE" align=center
+       onmouseover="hoverOn()" onmouseout="hoverOff()">
+mouse is out - park the pointer here</td></tr>
+</table>
+
+<h2>6. body onload marker</h2>
+<table border=1 cellpadding=4 cellspacing=0>
+<tr><td id="loadMarker" bgcolor="#EEEEEE">ONLOAD: static fallback - the body onload handler has not fired.</td></tr>
+</table>
+<p>(loadMarker is updated by the body onload attribute, not by document.write.)</p>
+
+<h2>7. onclick - all three wiring paths</h2>
+<form name="clickForm" action="#" onsubmit="return false">
+<table border=1 cellpadding=4 cellspacing=0>
+<tr><td id="cell1" bgcolor="#EEEEEE" width=170 align=center>path 1 idle</td>
+    <td><input type="button" id="btnInline" value="Path 1: inline attribute" onclick="clickInline()"></td></tr>
+<tr><td id="cell2" bgcolor="#EEEEEE" width=170 align=center>path 2 idle</td>
+    <td><input type="button" id="btnSetAttr" value="Path 2: setAttribute"></td></tr>
+<tr><td id="cell3" bgcolor="#EEEEEE" width=170 align=center>path 3 idle</td>
+    <td><input type="button" id="btnAssign"  value="Path 3: property assignment"></td></tr>
+</table>
+</form>
+<div id="clickResults">CLICK-MARKERS: none yet - click the three buttons above.</div>
+<script language="JavaScript">
+    // JSB-17: wiring path 2 - setAttribute("onclick", "...").
+    var btn2 = null;
+    if (document.getElementById) btn2 = document.getElementById("btnSetAttr");
+    if (btn2 && btn2.setAttribute) {
+        btn2.setAttribute("onclick", "clickSetAttr()");
+    } else {
+        document.write('<p><i><b>PATH-2 NOTE:</b> setAttribute is unavailable here, so the setAttribute wiring path could not be installed - documented fallback, layout unaffected.</i></p>');
+    }
+
+    // JSB-18: wiring path 3 - element.onclick = function.
+    var btn3 = null;
+    if (document.getElementById) btn3 = document.getElementById("btnAssign");
+    if (btn3) {
+        btn3.onclick = function () { addClickMarker("PATH-3 element.onclick property assignment", "cell3", "#9090FF"); };
+    }
+</script>
+
+<h2>8. setTimeout with synchronous fallback</h2>
+<table border=1 cellpadding=4 cellspacing=0>
+<tr><td id="timerMarker" bgcolor="#EEEEEE">SETTIMEOUT: static fallback - the 500 ms timer has not fired yet.</td></tr>
+</table>
+<script language="JavaScript">
+    document.write('<p><b>SETTIMEOUT-REG:</b> a 500 ms timer was registered during parse.</p>');
+    setTimeout(function () {
+        paint("timerMarker", "#9090FF", "<b>SETTIMEOUT-OK:</b> the 500 ms timer fired and rewrote this line.");
+    }, 500);
+</script>
+
+<h2>9. Dialogs: alert, confirm, prompt</h2>
+<script language="JavaScript">
+    alert("javascript-basic.html: alert() dialog - this text should be fully legible.");
+</script>
+<script language="JavaScript">
+    var confirmed = confirm("javascript-basic.html: confirm() dialog - OK or Cancel?");
+    document.write('<p><b>CONFIRM-RESULT:</b> confirm() returned <b>' + confirmed + '</b>. (The page layout does not depend on this value.)</p>');
+</script>
+<script language="JavaScript">
+    var entered = prompt("Enter a test string:", "JS 1.1 OK");
+    document.write('<p><b>PROMPT-RESULT:</b> prompt("Enter a test string:", "JS 1.1 OK") returned "' + entered + '" - the returned value is echoed here. (Layout does not depend on it.)</p>');
+</script>
+<noscript>
+<p><b>JavaScript is disabled or unsupported.</b> This noscript paragraph must NOT be visible when JavaScript is enabled.</p>
+</noscript>
+
+<h2>10. Form validation (onsubmit returns false)</h2>
+<form name="gbForm" action="#" onsubmit="return validateGuestbook(this)">
+<pre>
+Name:  <input type="text" name="gbName" size=25 maxlength=40 value="">
+Email: <input type="text" name="gbEmail" size=25 maxlength=60 value="">
+</pre>
+<input type="submit" value="Sign Guestbook"> <input type="reset" value="Clear Form">
+</form>
+<table border=1 cellpadding=4 cellspacing=0>
+<tr><td id="validateResult" bgcolor="#EEEEEE">VALIDATION: static fallback - no submit attempt yet.</td></tr>
+</table>
+
+<hr size=2>
+<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width=420 height=4 alt="spacer rule drawn with a stretched 1x1 GIF">
+<p><font size=2>javascript-basic.html - Retro96 QA suite, batch C -
+<a href="javascript-nasty.html">continue to the nasty page</a> or
+<a href="frames.html">the frames test</a>.</font></p>
+</body>
+</html>

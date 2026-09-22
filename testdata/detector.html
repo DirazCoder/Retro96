@@ -1,0 +1,93 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+    <title>Browser Detector (1996 Compatible)</title>
+</head>
+<body bgcolor="#FFFFFF" text="#000000" link="#0000FF" vlink="#800080">
+
+<h2>Browser Detection Results</h2>
+
+<form name="detectorForm">
+    <table border="1" cellpadding="5" cellspacing="0">
+        <tr>
+            <td><b>Browser Name:</b></td>
+            <td><input type="text" name="bName" size="40" value="Detecting..."></td>
+        </tr>
+        <tr>
+            <td><b>Browser Version:</b></td>
+            <td><input type="text" name="bVer" size="40" value="Detecting..."></td>
+        </tr>
+        <tr>
+            <td><b>Platform / OS:</b></td>
+            <td><input type="text" name="bPlatform" size="40" value="Detecting..."></td>
+        </tr>
+        <tr>
+            <td><b>User Agent:</b></td>
+            <td><input type="text" name="bAgent" size="60" value="Detecting..."></td>
+        </tr>
+    </table>
+</form>
+
+<hr>
+
+<script language="JavaScript">
+<!--
+
+// Strictly JavaScript 1.1 / ES1 compatible variable declarations (var only)
+var ua = navigator.userAgent;
+var appName = navigator.appName;
+var appVersion = navigator.appVersion;
+var platform = navigator.platform ? navigator.platform : "Unknown";
+
+var detectedName = appName;
+var detectedVersion = appVersion;
+
+// Parsing rules using standard String.indexOf substring searches
+if (ua.indexOf("Firefox/") != -1) {
+    detectedName = "Mozilla Firefox";
+    detectedVersion = ua.substring(ua.indexOf("Firefox/") + 8);
+} else if (ua.indexOf("Edg/") != -1) {
+    detectedName = "Microsoft Edge";
+    detectedVersion = ua.substring(ua.indexOf("Edg/") + 4);
+} else if (ua.indexOf("Chrome/") != -1) {
+    detectedName = "Google Chrome";
+    detectedVersion = ua.substring(ua.indexOf("Chrome/") + 7).split(" ")[0];
+} else if (ua.indexOf("Safari/") != -1 && ua.indexOf("Chrome/") == -1) {
+    detectedName = "Apple Safari";
+    if (ua.indexOf("Version/") != -1) {
+        detectedVersion = ua.substring(ua.indexOf("Version/") + 8).split(" ")[0];
+    }
+} else if (ua.indexOf("MSIE ") != -1) {
+    detectedName = "Microsoft Internet Explorer";
+    detectedVersion = ua.substring(ua.indexOf("MSIE ") + 5).split(";")[0];
+} else if (ua.indexOf("Trident/") != -1) {
+    detectedName = "Microsoft Internet Explorer";
+    detectedVersion = "11.0";
+} else if (ua.indexOf("Mozilla/3") != -1 || ua.indexOf("Netscape") != -1) {
+    detectedName = "Netscape Navigator";
+}
+
+// Write directly into form fields (Standard mechanism supported in 1996 JavaScript)
+if (document.forms && document.forms["detectorForm"]) {
+    document.forms["detectorForm"].elements["bName"].value = detectedName;
+    document.forms["detectorForm"].elements["bVer"].value = detectedVersion;
+    document.forms["detectorForm"].elements["bPlatform"].value = platform;
+    document.forms["detectorForm"].elements["bAgent"].value = ua;
+}
+
+// Direct HTML document stream output for ancient engines without HTML forms support
+document.write("<h3>Raw Output for Legacy Browsers</h3>");
+document.write("<p><b>Browser:</b> " + detectedName + "<br>");
+document.write("<b>Version:</b> " + detectedVersion + "<br>");
+document.write("<b>Platform:</b> " + platform + "<br>");
+document.write("<b>User Agent:</b> " + ua + "</p>");
+
+// -->
+</script>
+
+<noscript>
+    <p><b>Notice:</b> Your browser does not support JavaScript or has JavaScript disabled.</p>
+</noscript>
+
+</body>
+</html>

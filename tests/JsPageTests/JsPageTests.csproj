@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>JsPageTests</AssemblyName>
+    <RootNamespace>JsPageTests</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.116.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.116.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="DebugLogStub.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Drawing/*.cs" />
+    <Compile Include="BrowserCanvasStub.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsLexer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsAst.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsValue.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsScope.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsInterpreter.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/JsRuntime.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Js/DomBindings.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlTokenizer.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Html/HtmlEntities.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Dom/DomNode.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/ComputedStyle.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/CssParser.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/CssSelector.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Css/StyleResolver.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/ParsedUrl.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Network/CookieStore.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Layout/LayoutBox.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/NavigationHistory.cs" />
+    <Compile Include="../../Retro96-fixed/Engine/Render/GlyphSubstitution.cs" />
+  </ItemGroup>
+</Project>
