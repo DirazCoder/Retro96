@@ -50,6 +50,37 @@ Chrome won't add `<blink>` back. people have asked. the issues are closed. Retro
 
 ---
 
+## This is a full rewrite of my old Rust project. it was bad. genuinely bad
+
+[Retro1996 (Rust)](https://github.com/DirazCoder/Retro1996) — clone the master branch if you want to see for yourself — was my first attempt at this. it had bookmarks. it had downloads. it had a full feature list in the README. it also had a `crash.txt` in the repo that shows it panicking on a bullet point character inside its own welcome page HTML before it even loads anything from the internet
+
+```
+PANIC: panicked at src\engine.rs:740:38:
+byte index 8712 is not a char boundary; it is inside '•' (bytes 8711..8714) of `<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">...
+```
+
+that's the welcome page. the one it ships with. it crashed loading itself
+
+here's what actually happened under the hood:
+
+**layout engine** — the Rust version had one function that did everything. every element, regardless of what it was, got stacked vertically with a hardcoded `current_y += height + 10.0`. that's it. that's the layout engine. ten pixels. between everything. always. framesets returned an empty node. inline layout didn't exist as a concept. Retro96 has `InlineLayout.cs`, `TableLayout.cs`, `LayoutEngine.cs` — actual separate layout passes, actual inline text flow, actual table column width resolution
+
+**CSS parser** — the Rust one had about 11 property matches across 657 lines. Retro96 has a 807-line parser, a 1063-line computed style system, a 707-line style resolver, and a 391-line selector engine. these are different things that do different things
+
+**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is one 2442-line file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, scope — 6617 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is 1362 lines on its own
+
+**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 has 101 xUnit facts, 29 live JS contract checks against real pages, 26 hand-authored QA HTML files, a layout lab, and a Playwright visual diff harness that renders pages side-by-side against Chromium and diffs them pixel by pixel. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
+
+**real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
+
+here's spacejam.com/1996/ in Retro96, not photoshopped, not a mockup, just the browser loading the page:
+
+![spacejam.com/1996/ running in Retro96](docs/spacejam-proof.png)
+
+starfield background. planet nav icons. the logo. footer text. all of it. the Rust version never got close
+
+both projects are the same size (roughly 25k lines). one of them works
+
 ## Status
 
 Side project built for fun, not production software. The engine has a full regression suite (100 xUnit facts, 29 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium) — see `tests/reports/bug-report.md` for the full QA writeup including root causes for every tracked bug.
@@ -61,7 +92,7 @@ The whole engine draws through SkiaSharp. `Engine/Drawing/` is a `System.Drawing
 ## Project layout
 
 ```
-Retro96-fixed/       the engine + WinForms shell (net11.0-windows)
+Retro96/       the engine + WinForms shell (net11.0-windows)
   Engine/
     Css/              CSS1 parser, selectors, style resolution
     Dom/              DOM node tree
