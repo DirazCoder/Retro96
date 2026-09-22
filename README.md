@@ -4,6 +4,8 @@ A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way
 
 Built for fun. Runs on Windows. Has no chill.
 
+![Retro96 home page](docs/retro96-homepage.png)
+
 ## Why does this exist
 
 Because Chrome opened a 1997 Geocities page and said "yeah this looks fine" and it did NOT look fine. The `<blink>` tags weren't blinking. The frames were broken. The Bravenet hit counter JavaScript was dead. Retro96 does not fix things. Retro96 renders things.
@@ -77,13 +79,27 @@ here's spacejam.com/1996/ in Retro96, not photoshopped, not a mockup, just the b
 
 ![spacejam.com/1996/ running in Retro96](docs/spacejam-proof.png)
 
-starfield background. planet nav icons. the logo. footer text. all of it. the Rust version never got close
+starfield background. planet nav icons. the logo. footer text. all of it.
+
+here's what the Rust version looked like when I fixed it enough to launch and then searched frogfind.com:
+
+![Retro1996 launched](docs/rust-launched.png)
+
+it launched. "Welcome page not found." it showed me a fallback page. and then I typed frogfind.com into the address bar
+
+![Retro1996 Not Responding](docs/rust-not-responding.png)
+
+"Not Responding." it froze. on frogfind.com. a website that exists specifically to serve simple HTML to old browsers. the Rust browser looked at the simplest possible website on the internet and said no
+
+and here's frogfind.com in Retro96, loaded instantly, no drama:
+
+![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
 both projects are the same size (roughly 25k lines). one of them works
 
 ## Status
 
-Side project built for fun, not production software. The engine has a full regression suite (100 xUnit facts, 29 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium) — see `tests/reports/bug-report.md` for the full QA writeup including root causes for every tracked bug.
+Side project built for fun, not production software. The engine has a full regression suite (100 xUnit facts, 29 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium).
 
 ## Rendering stack
 
@@ -92,7 +108,7 @@ The whole engine draws through SkiaSharp. `Engine/Drawing/` is a `System.Drawing
 ## Project layout
 
 ```
-Retro96/       the engine + WinForms shell (net11.0-windows)
+Retro96-fixed/       the engine + WinForms shell (net11.0-windows)
   Engine/
     Css/              CSS1 parser, selectors, style resolution
     Dom/              DOM node tree
