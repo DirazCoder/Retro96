@@ -12,6 +12,7 @@
 //   • period families resolve directly or through metric-compatible aliases,
 //   • unknown families throw ArgumentException from the FontFamily ctor —
 //     the signal TextMeasurer/FontCache catch to walk to the next name.
+using System;
 using System.Collections.Concurrent;
 
 using SkiaSharp;
@@ -229,18 +230,23 @@ public sealed class Font : IDisposable
     public FontFamily FontFamily { get; }
     public float Size { get; }             // in GraphicsUnit (engine uses Pixel)
     public FontStyle Style { get; }
+    public int Weight { get; }
+    public bool Oblique { get; }
     public GraphicsUnit Unit { get; }
 
     private readonly float _lineHeight;
     private readonly float _ascent;
 
-    public Font(FontFamily family, float size, FontStyle style, GraphicsUnit unit)
+    public Font(FontFamily family, float size, FontStyle style, GraphicsUnit unit, int weight = 400, bool oblique = false)
     {
         if (family == null) throw new ArgumentNullException(nameof(family));
         if (float.IsNaN(size) || size <= 0f) size = 16f;
 
         FontFamily = family;
         Style = style;
+        int requestedWeight = (style & FontStyle.Bold) != 0 && weight == 400 ? 700 : weight;
+        Weight = Math.Clamp(requestedWeight, 100, 900);
+        Oblique = oblique;
         Unit = unit;
 
         float px = unit == GraphicsUnit.Pixel
@@ -248,13 +254,14 @@ public sealed class Font : IDisposable
             : size * 96f / 72f;             // Point at 96 dpi
         Size = size;
 
-        bool bold = (style & FontStyle.Bold) != 0;
         bool italic = (style & FontStyle.Italic) != 0;
 
-        // Prefer the family's REAL bold/italic face (Liberation has them
-        // all); fall back to the regular face + synthesis when absent.
+        // Resolve the actual requested CSS weight instead of collapsing every
+        // non-bold value to the regular face.  This is what allows 300/500/600
+        // and the resolved lighter/bolder keywords to select real lighter or
+        // semibold faces when the family provides them.
         var wanted = new SKFontStyle(
-            bold ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
+            (SKFontStyleWeight)Weight,
             SKFontStyleWidth.Normal,
             italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
         var styled = SKTypeface.FromFamilyName(family.Name, wanted);
@@ -276,8 +283,13 @@ public sealed class Font : IDisposable
 
         // Families without a real bold face get Skia's synthetic embolden —
         // the equivalent of GDI+'s automatic bold synthesis.
-        if (bold && Typeface.FontStyle.Weight < 550)
+        if (Weight >= 600 && Typeface.FontStyle.Weight < 550)
             SkFont.Embolden = true;
+
+        // CSS oblique is a geometric slant.  Keep it distinct from italic so
+        // a family without an italic face still visibly honours oblique.
+        if (oblique)
+            SkFont.SkewX = -0.20f;
 
         var m = SkFont.Metrics;
         _ascent = -m.Ascent;

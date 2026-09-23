@@ -95,11 +95,13 @@ public class ImageCache : IDisposable
         if (string.IsNullOrEmpty(baseUrl))
             return url;
 
-        // Wayback-rewritten documents served through TheOldNet use
-        // root-relative /web/... URLs for frames and images. Those paths
-        // belong to web.archive.org, not the TheOldNet proxy origin.
+        // Wayback-rewritten documents use root-relative /web/... URLs for
+        // frames and images. When the saved capture is opened from file://,
+        // the page's local base must not turn that path into file:///web/... .
+        // It is still a Wayback replay URL and belongs to web.archive.org.
         if (url.StartsWith("/web/", StringComparison.OrdinalIgnoreCase) &&
-            (baseUrl.Contains("theoldnet.com", StringComparison.OrdinalIgnoreCase) ||
+            (baseUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase) ||
+             baseUrl.Contains("theoldnet.com", StringComparison.OrdinalIgnoreCase) ||
              baseUrl.Contains("web.archive.org", StringComparison.OrdinalIgnoreCase)))
             return "https://web.archive.org" + url;
 

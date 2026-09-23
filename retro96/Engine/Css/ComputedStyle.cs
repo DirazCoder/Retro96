@@ -46,7 +46,8 @@ public class ComputedStyle
     /// to decide whether a form control takes CSS1 colours (IE3-era form
     /// styling) or the classic native look: an inherited BODY text=
     /// colour must never turn input text invisible-on-white.</summary>
-    public bool OwnColor, OwnBackground, OwnTextAlign;
+    public bool OwnColor, OwnBackground, OwnTextAlign, OwnMarginLeft, OwnPaddingLeft;
+    public bool OwnListStyleType, OwnListStyleImage;
 
     // === BOX MODEL (px) ===
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;
@@ -157,14 +158,14 @@ public class ComputedStyle
         if (own != null)
         {
             foreach (var decl in own)
-                child.Apply(decl, parent.FontSize, 800f);
+                child.Apply(decl, parent.FontSize, 800f, parent.FontWeight);
         }
 
         return child;
     }
 
     /// <summary>Parse and apply a single declaration in place.</summary>
-    public void Apply(CssDeclaration decl, float parentFontSize, float viewportWidth)
+    public void Apply(CssDeclaration decl, float parentFontSize, float viewportWidth, FontWeightValue parentFontWeight = FontWeightValue.Normal)
     {
         if (decl == null) return;
 
@@ -176,10 +177,10 @@ public class ComputedStyle
             // === FONT ===
             case "font-family": FontFamily = ParseFontFamily(value); break;
             case "font-size": FontSize = ParseFontSize(value, parentFontSize); OwnFontSize = true; break;
-            case "font-weight": FontWeight = ParseFontWeight(value); break;
+            case "font-weight": FontWeight = ParseFontWeight(value, parentFontWeight); break;
             case "font-style": FontStyle = ParseFontStyle(value); break;
             case "font-variant": FontVariant = ParseFontVariant(value); break;
-            case "font": ParseFontShorthand(value, parentFontSize); OwnFontSize = true; break;
+            case "font": ParseFontShorthand(value, parentFontSize, parentFontWeight); OwnFontSize = true; break;
 
             // === TEXT ===
             case "color": Color = ParseColor(value, Color); OwnColor = true; break;
@@ -209,14 +210,16 @@ public class ComputedStyle
             case "margin-bottom": MarginBottom = ParseLength(value, parentFontSize, viewportWidth); break;
             case "margin-left":
                 MarginLeft = ParseLength(value, parentFontSize, viewportWidth);
-                MarginLeftAuto = IsAutoKeyword(value); break;
-            case "margin": ParseMarginShorthand(value, parentFontSize, viewportWidth); break;
+                MarginLeftAuto = IsAutoKeyword(value);
+                OwnMarginLeft = true;
+                break;
+            case "margin": ParseMarginShorthand(value, parentFontSize, viewportWidth); OwnMarginLeft = true; break;
 
             case "padding-top": PaddingTop = ParseLength(value, parentFontSize, viewportWidth); break;
             case "padding-right": PaddingRight = ParseLength(value, parentFontSize, viewportWidth); break;
             case "padding-bottom": PaddingBottom = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "padding-left": PaddingLeft = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "padding": ParsePaddingShorthand(value, parentFontSize, viewportWidth); break;
+            case "padding-left": PaddingLeft = ParseLength(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
+            case "padding": ParsePaddingShorthand(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
 
             case "border-top-width": BorderTopWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
             case "border-right-width": BorderRightWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
@@ -249,8 +252,8 @@ public class ComputedStyle
             case "z-index": ZIndex = ParseZIndex(value); break;
 
             // === LISTS ===
-            case "list-style-type": ListStyleType = ParseListStyleType(value); break;
-            case "list-style-image": ListStyleImage = ParseUrl(value); break;
+            case "list-style-type": ListStyleType = ParseListStyleType(value); OwnListStyleType = true; break;
+            case "list-style-image": ListStyleImage = ParseUrl(value); OwnListStyleImage = true; break;
             case "list-style-position": ListStylePosition = ParseListStylePosition(value); break;
 
             // === SIZE ===
@@ -323,14 +326,14 @@ public class ComputedStyle
         return ParseLength(v, parentFontSize, 800f, parentFontSize);
     }
 
-    private static FontWeightValue ParseFontWeight(string value)
+    private static FontWeightValue ParseFontWeight(string value, FontWeightValue parentWeight)
     {
         return value.Trim().ToLowerInvariant() switch
         {
-            "normal" or "400" => FontWeightValue.Normal,
-            "bold" or "700" => FontWeightValue.Bold,
-            "bolder" => FontWeightValue.Bolder,
-            "lighter" => FontWeightValue.Lighter,
+            "normal" or "400" => FontWeightValue.W400,
+            "bold" or "700" => FontWeightValue.W700,
+            "bolder" => ResolveRelativeWeight(parentWeight, heavier: true),
+            "lighter" => ResolveRelativeWeight(parentWeight, heavier: false),
             "100" => FontWeightValue.W100,
             "200" => FontWeightValue.W200,
             "300" => FontWeightValue.W300,
@@ -338,7 +341,32 @@ public class ComputedStyle
             "600" => FontWeightValue.W600,
             "800" => FontWeightValue.W800,
             "900" => FontWeightValue.W900,
-            _ => FontWeightValue.Normal
+            _ => FontWeightValue.W400
+        };
+    }
+
+    private static FontWeightValue ResolveRelativeWeight(FontWeightValue parentWeight, bool heavier)
+    {
+        int w = (int)parentWeight;
+        if (w <= 0) w = 400;
+
+        int resolved = heavier
+            ? w < 400 ? 400 : w < 700 ? 700 : w < 900 ? 900 : 900
+            : w <= 100 ? 100 : w <= 200 ? 100 : w <= 300 ? 200 :
+              w <= 400 ? 300 : w <= 500 ? 400 : w <= 600 ? 500 :
+              w <= 700 ? 400 : w <= 800 ? 700 : 800;
+
+        return resolved switch
+        {
+            100 => FontWeightValue.W100,
+            200 => FontWeightValue.W200,
+            300 => FontWeightValue.W300,
+            400 => FontWeightValue.W400,
+            500 => FontWeightValue.W500,
+            600 => FontWeightValue.W600,
+            700 => FontWeightValue.W700,
+            800 => FontWeightValue.W800,
+            _ => FontWeightValue.W900
         };
     }
 
@@ -362,7 +390,7 @@ public class ComputedStyle
     }
 
     /// <summary>font: [style] [variant] [weight] size[/line-height] family</summary>
-    private void ParseFontShorthand(string value, float parentFontSize)
+    private void ParseFontShorthand(string value, float parentFontSize, FontWeightValue parentFontWeight)
     {
         var parts = SplitTopLevel(value);
         string? size = null, family = null;
@@ -392,7 +420,7 @@ public class ComputedStyle
                 FontVariant = FontVariantValue.SmallCaps;
             else if (part is "bold" or "bolder" or "lighter" ||
                      (part.Length == 3 && int.TryParse(part, out _)))
-                FontWeight = ParseFontWeight(part);
+                FontWeight = ParseFontWeight(part, parentFontWeight);
             else if (LooksLikeSize(part))
             {
                 size = parts[i];

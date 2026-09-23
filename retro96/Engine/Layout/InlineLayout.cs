@@ -241,18 +241,57 @@ public static class InlineLayout
     {
         if (string.IsNullOrEmpty(text) || _fontCache == null)
             return text is null ? 0f : text.Length * 8f;
+
+        if (style.FontVariant == FontVariantValue.SmallCaps)
+            return MeasureSmallCapsWidth(text, style);
+
         var font = ResolveRunFont(style);
         var sz = _measureG.MeasureString(text, font, int.MaxValue, _sf);
         return (float)Math.Ceiling(sz.Width);
+    }
+
+    private static float MeasureSmallCapsWidth(string text, ComputedStyle style)
+    {
+        var fullFont = ResolveRunFont(style);
+        float smallSize = Math.Max(1f, style.FontSize * 0.80f);
+        var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        var smallFont = _fontCache!.Resolve(family, smallSize, (int)style.FontWeight, italic, oblique);
+
+        float width = 0f;
+        int i = 0;
+        while (i < text.Length)
+        {
+            bool lower = char.IsLetter(text[i]) && char.IsLower(text[i]);
+            int start = i++;
+            while (i < text.Length)
+            {
+                bool nextLower = char.IsLetter(text[i]) && char.IsLower(text[i]);
+                if (nextLower != lower) break;
+                i++;
+            }
+
+            string run = text[start..i];
+            string draw = lower ? run.ToUpperInvariant() : run;
+            // Synthetic small-caps use the reduced-size glyphs only for
+            // their outlines. Keep the nominal/full-size advance so the
+            // letters do not bunch together just because the fallback
+            // small-cap font is smaller. This also keeps word spacing
+            // consistent with the normal text metrics.
+            width += _measureG.MeasureString(draw, fullFont, int.MaxValue, _sf).Width;
+        }
+
+        return (float)Math.Ceiling(width);
     }
 
     private static Font ResolveRunFont(ComputedStyle style)
     {
         var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
         float size = style.FontSize > 0f ? style.FontSize : 16f;
-        bool bold = style.FontWeight >= FontWeightValue.Bold;
         bool italic = style.FontStyle == FontStyleValue.Italic;
-        return _fontCache!.Resolve(family, size, bold, italic);
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        return _fontCache!.Resolve(family, size, (int)style.FontWeight, italic, oblique);
     }
 
     /// <summary>

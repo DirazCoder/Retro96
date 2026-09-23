@@ -35,7 +35,7 @@ public class BrowserCanvas : Control
     private readonly HScrollBar _hScroll = new();
     private PointF _scrollOffset = PointF.Empty;
 
-    private readonly Timer _animationTimer = new() { Interval = 100 };
+    private readonly Timer _animationTimer = new() { Interval = 1 };
     private readonly Timer _blinkTimer = new() { Interval = 500 };
     private readonly Timer _jsTimer = new() { Interval = 50 };
     private readonly Timer _resizeReflowTimer = new() { Interval = 150 };
@@ -3005,7 +3005,7 @@ public class BrowserCanvas : Control
                 SelectListBoxOption(element, x, y, js, layoutRoot);
                 return;
             }
-            ShowSelectDropdown(element, js);
+            ShowSelectDropdown(element, js, frameView);
             return;
         }
 
@@ -3350,7 +3350,7 @@ public class BrowserCanvas : Control
     // Select dropdown
     // ─────────────────────────────────────────────────────────────────────
 
-    private void ShowSelectDropdown(DomElement select, JsInterpreter? js)
+    private void ShowSelectDropdown(DomElement select, JsInterpreter? js, FrameView? frameView = null)
     {
         var options = select.Descendants()
             .OfType<DomElement>()
@@ -3404,27 +3404,100 @@ public class BrowserCanvas : Control
             }
         }
 
-        // The shared bold font is disposed together with the menu.
         var sharedBold = bold;
         menu.Disposed += (s, e) => sharedBold?.Dispose();
 
-        // Open UNDER the control, left-aligned with its box.
+        // The menu is shown in BrowserCanvas client coordinates.  A select in
+        // a frame has its own document coordinate system, so using _rootBox
+        // here places the popup against the top-level page instead of the
+        // actual select.  Resolve the frame's screen origin and subtract both
+        // document scroll offsets before showing the native menu.
         System.Drawing.Point pt;
-        var box = _rootBox != null ? FindBoxForElement(_rootBox, select) : null;
-        if (box != null)
+        if (frameView != null && TryGetFrameScreenOrigin(frameView, out var frameScreenX, out var frameScreenY, out var containingFrameBox))
         {
-            var border = box.BorderRect;
-            pt = new System.Drawing.Point(
-                Math.Max(0, (int)Math.Round(border.X - _scrollOffset.X)),
-                Math.Max(0, (int)Math.Round(border.Bottom - _scrollOffset.Y)));
+            var frameBox = FindBoxForElement(frameView.RootBox, select);
+            if (frameBox != null)
+            {
+                var border = frameBox.BorderRect;
+                pt = new System.Drawing.Point(
+                    Math.Max(0, (int)Math.Round(frameScreenX + border.X - frameView.Scroll.X - _scrollOffset.X)),
+                    Math.Max(0, (int)Math.Round(frameScreenY + border.Bottom - frameView.Scroll.Y - _scrollOffset.Y)));
+            }
+            else
+            {
+                pt = PointToClient(MousePosition);
+            }
         }
         else
         {
-            pt = PointToClient(MousePosition);
+            var box = _rootBox != null ? FindBoxForElement(_rootBox, select) : null;
+            if (box != null)
+            {
+                var border = box.BorderRect;
+                pt = new System.Drawing.Point(
+                    Math.Max(0, (int)Math.Round(border.X - _scrollOffset.X)),
+                    Math.Max(0, (int)Math.Round(border.Bottom - _scrollOffset.Y)));
+            }
+            else
+            {
+                pt = PointToClient(MousePosition);
+            }
         }
 
         TrackMenu(menu);
         menu.Show(this, pt);
+    }
+
+    private bool TryGetFrameScreenOrigin(FrameView target, out float screenX, out float screenY,
+                                         out LayoutBox? containingFrameBox)
+    {
+        foreach (var (box, view) in _frames)
+        {
+            if (ReferenceEquals(view, target))
+            {
+                screenX = box.X - _scrollOffset.X;
+                screenY = box.Y - _scrollOffset.Y;
+                containingFrameBox = box;
+                return true;
+            }
+
+            if (TryGetNestedFrameScreenOrigin(view, box.X - _scrollOffset.X,
+                                               box.Y - _scrollOffset.Y,
+                                               target, out screenX, out screenY,
+                                               out containingFrameBox))
+                return true;
+        }
+
+        screenX = screenY = 0;
+        containingFrameBox = null;
+        return false;
+    }
+
+    private static bool TryGetNestedFrameScreenOrigin(FrameView parent, float parentScreenX,
+                                                       float parentScreenY, FrameView target,
+                                                       out float screenX, out float screenY,
+                                                       out LayoutBox? containingFrameBox)
+    {
+        foreach (var (childBox, childView) in parent.ChildFrames)
+        {
+            float childScreenX = parentScreenX + childBox.X - parent.Scroll.X;
+            float childScreenY = parentScreenY + childBox.Y - parent.Scroll.Y;
+            if (ReferenceEquals(childView, target))
+            {
+                screenX = childScreenX;
+                screenY = childScreenY;
+                containingFrameBox = childBox;
+                return true;
+            }
+
+            if (TryGetNestedFrameScreenOrigin(childView, childScreenX, childScreenY, target,
+                                               out screenX, out screenY, out containingFrameBox))
+                return true;
+        }
+
+        screenX = screenY = 0;
+        containingFrameBox = null;
+        return false;
     }
 
     private static string GlyphSubstituteOptionLabel(DomElement opt) =>

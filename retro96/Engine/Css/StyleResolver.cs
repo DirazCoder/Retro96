@@ -46,9 +46,22 @@ public static class StyleResolver
     {
         if (string.IsNullOrWhiteSpace(value))
             return null;
+
+        string v = value.Trim();
+        // HTML 3.x accepted bare 3/6-digit hexadecimal colours in
+        // presentational attributes (e.g. LINK="CC3333", TEXT="FFFFFF").
+        // CSS requires the '#', so keep this compatibility rule here instead
+        // of weakening ComputedStyle.ParseColor for actual CSS.
+        if (!v.StartsWith('#') &&
+            ((v.Length == 3 || v.Length == 6) &&
+             v.All(c => Uri.IsHexDigit(c))))
+        {
+            v = "#" + v;
+        }
+
         try
         {
-            return ComputedStyle.ParseColor(value.Trim(), Color.Transparent);
+            return ComputedStyle.ParseColor(v, Color.Transparent);
         }
         catch
         {
@@ -146,21 +159,21 @@ public static class StyleResolver
             }
             foreach (var (decl, _, _) in
                      normalDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                style.Apply(decl, parentFs, viewportWidth);
+                style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
 
             // 3. Inline STYLE= — outranks non-important author rules.
             var inlineStyle = elem.GetAttr("style");
             if (!string.IsNullOrEmpty(inlineStyle))
             {
                 foreach (var decl in CssParser.ParseInlineStyle(inlineStyle))
-                    style.Apply(decl, parentFs, viewportWidth);
+                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
             }
 
             // 3b. !important tier — beats every non-important declaration,
             //     inline included.
             foreach (var (decl, _, _) in
                      importantDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                style.Apply(decl, parentFs, viewportWidth);
+                style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
 
             if (activeBaseFontSize != 3 && !style.OwnFontSize &&
                 elem.TagName is not ("h1" or "h2" or "h3" or "h4" or "h5" or "h6" or
@@ -177,6 +190,28 @@ public static class StyleResolver
             // keeps BASEFONT ahead of the <font size=+n> elements that
             // read it.
             ApplyHtmlAttributes(elem, style, doc);
+
+            // CSS list-style-type:none has no marker to reserve the normal
+            // list gutter for.  Keep an explicitly authored margin-left, but
+            // remove the UA 40px list margin when the marker is suppressed.
+            if (elem.TagName is "ul" or "ol" or "menu" or "dir" &&
+                style.ListStyleType == ListStyleType.None &&
+                !style.OwnMarginLeft && style.MarginLeft == 40f)
+            {
+                style.MarginLeft = 0f;
+            }
+
+            // The UA list gutter is represented by 40px of left padding, not
+            // by the marker itself.  list-style-type:none suppresses that
+            // UA padding unless the author explicitly supplied padding-left
+            // or padding shorthand.
+            if (elem.TagName is "ul" or "ol" or "menu" or "dir" &&
+                style.ListStyleType == ListStyleType.None &&
+                !style.OwnPaddingLeft && style.PaddingLeft == 40f)
+            {
+                style.PaddingLeft = 0f;
+            }
+
             if (elem.TagName == "basefont")
                 activeBaseFontSize = doc.BaseFontSize;
 
@@ -211,10 +246,10 @@ public static class StyleResolver
         var pseudo = baseStyle.Clone();
         if (normalList != null)
             foreach (var (decl, _, _) in normalList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, 800f);
+                pseudo.Apply(decl, baseStyle.FontSize, 800f, baseStyle.FontWeight);
         if (importantList != null)
             foreach (var (decl, _, _) in importantList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, 800f);
+                pseudo.Apply(decl, baseStyle.FontSize, 800f, baseStyle.FontWeight);
         assign(pseudo);
     }
 

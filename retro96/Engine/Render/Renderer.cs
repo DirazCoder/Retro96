@@ -294,8 +294,19 @@ public class Renderer
             return;
         }
 
-        PaintBackground(g, box, images);
-        PaintBorder(g, box);
+        // Text fragments created for a block element keep the owning element
+        // on LayoutBox so they inherit its text style. They are not the
+        // element's principal box. Repainting the block background for each
+        // word resets a tiled image's origin and creates stray colour patches
+        // behind individual words.
+        bool isDecorationFragment = box.BoxType == BoxType.Inline &&
+            box.Element?.Style?.Display is not null &&
+            box.Element.Style.Display != DisplayValue.Inline;
+        if (!isDecorationFragment)
+        {
+            PaintBackground(g, box, images);
+            PaintBorder(g, box);
+        }
         PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
 
         // <marquee> — IE/NN extension: the block lays out normally, but the
@@ -539,8 +550,14 @@ public class Renderer
             // FIX: draw cap — a small tile on a large element used to be an
             // unbounded loop (worst case: millions of DrawImage calls).
             int drawn = 0;
+            var oldInterpolation = g.InterpolationMode;
+            var oldPixelOffset = g.PixelOffsetMode;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.None;
 
-            switch (style.BackgroundRepeat)
+            try
+            {
+                switch (style.BackgroundRepeat)
             {
                 case BackgroundRepeat.NoRepeat:
                     g.DrawImage(image, anchorX, anchorY, iw, ih);
@@ -580,6 +597,12 @@ public class Renderer
                             }
                         break;
                     }
+                }
+            }
+            finally
+            {
+                g.InterpolationMode = oldInterpolation;
+                g.PixelOffsetMode = oldPixelOffset;
             }
         }
         finally
@@ -788,47 +811,55 @@ public class Renderer
     {
         if (w < 1) return;
 
-        // tl = the shade on the OUTER half of the top/left edges.  Raised
-        // styles (outset/ridge) take the light shade there, sunken styles
-        // (inset/groove) the dark one.
-        Color tl, br;
-        switch (style)
+        Color light = ControlPaint.LightLight(baseColor);
+        Color midLight = ControlPaint.Light(baseColor);
+        Color dark = ControlPaint.Dark(baseColor);
+        Color darkDark = ControlPaint.DarkDark(baseColor);
+
+        bool topLeft = side is BorderSide.Top or BorderSide.Left;
+        bool raised = style is BorderStyleValue.Ridge or BorderStyleValue.Outset;
+
+        if (style is BorderStyleValue.Inset or BorderStyleValue.Outset)
         {
-            case BorderStyleValue.Outset:
-                tl = ControlPaint.LightLight(baseColor);
-                br = ControlPaint.DarkDark(baseColor); break;
-            case BorderStyleValue.Inset:
-                tl = ControlPaint.DarkDark(baseColor);
-                br = ControlPaint.LightLight(baseColor); break;
-            case BorderStyleValue.Ridge:
-                tl = ControlPaint.Light(baseColor);
-                br = ControlPaint.Dark(baseColor); break;
-            default: // Groove
-                tl = ControlPaint.Dark(baseColor);
-                br = ControlPaint.Light(baseColor); break;
+            Color shade = (raised == topLeft) ? light : darkDark;
+            using var brush = new SolidBrush(shade);
+            switch (side)
+            {
+                case BorderSide.Top: g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, w); break;
+                case BorderSide.Bottom: g.FillRectangle(brush, rect.Left, rect.Bottom - w, rect.Width, w); break;
+                case BorderSide.Left: g.FillRectangle(brush, rect.Left, rect.Top, w, rect.Height); break;
+                case BorderSide.Right: g.FillRectangle(brush, rect.Right - w, rect.Top, w, rect.Height); break;
+            }
+            return;
         }
 
-        using var penTL = new Pen(tl, 1);
-        using var penBR = new Pen(br, 1);
+        // Groove and ridge are two-tone borders. The light/dark order flips
+        // on the bottom/right half so the border reads as carved or raised.
+        bool outerLight = raised == topLeft;
+        Color outer = outerLight ? light : darkDark;
+        Color inner = outerLight ? midLight : dark;
+        int first = Math.Max(1, w / 2);
+        int second = Math.Max(1, w - first);
+        using var outerBrush = new SolidBrush(outer);
+        using var innerBrush = new SolidBrush(inner);
 
-        int half = w / 2;
         switch (side)
         {
             case BorderSide.Top:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(i < half ? penTL : penBR, rect.Left, rect.Top + i, rect.Right, rect.Top + i);
+                g.FillRectangle(outerBrush, rect.Left, rect.Top, rect.Width, first);
+                g.FillRectangle(innerBrush, rect.Left, rect.Top + first, rect.Width, second);
                 break;
             case BorderSide.Bottom:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(i < half ? penBR : penTL, rect.Left, rect.Bottom - i - 1, rect.Right, rect.Bottom - i - 1);
+                g.FillRectangle(innerBrush, rect.Left, rect.Bottom - w, rect.Width, second);
+                g.FillRectangle(outerBrush, rect.Left, rect.Bottom - first, rect.Width, first);
                 break;
             case BorderSide.Left:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(i < half ? penTL : penBR, rect.Left + i, rect.Top, rect.Left + i, rect.Bottom);
+                g.FillRectangle(outerBrush, rect.Left, rect.Top, first, rect.Height);
+                g.FillRectangle(innerBrush, rect.Left + first, rect.Top, second, rect.Height);
                 break;
             case BorderSide.Right:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(i < half ? penBR : penTL, rect.Right - i - 1, rect.Top, rect.Right - i - 1, rect.Bottom);
+                g.FillRectangle(innerBrush, rect.Right - w, rect.Top, second, rect.Height);
+                g.FillRectangle(outerBrush, rect.Right - first, rect.Top, first, rect.Height);
                 break;
         }
     }
@@ -838,59 +869,32 @@ public class Renderer
     {
         if (w < 3)
         {
-            // Too thin for two strokes and a gap — degrade to solid.
             using var solidPen = new Pen(color, 1);
             PaintSimpleSide(g, rect, w, solidPen, side);
             return;
         }
 
-        int lw = Math.Max(1, w / 3);
-        int gap = Math.Max(1, w / 3);
+        int line = Math.Max(1, w / 3);
+        int gap = Math.Max(1, w - line * 2);
+        using var brush = new SolidBrush(color);
 
-        using var pen = new Pen(color, 1);
         switch (side)
         {
             case BorderSide.Top:
-                for (int i = 0; i < lw; i++)
-                    g.DrawLine(pen, rect.Left, rect.Top + i, rect.Right, rect.Top + i);
-                for (int i = 0; i < lw; i++)
-                {
-                    float y = rect.Top + lw + gap + i;
-                    if (y < rect.Bottom) g.DrawLine(pen, rect.Left, y, rect.Right, y);
-                }
+                g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, line);
+                g.FillRectangle(brush, rect.Left, rect.Top + line + gap, rect.Width, line);
                 break;
             case BorderSide.Bottom:
-                for (int i = 0; i < lw; i++)
-                {
-                    float y = rect.Bottom - lw - gap - lw + i;
-                    if (y >= rect.Top) g.DrawLine(pen, rect.Left, y, rect.Right, y);
-                }
-                for (int i = 0; i < lw; i++)
-                {
-                    float y = rect.Bottom - lw + i;
-                    if (y < rect.Bottom) g.DrawLine(pen, rect.Left, y, rect.Right, y);
-                }
+                g.FillRectangle(brush, rect.Left, rect.Bottom - line - gap - line, rect.Width, line);
+                g.FillRectangle(brush, rect.Left, rect.Bottom - line, rect.Width, line);
                 break;
             case BorderSide.Left:
-                for (int i = 0; i < lw; i++)
-                    g.DrawLine(pen, rect.Left + i, rect.Top, rect.Left + i, rect.Bottom);
-                for (int i = 0; i < lw; i++)
-                {
-                    float x = rect.Left + lw + gap + i;
-                    if (x < rect.Right) g.DrawLine(pen, x, rect.Top, x, rect.Bottom);
-                }
+                g.FillRectangle(brush, rect.Left, rect.Top, line, rect.Height);
+                g.FillRectangle(brush, rect.Left + line + gap, rect.Top, line, rect.Height);
                 break;
             case BorderSide.Right:
-                for (int i = 0; i < lw; i++)
-                {
-                    float x = rect.Right - lw - gap - lw + i;
-                    if (x >= rect.Left) g.DrawLine(pen, x, rect.Top, x, rect.Bottom);
-                }
-                for (int i = 0; i < lw; i++)
-                {
-                    float x = rect.Right - lw + i;
-                    if (x < rect.Right) g.DrawLine(pen, x, rect.Top, x, rect.Bottom);
-                }
+                g.FillRectangle(brush, rect.Right - line - gap - line, rect.Top, line, rect.Height);
+                g.FillRectangle(brush, rect.Right - line, rect.Top, line, rect.Height);
                 break;
         }
     }
@@ -1037,13 +1041,20 @@ public class Renderer
             TextTransform.Capitalize => CapitalizeWords(box.TextRun),
             _ => box.TextRun
         };
-        g.DrawString(text, font, brush, contentRect.X, contentRect.Y, sf);
 
-        // Text decoration — from the STYLE only.  The old `isLink →
-        // force underline` line made `a { text-decoration: none }`
-        // impossible; the UA underline comes from StyleResolver, which
-        // CSS overrides.
+        if (style.FontVariant == FontVariantValue.SmallCaps)
+            PaintSmallCapsText(g, contentRect.X, contentRect.Y, text, style, fonts, textColor, sf);
+        else
+            g.DrawString(text, font, brush, contentRect.X, contentRect.Y, sf);
+
+        // Text decoration.  HTML links carry their UA underline through
+        // descendant inline elements such as <font>, even though
+        // text-decoration itself is not a normal inherited CSS property.
+        // Use the anchor's final computed decoration so `a { text-decoration:
+        // none }` still removes it.
         var deco = style.TextDecoration;
+        if (isLink && linkAnchor?.Style?.TextDecoration.HasFlag(TextDecoration.Underline) == true)
+            deco |= TextDecoration.Underline;
 
         // A blank (space-only) run that sits at the EDGE of a link draws no
         // glyphs, so decorating it leaves a stray "_" stub.  But a blank
@@ -1080,6 +1091,46 @@ public class Renderer
     }
 
     /// <summary>True for a text run made only of collapsible whitespace.</summary>
+    private static void PaintSmallCapsText(Graphics g, float x, float y, string text,
+                                           ComputedStyle style, FontCache fonts,
+                                           Color color, StringFormat sf)
+    {
+        float smallSize = Math.Max(1f, style.FontSize * 0.80f);
+        var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        var smallFont = fonts.Resolve(family, smallSize, (int)style.FontWeight, italic, oblique);
+        var fullFont = fonts.Resolve(family, style.FontSize > 0f ? style.FontSize : 16f, (int)style.FontWeight, italic, oblique);
+        using var runBrush = new SolidBrush(color);
+
+        int i = 0;
+        float drawX = x;
+        while (i < text.Length)
+        {
+            bool lower = char.IsLetter(text[i]) && char.IsLower(text[i]);
+            int start = i++;
+            while (i < text.Length)
+            {
+                bool nextLower = char.IsLetter(text[i]) && char.IsLower(text[i]);
+                if (nextLower != lower) break;
+                i++;
+            }
+
+            string run = text[start..i];
+            string draw = lower ? run.ToUpperInvariant() : run;
+            var runFont = lower ? smallFont : fullFont;
+            float baselineOffset = lower ? Math.Max(0f, fullFont.AscentPx - smallFont.AscentPx) : 0f;
+            g.DrawString(draw, runFont, runBrush, drawX, y + baselineOffset, sf);
+
+            // Small-cap glyphs are visually reduced, but their advance stays
+            // on the normal/full-size metric grid. Using the reduced glyph
+            // width here made strings such as "The Quick Brown Fox" look
+            // unnaturally cramped after the lowercase letters were promoted
+            // to capitals.
+            drawX += g.MeasureString(draw, fullFont, int.MaxValue, sf).Width;
+        }
+    }
+
     private static string CapitalizeWords(string text)
     {
         var chars = text.ToCharArray();
@@ -1142,9 +1193,9 @@ public class Renderer
     {
         var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
         float size = style.FontSize > 0f ? style.FontSize : 16f;
-        bool bold = style.FontWeight >= FontWeightValue.Bold;
         bool italic = style.FontStyle == FontStyleValue.Italic;
-        return fonts.Resolve(family, size, bold, italic);
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        return fonts.Resolve(family, size, (int)style.FontWeight, italic, oblique);
     }
 
     /// <summary>Unset/transparent text colours render black, not invisible.</summary>
@@ -1535,7 +1586,7 @@ public class Renderer
         }
 
         bool bold = style.FontWeight >= FontWeightValue.Bold;
-        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool italic = style.FontStyle is FontStyleValue.Italic or FontStyleValue.Oblique;
         var font = ResolveFont(fonts, style);
 
         string text = elem.InnerText ?? "";
@@ -1626,12 +1677,18 @@ public class Renderer
         int start = parent.GetAttrInt("start", 1);
 
         var style = elem.Style ?? FallbackStyle(elem);
+        var listStyle = style.Clone();
+        if (!style.OwnListStyleType && parent.Style != null)
+            listStyle.ListStyleType = parent.Style.ListStyleType;
+        if (!style.OwnListStyleImage && parent.Style != null)
+            listStyle.ListStyleImage = parent.Style.ListStyleImage;
+
         var font = ResolveFont(fonts, style);
         Color markerColor = EffectiveTextColor(style);
 
         float markerY = box.Y + box.BorderTop + box.PaddingTop;
 
-        if (style.ListStyleImage is { Length: > 0 } imageUrl)
+        if (listStyle.ListStyleImage is { Length: > 0 } imageUrl)
         {
             string absolute = ImageCache.ResolveUrl(imageUrl, _baseUrl);
             if (TryGetFrame(images, absolute, out var frame) && frame != null)
@@ -1686,7 +1743,20 @@ public class Renderer
         // (disc → circle → square, per the era's nesting behaviour)
         if (parentTag is "ul" or "menu" or "dir")
         {
-            string shape = (type ?? "").ToLowerInvariant();
+            // CSS list-style-* is inherited by the <li>; use the computed
+            // style rather than looking only at the old HTML TYPE attribute.
+            // `none` means there is no marker at all.
+            if (listStyle.ListStyleType == ListStyleType.None)
+                return;
+
+            string shape = listStyle.ListStyleType switch
+            {
+                ListStyleType.Circle => "circle",
+                ListStyleType.Square => "square",
+                ListStyleType.Disc => "disc",
+                _ => (type ?? "").ToLowerInvariant()
+            };
+
             if (shape.Length == 0)
             {
                 int depth = 0;
@@ -1700,20 +1770,22 @@ public class Renderer
                 shape = depth <= 1 ? "disc" : depth == 2 ? "circle" : "square";
             }
 
-            float cx = box.X - 10;
+            float markerSize = Math.Clamp((style.FontSize > 0f ? style.FontSize : 16f) * 0.45f, 7f, 9f);
+            float cx = box.X - 10f;
             float cy = markerY + (style.FontSize > 0f ? style.FontSize : 16f) * 0.42f;
+            float half = markerSize * 0.5f;
 
             switch (shape)
             {
                 case "circle":
                     using (var pen = new Pen(markerColor, 1))
-                        g.DrawEllipse(pen, cx - 3, cy - 3, 6, 6);
+                        g.DrawEllipse(pen, cx - half, cy - half, markerSize, markerSize);
                     break;
                 case "square":
-                    g.FillRectangle(brush, cx - 3, cy - 3, 6, 6);
+                    g.FillRectangle(brush, cx - half, cy - half, markerSize, markerSize);
                     break;
-                default:    // disc
-                    g.FillEllipse(brush, cx - 3, cy - 3, 6, 6);
+                default:
+                    g.FillEllipse(brush, cx - half, cy - half, markerSize, markerSize);
                     break;
             }
         }

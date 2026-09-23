@@ -33,6 +33,9 @@ public class FontCache : IDisposable
 
     /// <summary>Resolve a font from a CSS/HTML font-family list.</summary>
     public Font Resolve(IEnumerable<string>? familyList, float sizePx, bool bold, bool italic)
+        => Resolve(familyList, sizePx, bold ? 700 : 400, italic, false);
+
+    public Font Resolve(IEnumerable<string>? familyList, float sizePx, int weight, bool italic, bool oblique = false)
     {
         // The Font constructor throws on non-positive or NaN sizes — a
         // stray unresolved style must not take the whole paint down.
@@ -40,12 +43,11 @@ public class FontCache : IDisposable
 
         lock (_lock)
         {
-            string key = BuildKey(familyList, sizePx, bold, italic);
+            string key = BuildKey(familyList, sizePx, weight, italic, oblique);
             if (_cache.TryGetValue(key, out var cached))
                 return cached;
 
-            FontStyle style = FontStyle.Regular;
-            if (bold)   style |= FontStyle.Bold;
+            FontStyle style = weight >= 700 ? FontStyle.Bold : FontStyle.Regular;
             if (italic) style |= FontStyle.Italic;
 
             Font? font = null;
@@ -60,7 +62,7 @@ public class FontCache : IDisposable
                     try
                     {
                         var family = GetOrCreateFamily(trimmed);
-                        font = new Font(family, sizePx, style, GraphicsUnit.Pixel);
+                        font = new Font(family, sizePx, style, GraphicsUnit.Pixel, weight, oblique);
                         break;
                     }
                     catch
@@ -71,7 +73,7 @@ public class FontCache : IDisposable
             }
 
             // Platform default
-            font ??= new Font(FontFamily.GenericSerif, sizePx, style, GraphicsUnit.Pixel);
+            font ??= new Font(FontFamily.GenericSerif, sizePx, style, GraphicsUnit.Pixel, weight, oblique);
 
             if (_disposed)
                 return font;   // cache is gone (shutdown) — hand out an uncached one
@@ -161,17 +163,15 @@ public class FontCache : IDisposable
         catch { return null; }
     }
 
-    private static string BuildKey(IEnumerable<string>? familyList, float sizePx,
-                                   bool bold, bool italic)
+    private static string BuildKey(IEnumerable<string>? familyList, float sizePx, int weight, bool italic, bool oblique)
     {
-        var sb = new StringBuilder();
-        foreach (var family in familyList ?? Array.Empty<string>())
-        {
-            if (sb.Length > 0) sb.Append(',');
-            sb.Append(family?.Trim());
-        }
-        sb.Append('|').Append(sizePx.ToString("0.##", CultureInfo.InvariantCulture))
-          .Append('|').Append(bold ? 'b' : ' ').Append(italic ? 'i' : ' ');
+        var sb = new System.Text.StringBuilder();
+        if (familyList != null)
+            foreach (var f in familyList) sb.Append(f).Append(',');
+        sb.Append('|').Append(sizePx.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture))
+          .Append('|').Append(Math.Clamp(weight, 100, 900))
+          .Append(italic ? 'i' : ' ')
+          .Append(oblique ? 'o' : ' ');
         return sb.ToString();
     }
 

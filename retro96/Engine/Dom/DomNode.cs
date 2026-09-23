@@ -55,7 +55,7 @@ public abstract class DomNode
         Children.Add(child);
     }
 
-    public void InsertBefore(DomNode newNode, DomNode referenceNode)
+    public void InsertBefore(DomNode newNode, DomNode? referenceNode)
     {
         if (newNode == null) return;
         if (referenceNode == null)
