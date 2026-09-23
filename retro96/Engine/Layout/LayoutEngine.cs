@@ -821,8 +821,15 @@ public static class LayoutEngine
                 break;
 
             case "textarea":
-                if (box.Width <= 0f) box.Width = Math.Min(elem.GetAttrInt("cols", 20) * 8f, MaxAttrLength);
+                if (box.Width <= 0f) box.Width = Math.Min(elem.GetAttrInt("cols", 20) > 0
+                    ? elem.GetAttrInt("cols", 20) * 8f : 160f, MaxAttrLength);
                 if (box.Height <= 0f) box.Height = Math.Min(elem.GetAttrInt("rows", 4) * 16f, MaxAttrLength);
+                if (!elem.HasAttr("width") &&
+                    InlineLayout.ControlNaturalSize(elem, elem.Style, out float tw, out float th))
+                {
+                    if (tw > 0f) box.Width = tw;
+                    if (th > 0f) box.Height = th;
+                }
                 break;
 
             case "button":

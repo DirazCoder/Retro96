@@ -118,6 +118,9 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
             port = urlScheme == "https" ? 443 : 80;
 
         string path = NormalizePath(uri.AbsolutePath);
+        if (host.Equals("web.archive.org", StringComparison.OrdinalIgnoreCase) &&
+            path.StartsWith("/web/", StringComparison.OrdinalIgnoreCase))
+            path = path.Replace("%3A", ":", StringComparison.OrdinalIgnoreCase);
         string query = uri.Query.TrimStart('?');
         string fragment = uri.Fragment.TrimStart('#');
 

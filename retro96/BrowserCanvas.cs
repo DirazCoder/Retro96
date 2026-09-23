@@ -55,6 +55,7 @@ public class BrowserCanvas : Control
     private int _fieldSelAnchor;
     private bool _fieldDragging;
     private float _fieldScrollX;
+    private int _textareaScrollLine;
 
     // Pressed button (Win95 bevel animation)
     private DomElement? _pressedControl;
@@ -682,7 +683,10 @@ public class BrowserCanvas : Control
                 frameBox.Width, frameBox.Height,
                 0f, 0f,
                 _lastHoveredElement,
-                _blinkVisible);
+                _blinkVisible,
+                focusedElement: _focusedInput != null &&
+                    FindBoxForElement(view.RootBox, _focusedInput) != null
+                    ? _focusedInput : null);
 
             view.Rendered?.Dispose();
             view.Rendered = bmp;
@@ -833,6 +837,9 @@ public class BrowserCanvas : Control
                 using var focusPen = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 1);
                 g.DrawRectangle(focusPen, destRect.X, destRect.Y,
                     destRect.Width - 1, destRect.Height - 1);
+                if (_focusedInput != null &&
+                    FindBoxForElement(view.RootBox, _focusedInput) != null)
+                    PaintFrameFieldOverlay(g, box, view);
             }
         }
 
@@ -996,6 +1003,141 @@ public class BrowserCanvas : Control
             face.Width - 1, face.Height - 1);
     }
 
+    private void PaintFrameFieldOverlay(Graphics g, LayoutBox frameBox, FrameView view)
+    {
+        var el = _focusedInput;
+        if (el == null) return;
+        var box = FindBoxForElement(view.RootBox, el);
+        if (box == null || _fontCache == null) return;
+
+        float frameX = frameBox.X - _scrollOffset.X;
+        float frameY = frameBox.Y - _scrollOffset.Y;
+        var localFace = box.ContentRect;
+        var face = new RectangleF(
+            frameX + localFace.X - view.Scroll.X,
+            frameY + localFace.Y - view.Scroll.Y,
+            localFace.Width, localFace.Height);
+        var font = ResolveFieldFont(el);
+        if (font == null) return;
+
+        string text = GetFieldText(el);
+        if (el.TagName == "input" &&
+            el.GetAttrOrDefault("type", "text").Trim().Equals("password",
+                StringComparison.OrdinalIgnoreCase))
+            text = new string('*', text.Length);
+
+        var style = el.Style;
+        Color backgroundColor = style != null && style.OwnBackground &&
+            style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
+        Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
+        using var background = new SolidBrush(backgroundColor);
+        using var foreground = new SolidBrush(foregroundColor);
+        using var format = NewFieldFormat(noWrap: el.TagName != "textarea");
+
+        var state = g.Save();
+        g.SetClip(face, CombineMode.Intersect);
+        g.FillRectangle(background, face);
+
+        int caret = Math.Clamp(_fieldCaret, 0, text.Length);
+        int anchor = Math.Clamp(_fieldSelAnchor, 0, text.Length);
+        int selStart = Math.Min(anchor, caret);
+        int selEnd = Math.Max(anchor, caret);
+
+        if (el.TagName == "textarea")
+        {
+            var geo = GetTextareaGeometry(el, box);
+            if (geo != null)
+            {
+                float lineHeight = geo.Font.GetHeight(g);
+                int scrollLine = EnsureTextareaScrollLine(geo.Lines, lineHeight,
+                    face.Height, caret);
+                float textX = face.X + 3;
+                float textY = face.Y + 2 - scrollLine * lineHeight;
+                using var lineFormat = NewFieldFormat(noWrap: true);
+                Engine.Render.TextareaOverlay.DrawLines(g, text, geo.Font, geo.Lines,
+                    foreground, textX, textY, face.Width - 4, lineHeight,
+                    scrollLine);
+
+                if (selEnd > selStart)
+                {
+                    using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
+                    for (int line = 0; line < geo.Lines.Count; line++)
+                    {
+                        var (start, end) = geo.Lines[line];
+                        int a = Math.Max(selStart, start), b = Math.Min(selEnd, end);
+                        if (b <= a) continue;
+                        float x1 = textX + g.MeasureString(text[start..a], geo.Font,
+                            int.MaxValue, lineFormat).Width;
+                        float x2 = textX + g.MeasureString(text[start..b], geo.Font,
+                            int.MaxValue, lineFormat).Width;
+                        g.FillRectangle(highlight, x1, textY + line * lineHeight,
+                            Math.Max(1, x2 - x1), lineHeight);
+                    }
+                }
+
+                PaintTextareaScrollbar(g, face, geo.Lines.Count, lineHeight, scrollLine);
+
+                if ((uint)Environment.TickCount / 500 % 2 == 0)
+                {
+                    int line = CaretLineIndex(geo.Lines, caret);
+                    var (start, _) = geo.Lines[line];
+                    float cx = textX + g.MeasureString(text[start..caret], geo.Font,
+                        int.MaxValue, lineFormat).Width;
+                    using var caretPen = new Pen(Color.Black, 1);
+                    g.DrawLine(caretPen, cx, textY + line * lineHeight,
+                        cx, textY + (line + 1) * lineHeight);
+                }
+            }
+        }
+        else
+        {
+            float scroll = EnsureSingleLineCaretVisible(g, text, font, face, caret);
+            float textX = face.X + 3 - scroll;
+            format.LineAlignment = StringAlignment.Center;
+            float textWidth = g.MeasureString(text, font, int.MaxValue, format).Width;
+            g.DrawString(text, font, foreground,
+                new RectangleF(textX, face.Y, Math.Max(face.Width, textWidth + 8), face.Height), format);
+            if (selEnd > selStart)
+            {
+                using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
+                float x1 = textX + g.MeasureString(text[..selStart], font, int.MaxValue, format).Width;
+                float x2 = textX + g.MeasureString(text[..selEnd], font, int.MaxValue, format).Width;
+                g.FillRectangle(highlight, x1, face.Y, Math.Max(1, x2 - x1), face.Height);
+            }
+            if ((uint)Environment.TickCount / 500 % 2 == 0)
+            {
+                float cx = textX + g.MeasureString(text[..caret], font, int.MaxValue, format).Width;
+                using var caretPen = new Pen(Color.Black, 1);
+                g.DrawLine(caretPen, cx, face.Y + 2, cx, face.Bottom - 2);
+            }
+        }
+        g.Restore(state);
+
+        using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+        g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
+    }
+
+    private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
+                                               int lineCount, float lineHeight,
+                                               int scrollLine = 0)
+    {
+        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+        if (lineCount <= visibleLines || face.Width < 12 || face.Height < 8) return;
+
+        float trackX = face.Right - 12;
+        float trackY = face.Top + 1;
+        float trackHeight = Math.Max(1, face.Height - 2);
+        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        g.FillRectangle(track, trackX, trackY, 11, trackHeight);
+        float thumbHeight = Math.Max(10, trackHeight * visibleLines / lineCount);
+        float maxThumbY = Math.Max(1, trackHeight - thumbHeight);
+        float thumbY = trackY + 1 + maxThumbY * scrollLine /
+            Math.Max(1, lineCount - visibleLines);
+        g.FillRectangle(thumb, trackX + 1, thumbY, 9,
+            Math.Min(trackHeight - 2, thumbHeight - 2));
+    }
+
     private void PaintTextareaFieldOverlay(Graphics g)
     {
         var el = _focusedInput;
@@ -1012,6 +1154,8 @@ public class BrowserCanvas : Control
         float textY = face.Y + 2 - _scrollOffset.Y;
         float textBottom = face.Bottom - 2 - _scrollOffset.Y;
         float lineHeight = font.GetHeight(g);
+        int scrollLine = EnsureTextareaScrollLine(lines, lineHeight, face.Height, _fieldCaret);
+        textY -= scrollLine * lineHeight;
         using var noWrap = NewFieldFormat(noWrap: true);
 
         float Measure(int start, int end) => end <= start ? 0f
@@ -1027,6 +1171,19 @@ public class BrowserCanvas : Control
         int selStart = Math.Min(anchor, caret);
         int selEnd = Math.Max(anchor, caret);
 
+        var style = el.Style;
+        Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
+            ? style.BackgroundColor : Color.White;
+        Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
+        using (var background = new SolidBrush(fieldBackground))
+            g.FillRectangle(background, face.X + 1 - _scrollOffset.X,
+                face.Y + 1 - _scrollOffset.Y, Math.Max(1, face.Width - 2),
+                Math.Max(1, face.Height - 2));
+
+        using (var foreground = new SolidBrush(fieldForeground))
+            Engine.Render.TextareaOverlay.DrawLines(g, text, font, lines,
+                foreground, textX, textY, face.Width - 4, lineHeight, scrollLine);
+
         if (selEnd > selStart)
         {
             using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
@@ -1041,6 +1198,8 @@ public class BrowserCanvas : Control
             }
         }
 
+        PaintTextareaScrollbar(g, face, lines.Count, lineHeight, scrollLine);
+
         if ((uint)Environment.TickCount / 500 % 2 == 0)
         {
             // A caret at a wrap boundary belongs to the START of the next line;
@@ -1054,6 +1213,12 @@ public class BrowserCanvas : Control
         }
 
         g.Restore(oldClip);
+
+        // Match the single-line input overlay: the focus ring is painted
+        // after the clipped field contents so it remains visible on top.
+        using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+        g.DrawRectangle(focusPen, face.X - _scrollOffset.X, face.Y - _scrollOffset.Y,
+            face.Width - 1, face.Height - 1);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1222,6 +1387,23 @@ public class BrowserCanvas : Control
         float x = e.X + _scrollOffset.X;
         float y = e.Y + _scrollOffset.Y;
 
+        if (_focusedInput?.TagName == "textarea" &&
+            TryGetFocusedTextareaBox(x, y, out var textareaBox))
+        {
+            var geo = GetTextareaGeometry(_focusedInput, textareaBox);
+            if (geo != null)
+            {
+                float lineHeight = geo.Font.GetHeight(MeasureGraphics);
+                int visibleLines = Math.Max(1,
+                    (int)Math.Floor((textareaBox.ContentRect.Height - 4) / lineHeight));
+                int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
+                int delta = e.Delta > 0 ? -3 : 3;
+                _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
+                Invalidate();
+                return;
+            }
+        }
+
         var frameBox = FrameBoxAtPoint(x, y);
         if (frameBox != null && _frames.TryGetValue(frameBox, out var view) &&
             view.ScrollingEnabled)
@@ -1320,7 +1502,20 @@ public class BrowserCanvas : Control
         {
             if (_focusedInput.TagName == "textarea")
             {
-                // The newline is inserted by OnCanvasKeyPress — don't swallow it.
+                // Enter is claimed by IsInputKey, so WinForms does not
+                // reliably follow it with KeyPress. Insert the textarea
+                // newline here instead of waiting for a character event.
+                var js = _jsInterpreter;
+                var evt = js?.CreateKeyEvent("Enter", 13);
+                var down = js?.FireEvent(_focusedInput, "onkeydown", evt);
+                var press = js?.FireEvent(_focusedInput, "onkeypress", evt);
+                bool cancelled =
+                    (down is { Type: JsType.Boolean } && !down.ToBoolean()) ||
+                    (press is { Type: JsType.Boolean } && !press.ToBoolean());
+                if (!cancelled)
+                    FieldInsertText("\n");
+                e.Handled = true;
+                e.SuppressKeyPress = true;
             }
             else if (IsEditableField(_focusedInput))
             {
@@ -1623,12 +1818,6 @@ public class BrowserCanvas : Control
         bool bold = style?.FontWeight >= FontWeightValue.Bold;
         bool italic = style?.FontStyle == FontStyleValue.Italic;
 
-        if (el.TagName == "textarea")
-        {
-            float size = style?.FontSize > 0f ? Math.Min(style.FontSize, 13f) : 13f;
-            return _fontCache.Resolve(new List<string> { "Courier New", "monospace" }, size, bold, italic);
-        }
-
         return _fontCache.Resolve(
             style?.FontFamily is { Count: > 0 } fam ? fam : new List<string> { "Times New Roman", "serif" },
             style?.FontSize > 0f ? style.FontSize : 16f,
@@ -1719,6 +1908,22 @@ public class BrowserCanvas : Control
         return Math.Max(0, lines.Count - 1);
     }
 
+    private int EnsureTextareaScrollLine(List<(int Start, int End)> lines,
+                                         float lineHeight, float faceHeight,
+                                         int caret)
+    {
+        int visibleLines = Math.Max(1, (int)Math.Floor((faceHeight - 4) / lineHeight));
+        int maxLine = Math.Max(0, lines.Count - visibleLines);
+        int caretLine = CaretLineIndex(lines, Math.Clamp(caret, 0,
+            lines.Count == 0 ? 0 : lines[^1].End));
+        if (caretLine < _textareaScrollLine)
+            _textareaScrollLine = caretLine;
+        else if (caretLine >= _textareaScrollLine + visibleLines)
+            _textareaScrollLine = caretLine - visibleLines + 1;
+        _textareaScrollLine = Math.Clamp(_textareaScrollLine, 0, maxLine);
+        return _textareaScrollLine;
+    }
+
     /// <summary>
     /// Caret index inside [start,end) whose x-edge is closest to relX.
     /// PERF: prefix widths are non-decreasing, so a binary search replaces
@@ -1763,7 +1968,9 @@ public class BrowserCanvas : Control
             var geo = GetTextareaGeometry(el, box);
             if (geo == null || geo.Lines.Count == 0) return text.Length;
             float lineH = font.GetHeight(MeasureGraphics);
-            int li = Math.Clamp((int)Math.Floor((docY - (face.Y + 2)) / lineH), 0, geo.Lines.Count - 1);
+            int li = Math.Clamp(_textareaScrollLine +
+                (int)Math.Floor((docY - (face.Y + 2)) / lineH),
+                0, geo.Lines.Count - 1);
             var (ls, le) = geo.Lines[li];
             return NearestCaretIndex(geo.Text, font, fmt, ls, le, docX - (face.X + 3));
         }
@@ -1873,6 +2080,7 @@ public class BrowserCanvas : Control
         RememberDefault(el);
         _fieldCaret = _fieldSelAnchor = Math.Clamp(caretPos, 0, GetFieldText(el).Length);
         _fieldScrollX = 0f;
+        _textareaScrollLine = 0;
         RequestRerender();
     }
 
@@ -1912,6 +2120,56 @@ public class BrowserCanvas : Control
 
         float x = e.X + _scrollOffset.X;
         float y = e.Y + _scrollOffset.Y;
+
+        if (e.Button == MouseButtons.Left &&
+            _focusedInput?.TagName == "textarea" &&
+            TryGetFocusedTextareaScrollbarPoint(x, y, out var scrollbarBox,
+                out float scrollbarX, out float scrollbarY))
+        {
+            var geo = GetTextareaGeometry(_focusedInput, scrollbarBox);
+            if (geo != null)
+            {
+                float lineHeight = geo.Font.GetHeight(MeasureGraphics);
+                int visibleLines = Math.Max(1,
+                    (int)Math.Floor((scrollbarBox.ContentRect.Height - 4) / lineHeight));
+                int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
+                float trackHeight = Math.Max(1, scrollbarBox.ContentRect.Height - 2);
+                float thumbHeight = Math.Max(10,
+                    trackHeight * visibleLines / Math.Max(1, geo.Lines.Count));
+                float travel = Math.Max(1, trackHeight - thumbHeight);
+                _textareaScrollLine = Math.Clamp((int)Math.Round(
+                    (scrollbarY - scrollbarBox.ContentRect.Top - thumbHeight / 2) /
+                    travel * maxLine), 0, maxLine);
+                Invalidate();
+                return;
+            }
+        }
+
+        // Frame documents have their own layout tree.  Resolve editable
+        // controls in that tree before the parent hit-test sees only the
+        // frame box; otherwise clicks in corporate-page forms never focus
+        // the actual input or textarea.
+        var frameAtPoint = FrameBoxAtPoint(x, y);
+        if (frameAtPoint != null && _frames.TryGetValue(frameAtPoint, out var frameView))
+        {
+            float frameX = x - frameAtPoint.X + frameView.Scroll.X;
+            float frameY = y - frameAtPoint.Y + frameView.Scroll.Y;
+            var frameBox = HitTestDeepestBox(frameView.RootBox, frameX, frameY);
+            var frameElement = frameBox?.Element;
+            if (_focusedInput != null && !ReferenceEquals(frameElement, _focusedInput))
+                BlurField();
+            if (frameElement != null && IsEditableField(frameElement) &&
+                !frameElement.HasAttr("disabled"))
+            {
+                FocusControl(frameElement,
+                    FieldCaretFromPoint(frameElement, frameBox!, frameX, frameY),
+                    frameView.Interpreter ?? _jsInterpreter);
+                _focusedFrame = frameAtPoint;
+                _fieldDragging = true;
+                Capture = true;
+                return;
+            }
+        }
 
         var deepest = HitTestDeepestBox(_rootBox, x, y);
         var el = deepest?.Element;
@@ -2016,6 +2274,17 @@ public class BrowserCanvas : Control
             float x = e.X + _scrollOffset.X;
             float y = e.Y + _scrollOffset.Y;
             var box = FindBoxForElement(_rootBox, _focusedInput);
+            if (box == null && _focusedFrame != null &&
+                _frames.TryGetValue(_focusedFrame, out var frameView))
+            {
+                float frameX = x - _focusedFrame.X + frameView.Scroll.X;
+                float frameY = y - _focusedFrame.Y + frameView.Scroll.Y;
+                box = FindBoxForElement(frameView.RootBox, _focusedInput);
+                if (box != null)
+                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, frameX, frameY);
+                Invalidate();
+                return;
+            }
             if (box != null)
             {
                 _fieldCaret = FieldCaretFromPoint(_focusedInput, box, x, y);
@@ -2415,6 +2684,58 @@ public class BrowserCanvas : Control
             if (box.BorderRect.Contains(x, y))
                 return box;
         return null;
+    }
+
+    private bool TryGetFocusedTextareaBox(float x, float y, out LayoutBox box)
+    {
+        box = null!;
+        if (_focusedInput == null) return false;
+
+        var rootBox = FindBoxForElement(_rootBox!, _focusedInput);
+        if (rootBox != null && rootBox.BorderRect.Contains(x, y))
+        {
+            box = rootBox;
+            return true;
+        }
+
+        var frame = FrameBoxAtPoint(x, y);
+        if (frame == null || !_frames.TryGetValue(frame, out var view)) return false;
+        var localX = x - frame.X + view.Scroll.X;
+        var localY = y - frame.Y + view.Scroll.Y;
+        var frameField = FindBoxForElement(view.RootBox, _focusedInput);
+        if (frameField == null || !frameField.BorderRect.Contains(localX, localY)) return false;
+        box = frameField;
+        return true;
+    }
+
+    private bool TryGetFocusedTextareaScrollbarPoint(float x, float y,
+                                                      out LayoutBox box,
+                                                      out float localX,
+                                                      out float localY)
+    {
+        box = null!;
+        localX = localY = 0;
+        if (_focusedInput == null) return false;
+
+        var rootField = FindBoxForElement(_rootBox!, _focusedInput);
+        if (rootField != null && rootField.BorderRect.Contains(x, y))
+        {
+            box = rootField;
+            localX = x;
+            localY = y;
+        }
+        else
+        {
+            var frame = FrameBoxAtPoint(x, y);
+            if (frame == null || !_frames.TryGetValue(frame, out var view)) return false;
+            localX = x - frame.X + view.Scroll.X;
+            localY = y - frame.Y + view.Scroll.Y;
+            box = FindBoxForElement(view.RootBox, _focusedInput)!;
+            if (box == null || !box.BorderRect.Contains(localX, localY)) return false;
+        }
+
+        var face = box.ContentRect;
+        return localX >= face.Right - 14 && localY >= face.Top && localY <= face.Bottom;
     }
 
     private static LayoutBox? FindBoxForElement(LayoutBox root, DomElement element) =>

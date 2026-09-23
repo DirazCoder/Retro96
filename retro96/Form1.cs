@@ -22,19 +22,21 @@ using Retro96.Engine.Render;
 using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 
 /// <summary>
-/// Temporary diagnostic logger. Writes to retro96-debug.log next to the
-/// exe so we can see exactly what happened on a run where the UI itself
-/// gives no useful signal (blank page, stuck "loading", etc). Remove once
-/// the root cause is found — this is not meant to ship.
+/// Opt-in diagnostic logger. Set RETRO96_DEBUG=1 before launching to write
+/// retro96-debug.log next to the executable.
 /// </summary>
 public static class DebugLog
 {
+    public static readonly bool Enabled =
+        Environment.GetEnvironmentVariable("RETRO96_DEBUG") == "1";
+
     private static readonly string Path =
         System.IO.Path.Combine(AppContext.BaseDirectory, "retro96-debug.log");
     private static readonly object Lock = new();
 
     public static void Write(string message)
     {
+        if (!Enabled) return;
         try
         {
             lock (Lock)
@@ -1525,7 +1527,26 @@ public partial class Form1 : Form
             catch { }
         }
 
-        if (!changed) return;
+        if (!changed)
+        {
+            // Images with explicit WIDTH/HEIGHT do not trigger a relayout,
+            // but they still arrive after the first frame bitmap was painted.
+            // Refresh the frame anyway so the decoded pixels replace the
+            // initial blank/broken image.
+            if (parentView != null)
+            {
+                var liveChild = parentView.ChildFrames
+                    .FirstOrDefault(f => f.Box.Element == frameElem);
+                if (liveChild.Box != null)
+                    _canvas.RefreshChildFrame(parentView, liveChild.Box, view);
+            }
+            else
+            {
+                var live = _canvas.FindFrameBox(frameElem) ?? originalBox;
+                _canvas.SetFrame(live, view);
+            }
+            return;
+        }
 
         // Rebuild the frame layout at its CURRENT box size and repaint.
         if (parentView != null)

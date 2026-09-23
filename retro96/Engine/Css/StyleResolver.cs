@@ -30,13 +30,17 @@ public static class StyleResolver
     // ── Document colour accessors (used by the Renderer) ─────────────────
 
     public static Color GetLinkColor(DomDocument doc) =>
-        ParseHtmlColor(doc.BodyLinkColor) ?? Color.FromArgb(0x00, 0x00, 0xEE);
+        UsableColor(ParseHtmlColor(doc.BodyLinkColor), Color.FromArgb(0x00, 0x00, 0xEE));
 
     public static Color GetVLinkColor(DomDocument doc) =>
-        ParseHtmlColor(doc.BodyVLinkColor) ?? Color.FromArgb(0x55, 0x1A, 0x8B);
+        UsableColor(ParseHtmlColor(doc.BodyVLinkColor), Color.FromArgb(0x55, 0x1A, 0x8B));
 
     public static Color GetALinkColor(DomDocument doc) =>
-        ParseHtmlColor(doc.BodyALinkColor) ?? Color.FromArgb(0xFF, 0x00, 0x00);
+        UsableColor(ParseHtmlColor(doc.BodyALinkColor), Color.FromArgb(0xFF, 0x00, 0x00));
+
+    private static Color UsableColor(Color? parsed, Color fallback) =>
+        parsed is { } color && color != Color.Empty && color != Color.Transparent
+            ? color : fallback;
 
     internal static Color? ParseHtmlColor(string? value)
     {

@@ -337,7 +337,9 @@ public static class InlineLayout
                 {
                     int cols = el.GetAttrInt("cols", 0);
                     if (cols > 0)
-                        width = cols * 8f;
+                        width = MeasureTextWidth(new string('0', cols), style) + 12f;
+                    int rows = Math.Max(1, el.GetAttrInt("rows", 4));
+                    height = (float)Math.Ceiling(font.GetHeight(_measureG)) * rows + 4f;
                     return true;
                 }
         }
@@ -439,6 +441,7 @@ public static class InlineLayout
             {
                 float brH = it.H > 0 ? it.H :
                             (lineItems.Count > 0 ? lineItems[^1].H : 16f);
+                bool hadLineContent = lineItems.Count > 0;
 
                 currentY += FlushLine(lineItems, containerX, currentY, lineW,
                                       containerWidth, containerStyle, floats,
@@ -458,7 +461,11 @@ public static class InlineLayout
                 it.Box.Y = currentY;
                 it.Box.Width = 0f;
                 it.Box.Height = brH;
-                currentY += brH;
+                // FlushLine already advances past a non-empty line.  Adding
+                // brH as well double-counted the line after controls such as
+                // <input><br><input>, leaving an extra vertical gap.
+                if (!hadLineContent)
+                    currentY += brH;
                 availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
                 continue;
             }
@@ -604,15 +611,6 @@ public static class InlineLayout
                 de.Style?.WhiteSpace is WhiteSpaceValue.Pre or WhiteSpaceValue.Nowrap)
                 return true;
 
-            // Navigation links in table cells are a single visual item. Do
-            // not fragment "[ Previous Site ]" at its spaces and strand the
-            // closing bracket on a line by itself.
-            if (node is DomElement link && link.TagName == "a")
-            {
-                for (var ancestor = link.Parent; ancestor != null; ancestor = ancestor.Parent)
-                    if (ancestor is DomElement cell && cell.TagName == "td")
-                        return true;
-            }
         }
         return false;
     }
@@ -977,6 +975,7 @@ public static class InlineLayout
 public static class LayoutTrace
 {
     public static readonly bool Enabled =
+        Retro96.DebugLog.Enabled ||
         Environment.GetEnvironmentVariable("RETRO96_TRACE_FLOATS") == "1";
 
     // Written once, at class init, UNCONDITIONALLY (no Enabled check, no
@@ -985,6 +984,7 @@ public static class LayoutTrace
     // out true — instead of silently producing nothing on any I/O failure.
     static LayoutTrace()
     {
+        if (!Enabled) return;
         try
         {
             string markerPath = System.IO.Path.Combine(

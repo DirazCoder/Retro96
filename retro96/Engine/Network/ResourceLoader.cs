@@ -21,7 +21,10 @@ public class ResourceLoader : IDisposable
     private readonly List<FetchRecord> _history = new();
     private readonly object _historyLock = new();
 
-    private const int MaxFetchesPerPage = 200;
+    // The budget is shared by the top document and all nested frames. The
+    // Old Net alone references roughly 187 images before its archived frame
+    // assets are fetched, so 200 incorrectly starved later frame GIFs.
+    private const int MaxFetchesPerPage = 1000;
     private static readonly TimeSpan PageIdleReset = TimeSpan.FromSeconds(15);
 
     public ResourceLoader(CookieStore defaultCookies, HttpClient? httpClient = null)

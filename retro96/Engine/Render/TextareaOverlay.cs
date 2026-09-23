@@ -9,6 +9,30 @@ namespace Retro96.Engine.Render;
 
 public static class TextareaOverlay
 {
+    public static void DrawLines(Graphics g, string text, Font font,
+                                 List<(int Start, int End)> lines,
+                                 SolidBrush brush, float x, float y,
+                                 float width, float lineHeight,
+                                 int scrollLine = 0)
+    {
+        using var format = new StringFormat(StringFormat.GenericTypographic)
+        {
+            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
+            Trimming = StringTrimming.None,
+            LineAlignment = StringAlignment.Near,
+            Alignment = StringAlignment.Near
+        };
+
+        for (int line = 0; line < lines.Count; line++)
+        {
+            var (start, end) = lines[line];
+            if (end <= start) continue;
+            g.DrawString(text[start..end], font, brush,
+                new RectangleF(x, y + (line - scrollLine) * lineHeight,
+                    Math.Max(1, width), lineHeight), format);
+        }
+    }
+
     /// <summary>
     /// Breaks field text into visual lines exactly the way the canvas does:
     /// hard breaks at \r / \n / \r\n, GDI+-measured word wrap otherwise

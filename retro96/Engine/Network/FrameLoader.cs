@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -86,6 +87,7 @@ public static class FrameLoader
         string abs = absolute
             ? trimmed
             : ImageCache.ResolveUrl(trimmed, baseUrl);
+        Retro96.DebugLog.Write($"[FRAME] src='{trimmed}' base='{baseUrl}' resolved='{abs}' size={frameW}x{frameH}");
 
         ParsedUrl parsed;
         try { parsed = ParsedUrl.Parse(abs); }
@@ -121,11 +123,14 @@ public static class FrameLoader
                                 ErrorPage.NetworkError(abs, "No HTTP client available"), abs, frameW, frameH);
 
                         var result = await http.GetAsync(parsed, cookies, ct);
+                        Retro96.DebugLog.Write($"[FRAME] response resolved='{abs}' result={result.GetType().Name} " +
+                            (result is HttpSuccess success
+                                ? $"status={success.StatusCode} bytes={success.Body.Length}"
+                                : result is HttpError error ? $"error='{error.Message}'" : ""));
                         return result switch
                         {
                             HttpSuccess { StatusCode: 200 } ok =>
-                                BuildContent(BodyDecoder.Decode(ok.Body, ok.Charset),
-                                    parsed, abs, frameW, frameH, cookies, runScript),
+                                BuildLoggedContent(ok, parsed, abs, frameW, frameH, cookies, runScript),
                             HttpSuccess err => ErrorContent(
                                 HttpStatusPage(err.StatusCode, abs), abs, frameW, frameH),
                             HttpError e => ErrorContent(
@@ -153,6 +158,18 @@ public static class FrameLoader
             // Never let a frame failure escape into the message loop.
             return ErrorContent(ErrorPage.NetworkError(abs, ex.Message), abs, frameW, frameH);
         }
+    }
+
+    private static FrameContent BuildLoggedContent(
+        HttpSuccess response, ParsedUrl parsed, string abs,
+        int frameW, int frameH, CookieStore cookies, InlineScriptExecutor? runScript)
+    {
+        string html = BodyDecoder.Decode(response.Body, response.Charset);
+        var content = BuildContent(html, parsed, abs, frameW, frameH, cookies, runScript);
+        Retro96.DebugLog.Write($"[FRAME] parsed resolved='{abs}' title='{content.Document.Title}' " +
+            $"root={content.RootBox.Width:0.#}x{content.RootBox.Height:0.#} " +
+            $"frames={content.RootBox.Descendants().Count(b => b.BoxType == BoxType.Frame)}");
+        return content;
     }
 
     private static FrameContent BuildContent(

@@ -95,6 +95,14 @@ public class ImageCache : IDisposable
         if (string.IsNullOrEmpty(baseUrl))
             return url;
 
+        // Wayback-rewritten documents served through TheOldNet use
+        // root-relative /web/... URLs for frames and images. Those paths
+        // belong to web.archive.org, not the TheOldNet proxy origin.
+        if (url.StartsWith("/web/", StringComparison.OrdinalIgnoreCase) &&
+            (baseUrl.Contains("theoldnet.com", StringComparison.OrdinalIgnoreCase) ||
+             baseUrl.Contains("web.archive.org", StringComparison.OrdinalIgnoreCase)))
+            return "https://web.archive.org" + url;
+
         // file:// base — pages opened with File → Open resolve every
         // relative image against the on-disk directory. The generic
         // ParsedUrl.Resolve path used to produce malformed double-slash
@@ -283,6 +291,7 @@ public class ImageCache : IDisposable
     public async Task<DecodedImage> GetAsync(string absoluteUrl,
         ResourceLoader loader, CancellationToken ct)
     {
+        Retro96.DebugLog.Write($"[IMAGE] request url='{absoluteUrl}'");
         // After Dispose (form closing while a prefetch is still in
         // flight) there is nothing left to fetch into or cache onto.
         if (_disposed)
@@ -394,11 +403,19 @@ public class ImageCache : IDisposable
                 var result = await loader.FetchAsync(
                     absoluteUrl, parsedUrl, CookieStore ?? new CookieStore());
 
+                Retro96.DebugLog.Write($"[IMAGE] response url='{absoluteUrl}' result={result.GetType().Name} " +
+                    (result is HttpSuccess responseSuccess
+                        ? $"status={responseSuccess.StatusCode} bytes={responseSuccess.Body.Length} type='{responseSuccess.ContentType}'"
+                        : result is HttpError responseError ? $"error='{responseError.Message}'" : ""));
+
                 if (result is HttpSuccess success)
                 {
                     if (success.StatusCode == 200 && success.Body.Length > 0)
                     {
                         decoded = ImageDecoder.Decode(success.Body, success.ContentType);
+                        Retro96.DebugLog.Write($"[IMAGE] decoded url='{absoluteUrl}' " +
+                            $"frames={decoded.Frames.Count} size={(decoded.Frames.Count > 0
+                                ? $"{decoded.Frames[0].Width}x{decoded.Frames[0].Height}" : "none")}");
                         if (decoded.Frames.Count == 0 || decoded.Frames[0].Width == 0)
                         {
                             // Decode produced nothing usable — treat like a failed
@@ -445,6 +462,7 @@ public class ImageCache : IDisposable
 
             _cache[absoluteUrl] = decoded;
             NaturalImageSizes.Register(absoluteUrl, decoded);
+            Retro96.DebugLog.Write($"[IMAGE] cached url='{absoluteUrl}'");
             if (_wasTransient.TryRemove(absoluteUrl, out _))
             {
                 try { ImageRecovered?.Invoke(absoluteUrl); }

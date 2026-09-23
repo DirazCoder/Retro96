@@ -933,7 +933,7 @@ public class Renderer
                         PaintSelect(g, box, fonts);
                         return;
                     case "textarea":
-                        PaintTextarea(g, box, fonts);
+                        PaintTextarea(g, box, fonts, box.Element == focusedElement);
                         return;
                     case "button":
                         {
@@ -995,7 +995,7 @@ public class Renderer
                 // not depend on comparing the authored colour with a fallback
                 // that may happen to be identical.
                 Color docLink = StyleResolver.GetLinkColor(ownerDoc);
-                bool authorStyled = style.OwnColor;
+                bool authorStyled = linkAnchor!.Style?.OwnColor == true;
 
                 if (!authorStyled)
                 {
@@ -1006,11 +1006,13 @@ public class Renderer
                     else
                         textColor = docLink;
                 }
+
             }
         }
 
         var fontColorElem = FindAncestorElement(elemForStyle, "font");
-        if (fontColorElem?.GetAttr("color") is { } fcAttr)
+        if (fontColorElem?.GetAttr("color") is { } fcAttr &&
+            (!isLink || ReferenceEquals(fontColorElem, linkAnchor)))
         {
             Color fc = ParseHtmlColor(fcAttr);
             if (fc != Color.Empty) textColor = fc;
@@ -1209,11 +1211,11 @@ public class Renderer
         try
         {
             var task = images.GetAsync(absoluteUrl, _resourceLoader, default);
-            if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
-            {
-                frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
-                return true;
-            }
+        if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
+        {
+            frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
+            return true;
+        }
         }
         catch { }
         frame = null;
@@ -1506,7 +1508,8 @@ public class Renderer
         });
     }
 
-    private static void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts)
+    private static void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts,
+                                      bool isFocused)
     {
         var elem = box.Element!;
         var rect = box.BorderRect;
@@ -1514,31 +1517,63 @@ public class Renderer
         var style = elem.Style ?? FallbackStyle(elem);
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
-        g.FillRectangle(Brushes.White, rect.X, rect.Y, rect.Width, rect.Height);
+        bool disabled = elem.HasAttr("disabled");
+        bool authoredBg = style.OwnBackground && style.BackgroundColor != Color.Transparent;
+        Color bgColor = disabled ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+                     : authoredBg ? style.BackgroundColor : Color.White;
+        Color fgColor = disabled ? Color.Gray
+                     : style.OwnColor ? style.Color : Color.Black;
+
+        using (var faceBrush = new SolidBrush(bgColor))
+            g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2);
+
+        if (isFocused)
+        {
+            using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+            g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
+        }
 
         bool bold = style.FontWeight >= FontWeightValue.Bold;
         bool italic = style.FontStyle == FontStyleValue.Italic;
-        float size = style.FontSize > 0f ? Math.Min(style.FontSize, 13f) : 13f;
-        var font = fonts.Resolve(MonospaceFamily, size, bold, italic);
+        var font = ResolveFont(fonts, style);
 
         string text = elem.InnerText ?? "";
 
-        using var brush = new SolidBrush(Color.Black);
+        using var brush = new SolidBrush(fgColor);
         bool wrapOff = elem.GetAttrOrDefault("wrap", "").Trim().ToLowerInvariant() == "off";
 
-        using var sf = new StringFormat(StringFormat.GenericTypographic)
-        {
-            FormatFlags = (wrapOff ? StringFormatFlags.NoWrap : 0)
-                        | StringFormatFlags.MeasureTrailingSpaces,
-            Trimming = StringTrimming.None,
-            LineAlignment = StringAlignment.Near,
-            Alignment = StringAlignment.Near
-        };
+        var lines = TextareaOverlay.BreakLines(g, text, font,
+            Math.Max(1f, face.Width - 6), wrapOff);
+        float lineHeight = font.GetHeight(g);
+        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+        var textClip = g.Save();
+        g.SetClip(new RectangleF(face.X + 1, face.Y + 1,
+            Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
+            CombineMode.Intersect);
+        TextareaOverlay.DrawLines(g, text, font, lines, brush,
+            face.X + 3, face.Y + 2, face.Width - 6, lineHeight);
+        g.Restore(textClip);
 
-        var textRect = new RectangleF(face.X + 3, face.Y + 2,
-                                      Math.Max(0, face.Width - 6), Math.Max(0, face.Height - 4));
-        g.DrawString(text, font, brush, textRect, sf);
+        if (lines.Count > visibleLines)
+            PaintTextareaScrollbar(g, face, lines.Count, visibleLines);
+    }
+
+    private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
+                                               int lineCount, int visibleLines)
+    {
+        if (lineCount <= visibleLines || face.Width < 12 || face.Height < 8) return;
+
+        float trackX = face.Right - 12;
+        float trackY = face.Top + 1;
+        float trackHeight = Math.Max(1, face.Height - 2);
+        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        g.FillRectangle(track, trackX, trackY, 11, trackHeight);
+
+        float thumbHeight = Math.Max(10, trackHeight * visibleLines / lineCount);
+        g.FillRectangle(thumb, trackX + 1, trackY + 1, 9,
+            Math.Min(trackHeight - 2, thumbHeight - 2));
     }
 
     private void PaintButton(Graphics g, LayoutBox box, FontCache fonts, string text)

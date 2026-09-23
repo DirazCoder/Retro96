@@ -582,6 +582,17 @@ public static class TableLayout
                      ?? cell.Parent?.Element?.Style
                      ?? new ComputedStyle();
 
+        // A surrounding <center> controls the table's placement, but it
+        // must not center ordinary cell contents. Chromium resets the cell's
+        // default inline alignment to left unless the cell or its row
+        // explicitly supplies ALIGN/text-align.
+        if (styleOverride == null && cell.Element != null &&
+            !cell.Element.HasAttr("align") && !cellStyle.OwnTextAlign)
+        {
+            cellStyle = cellStyle.Clone();
+            cellStyle.TextAlign = TextAlign.Left;
+        }
+
         void FlushInlineRun()
         {
             if (pendingInline.Count == 0) return;
@@ -686,6 +697,10 @@ public static class TableLayout
         // A block child of a cell gets its content width fixed already; lay
         // out ITS children with the same inline-run discipline.
         var blockStyle = box.Element?.Style ?? containerStyle;
+        if (containerStyle.TextAlign == TextAlign.Left && box.Element != null &&
+            box.Element.TagName != "center" && !box.Element.HasAttr("align") &&
+            !blockStyle.OwnTextAlign)
+            blockStyle = containerStyle;
         float contentW = Math.Max(0f,
             outerWidth - box.BorderLeft - box.BorderRight
                        - box.PaddingLeft - box.PaddingRight);
@@ -732,6 +747,21 @@ public static class TableLayout
 
             child.X = contentX + child.MarginLeft;
             child.Y = currentY + child.MarginTop;
+
+            // Re-resolve percentage widths against this cell's content box.
+            // Generation happened before the containing cell had its final
+            // width, so retaining that provisional width makes nested blocks
+            // use the page width and overflow their cell.
+            if (child.StyleWidthPercent is { } cssPct)
+                child.Width = Math.Max(0f, contentW * cssPct / 100f);
+            else if (child.Element?.GetAttr("width") is { } htmlWidth &&
+                     htmlWidth.TrimEnd().EndsWith('%') &&
+                     float.TryParse(htmlWidth.TrimEnd().TrimEnd('%'),
+                         NumberStyles.Float, CultureInfo.InvariantCulture, out float htmlPct))
+                child.Width = Math.Max(0f, contentW * htmlPct / 100f
+                    - child.MarginLeft - child.MarginRight
+                    - child.BorderLeft - child.BorderRight
+                    - child.PaddingLeft - child.PaddingRight);
 
             if (child.Width <= 0f)
                 child.Width = Math.Max(0f,
@@ -1328,12 +1358,16 @@ public static class TableLayout
     private static float EstimateTableWidth(LayoutBox tableBox, bool min)
     {
         float widest = 0f;
-        foreach (var row in tableBox.Children.Where(IsRow))
+        // Use the same row-group-aware traversal as the real table layout.
+        // Normal HTML puts rows under TBODY, so scanning only direct children
+        // makes nested tables appear to have zero intrinsic width.
+        foreach (var row in BuildRowList(tableBox))
         {
             float rowW = 0f;
             int col = 0;
-            foreach (var cell in row.Children.Where(IsCell))
+            foreach (var entry in row.Cells)
             {
+                var cell = entry.Box;
                 int span = Math.Max(1, cell.Element?.GetAttrInt("colspan", 1) ?? 1);
 
                 // Content + the cell's OWN horizontal chrome (padding and
