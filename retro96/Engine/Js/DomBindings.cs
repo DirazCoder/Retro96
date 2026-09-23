@@ -374,6 +374,32 @@ public static class DomBindings
                 : JsValue.FromObject(WrapElement(el, state));
         }));
 
+        // createElement — old pages use this for small bits of dynamic DOM
+        // (usually an element is created, configured, then appended later).
+        d.Set("createElement", Fn(scope, "createElement", (self, args) =>
+        {
+            string tagName = args.Length > 0 ? args[0].ToJsString() : "";
+            if (string.IsNullOrWhiteSpace(tagName)) return JsValue.Null;
+
+            var element = new DomElement(tagName.Trim());
+            return JsValue.FromObject(WrapElement(element, state));
+        }));
+
+        // getElementsByTagName — legacy pages use this constantly for broad
+        // DOM scans, including document.getElementsByTagName("a") and "*".
+        d.Set("getElementsByTagName", Fn(scope, "getElementsByTagName", (self, args) =>
+        {
+            string tagName = args.Length > 0 ? args[0].ToJsString() : "";
+            if (string.IsNullOrEmpty(tagName)) return JsValue.FromObject(NewArray(scope));
+
+            IEnumerable<DomElement> matches = tagName == "*"
+                ? doc.ElementDescendants()
+                : doc.ElementDescendants().Where(e => string.Equals(
+                    e.TagName, tagName, StringComparison.OrdinalIgnoreCase));
+
+            return JsValue.FromObject(BuildElementCollection(scope, matches, state));
+        }));
+
         // getElementsByName — named lookups over anchors/inputs
         d.Set("getElementsByName", Fn(scope, "getElementsByName", (self, args) =>
         {
@@ -1028,6 +1054,26 @@ public static class DomBindings
                     new InlineStyleObject(_element, _canvas, _scope));
             }
 
+            // getElementsByTagName — DOM element collections are descendants
+            // of this element (the element itself is not included).
+            if (name == "getElementsByTagName")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    string tagName = args.Length > 0 ? args[0].ToJsString() : "";
+                    if (string.IsNullOrEmpty(tagName))
+                        return JsValue.FromObject(NewArray(_scope));
+
+                    var matches = tagName == "*"
+                        ? _element.ElementDescendants()
+                        : _element.ElementDescendants().Where(e => string.Equals(
+                            e.TagName, tagName, StringComparison.OrdinalIgnoreCase));
+
+                    if (_state == null)
+                        return JsValue.FromObject(NewArray(_scope));
+
+                    return JsValue.FromObject(BuildElementCollection(_scope, matches, _state));
+                }, _scope, "getElementsByTagName"));
+
             // Event handlers live as plain properties (assigned functions)
             if (name.StartsWith("on", StringComparison.OrdinalIgnoreCase))
                 return Properties.TryGetValue(name, out var h) ? h : JsValue.Undefined;
@@ -1130,6 +1176,58 @@ public static class DomBindings
                     _canvas?.SubmitForm(_element, null);
                     return JsValue.Undefined;
                 }, _scope, "submit"));
+
+            // appendChild / insertBefore / removeChild — enough of the old DOM
+            // mutation surface for pages that build small bits of UI at runtime.
+            if (name == "appendChild")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length == 0 || args[0].Type != JsType.Object)
+                        return JsValue.Null;
+
+                    if (args[0].GetObject() is not ElementWrapper childWrapper)
+                        return JsValue.Null;
+
+                    var child = childWrapper.Element;
+                    _element.AppendChild(child);
+                    _canvas?.ReflowDocument();
+                    return JsValue.FromObject(WrapElement(child, _state!));
+                }, _scope, "appendChild"));
+
+            if (name == "insertBefore")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length == 0 || args[0].Type != JsType.Object)
+                        return JsValue.Null;
+
+                    if (args[0].GetObject() is not ElementWrapper childWrapper)
+                        return JsValue.Null;
+
+                    var child = childWrapper.Element;
+                    DomElement? reference = null;
+                    if (args.Length > 1 && args[1].Type == JsType.Object &&
+                        args[1].GetObject() is ElementWrapper referenceWrapper)
+                        reference = referenceWrapper.Element;
+
+                    _element.InsertBefore(child, reference);
+                    _canvas?.ReflowDocument();
+                    return JsValue.FromObject(WrapElement(child, _state!));
+                }, _scope, "insertBefore"));
+
+            if (name == "removeChild")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length == 0 || args[0].Type != JsType.Object)
+                        return JsValue.Null;
+
+                    if (args[0].GetObject() is not ElementWrapper childWrapper)
+                        return JsValue.Null;
+
+                    var child = childWrapper.Element;
+                    _element.RemoveChild(child);
+                    _canvas?.ReflowDocument();
+                    return JsValue.FromObject(WrapElement(child, _state!));
+                }, _scope, "removeChild"));
 
             // setAttribute / getAttribute — the generic attribute surface
             // era scripts used for late wiring.  setAttribute on an "on*"

@@ -1634,6 +1634,19 @@ public partial class Form1 : Form
                 if (frameBox == null) return;
                 _canvas.SetFrame(frameBox, view);
 
+                // A frame navigation can target a fragment in the newly
+                // loaded document (for example corp-main.html#order).
+                // Preserve the fragment and scroll the existing frame view
+                // after its layout tree has been installed instead of
+                // leaving the frame at scroll position 0.
+                try
+                {
+                    var fragment = ParsedUrl.Parse(url).Fragment;
+                    if (!string.IsNullOrEmpty(fragment))
+                        _canvas.ScrollFrameToAnchor(view, fragment);
+                }
+                catch { }
+
                 _ = LoadFrameImagesThenReflowAsync(view, content, gen,
                     parentView: null, frameElem: frameBox.Element!,
                     originalBox: frameBox);
