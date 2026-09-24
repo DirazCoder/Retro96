@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Collections.Generic;
 using System.Windows.Forms;
+using WinFormsTimer = System.Windows.Forms.Timer;
 using EngColor = Retro96.Drawing.Color;
 using EngColorTranslator = Retro96.Drawing.ColorTranslator;
 using EngRectangleF = Retro96.Drawing.RectangleF;
@@ -20,6 +21,21 @@ public class PageInspector : Form
     private static readonly List<ConsoleLine> ConsoleLines = new();
     private static readonly object ConsoleLock = new();
     private static event Action? ConsoleUpdated;
+
+    // FIX: fonts were allocated per control and never disposed — Control.Dispose
+    // does NOT dispose Font.  Two shared instances, disposed with the form.
+    private readonly Font _uiFont = new("Segoe UI", 9f);
+    private readonly Font _monoFont = new("Consolas", 9f);
+
+    // FIX: ContextMenuStrip assigned via Control.ContextMenuStrip is not owned
+    // by the control — its native handle lived until finalization.  Tracked
+    // and disposed with the form.
+    private readonly List<ContextMenuStrip> _contextMenus = new();
+
+    // FIX: full-DOM search ran on every keystroke (InnerText aggregation per
+    // element) — debounced.  Console rebuilds coalesced the same way.
+    private readonly WinFormsTimer _searchDebounce = new() { Interval = 250 };
+    private readonly WinFormsTimer _consoleCoalesce = new() { Interval = 120 };
 
     private readonly BrowserCanvas _canvas;
     private readonly TreeView _tree = new();
@@ -43,6 +59,13 @@ public class PageInspector : Form
     private bool _sourceLoaded;
     private DomDocument? _sourceDocument;
     private DomDocument? _inspectedDocument;
+    private int _activeTab;
+    private bool _consoleDirty;
+
+    private static readonly HashSet<string> VoidElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "br", "img", "meta", "link", "input", "hr"
+    };
 
     public static void PublishConsole(string level, string message, DateTime timestamp)
     {
@@ -63,7 +86,7 @@ public class PageInspector : Form
         ClientSize = new Size(980, 650);
         MinimumSize = new Size(620, 400);
         ShowInTaskbar = false;
-        Font = new Font("Segoe UI", 9f);
+        Font = _uiFont;
         BackColor = SystemColors.Control;
         ForeColor = Color.FromArgb(35, 42, 52);
 
@@ -117,7 +140,11 @@ public class PageInspector : Form
         };
         applySource.Click += (s, e) => ApplySource();
         _showBoxes.CheckedChanged += (s, e) => _canvas.SetBoxOutlines(_showBoxes.Checked);
-        _search.TextChanged += (s, e) => FindInTree(_search.Text);
+        // FIX: debounced — the search is a full-DOM scan with per-element
+        // InnerText aggregation; running it per keystroke stalled typing
+        // on large pages.
+        _search.TextChanged += (s, e) => { _searchDebounce.Stop(); _searchDebounce.Start(); };
+        _searchDebounce.Tick += (s, e) => { _searchDebounce.Stop(); FindInTree(_search.Text); };
 
         _tree.Dock = DockStyle.Fill;
         _tree.HideSelection = false;
@@ -126,6 +153,15 @@ public class PageInspector : Form
         _tree.BackColor = Color.White;
         _tree.AfterSelect += (s, e) => ShowElement(e.Node?.Tag as DomElement);
         _tree.NodeMouseDoubleClick += (s, e) => e.Node?.Toggle();
+        // FIX: tooltips are computed lazily on hover.  The old eager
+        // MakeNode tooltip called Describe(element) — which serializes ALL
+        // descendant text — for EVERY node, making BuildTree O(n²) on
+        // text-heavy pages.
+        _tree.NodeMouseHover += (s, e) =>
+        {
+            if (e.Node?.Tag is DomElement el && e.Node.ToolTipText.Length == 0)
+                e.Node.ToolTipText = el.Children.Count > 500 ? LabelFor(el) : Describe(el);
+        };
         _tree.NodeMouseClick += (s, e) =>
         {
             if (e.Button == MouseButtons.Right) _tree.SelectedNode = e.Node;
@@ -164,7 +200,7 @@ public class PageInspector : Form
         _summary.Dock = DockStyle.Top;
         _summary.Height = 72;
         _summary.Padding = new Padding(12, 7, 12, 5);
-        _summary.Font = new Font("Segoe UI", 9f, FontStyle.Regular);
+        _summary.Font = _uiFont;
         _summary.BackColor = Color.FromArgb(245, 247, 250);
 
         _crumbs.Dock = DockStyle.Bottom;
@@ -188,7 +224,13 @@ public class PageInspector : Form
         tabs.TabPages.Add(MakeTab("Network", _network));
         tabs.SelectedIndexChanged += (s, e) =>
         {
-            RefreshToolTab(tabs.SelectedIndex);
+            _activeTab = tabs.SelectedIndex;
+            if (_activeTab == 1 && _consoleDirty)
+            {
+                _consoleDirty = false;
+                RefreshConsole();
+            }
+            RefreshToolTab(_activeTab);
         };
 
         Controls.Add(tabs);
@@ -207,16 +249,75 @@ public class PageInspector : Form
 
         _canvas.PageChanged += OnPageChanged;
         ConsoleUpdated += OnConsoleUpdated;
+        // FIX: coalesced console refresh — a fast logging loop (JS spamming
+        // console.log) used to queue one full ListView rebuild per message.
+        _consoleCoalesce.Tick += (s, e) =>
+        {
+            _consoleCoalesce.Stop();
+            if (IsDisposed) return;
+            if (_activeTab == 1) RefreshConsole();
+            else _consoleDirty = true;
+        };
         FormClosed += (s, e) =>
         {
-            _canvas.PageChanged -= OnPageChanged;
-            ConsoleUpdated -= OnConsoleUpdated;
             if (_showBoxes.Checked) _canvas.SetBoxOutlines(false);
         };
 
         BuildTree();
         RefreshToolTab(0);
         if (initialElement != null) SelectElement(initialElement);
+    }
+
+    // FIX: full cleanup on dispose.  Control.Dispose does not dispose fonts,
+    // ToolStrip-assigned context menus are not owned by their host control,
+    // and the timers hold live handles.  Event unsubscription also lives
+    // here (FormClosed missed the never-shown path).
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _canvas.PageChanged -= OnPageChanged;
+            ConsoleUpdated -= OnConsoleUpdated;
+
+            _searchDebounce.Dispose();
+            _consoleCoalesce.Dispose();
+
+            foreach (var menu in _contextMenus)
+            {
+                try { menu.Dispose(); } catch { /* already torn down */ }
+            }
+            _contextMenus.Clear();
+
+            _uiFont.Dispose();
+            _monoFont.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    /// <summary>
+    /// FIX: one safe marshal helper.  The old OnPageChanged called
+    /// BeginInvoke with no guards (throws InvalidOperationException when the
+    /// handle isn't created yet, or during the disposed-race window), and
+    /// OnConsoleUpdated caught only one of the two exception types.  Note
+    /// InvokeRequired returns FALSE when there is no handle, so the handle
+    /// check must come first.
+    /// </summary>
+    private void RunOnUi(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            if (InvokeRequired) BeginInvoke(action);
+            else action();
+        }
+        catch (ObjectDisposedException) { }      // disposed while queued or during teardown
+        catch (InvalidOperationException) { }   // handle destroyed mid-flight
+    }
+
+    private ContextMenuStrip Track(ContextMenuStrip menu)
+    {
+        _contextMenus.Add(menu);
+        return menu;
     }
 
     private Control BuildElementDetails()
@@ -247,7 +348,7 @@ public class PageInspector : Form
         return panel;
     }
 
-    private static void ConfigureTextBox(TextBox box)
+    private void ConfigureTextBox(TextBox box)
     {
         box.Dock = DockStyle.Fill;
         box.Multiline = true;
@@ -255,7 +356,7 @@ public class PageInspector : Form
         box.ScrollBars = ScrollBars.Both;
         box.WordWrap = false;
         box.BackColor = Color.White;
-        box.Font = new Font("Consolas", 9f);
+        box.Font = _monoFont;
     }
 
     private void ConfigureSourceEditor()
@@ -273,7 +374,7 @@ public class PageInspector : Form
         _sources.TabIndex = 0;
         _sources.CausesValidation = false;
         _sources.BorderStyle = BorderStyle.Fixed3D;
-        _sources.Font = new Font("Consolas", 9f);
+        _sources.Font = _monoFont;
     }
 
     private void ConfigureConsoleList()
@@ -285,7 +386,7 @@ public class PageInspector : Form
         _console.HideSelection = false;
         _console.BackColor = Color.FromArgb(24, 29, 36);
         _console.ForeColor = Color.FromArgb(225, 231, 239);
-        _console.Font = new Font("Consolas", 9f);
+        _console.Font = _monoFont;
         _console.Columns.Add("Time", 78);
         _console.Columns.Add("Level", 72);
         _console.Columns.Add("Message", 680);
@@ -299,7 +400,7 @@ public class PageInspector : Form
         _consoleFilter.BorderStyle = BorderStyle.FixedSingle;
         _consoleFilter.BackColor = Color.FromArgb(38, 45, 55);
         _consoleFilter.ForeColor = Color.White;
-        _consoleFilter.Font = new Font("Segoe UI", 9f);
+        _consoleFilter.Font = _uiFont;
         _consoleFilter.PlaceholderText = "Filter console messages...";
         _consoleFilter.TextChanged += (s, e) => RefreshConsole();
         panel.Controls.Add(_console);
@@ -333,14 +434,15 @@ public class PageInspector : Form
         menu.Items.Add("Copy message", null, (s, e) =>
         {
             if (_console.SelectedItems.Count > 0)
-                Clipboard.SetText(string.Join(" ", _console.SelectedItems[0].SubItems.Cast<ListViewItem.ListViewSubItem>().Select(x => x.Text)));
+                SafeSetClipboard(string.Join(" ",
+                    _console.SelectedItems[0].SubItems.Cast<ListViewItem.ListViewSubItem>().Select(x => x.Text)));
         });
         menu.Items.Add("Clear console", null, (s, e) =>
         {
             lock (ConsoleLock) ConsoleLines.Clear();
             RefreshConsole();
         });
-        return menu;
+        return Track(menu);
     }
 
     private ContextMenuStrip BuildTextMenu(TextBoxBase textBox)
@@ -355,7 +457,7 @@ public class PageInspector : Form
         menu.Items.Add("Copy", null, (s, e) => textBox.Copy());
         if (!textBox.ReadOnly) menu.Items.Add("Paste", null, (s, e) => textBox.Paste());
         menu.Items.Add("Select all", null, (s, e) => textBox.SelectAll());
-        return menu;
+        return Track(menu);
     }
 
     private ContextMenuStrip BuildTreeMenu()
@@ -366,13 +468,13 @@ public class PageInspector : Form
         menu.Items.Add("Copy selector", null, (s, e) =>
         {
             if (_tree.SelectedNode?.Tag is DomElement element)
-                Clipboard.SetText(CssPath(element));
+                SafeSetClipboard(CssPath(element));
         });
         menu.Items.Add("Copy element details", null, (s, e) => CopyDetails());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Expand subtree", null, (s, e) => _tree.SelectedNode?.ExpandAll());
         menu.Items.Add("Collapse subtree", null, (s, e) => _tree.SelectedNode?.Collapse(false));
-        return menu;
+        return Track(menu);
     }
 
     private ContextMenuStrip BuildNetworkMenu()
@@ -380,66 +482,85 @@ public class PageInspector : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add("Copy URL", null, (s, e) =>
         {
-            if (_network.SelectedItems.Count > 0) Clipboard.SetText(_network.SelectedItems[0].SubItems[0].Text);
+            if (_network.SelectedItems.Count > 0)
+                SafeSetClipboard(_network.SelectedItems[0].SubItems[0].Text);
         });
         menu.Items.Add("Clear network", null, (s, e) =>
         {
             _canvas.ResourceLoader?.ClearHistory();
             RefreshToolTab(3);
         });
-        return menu;
+        return Track(menu);
     }
 
     private void RefreshToolTab(int tabIndex)
     {
         if (tabIndex == 1)
         {
+            _consoleDirty = false;
             RefreshConsole();
         }
         else if (tabIndex == 2)
         {
             if (_sources.Focused || _sourceDirty) return;
-            if (!_sourceDirty && !_sourceLoaded)
+
+            var doc = _canvas.PageDocument;
+            // FIX: _sourceDocument used to be written but never READ (dead).
+            // It now drives a reload when the document swapped without a
+            // PageChanged-driven reset — the Sources tab could otherwise
+            // keep showing the previous page's source.
+            if (_sourceLoaded && doc != null && !ReferenceEquals(_sourceDocument, doc))
+                _sourceLoaded = false;
+
+            if (!_sourceLoaded)
             {
                 _loadingSource = true;
-                _sources.Text = BuildPageSource();
-                _loadingSource = false;
+                try { _sources.Text = BuildPageSource(); }
+                finally { _loadingSource = false; }
                 _sourceLoaded = true;
-                _sourceDocument = _canvas.PageDocument;
+                _sourceDocument = doc;
             }
         }
         else if (tabIndex == 3)
         {
             _network.BeginUpdate();
             _network.Items.Clear();
-            foreach (var item in _canvas.ResourceLoader?.History ?? Array.Empty<Engine.Network.ResourceLoader.FetchRecord>())
+            var history = _canvas.ResourceLoader?.History;
+            if (history != null)
             {
-                double duration = (item.CompletedUtc - item.StartedUtc).TotalMilliseconds;
-                _network.Items.Add(new ListViewItem(new[]
+                foreach (var item in history)
                 {
-                    item.Url,
-                    item.StatusCode.HasValue ? $"{item.StatusCode} {item.Status}" : item.Status,
-                    item.CompletedUtc.ToLocalTime().ToString("HH:mm:ss"),
-                    $"{duration:0} ms"
-                }));
+                    // FIX: in-flight requests have CompletedUtc = default
+                    // (year 0001) — the duration column used to show a huge
+                    // NEGATIVE millisecond value and the time column 00:00:00.
+                    bool finished = item.CompletedUtc > DateTime.MinValue;
+                    double duration = finished
+                        ? (item.CompletedUtc - item.StartedUtc).TotalMilliseconds
+                        : 0;
+                    DateTime stamp = finished ? item.CompletedUtc : item.StartedUtc;
+                    _network.Items.Add(new ListViewItem(new[]
+                    {
+                        item.Url,
+                        item.StatusCode.HasValue ? $"{item.StatusCode} {item.Status}" : item.Status,
+                        stamp.ToLocalTime().ToString("HH:mm:ss"),
+                        finished ? $"{duration:0} ms" : "…"
+                    }));
+                }
             }
             _network.EndUpdate();
         }
     }
 
-    private void OnConsoleUpdated()
+    private void OnConsoleUpdated() => RunOnUi(() =>
     {
         if (IsDisposed) return;
-        if (InvokeRequired)
-        {
-            try { BeginInvoke(OnConsoleUpdated); } catch (InvalidOperationException) { }
-            return;
-        }
-        RefreshConsole();
-    }
+        _consoleCoalesce.Stop();
+        _consoleCoalesce.Start();
+    });
 
     private void RefreshConsole()
     {
+        _consoleDirty = false;
         string filter = _consoleFilter.Text.Trim();
         ConsoleLine[] lines;
         lock (ConsoleLock) lines = ConsoleLines.ToArray();
@@ -465,6 +586,7 @@ public class PageInspector : Form
         {
             _sourceDirty = false;
             _sourceLoaded = true;
+            _sourceDocument = _canvas.PageDocument;   // FIX: record the reparsed document
             _summary.Text = "Source applied. The document was reparsed and relaid out.";
         }
         else
@@ -477,46 +599,94 @@ public class PageInspector : Form
         var doc = _canvas.PageDocument;
         if (doc == null) return "No document loaded.";
         var sb = new StringBuilder();
-        foreach (var node in doc.Children) AppendSource(sb, node, 0);
+        foreach (var node in doc.Children) AppendSource(sb, node);
         return sb.ToString();
     }
 
-    private static void AppendSource(StringBuilder sb, DomNode node, int depth)
+    /// <summary>
+    /// FIX: iterative (the recursive version overflowed the stack on deeply
+    /// nested tag soup — the same input class the engine's own walkers are
+    /// hardened against), and it now ESCAPES text and attribute content.
+    /// The old serializer wrote raw text/attrs: a page containing
+    /// "a &lt; b", "AT&amp;T" or href="…?x=1&amp;y=2" reparsed into a
+    /// mangled document when Apply source ran.
+    /// </summary>
+    private static void AppendSource(StringBuilder sb, DomNode root)
     {
-        string indent = new(' ', depth * 2);
-        if (node is DomElement element)
+        var stack = new Stack<(DomNode Node, int Depth, bool Closing)>();
+        stack.Push((root, 0, false));
+
+        while (stack.Count > 0)
         {
-            sb.Append(indent).Append('<').Append(element.TagName);
-            foreach (var attr in element.Attrs.OrderBy(a => a.Key))
-                sb.Append(' ').Append(attr.Key).Append("=\"").Append(attr.Value.Replace("\"", "&quot;")).Append('"');
-            if (element.Children.Count == 0 && new[] { "br", "img", "meta", "link", "input", "hr" }.Contains(element.TagName))
+            var (node, depth, closing) = stack.Pop();
+
+            if (node is DomElement element)
             {
-                sb.AppendLine(">\r");
-                return;
+                if (closing)
+                {
+                    sb.Append(' ', depth * 2).Append("</").Append(element.TagName).AppendLine(">");
+                    continue;
+                }
+
+                sb.Append(' ', depth * 2).Append('<').Append(element.TagName);
+                foreach (var attr in element.Attrs.OrderBy(a => a.Key))
+                    sb.Append(' ').Append(attr.Key).Append("=\"").Append(EscapeAttr(attr.Value)).Append('"');
+
+                // FIX: was AppendLine(">\r") — AppendLine already appends
+                // CRLF, so every void element emitted ">\r\r\n" (stray CR,
+                // doubled blank lines in the editor).
+                if (element.Children.Count == 0 && VoidElements.Contains(element.TagName))
+                {
+                    sb.AppendLine(">");
+                    continue;
+                }
+
+                sb.AppendLine(">");
+
+                // LIFO: push the closing tag first, then children reversed,
+                // so children pop in document order and the closer pops last.
+                stack.Push((element, depth, true));
+                for (int i = element.Children.Count - 1; i >= 0; i--)
+                    stack.Push((element.Children[i], depth + 1, false));
             }
-            sb.AppendLine(">");
-            foreach (var child in element.Children) AppendSource(sb, child, depth + 1);
-            sb.Append(indent).Append("</").Append(element.TagName).AppendLine(">");
-        }
-        else if (node is DomText text)
-        {
-            string value = text.Data.Trim();
-            if (value.Length > 0) sb.Append(indent).AppendLine(value);
-        }
-        else if (node is DomComment comment)
-        {
-            sb.Append(indent).Append("<!-- ").Append(comment.Text).AppendLine(" -->");
+            else if (node is DomText text)
+            {
+                string value = EscapeText((text.Data ?? "").Trim());
+                if (value.Length > 0)
+                    sb.Append(' ', depth * 2).AppendLine(value);
+            }
+            else if (node is DomComment comment)
+            {
+                // "--" is illegal inside an HTML comment — it would truncate
+                // the comment on reparse.
+                string value = (comment.Text ?? "").Replace("--", "- -");
+                sb.Append(' ', depth * 2).Append("<!-- ").Append(value).AppendLine(" -->");
+            }
         }
     }
 
-    private void OnPageChanged()
+    private static string EscapeText(string value) =>
+        value.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+
+    private static string EscapeAttr(string? value) =>
+        (value ?? "").Replace("&", "&amp;").Replace("<", "&lt;")
+                     .Replace(">", "&gt;").Replace("\"", "&quot;");
+
+    private void OnPageChanged() => RunOnUi(OnPageChangedCore);
+
+    private void OnPageChangedCore()
     {
         if (IsDisposed) return;
-        if (InvokeRequired) { BeginInvoke(OnPageChanged); return; }
+
         bool documentChanged = !ReferenceEquals(_inspectedDocument, _canvas.PageDocument);
         bool editingSource = _sources.Focused || _sourceDirty;
         if (documentChanged && !editingSource)
         {
+            // FIX: _current pointed at an element of the OLD document —
+            // BuildTree's trailing SelectElement(_current) then rendered the
+            // previous page's element summary/attrs/style after navigation.
+            _current = null;
+
             _sourceDirty = false;
             _sourceLoaded = false;
             _sourceDocument = null;
@@ -561,21 +731,43 @@ public class PageInspector : Form
         _tree.EndUpdate();
         _selectionLabel.Text = $"{_elementCount} elements";
         if (_current != null) SelectElement(_current);
+        else ClearDetails();
+    }
+
+    private void ClearDetails()
+    {
+        _summary.Text = "No element selected.";
+        _crumbs.Text = "";
+        _attrs.BeginUpdate();
+        _attrs.Items.Clear();
+        _attrs.EndUpdate();
+        _computed.Clear();
+        _boxInfo.Clear();
+        _source.Clear();
     }
 
     private TreeNode MakeNode(DomElement element)
     {
         _elementCount++;
-        return new TreeNode(LabelFor(element)) { Tag = element, ToolTipText = Describe(element) };
+        // FIX: no eager ToolTipText — see the NodeMouseHover handler in the
+        // ctor (the eager Describe() made BuildTree O(n²)).
+        return new TreeNode(LabelFor(element)) { Tag = element };
     }
 
-    private void AddChildren(DomElement parent, TreeNode node)
+    /// <summary>FIX: iterative — deep tag soup overflowed the recursive version.</summary>
+    private void AddChildren(DomElement rootElement, TreeNode rootNode)
     {
-        foreach (var child in parent.ElementChildren())
+        var pending = new Stack<(DomElement Element, TreeNode Node)>();
+        pending.Push((rootElement, rootNode));
+        while (pending.Count > 0)
         {
-            var childNode = MakeNode(child);
-            node.Nodes.Add(childNode);
-            AddChildren(child, childNode);
+            var (element, node) = pending.Pop();
+            foreach (var child in element.ElementChildren())
+            {
+                var childNode = MakeNode(child);
+                node.Nodes.Add(childNode);
+                pending.Push((child, childNode));
+            }
         }
     }
 
@@ -591,7 +783,9 @@ public class PageInspector : Form
 
     private static string Describe(DomElement element)
     {
-        var text = element.InnerText.Trim().Replace(Environment.NewLine, " ");
+        // FIX: InnerText is nullable (every other consumer uses ?? "") —
+        // this was a NullReferenceException on text-less elements.
+        var text = (element.InnerText ?? "").Trim().Replace(Environment.NewLine, " ");
         return text.Length == 0 ? LabelFor(element) : LabelFor(element) + " - " + (text.Length > 80 ? text[..80] + "..." : text);
     }
 
@@ -628,13 +822,19 @@ public class PageInspector : Form
         ShowElement(element);
     }
 
+    /// <summary>FIX: iterative — same deep-tree hardening.</summary>
     private static TreeNode? FindNode(TreeNodeCollection nodes, DomElement element)
     {
-        foreach (TreeNode node in nodes)
+        var stack = new Stack<TreeNodeCollection>();
+        stack.Push(nodes);
+        while (stack.Count > 0)
         {
-            if (ReferenceEquals(node.Tag, element)) return node;
-            var found = FindNode(node.Nodes, element);
-            if (found != null) return found;
+            var col = stack.Pop();
+            foreach (TreeNode node in col)
+            {
+                if (ReferenceEquals(node.Tag, element)) return node;
+                stack.Push(node.Nodes);
+            }
         }
         return null;
     }
@@ -642,9 +842,14 @@ public class PageInspector : Form
     private void FindInTree(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
+        string needle = text.Trim();
         var match = _canvas.PageDocument?.ElementDescendants().FirstOrDefault(e =>
-            LabelFor(e).Contains(text, StringComparison.OrdinalIgnoreCase) ||
-            e.InnerText.Contains(text, StringComparison.OrdinalIgnoreCase));
+        {
+            if (LabelFor(e).Contains(needle, StringComparison.OrdinalIgnoreCase)) return true;
+            // FIX: null-safe — InnerText is null for text-less elements.
+            var inner = e.InnerText;
+            return inner != null && inner.Contains(needle, StringComparison.OrdinalIgnoreCase);
+        });
         if (match != null) SelectElement(match);
     }
 
@@ -654,7 +859,8 @@ public class PageInspector : Form
         _current = element;
         var box = FindBox(element);
         var style = element.Style;
-        var text = element.InnerText.Trim();
+        // FIX: null-safe InnerText (was element.InnerText.Trim()).
+        var text = (element.InnerText ?? "").Trim();
         var childCount = element.ElementChildren().Count();
         _summary.Text = $"{LabelFor(element)}\r\n{childCount} child elements   |   {element.Attrs.Count} attributes   |   " +
                         $"{(box == null ? "not laid out" : $"{box.BoxType} box {box.BorderRect.Width:0.#} x {box.BorderRect.Height:0.#}")}";
@@ -673,7 +879,7 @@ public class PageInspector : Form
 
     private static string BuildBreadcrumbs(DomElement element)
     {
-        var parts = new System.Collections.Generic.List<string>();
+        var parts = new List<string>();
         for (DomNode? node = element; node is DomElement current; node = current.Parent)
             parts.Add(LabelFor(current));
         parts.Reverse();
@@ -742,15 +948,29 @@ public class PageInspector : Form
     private void CopyDetails()
     {
         if (_current == null) return;
-        try { Clipboard.SetText(_source.Text + "\r\n" + _computed.Text + "\r\n" + _boxInfo.Text); }
-        catch (Exception) { }
+        SafeSetClipboard(_source.Text + "\r\n" + _computed.Text + "\r\n" + _boxInfo.Text);
     }
 
     private LayoutBox? FindBox(DomElement element)
     {
         var root = _canvas.RootBox;
         if (root == null) return null;
-        return ReferenceEquals(root.Element, element) ? root : root.Descendants().FirstOrDefault(box => ReferenceEquals(box.Element, element));
+        if (ReferenceEquals(root.Element, element)) return root;
+        // FIX: uses the shared hit-tester primitive the canvas uses, instead
+        // of a private linear scan (consistent behaviour, one implementation).
+        return Engine.Layout.HitTester.BoxForElement(root, element);
+    }
+
+    /// <summary>
+    /// FIX: the clipboard is routinely held by other processes — bare
+    /// Clipboard.SetText calls (copy selector, console copy, network copy)
+    /// could throw an unhandled exception into the UI.
+    /// </summary>
+    private static void SafeSetClipboard(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        try { Clipboard.SetText(text); }
+        catch { /* clipboard busy — drop silently */ }
     }
 
     private static string ColorName(EngColor color) =>

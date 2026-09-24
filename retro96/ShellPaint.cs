@@ -110,7 +110,12 @@ internal sealed class ScreenComposer : IDisposable
                     GdiImaging.PixelFormat.Format32bppArgb);
             }
 
-            if (!SkiaWinForms.CopyInto(_surfaceWrapper, _twin))
+            // ScreenComposer clears the Skia surface to an opaque colour
+            // before compositing the page, frames and overlays. The final
+            // screen pixels therefore have alpha=255, so the screen path
+            // does not need the per-pixel alpha scan/unpremultiply work used
+            // by generic image conversion.
+            if (!SkiaWinForms.CopyOpaqueInto(_surfaceWrapper, _twin))
             {
                 // Never present a half-written or mismatched twin.
                 _twin.Dispose();
@@ -163,6 +168,45 @@ internal sealed class ScreenComposer : IDisposable
 /// <summary>Engine-bitmap → GDI-bitmap conversion (screen blit, printing).</summary>
 internal static class SkiaWinForms
 {
+    /// <summary>Fast screen path for an already-opaque Skia surface.</summary>
+    public static bool CopyOpaqueInto(Bitmap engine, Gdi.Bitmap target)
+    {
+        if (engine == null || target == null) return false;
+
+        var sk = engine.SkBitmap;
+        if (sk.Width <= 0 || sk.Height <= 0) return false;
+        if (sk.Width != target.Width || sk.Height != target.Height) return false;
+
+        IntPtr srcBase = sk.GetPixels();
+        if (srcBase == IntPtr.Zero) return false;
+
+        int srcRow = sk.RowBytes;
+        int widthBytes = sk.Width * 4;
+        if (srcRow < widthBytes) return false;
+
+        var bd = target.LockBits(
+            new Gdi.Rectangle(0, 0, sk.Width, sk.Height),
+            GdiImaging.ImageLockMode.WriteOnly,
+            GdiImaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            if (bd.Stride < widthBytes) return false;
+
+            byte[] buf = GetRowBuffer(widthBytes);
+            IntPtr dstBase = bd.Scan0;
+            for (int y = 0; y < sk.Height; y++)
+            {
+                Marshal.Copy(IntPtr.Add(srcBase, y * srcRow), buf, 0, widthBytes);
+                Marshal.Copy(buf, 0, IntPtr.Add(dstBase, y * bd.Stride), widthBytes);
+            }
+            return true;
+        }
+        finally
+        {
+            target.UnlockBits(bd);
+        }
+    }
+
     // Reused per conversion — a paint never allocates.
     [ThreadStatic] private static byte[]? _rowBuffer;
 

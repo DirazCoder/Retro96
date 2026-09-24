@@ -35,7 +35,7 @@ public class BrowserCanvas : Control
     private readonly HScrollBar _hScroll = new();
     private PointF _scrollOffset = PointF.Empty;
 
-    private readonly Timer _animationTimer = new() { Interval = 1 };
+    private readonly Timer _animationTimer = new() { Interval = 100 };
     private readonly Timer _blinkTimer = new() { Interval = 500 };
     private readonly Timer _jsTimer = new() { Interval = 50 };
     private readonly Timer _resizeReflowTimer = new() { Interval = 150 };
@@ -813,11 +813,29 @@ public class BrowserCanvas : Control
         if (_renderedBitmap != null)
         {
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            int blitX = Math.Max(0, (int)_scrollOffset.X);
-            int blitY = Math.Max(0, (int)_scrollOffset.Y);
-            g.DrawImage(_renderedBitmap, -blitX, -blitY);
+
+            // IMPORTANT PERF: the page bitmap can be many thousands of
+            // pixels tall.  Passing the whole bitmap with a translated
+            // destination makes the raster backend consider the full source
+            // image on every scroll paint.  Give Skia the exact source slice
+            // that is visible instead.  Scrolling then costs roughly one
+            // viewport, not one whole document.
+            int sourceX = Math.Clamp((int)_scrollOffset.X, 0,
+                Math.Max(0, _renderedBitmap.Width - 1));
+            int sourceY = Math.Clamp((int)_scrollOffset.Y, 0,
+                Math.Max(0, _renderedBitmap.Height - 1));
+            int sourceW = Math.Min(vw, _renderedBitmap.Width - sourceX);
+            int sourceH = Math.Min(vh, _renderedBitmap.Height - sourceY);
+            if (sourceW > 0 && sourceH > 0)
+            {
+                g.DrawImage(_renderedBitmap,
+                    new RectangleF(0, 0, sourceW, sourceH),
+                    new RectangleF(sourceX, sourceY, sourceW, sourceH),
+                    GraphicsUnit.Pixel);
+            }
         }
 
+        var viewportRect = new RectangleF(0, 0, vw, vh);
         foreach (var (box, view) in _frames)
         {
             if (view.Rendered == null) continue;
@@ -827,20 +845,36 @@ public class BrowserCanvas : Control
                 box.Y - _scrollOffset.Y,
                 box.Width, box.Height);
 
-            float sw = Math.Min(destRect.Width, view.Rendered.Width - view.Scroll.X);
-            float sh = Math.Min(destRect.Height, view.Rendered.Height - view.Scroll.Y);
-            if (sw > 0 && sh > 0)
+            // Skip frames that are completely outside the viewport.  This is
+            // especially important on old-school sites with many stacked
+            // frames: their bitmaps can be large even though only a tiny
+            // fraction of the page is visible.
+            // Compute the viewport intersection explicitly.  Using
+            // RectangleF.Intersect here can bind to LINQ/AsyncEnumerable
+            // overloads in this project because of the imported namespaces.
+            float visibleLeft = Math.Max(destRect.Left, viewportRect.Left);
+            float visibleTop = Math.Max(destRect.Top, viewportRect.Top);
+            float visibleRight = Math.Min(destRect.Right, viewportRect.Right);
+            float visibleBottom = Math.Min(destRect.Bottom, viewportRect.Bottom);
+            var visible = new RectangleF(
+                visibleLeft,
+                visibleTop,
+                Math.Max(0f, visibleRight - visibleLeft),
+                Math.Max(0f, visibleBottom - visibleTop));
+            float sourceX = view.Scroll.X + (visible.X - destRect.X);
+            float sourceY = view.Scroll.Y + (visible.Y - destRect.Y);
+            float sourceW = Math.Min(visible.Width, view.Rendered.Width - sourceX);
+            float sourceH = Math.Min(visible.Height, view.Rendered.Height - sourceY);
+
+            if (visible.Width > 0 && visible.Height > 0 && sourceW > 0 && sourceH > 0)
             {
-                var state = g.Save();
-                g.SetClip(destRect);
                 g.DrawImage(view.Rendered,
-                    new RectangleF(destRect.X, destRect.Y, sw, sh),
-                    new RectangleF(view.Scroll.X, view.Scroll.Y, sw, sh),
+                    new RectangleF(visible.X, visible.Y, sourceW, sourceH),
+                    new RectangleF(sourceX, sourceY, sourceW, sourceH),
                     GraphicsUnit.Pixel);
-                g.Restore(state);
             }
 
-            if (_focusedFrame == box)
+            if (_focusedFrame == box && visible.Width > 0 && visible.Height > 0)
             {
                 using var focusPen = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 1);
                 g.DrawRectangle(focusPen, destRect.X, destRect.Y,
