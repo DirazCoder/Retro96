@@ -104,6 +104,12 @@ public static class FrameLoader
 
                 case "file":
                     {
+                        bool parentIsHostOpenedLocalPage =
+                            baseUrl?.StartsWith("file:", StringComparison.OrdinalIgnoreCase) == true;
+                        if (!parentIsHostOpenedLocalPage && !BrowserRuntime.AllowPageFileAccess)
+                            return ErrorContent(
+                                ErrorPage.AccessDenied(abs), abs, frameW, frameH);
+
                         string? local = FileUrls.LocalPathFromFileUrl(parsed);
                         if (local == null || !File.Exists(local))
                             return ErrorContent(

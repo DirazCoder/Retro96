@@ -57,6 +57,13 @@ public class ResourceLoader : IDisposable
         }
 
         string absoluteUrl = resolvedUrl.ToAbsolute();
+        if (resolvedUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase) &&
+            !BrowserRuntime.AllowPageFileAccess)
+            return new HttpError("Local file resources are blocked by the current trust mode");
+
+        if (!resolvedUrl.IsHttp)
+            return new HttpError("Only host-mediated HTTP(S) resources are allowed here");
+
         DateTime startedUtc = DateTime.UtcNow;
 
         // Lazy-based de-duplication: two concurrent FetchAsync calls for

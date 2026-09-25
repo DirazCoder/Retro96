@@ -201,7 +201,7 @@ public static class DomBindings
             string url = args.Length > 0 ? args[0].ToJsString() : "";
             // Feature strings ("width=400,height=300") were cosmetic
             // differences between shells — accepted and ignored here.
-            if (!string.IsNullOrEmpty(url))
+            if (!string.IsNullOrEmpty(url) && BrowserRuntime.ScriptedWindowsAllowed)
                 canvas.OpenNewWindow(url);
             return JsValue.Undefined;
         }));
@@ -267,17 +267,28 @@ public static class DomBindings
 
     private static void RegisterNavigator(JsScope scope)
     {
+        var prefs = BrowserRuntime.Settings;
         var n = new JsObject();
 
         // Pretend to be Navigator 3.01 on Windows 95 — this is what
         // era sniffing scripts expect to find
-        n.Set("appName", JsValue.From("Netscape"));
-        n.Set("appVersion", JsValue.From("3.01 (Win95; I)"));
-        n.Set("appCodeName", JsValue.From("Mozilla"));
-        n.Set("userAgent", JsValue.From("Mozilla/3.0 (compatible; Retro96/1.0; Windows 95)"));
+        if (prefs.EngineMode == RetroEngineMode.InternetExplorer3)
+        {
+            n.Set("appName", JsValue.From("Microsoft Internet Explorer"));
+            n.Set("appVersion", JsValue.From("3.02 (Windows 95)"));
+            n.Set("appCodeName", JsValue.From("Mozilla"));
+        }
+        else
+        {
+            n.Set("appName", JsValue.From("Netscape"));
+            n.Set("appVersion", JsValue.From("3.01 (Win95; I)"));
+            n.Set("appCodeName", JsValue.From("Mozilla"));
+        }
+
+        n.Set("userAgent", JsValue.From(prefs.EffectiveUserAgent));
         n.Set("language", JsValue.From("en"));
         n.Set("platform", JsValue.From("Win32"));
-        n.Set("cookieEnabled", JsValue.From(true));
+        n.Set("cookieEnabled", JsValue.From(BrowserRuntime.CookiesEnabled));
 
         // mimeTypes / plugins — sniffed occasionally; empty arrays
         n.Set("mimeTypes", JsValue.FromObject(NewArray(scope)));
@@ -739,8 +750,23 @@ public static class DomBindings
                         return JsValue.FromObject(WrapElement(target, _state));
                     }
                 case "cookie":
+                    if (!BrowserRuntime.CookiesEnabled) return JsValue.From("");
                     try { return JsValue.From(_doc.Cookies.Get(BaseUrlOrBlank)); }
                     catch { return JsValue.From(""); }
+                case "all" when BrowserRuntime.Settings.EngineMode == RetroEngineMode.InternetExplorer3:
+                    {
+                        var all = NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope());
+                        if (_state != null)
+                        {
+                            int i = 0;
+                            foreach (var e in _doc.ElementDescendants())
+                                all.Set((i++).ToString(), JsValue.FromObject(WrapElement(e, _state)));
+                            all.Set("length", JsValue.From(i));
+                        }
+                        return JsValue.FromObject(all);
+                    }
+                case "layers" when BrowserRuntime.Settings.EngineMode == RetroEngineMode.Netscape3:
+                    return JsValue.FromObject(NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope()));
                 case "bgColor": return JsValue.From(Body?.GetAttr("bgcolor") ?? "#c0c0c0");
                 case "fgColor": return JsValue.From(_doc.BodyTextColor);
                 case "linkColor": return JsValue.From(_doc.BodyLinkColor);
@@ -779,6 +805,7 @@ public static class DomBindings
                     _canvas.UpdateDocumentTitle(_doc.Title);
                     return;
                 case "cookie":
+                    if (!BrowserRuntime.CookiesEnabled) return;
                     try { _doc.Cookies.Set(value.ToJsString(), BaseUrlOrBlank); }
                     catch { /* cookies are best-effort from script */ }
                     return;

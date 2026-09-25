@@ -42,6 +42,16 @@ public class ImageCache : IDisposable
     public CookieStore? CookieStore { get; set; }
 
     /// <summary>
+    /// True only while the current document is one the user opened directly
+    /// via File → Open (a genuine local file: page). A remote page must
+    /// never be able to pull file:// image sources off the user's disk just
+    /// by embedding one — that flag stays false for anything fetched over
+    /// http(s), even if it references a file:// URL. Form1 sets this on
+    /// navigation start/end; it is not inferred from the image URL itself.
+    /// </summary>
+    public bool HostOpenedLocalPage { get; set; }
+
+    /// <summary>
     /// Raised when a URL finishes loading SUCCESSFULLY after having been
     /// cached as a transient failure — i.e. a refetch that no caller is
     /// awaiting (the painter fires GetAsync and moves on).  The shell hooks
@@ -255,6 +265,9 @@ public class ImageCache : IDisposable
         if (!decoded.IsAnimated || decoded.Frames.Count == 1)
             return decoded.Frames[0];
 
+        if (!BrowserRuntime.AnimatedImagesEnabled)
+            return decoded.Frames[0];
+
         var state = _animState.GetOrAdd(absoluteUrl, _ => new AnimationState());
 
         // Advance as many frames as elapsed time covers so playback stays
@@ -344,6 +357,10 @@ public class ImageCache : IDisposable
             // dolekemp96.org landing page was all broken icons.
             if (parsedUrl.Scheme == "file")
             {
+                // Trust decision already made by IsSafeImageUrl above
+                // (HostOpenedLocalPage OR AllowPageFileAccess) — don't
+                // duplicate it here with a narrower check that ignores
+                // the AllowPageFileAccess override.
                 var local = LocalPathFromFileUrl(absoluteUrl);
                 if (local == null)
                     return MarkBroken(absoluteUrl);

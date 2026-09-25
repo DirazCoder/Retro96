@@ -366,13 +366,22 @@ public class BrowserCanvas : Control
     // ─────────────────────────────────────────────────────────────────────
 
     public virtual void ShowAlert(string message)
-        => MessageBox.Show(FindForm(), message, "Retro96", MessageBoxButtons.OK);
+    {
+        if (!BrowserRuntime.JavaScriptDialogsEnabled) return;
+        MessageBox.Show(FindForm(), message, "Retro96", MessageBoxButtons.OK);
+    }
 
     public virtual bool ShowConfirm(string message)
-        => MessageBox.Show(FindForm(), message, "Retro96", MessageBoxButtons.YesNo) == DialogResult.Yes;
+    {
+        if (!BrowserRuntime.JavaScriptDialogsEnabled) return false;
+        return MessageBox.Show(FindForm(), message, "Retro96", MessageBoxButtons.YesNo) == DialogResult.Yes;
+    }
 
     public virtual string? ShowPrompt(string message, string defaultValue)
-        => PromptDialog.Show(FindForm(), message, defaultValue);
+    {
+        if (!BrowserRuntime.JavaScriptDialogsEnabled) return null;
+        return PromptDialog.Show(FindForm(), message, defaultValue);
+    }
 
     public virtual void CloseHostWindow()
         => FindForm()?.Close();
@@ -3766,29 +3775,44 @@ public class BrowserCanvas : Control
         }
         _hasAnimatedImages = _imageCache?.HasAnimatedImages ?? false;
 
-        bool needsAnimation = _hasAnimatedImages || _hasMarquee;
+        bool needsAnimatedImages = BrowserRuntime.AnimatedImagesEnabled && _hasAnimatedImages;
+        bool needsMarquee = BrowserRuntime.MarqueeEnabled && _hasMarquee;
+        bool needsAnimation = needsAnimatedImages || needsMarquee;
         if (needsAnimation) { if (!_animationTimer.Enabled) _animationTimer.Start(); }
         else if (_animationTimer.Enabled) _animationTimer.Stop();
 
-        if (hasBlink) { if (!_blinkTimer.Enabled) _blinkTimer.Start(); }
+        if (!BrowserRuntime.BlinkEnabled)
+            _blinkVisible = true;
+
+        if (BrowserRuntime.BlinkEnabled && hasBlink)
+        {
+            if (!_blinkTimer.Enabled) _blinkTimer.Start();
+        }
         else if (_blinkTimer.Enabled) _blinkTimer.Stop();
 
         // PERF: the JS timer used to run forever at 20 Hz even with no
         // interpreter at all.  It now stops when there's nothing to tick.
-        bool needsJsTick = _jsInterpreter != null ||
-            _frames.Values.Any(v => v.Interpreter != null);
+        bool needsJsTick = BrowserRuntime.JavaScriptTimersEnabled &&
+            (_jsInterpreter != null || _frames.Values.Any(v => v.Interpreter != null));
         if (needsJsTick) { if (!_jsTimer.Enabled) _jsTimer.Start(); }
         else if (_jsTimer.Enabled) _jsTimer.Stop();
     }
 
     private void OnAnimationTick(object? sender, EventArgs e)
     {
-        if (_hasAnimatedImages || _hasMarquee)
+        if ((BrowserRuntime.AnimatedImagesEnabled && _hasAnimatedImages) ||
+            (BrowserRuntime.MarqueeEnabled && _hasMarquee))
             RequestRerender();
     }
 
     private void OnBlinkTick(object? sender, EventArgs e)
     {
+        if (!BrowserRuntime.BlinkEnabled)
+        {
+            _blinkVisible = true;
+            _blinkTimer.Stop();
+            return;
+        }
         _blinkVisible = !_blinkVisible;
         RequestRerender();
     }
@@ -3824,6 +3848,12 @@ public class BrowserCanvas : Control
 
     private void OnJsTimerTick(object? sender, EventArgs e)
     {
+        if (!BrowserRuntime.JavaScriptTimersEnabled)
+        {
+            _jsTimer.Stop();
+            return;
+        }
+
         _jsInterpreter?.TickTimers();
 
         // Frame scripts run on their own interpreters — tick those too, or
@@ -3925,6 +3955,7 @@ public class BrowserCanvas : Control
 
     public void PrefetchImage(string url)
     {
+        if (!BrowserRuntime.ImagesEnabled) return;
         if (_resourceLoader == null || _imageCache == null || _document?.BaseUrl == null)
             return;
         try

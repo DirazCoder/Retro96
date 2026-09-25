@@ -39,6 +39,19 @@ public record TooManyRedirects() : HttpResult;
 /// </summary>
 public class HttpClient
 {
+    private readonly bool _allowInvalidCertificates;
+
+    public HttpClient(bool allowInvalidCertificates = true)
+    {
+        _allowInvalidCertificates = allowInvalidCertificates;
+    }
+
+    /// <summary>When set by a broker session, this replaces BrowserRuntime.UserAgent for wire headers.</summary>
+    public string? UserAgentOverride { get; set; }
+
+    /// <summary>Current page URL used as the Referer header when enabled.</summary>
+    public string? ReferrerOverride { get; set; }
+
     private const int MaxRedirects = 5;
     private const int MaxBodySize = 8 * 1024 * 1024;    // 8 MB is generous for 1996 pages
     private const int ConnectTimeoutMs = 10_000;
@@ -51,11 +64,18 @@ public class HttpClient
     // derives a loopback-only client so external-host luck can never
     // influence a diff run).  Behaviour is unchanged for the shell.
     public virtual Task<HttpResult> GetAsync(ParsedUrl url, CookieStore cookies, CancellationToken ct) =>
-        SendRequestAsync("GET", url, null, cookies, ct);
+        GetAsync(url, cookies, ct, ResourceKind.Document);
+
+    public virtual Task<HttpResult> GetAsync(ParsedUrl url, CookieStore cookies, CancellationToken ct, ResourceKind resourceKind) =>
+        SendRequestAsync("GET", url, null, cookies, ct, resourceKind: resourceKind);
 
     public virtual Task<HttpResult> PostAsync(ParsedUrl url, string formData,
                                              CookieStore cookies, CancellationToken ct) =>
-        SendRequestAsync("POST", url, Encoding.ASCII.GetBytes(formData), cookies, ct);
+        PostAsync(url, formData, cookies, ct, ResourceKind.Document);
+
+    public virtual Task<HttpResult> PostAsync(ParsedUrl url, string formData,
+                                             CookieStore cookies, CancellationToken ct, ResourceKind resourceKind) =>
+        SendRequestAsync("POST", url, Encoding.ASCII.GetBytes(formData), cookies, ct, resourceKind: resourceKind);
 
     /// <summary>
     /// POST with multipart/form-data — file upload encoding.
@@ -94,7 +114,7 @@ public class HttpClient
 
     private async Task<HttpResult> SendRequestAsync(
         string method, ParsedUrl url, byte[]? body, CookieStore cookies,
-        CancellationToken ct, int redirectCount = 0, string? contentType = null)
+        CancellationToken ct, int redirectCount = 0, string? contentType = null, ResourceKind resourceKind = ResourceKind.Document)
     {
         if (redirectCount > MaxRedirects)
             return new TooManyRedirects();
@@ -106,7 +126,7 @@ public class HttpClient
 
         // Bare "name=value; …" values — the "Cookie: " prefix is added when
         // the header block is built.
-        string cookieValues = cookies.Get(url);
+        string cookieValues = BrowserRuntime.CookiesEnabled ? cookies.Get(url) : string.Empty;
         string requestPath = string.IsNullOrEmpty(url.Query)
             ? url.Path
             : url.Path + "?" + url.Query;
@@ -114,17 +134,43 @@ public class HttpClient
         var (headerBlock, headerBytes) = BuildRequestHeaders(
             method, url, requestPath, cookieValues, body, contentType);
 
-        var result = await SendOverSocketAsync(url, headerBytes, ct);
+        HttpResult result;
+        if (SandboxContext.BrokerAllNetwork ||
+            (resourceKind == ResourceKind.Image && SandboxContext.BrokerImages))
+        {
+            if (SandboxContext.Broker == null)
+                return new HttpError("Network broker is unavailable in the current isolation mode");
+
+            var wireHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in headerBlock.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+            {
+                int colon = line.IndexOf(':');
+                if (colon > 0) wireHeaders[line[..colon].Trim()] = line[(colon + 1)..].Trim();
+            }
+
+            var brokerReply = await SandboxContext.Broker.FetchRawAsync(
+                method, url.ToAbsolute(), wireHeaders,
+                body, resourceKind.ToString(), MaxBodySize, ct).ConfigureAwait(false);
+            result = MapBrokerReply(brokerReply, url);
+        }
+        else
+        {
+            result = await SendOverSocketAsync(url, headerBytes, ct);
+        }
 
         if (result is not HttpSuccess success)
             return result;
 
         // Set-Cookie on ANY response (including redirects)
-        StoreCookies(success, url, cookies);
+        if (BrowserRuntime.CookiesEnabled)
+            StoreCookies(success, url, cookies);
 
         if (IsRedirect(success.StatusCode) &&
             success.Headers.TryGetValue("location", out var location))
         {
+            if (!BrowserRuntime.RedirectsEnabled)
+                return new HttpError("HTTP redirects are disabled in Preferences → Advanced.");
+
             ParsedUrl newUrl;
             try
             {
@@ -144,10 +190,32 @@ public class HttpClient
                 useGet ? "GET" : method,
                 newUrl,
                 useGet ? null : body,
-                cookies, ct, redirectCount + 1, contentType);
+                cookies, ct, redirectCount + 1, contentType, resourceKind);
         }
 
         return success;
+    }
+
+    private static HttpResult MapBrokerReply(SandboxProtocol.FetchReply reply, ParsedUrl url)
+    {
+        if (reply.Success)
+        {
+            byte[] body;
+            try { body = string.IsNullOrEmpty(reply.BodyBase64) ? Array.Empty<byte>() : Convert.FromBase64String(reply.BodyBase64); }
+            catch { return new HttpError("Sandbox broker returned invalid response bytes"); }
+
+            return new HttpSuccess(
+                reply.StatusCode,
+                reply.Headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                reply.ContentType ?? "",
+                reply.Charset ?? "",
+                body,
+                string.IsNullOrEmpty(reply.EffectiveUrl) ? url.ToAbsolute() : reply.EffectiveUrl);
+        }
+
+        if (!string.IsNullOrEmpty(reply.CertError))
+            return new CertError(reply.CertError);
+        return new HttpError(reply.Error ?? "Sandbox broker request failed");
     }
 
     private static void StoreCookies(HttpSuccess success, ParsedUrl url, CookieStore cookies)
@@ -181,7 +249,7 @@ public class HttpClient
         sb.Append("Host: ").Append(hostHeader).Append("\r\n");
 
         // Match navigator.userAgent so sniffing scripts agree with the wire
-        sb.Append("User-Agent: Mozilla/3.0 (compatible; Retro96/1.0; Windows 95)\r\n");
+        sb.Append("User-Agent: ").Append(UserAgentOverride ?? BrowserRuntime.UserAgent).Append("\r\n");
         sb.Append("Accept: text/html, image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, */*\r\n");
         sb.Append("Accept-Charset: iso-8859-1,*,utf-8\r\n");
 
@@ -190,6 +258,9 @@ public class HttpClient
 
         if (BasicAuthHeader != null)
             sb.Append("Authorization: ").Append(BasicAuthHeader).Append("\r\n");
+
+        if (BrowserRuntime.ReferrerEnabled && !string.IsNullOrWhiteSpace(ReferrerOverride))
+            sb.Append("Referer: ").Append(ReferrerOverride).Append("\r\n");
 
         if (body != null && body.Length > 0)
         {
@@ -223,15 +294,21 @@ public class HttpClient
         return (headerText, wire);
     }
 
+    internal async Task<HttpResult> SendRawAsync(
+        ParsedUrl url, byte[] wire, CancellationToken ct, System.Net.IPAddress? connectAddress = null) =>
+        await SendOverSocketAsync(url, wire, ct, connectAddress).ConfigureAwait(false);
+
     private async Task<HttpResult> SendOverSocketAsync(
-        ParsedUrl url, byte[] wire, CancellationToken ct)
+        ParsedUrl url, byte[] wire, CancellationToken ct, System.Net.IPAddress? connectAddress = null)
     {
         TcpClient? tcpClient = null;
         try
         {
             tcpClient = new TcpClient();
 
-            var connectTask = tcpClient.ConnectAsync(url.Host, url.Port, ct).AsTask();
+            var connectTask = connectAddress == null
+                ? tcpClient.ConnectAsync(url.Host, url.Port, ct).AsTask()
+                : tcpClient.ConnectAsync(connectAddress, url.Port, ct).AsTask();
             var timeoutTask = Task.Delay(ConnectTimeoutMs, ct);
             var completed = await Task.WhenAny(connectTask, timeoutTask);
 
@@ -255,7 +332,7 @@ public class HttpClient
                 try
                 {
                     var sslStream = new SslStream(stream, false,
-                        (sender, cert, chain, errors) => true);   // 1996: no validation UI
+                        (sender, cert, chain, errors) => _allowInvalidCertificates || errors == SslPolicyErrors.None);
                     await sslStream.AuthenticateAsClientAsync(url.Host);
                     stream = sslStream;
                 }

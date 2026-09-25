@@ -113,6 +113,7 @@ public partial class Form1 : Form
     private readonly FontCache _fontCache = new();
     private ResourceLoader? _resourceLoader;
     private readonly HttpClient _httpClient = new();
+    private bool _hostOpenedLocalDocument;
 
     // Per-page JS
     private JsScope? _globalScope;
@@ -121,6 +122,7 @@ public partial class Form1 : Form
 
     public Form1()
     {
+        BrowserRuntime.Apply(_settings);
         InitializeComponent();
         InitializeBrowser();
     }
@@ -140,9 +142,18 @@ public partial class Form1 : Form
         FormClosing += (s, e) =>
         {
             _loadCts?.Cancel();
+            if (_settings.DiscardPageStateOnClose)
+            {
+                _canvas.ClearForNavigation();
+                _cookieStore.ClearAll();
+            }
             _resourceLoader?.Dispose();
             _imageCache?.Dispose();
             _fontCache?.Dispose();
+            _globalScope = null;
+            _jsState = null;
+            _jsInterpreter = null;
+            _currentPageUrl = null;
             foreach (var child in _childWindows.ToArray())
                 child.Close();
         };
@@ -256,8 +267,8 @@ public partial class Form1 : Form
                 _txtUrl.Width = (int)(480 * scale);
             }
 
-            // Land on the built-in home page instead of a blank canvas.
-            NavigateTo("retro96:home");
+            // Land on the configured home page instead of a blank canvas.
+            NavigateTo(_settings.HomePageUrl);
             SetAppIcon();
         };
 
@@ -286,6 +297,7 @@ public partial class Form1 : Form
     {
         _resourceLoader = new ResourceLoader(_cookieStore);
         _imageCache.CookieStore = _cookieStore;
+        _imageCache.HostOpenedLocalPage = _hostOpenedLocalDocument;
 
         // An image that failed transiently and later recovered (cooldown
         // refetch triggered from a paint) has nobody awaiting it — repaint
@@ -366,62 +378,44 @@ public partial class Form1 : Form
 
     private void ShowPreferencesDialog()
     {
-        using var form = new Form
-        {
-            Text = "Retro96 — Preferences",
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            StartPosition = FormStartPosition.CenterParent,
-            ClientSize = new Size(440, 150),
-            ShowInTaskbar = false,
-            Font = new Font("Microsoft Sans Serif", 8.25f)
-        };
+        using var dialog = new PreferencesDialog(_settings);
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
-        var label = new Label
-        {
-            Text = "Search query URL — %s marks where the query goes:",
-            AutoSize = true,
-            Location = new Point(12, 14)
-        };
-        var box = new TextBox
-        {
-            Text = _settings.SearchQueryUrl,
-            Location = new Point(12, 38),
-            Width = 410
-        };
-        var hint = new Label
-        {
-            Text = "Default: " + UserSettings.DefaultSearchUrl + "  (FrogFind)",
-            AutoSize = true,
-            Location = new Point(12, 66),
-            ForeColor = SystemColors.GrayText
-        };
-        var ok = new Button
-        {
-            Text = "OK",
-            DialogResult = DialogResult.OK,
-            Location = new Point(260, 104),
-            Width = 75
-        };
-        var cancel = new Button
-        {
-            Text = "Cancel",
-            DialogResult = DialogResult.Cancel,
-            Location = new Point(345, 104),
-            Width = 75
-        };
+        var updated = dialog.Settings;
+        _settings.SearchQueryUrl = updated.SearchQueryUrl;
+        _settings.HomePageUrl = updated.HomePageUrl;
+        _settings.EngineMode = updated.EngineMode;
+        _settings.UserAgentOverride = updated.UserAgentOverride;
+        _settings.BackgroundMode = updated.BackgroundMode;
+        _settings.ForcedBackgroundColor = updated.ForcedBackgroundColor;
+        _settings.LoadImages = updated.LoadImages;
+        _settings.EnableJavaScript = updated.EnableJavaScript;
+        _settings.AllowScriptedWindows = updated.AllowScriptedWindows;
+        _settings.LoadStylesheets = updated.LoadStylesheets;
+        _settings.LoadFrames = updated.LoadFrames;
+        _settings.AllowFormSubmissions = updated.AllowFormSubmissions;
+        _settings.EnableJavaScriptTimers = updated.EnableJavaScriptTimers;
+        _settings.EnableJavaScriptDialogs = updated.EnableJavaScriptDialogs;
+        _settings.FollowHttpRedirects = updated.FollowHttpRedirects;
+        _settings.FollowMetaRefresh = updated.FollowMetaRefresh;
+        _settings.EnableCookies = updated.EnableCookies;
+        _settings.SendReferrer = updated.SendReferrer;
+        _settings.AnimateImages = updated.AnimateImages;
+        _settings.BlinkText = updated.BlinkText;
+        _settings.MarqueeText = updated.MarqueeText;
+        _settings.TrustMode = updated.TrustMode;
+        _settings.HostCheckImages = updated.HostCheckImages;
+        _settings.DiscardPageStateOnClose = updated.DiscardPageStateOnClose;
+        _settings.Save();
+        BrowserRuntime.Apply(_settings);
 
-        form.Controls.AddRange(new Control[] { label, box, hint, ok, cancel });
-        form.AcceptButton = ok;
-        form.CancelButton = cancel;
-
-        if (form.ShowDialog(this) == DialogResult.OK)
-        {
-            string v = box.Text.Trim();
-            _settings.SearchQueryUrl = v.Length > 0 ? v : UserSettings.DefaultSearchUrl;
-            _settings.Save();
-        }
+        // Preferences are live for the current page where possible.  A reload
+        // is required for navigator/User-Agent, scripting and newly tightened
+        // resource policy to apply consistently to the active document.
+        if (_currentPageUrl != null)
+            Reload();
+        else
+            _canvas.RequestRerender();
     }
 
     private static string EscapeHtmlText(string? s) =>
@@ -438,6 +432,19 @@ public partial class Form1 : Form
                                      bool replaceHistory = false)
     {
         if (string.IsNullOrWhiteSpace(rawUrl)) return;
+
+        if (rawUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
+            !_hostOpenedLocalDocument && !BrowserRuntime.AllowPageFileAccess)
+        {
+            _statusLabel.Text = "Blocked by the current security mode: page-directed file access.";
+            return;
+        }
+
+        if (!rawUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            _hostOpenedLocalDocument = false;
+            _imageCache.HostOpenedLocalPage = false;
+        }
 
         long myGeneration = ++_navGeneration;
         _canvas.ClearForNavigation();
@@ -583,7 +590,8 @@ public partial class Form1 : Form
             _loadCts?.Cancel();
             _loadCts = new CancellationTokenSource();
             var ct = _loadCts.Token;
-            _referrerUrl = _currentPageUrl;
+            _referrerUrl = BrowserRuntime.ReferrerEnabled ? _currentPageUrl : null;
+            _httpClient.ReferrerOverride = BrowserRuntime.ReferrerEnabled ? _referrerUrl : null;
 
             try
             {
@@ -802,7 +810,8 @@ public partial class Form1 : Form
         state.Referrer = _referrerUrl ?? "";
 
         BeginInvoke(() => _statusLabel.Text = "Fetching stylesheets…");
-        await FetchStylesheetsAsync(document, url, ct);
+        if (BrowserRuntime.StylesheetsEnabled)
+            await FetchStylesheetsAsync(document, url, ct);
 
         BeginInvoke(() => _statusLabel.Text = "Laying out…");
         _visitedUrls.Add(url.ToAbsolute());
@@ -831,7 +840,7 @@ public partial class Form1 : Form
                     interpreter.CallHandler(onload, JsValue.FromObject(win));
                 var body = document.ElementDescendants()
                     .FirstOrDefault(e => e.TagName == "body");
-                if (body != null)
+                if (body != null && BrowserRuntime.JavaScriptEnabled)
                 {
                     DebugLog.Write($"BODY ONLOAD: found attrs={body.Attrs.Count} " +
                                    $"handlers=[{string.Join(",", body.EventHandlers.Keys)}]");
@@ -879,16 +888,20 @@ public partial class Form1 : Form
                 }
                 else
                     DebugLog.Write("BODY ONLOAD: body element not found");
-                foreach (var elem in document.ElementDescendants()
-                             .Where(e => !ReferenceEquals(e, body) &&
-                                        e.EventHandlers.ContainsKey("onload")))
-                    interpreter.FireEvent(elem, "onload");
+                if (BrowserRuntime.JavaScriptEnabled)
+                {
+                    foreach (var elem in document.ElementDescendants()
+                                 .Where(e => !ReferenceEquals(e, body) &&
+                                            e.EventHandlers.ContainsKey("onload")))
+                        interpreter.FireEvent(elem, "onload");
+                }
                 // Start image loading after the initial page is live. Fast
                 // data-URI images otherwise queued natural-size reflow
                 // against the old page before UpdatePage installed it.
                 _ = PrefetchImagesAsync(document, url, ct,
                     reflowWhenLoaded: true, myGeneration);
-                _ = LoadFramesAsync(document, rootBox);
+                if (BrowserRuntime.FramesEnabled)
+                    _ = LoadFramesAsync(document, rootBox);
             }
             catch (Exception ex)
             {
@@ -902,7 +915,7 @@ public partial class Form1 : Form
             }
         });
 
-        if (!string.IsNullOrEmpty(document.MetaRefresh))
+        if (BrowserRuntime.MetaRefreshEnabled && !string.IsNullOrEmpty(document.MetaRefresh))
         {
             var (delay, refreshUrl) = ParseMetaRefresh(document.MetaRefresh, url);
             if (refreshUrl != null)
@@ -1032,7 +1045,9 @@ public partial class Form1 : Form
         _jsInterpreter.RegisterRuntimeBuiltins();
 
         var document = HtmlParser.Parse(html, url, _cookieStore,
-            (doc, src) => RunInlineScript(doc, src, _jsInterpreter, _jsState));
+            BrowserRuntime.JavaScriptEnabled
+                ? (doc, src) => RunInlineScript(doc, src, _jsInterpreter!, _jsState!)
+                : null);
 
         return (document, _jsInterpreter, _jsState);
     }
@@ -1135,6 +1150,8 @@ public partial class Form1 : Form
                                            CancellationToken ct, bool reflowWhenLoaded,
                                            long myGeneration)
     {
+        if (!BrowserRuntime.ImagesEnabled) return;
+        _imageCache.HostOpenedLocalPage = _hostOpenedLocalDocument;
         var urls = new List<string>();
 
         foreach (var elem in doc.ElementDescendants())
@@ -1230,6 +1247,7 @@ public partial class Form1 : Form
 
     private async Task FetchOneImageAsync(string absoluteUrl, CancellationToken ct, long myGeneration)
     {
+        if (!BrowserRuntime.ImagesEnabled) return;
         try
         {
             await _imageCache.GetAsync(absoluteUrl, _resourceLoader!, ct);
@@ -1317,8 +1335,9 @@ public partial class Form1 : Form
                     baseUrl, src,
                     (int)frameBox.Width, (int)frameBox.Height,
                     _httpClient, _cookieStore, frameCts.Token,
-                    (fdoc, scriptSrc) => RunFrameScript(
-                        fdoc, scriptSrc, frameInterpreter, frameState));
+                    BrowserRuntime.JavaScriptEnabled
+                        ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, frameInterpreter, frameState)
+                        : null);
                 if (gen != _navGeneration) return;
 
                 if (content != null)
@@ -1401,6 +1420,7 @@ public partial class Form1 : Form
                                   DocumentBindingsState state)
     {
         state.Document = document;
+        if (!BrowserRuntime.JavaScriptEnabled) return "";
         DomBindings.RegisterAll((JsScope)interpreter.GlobalScope!, document,
             new NavigationHistory(), _canvas, state);
         interpreter.RegisterRuntimeBuiltins();
@@ -1446,9 +1466,12 @@ public partial class Form1 : Form
             var fwin = frameState.WindowObject;
             if (fwin != null && fwin.Get("onload") is { Type: JsType.Function } fol)
                 frameInterpreter.CallHandler(fol, JsValue.FromObject(fwin));
-            foreach (var elem in content.Document.ElementDescendants()
-                         .Where(e => e.EventHandlers.ContainsKey("onload")))
-                frameInterpreter.FireEvent(elem, "onload");
+            if (BrowserRuntime.JavaScriptEnabled)
+            {
+                foreach (var elem in content.Document.ElementDescendants()
+                             .Where(e => e.EventHandlers.ContainsKey("onload")))
+                    frameInterpreter.FireEvent(elem, "onload");
+            }
         }
         catch (Exception ex)
         {
@@ -1597,7 +1620,9 @@ public partial class Form1 : Form
                 content = await FrameLoader.LoadAsync(
                     view.Url, url, w, h,
                     _httpClient, _cookieStore, CancellationToken.None,
-                    (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state));
+                    BrowserRuntime.JavaScriptEnabled
+                        ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+                        : null);
             }
             else
             {
@@ -1610,7 +1635,9 @@ public partial class Form1 : Form
                 {
                     string html = DecodeBody(s);
                     var doc = HtmlParser.Parse(html, parsed, _cookieStore,
-                        (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state));
+                        BrowserRuntime.JavaScriptEnabled
+                            ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+                            : null);
                     StyleResolver.Resolve(doc);
 
                     var frameBox = _canvas.Frames
@@ -1633,19 +1660,6 @@ public partial class Form1 : Form
                     .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
                 if (frameBox == null) return;
                 _canvas.SetFrame(frameBox, view);
-
-                // A frame navigation can target a fragment in the newly
-                // loaded document (for example corp-main.html#order).
-                // Preserve the fragment and scroll the existing frame view
-                // after its layout tree has been installed instead of
-                // leaving the frame at scroll position 0.
-                try
-                {
-                    var fragment = ParsedUrl.Parse(url).Fragment;
-                    if (!string.IsNullOrEmpty(fragment))
-                        _canvas.ScrollFrameToAnchor(view, fragment);
-                }
-                catch { }
 
                 _ = LoadFrameImagesThenReflowAsync(view, content, gen,
                     parentView: null, frameElem: frameBox.Element!,
@@ -1768,7 +1782,8 @@ public partial class Form1 : Form
             // stylesheets here — the fetcher's own file:// branch used to
             // be unreachable from this render path (only the HTTP success
             // path called it), so a local page's CSS silently vanished.
-            await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
+            if (BrowserRuntime.StylesheetsEnabled)
+                await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
 
             StyleResolver.Resolve(document);
             document.VisitedUrls.UnionWith(_visitedUrls);
@@ -1792,14 +1807,15 @@ public partial class Form1 : Form
                     // the HTTP success path, so they need the same post-load
                     // event dispatch explicitly.
                     var win = interpreter.WindowObject;
-                    if (win != null && win.Get("onload") is { Type: JsType.Function } onload)
+                    if (BrowserRuntime.JavaScriptEnabled &&
+                        win != null && win.Get("onload") is { Type: JsType.Function } onload)
                         interpreter.CallHandler(onload, JsValue.FromObject(win));
 
                     var body = document.ElementDescendants()
                         .FirstOrDefault(e => e.TagName == "body");
                     DebugLog.Write($"BODY ONLOAD(local): found={body != null} " +
                                    $"source='{body?.GetAttr("onload") ?? "<null>"}'");
-                    if (body != null)
+                    if (BrowserRuntime.JavaScriptEnabled && body != null)
                     {
                         var bodyOnload = body.GetAttr("onload");
                         if (!string.IsNullOrEmpty(bodyOnload))
@@ -1815,7 +1831,8 @@ public partial class Form1 : Form
                     // LoadFramesAsync, so an iframe on a locally-opened
                     // page never even attempted to load ("iframe don't
                     // work").
-                    _ = LoadFramesAsync(document, root);
+                    if (BrowserRuntime.FramesEnabled)
+                        _ = LoadFramesAsync(document, root);
                 }
                 catch (Exception ex)
                 {
@@ -1865,6 +1882,12 @@ public partial class Form1 : Form
     private void OnFormSubmitted((string Url, string Body, string? Target,
                                   BrowserCanvas.FrameView? Frame) submit)
     {
+        if (!BrowserRuntime.FormSubmissionsEnabled)
+        {
+            _statusLabel.Text = "Form submission blocked by Preferences → Advanced.";
+            return;
+        }
+
         if (submit.Frame != null &&
             (string.IsNullOrEmpty(submit.Target) || submit.Target == "_self"))
         {
@@ -1927,6 +1950,11 @@ public partial class Form1 : Form
 
     private void OpenNewBrowserWindow(string url)
     {
+        if (!BrowserRuntime.ScriptedWindowsAllowed && !url.Equals("about:blank", StringComparison.OrdinalIgnoreCase))
+        {
+            _statusLabel.Text = "New window blocked by High trust mode.";
+            return;
+        }
         var window = new Form1();
         _childWindows.Add(window);
         window.FormClosed += (s, e) => _childWindows.Remove(window);
@@ -1944,6 +1972,8 @@ public partial class Form1 : Form
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         long myGeneration = ++_navGeneration;
+        _hostOpenedLocalDocument = true;
+        _imageCache.HostOpenedLocalPage = true;
         DebugLog.Write($"OpenHtmlFile gen={myGeneration} file='{dialog.FileName}'");
 
         try

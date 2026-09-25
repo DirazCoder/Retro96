@@ -161,7 +161,7 @@ public class Renderer
         // ── Page background: colour fill FIRST, then the tiled image on
         //    top (the old order painted the tiles and then blanked them
         //    with the fill).
-        Color pageBackground = ResolveBodyBackgroundColor(document);
+        Color pageBackground = BrowserRuntime.ResolveBackground(ResolveBodyBackgroundColor(document));
         using (var bgBrush = new SolidBrush(pageBackground))
         {
             g.FillRectangle(bgBrush, 0, 0, bmp.Width, bmp.Height);
@@ -223,6 +223,9 @@ public class Renderer
     private void PaintBodyBackgroundImage(DomDocument? doc,
         ImageCache images, Graphics g, float w, float h)
     {
+        if (!BrowserRuntime.ImagesEnabled ||
+            BrowserRuntime.Settings.BackgroundMode == BackgroundMode.Force) return;
+
         var body = doc?.ElementDescendants()
                        .FirstOrDefault(e => e.TagName == "body");
         if (body == null) return;
@@ -312,7 +315,7 @@ public class Renderer
         // <marquee> — IE/NN extension: the block lays out normally, but the
         // content is repainted through a horizontal scroll transform clipped
         // to the marquee's border box.
-        if (box.Element?.TagName == "marquee")
+        if (box.Element?.TagName == "marquee" && BrowserRuntime.MarqueeEnabled)
         {
             PaintMarqueeContent(g, box, fonts, images, hoveredElement,
                 blinkVisible, focusedElement);
@@ -490,6 +493,13 @@ public class Renderer
         if (style == null) return;
 
         var rect = box.BorderRect;
+        if (box.Element.TagName == "body" &&
+            BrowserRuntime.Settings.BackgroundMode == BackgroundMode.Force)
+        {
+            g.FillRectangle(SolidBrushFor(BrowserRuntime.Settings.GetForcedBackgroundColor()),
+                rect.X, rect.Y, rect.Width, rect.Height);
+            return;
+        }
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         // Solid colour — bgcolor attribute beats CSS

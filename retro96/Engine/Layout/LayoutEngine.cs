@@ -1570,7 +1570,8 @@ public static class LayoutEngine
                 st?.Bottom == null && st?.BottomPercent == null)
                 child.Y = currentY + prevMarginBottom;
 
-            LayoutBlock(child, box.Width, containingHeight);
+            var positionedContainingBlock = FindPositionedContainingBlock(box);
+            LayoutBlock(child, positionedContainingBlock.Width, positionedContainingBlock.Height);
 
             float prevX = child.X, prevY = child.Y;
             // FIX: the containing block for an absolutely positioned box is its
@@ -1580,8 +1581,12 @@ public static class LayoutEngine
             // absolute; top:30%; left:30%">...</div></div> anchored to the
             // unpositioned overlay's box instead of the page, landing wherever
             // that overlay happened to be laid out rather than at 30%/30% of the
-            // viewport.
-            LayoutAbsolute(child, FindPositionedContainingBlock(box));
+            // viewport. The same containing block must also be used to resolve
+            // any WIDTH/HEIGHT percentage on the box itself (see LayoutBlock
+            // call above) — sizing against one box and positioning against a
+            // different one is how a percent-width dialog like this one ended
+            // up both the wrong size AND in the wrong place.
+            LayoutAbsolute(child, positionedContainingBlock);
             float dx = child.X - prevX;
             float dy = child.Y - prevY;
             if (Math.Abs(dx) > 0.01f || Math.Abs(dy) > 0.01f)
