@@ -78,7 +78,7 @@ public static class FrameLoader
         bool absolute =
             trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.StartsWith("file://", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("file:", StringComparison.OrdinalIgnoreCase) ||
             trimmed.StartsWith("about:", StringComparison.OrdinalIgnoreCase);
 
         // Resolve relative srcs through the image resolver: it already
@@ -216,44 +216,300 @@ public static class FrameLoader
 /// <summary>Local-path ↔ canonical file:/// URL conversions.</summary>
 public static class FileUrls
 {
-    /// <summary>Local path behind a file: URL, accepting both
-    /// file:///C:/x and file://C:/x forms; null when unmappable.</summary>
+    /// <summary>
+    /// Converts a local filesystem path into the one canonical URL form used
+    /// throughout the browser: file:///C:/... for drive paths and
+    /// file://server/share/... for UNC paths.
+    /// </summary>
+    public static string CanonicalFileUrl(string localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath))
+            throw new ArgumentException("Local path is empty.", nameof(localPath));
+
+        string path = localPath.Trim().Replace('\\', '/');
+
+        // Do not ask the host OS to turn a Windows drive/UNC path into an
+        // absolute path when tests or tooling run on a non-Windows host.
+        if (!IsDrivePath(path) && !IsUncPath(path) && !path.StartsWith('/'))
+            path = Path.GetFullPath(path).Replace('\\', '/');
+
+        if (IsUncPath(path))
+        {
+            string unc = path.TrimStart('/');
+            return "file://" + EscapeFilePath(unc, encodeColon: true);
+        }
+
+        if (IsDrivePath(path))
+            return "file:///" + EscapeFilePath(path, encodeColon: false);
+
+        if (!path.StartsWith('/'))
+            path = "/" + path;
+        return "file://" + EscapeFilePath(path, encodeColon: true);
+    }
+
+    /// <summary>
+    /// Maps a parsed file: URL back to a native filesystem path. Handles
+    /// canonical drive URLs, the older file://C:/ form, POSIX paths and UNC
+    /// file://server/share URLs.
+    /// </summary>
     public static string? LocalPathFromFileUrl(ParsedUrl url)
     {
-        if (url.Scheme != "file") return null;
+        if (!string.Equals(url.Scheme, "file", StringComparison.OrdinalIgnoreCase))
+            return null;
 
         string p;
-        try
+        try { p = Uri.UnescapeDataString(url.Path); }
+        catch { return null; }
+
+        if (!string.IsNullOrEmpty(url.Host))
         {
-            p = Uri.UnescapeDataString(url.Path);
+            string unc = "\\\\" + url.Host + "/" + p.TrimStart('/');
+            return unc.Replace('/', '\\');
         }
-        catch
+
+        // Canonical file:///C:/... arrives as ///C:/... from the opaque parser.
+        if (p.StartsWith("///", StringComparison.Ordinal))
+            p = p[2..];
+
+        if (p.Length >= 4 && p[0] == '/' && char.IsLetter(p[1]) && p[2] == ':')
+            return p[1..].Replace('/', '\\');
+
+        if (p.StartsWith("//", StringComparison.Ordinal))
         {
-            return null;
+            string candidate = p[2..];
+            if (IsDrivePath(candidate))
+                return candidate.Replace('/', '\\');
+            if (candidate.Contains('/'))
+                return "\\\\" + candidate.Replace('/', '\\');
         }
-        if (p.StartsWith("//")) p = p[2..];            // strip authority slashes
+
+        if (IsDrivePath(p))
+            return p.Replace('/', '\\');
 
         if (p.StartsWith('/'))
-        {
-            // After the leading '/', the drive letter is p[1] and the colon
-            // p[2] ("/C:/dir/x").  This used to test p[1]==':' && IsLetter(p[0]),
-            // but p[0] is the '/', so the check never matched and every
-            // file:///C:/... URL kept its leading slash — invalid on Windows,
-            // so typed file URLs and Reload reported "File Not Found".
-            if (p.Length >= 3 && p[2] == ':' && char.IsLetter(p[1]))
-                return p[1..];                        // file:///C:/dir/x
-            return p;                                  // file:///home/z/x
-        }
-        if (p.Length >= 2 && p[1] == ':' && char.IsLetter(p[0]))
-            return p;                                  // file://C:/dir/x
+            return p.Replace('/', Path.DirectorySeparatorChar);
 
         return null;
     }
 
-    /// <summary>Canonical file:/// URL for a local path (used as base URL
-    /// so every relative resolution downstream is well-formed).</summary>
-    public static string CanonicalFileUrl(string localPath) =>
-        "file:///" + localPath.Replace('\\', '/');
+    /// <summary>
+    /// Resolves an href against a local file: document using filesystem
+    /// semantics at the URL/filesystem boundary. This handles spaces, '..',
+    /// drive-root links, fragments and UNC paths consistently for links,
+    /// forms, frames and resource loads.
+    /// </summary>
+    public static string Resolve(ParsedUrl baseUrl, string href)
+    {
+        if (!string.Equals(baseUrl.Scheme, "file", StringComparison.OrdinalIgnoreCase))
+            return baseUrl.Resolve(href).ToAbsolute();
+
+        string trimmed = (href ?? string.Empty).Trim();
+        if (trimmed.Length == 0)
+            return baseUrl.ToAbsolute();
+
+        if (trimmed.StartsWith('#'))
+            return StripQueryAndFragment(baseUrl.ToAbsolute()) + trimmed;
+
+        if (trimmed.StartsWith('?'))
+            return StripQueryAndFragment(baseUrl.ToAbsolute()) + trimmed;
+
+        // Protocol-relative URLs inherit the file: scheme. In a local page
+        // that is naturally a UNC-style file URL rather than a web URL.
+        if (trimmed.StartsWith("//", StringComparison.Ordinal))
+            return "file:" + trimmed;
+
+        if (HasExplicitScheme(trimmed))
+        {
+            try
+            {
+                var parsed = ParsedUrl.Parse(trimmed);
+                if (parsed.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+                {
+                    string? local = LocalPathFromFileUrl(parsed);
+                    return local == null
+                        ? parsed.ToAbsolute()
+                        : AppendUrlSuffix(CanonicalFileUrl(local), parsed.Query, parsed.Fragment);
+                }
+                return parsed.ToAbsolute();
+            }
+            catch
+            {
+                return trimmed;
+            }
+        }
+
+        string? basePath = LocalPathFromFileUrl(baseUrl);
+        if (basePath == null)
+            return baseUrl.Resolve(trimmed).ToAbsolute();
+
+        SplitPathSuffix(trimmed, out string rawPath, out string query, out string fragment);
+        string decodedPath;
+        try { decodedPath = Uri.UnescapeDataString(rawPath); }
+        catch { decodedPath = rawPath; }
+        decodedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
+
+        string combined;
+        if (decodedPath.StartsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+        {
+            if (IsDrivePath(basePath))
+            {
+                // Standard file:// semantics use the current drive root.
+                // Legacy local sites also commonly used leading-slash paths
+                // as a shorthand for a file beside the saved page. Preserve
+                // that compatibility without scattering the fallback across
+                // image/frame/link loaders.
+                string driveRoot = basePath[..2] + decodedPath;
+                string? pageDir = Path.GetDirectoryName(basePath);
+                string besidePage = string.IsNullOrEmpty(pageDir)
+                    ? decodedPath.TrimStart(Path.DirectorySeparatorChar)
+                    : Path.Combine(pageDir, decodedPath.TrimStart(Path.DirectorySeparatorChar));
+                combined = File.Exists(driveRoot) ? driveRoot : besidePage;
+            }
+            else
+            {
+                combined = decodedPath;
+            }
+        }
+        else
+        {
+            string? dir = Path.GetDirectoryName(basePath);
+            if (string.IsNullOrEmpty(dir)) dir = basePath;
+            combined = Path.Combine(dir!, decodedPath);
+        }
+
+        string fullPath;
+        try { fullPath = Path.GetFullPath(combined); }
+        catch { fullPath = combined; }
+
+        return AppendUrlSuffix(CanonicalFileUrl(fullPath), query, fragment);
+    }
+
+    /// <summary>
+    /// Normalises a local file URL or absolute filesystem path entered in the
+    /// address bar. On a local page, an existing relative file is also accepted.
+    /// </summary>
+    public static bool TryResolveAddressBarInput(
+        string input, string? currentPageUrl, out string canonicalUrl)
+    {
+        canonicalUrl = string.Empty;
+        string t = (input ?? string.Empty).Trim();
+        if (t.Length == 0) return false;
+
+        if (t.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var parsed = ParsedUrl.Parse(t);
+                if (!parsed.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                string? local = LocalPathFromFileUrl(parsed);
+                if (local == null) return false;
+                canonicalUrl = AppendUrlSuffix(
+                    CanonicalFileUrl(local), parsed.Query, parsed.Fragment);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        if (IsDrivePath(t) || IsUncPath(t))
+        {
+            SplitPathSuffix(t, out string path, out string query, out string fragment);
+            canonicalUrl = AppendUrlSuffix(CanonicalFileUrl(path), query, fragment);
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(currentPageUrl) &&
+            currentPageUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var baseUrl = ParsedUrl.Parse(currentPageUrl);
+                string candidate = Resolve(baseUrl, t);
+                string? local = LocalPathFromFileUrl(ParsedUrl.Parse(candidate));
+                if (local != null && File.Exists(local))
+                {
+                    canonicalUrl = candidate;
+                    return true;
+                }
+            }
+            catch { }
+        }
+
+        return false;
+    }
+
+    private static bool HasExplicitScheme(string s)
+    {
+        int colon = s.IndexOf(':');
+        if (colon <= 0 || !char.IsLetter(s[0])) return false;
+        for (int i = 1; i < colon; i++)
+        {
+            char c = s[i];
+            if (!(char.IsLetterOrDigit(c) || c is '+' or '-' or '.'))
+                return false;
+        }
+        return true;
+    }
+
+    private static bool IsDrivePath(string path) =>
+        path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' &&
+        (path[2] == '/' || path[2] == '\\');
+
+    private static bool IsUncPath(string path) =>
+        path.StartsWith("//", StringComparison.Ordinal) ||
+        path.StartsWith("\\\\", StringComparison.Ordinal);
+
+    private static void SplitPathSuffix(
+        string value, out string path, out string query, out string fragment)
+    {
+        fragment = string.Empty;
+        int hash = value.IndexOf('#');
+        if (hash >= 0)
+        {
+            fragment = value[(hash + 1)..];
+            value = value[..hash];
+        }
+
+        query = string.Empty;
+        int q = value.IndexOf('?');
+        if (q >= 0)
+        {
+            query = value[(q + 1)..];
+            value = value[..q];
+        }
+        path = value;
+    }
+
+    private static string AppendUrlSuffix(string url, string query, string fragment)
+    {
+        if (!string.IsNullOrEmpty(query)) url += "?" + query;
+        if (!string.IsNullOrEmpty(fragment)) url += "#" + fragment;
+        return url;
+    }
+
+    private static string StripQueryAndFragment(string url)
+    {
+        int q = url.IndexOf('?');
+        int h = url.IndexOf('#');
+        int cut = q < 0 ? h : h < 0 ? q : Math.Min(q, h);
+        return cut < 0 ? url : url[..cut];
+    }
+
+    private static string EscapeFilePath(string path, bool encodeColon)
+    {
+        var sb = new StringBuilder(path.Length + 16);
+        foreach (byte b in Encoding.UTF8.GetBytes(path))
+        {
+            char c = (char)b;
+            bool safe =
+                (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c is '-' or '_' or '.' or '~' or '/' ||
+                (!encodeColon && c == ':');
+            if (safe) sb.Append(c);
+            else sb.Append('%').Append(b.ToString("X2"));
+        }
+        return sb.ToString();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -115,21 +115,15 @@ public class ImageCache : IDisposable
              baseUrl.Contains("web.archive.org", StringComparison.OrdinalIgnoreCase)))
             return "https://web.archive.org" + url;
 
-        // file:// base — pages opened with File → Open resolve every
-        // relative image against the on-disk directory. The generic
-        // ParsedUrl.Resolve path used to produce malformed double-slash
-        // file:////C:/... URLs (the opaque file parse keeps the authority
-        // slashes inside Path), which then failed to load. Resolve the
-        // local path directly instead.
+        // Local file pages use one shared resolver for every resource type
+        // (images, backgrounds, links, frames and forms). Keeping the
+        // filesystem/URL conversion in FileUrls prevents the old collection
+        // of slightly different file:// implementations from drifting.
         try
         {
             var parsedBase = ParsedUrl.Parse(baseUrl);
             if (parsedBase.Scheme == "file")
-            {
-                if (TryGetLocalPath(parsedBase, out string basePath))
-                    return FileUrlFromRelative(url, basePath);
-                return url;
-            }
+                return FileUrls.Resolve(parsedBase, url);
         }
         catch { /* fall through to the generic resolver */ }
 
@@ -143,105 +137,11 @@ public class ImageCache : IDisposable
         }
     }
 
-    /// <summary>
-    /// Extracts a local filesystem path from a parsed file: URL, handling
-    /// both the canonical <c>file:///C:/dir/x.htm</c> form (empty
-    /// authority) and the two-slash <c>file://C:/dir/x.htm</c> form the
-    /// shell's File-Open builds. Returns false for UNC-ish or drive-less
-    /// paths the engine cannot map back to disk.
-    /// </summary>
-    private static bool TryGetLocalPath(ParsedUrl url, out string localPath)
-    {
-        localPath = "";
-        if (url.Scheme != "file") return false;
-
-        string p;
-        try
-        {
-            p = Uri.UnescapeDataString(url.Path);
-        }
-        catch
-        {
-            return false;
-        }
-
-        // Strip the "//" authority marker; a third leading slash is the
-        // start of the path proper (file:///…).
-        if (p.StartsWith("//")) p = p[2..];
-
-        if (p.StartsWith('/'))
-        {
-            // file:///C:/dir/x  →  Windows drive letter after the path slash
-            if (p.Length >= 3 && p[2] == ':' && char.IsLetter(p[1]))
-            {
-                localPath = p[1..];
-                return true;
-            }
-            // file:///home/z/x  →  Unix absolute path
-            localPath = p;
-            return true;
-        }
-
-        // file://C:/dir/x — drive form without the path slash
-        if (p.Length >= 2 && p[1] == ':' && char.IsLetter(p[0]))
-        {
-            localPath = p;
-            return true;
-        }
-
-        return false;
-    }
-
-    /// <summary>Builds a canonical file:/// URL from a base file path + a relative src.</summary>
-    private static string FileUrlFromRelative(string url, string basePath)
-    {
-        string trimmed = url.Trim();
-
-        // Absolute http(s) srcs inside a local page stay absolute — but
-        // only with an EXPLICIT scheme: ParsedUrl.Parse would also
-        // http://-prefix a bare "topper.gif" (address-bar host guessing),
-        // and the file:// page's own relative images would come back
-        // unchanged — every local image a broken icon.
-        if (trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            return trimmed;
-
-        string combined;
-        if (trimmed.StartsWith('/'))
-        {
-            // Root-relative on a file base normally means the drive root.
-            // Local QA pages commonly keep their fixtures beside the page,
-            // though, so use that directory when the drive-root candidate is
-            // absent. HTTP root-relative URLs never enter this file branch.
-            string root = basePath.Length >= 2 && basePath[1] == ':'
-                ? basePath[..2]
-                : "";
-            string driveRootPath = root + System.IO.Path.GetFullPath(trimmed);
-            string pageRelativePath = System.IO.Path.Combine(
-                System.IO.Path.GetDirectoryName(basePath) ?? basePath,
-                trimmed.TrimStart('/', '\\'));
-            combined = System.IO.File.Exists(driveRootPath)
-                ? driveRootPath
-                : pageRelativePath;
-        }
-        else
-        {
-            string dir = System.IO.Path.GetDirectoryName(basePath) ?? basePath;
-            combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(dir, trimmed));
-        }
-
-        // canonical file:/// form — exactly three slashes before an
-        // absolute path ("/home/…" / "C:/…"), not four.
-        return "file://" + (combined.StartsWith('/') ? combined : "/" + combined)
-            .Replace('\\', '/');
-    }
-
-    private static string? LocalPathFromFileUrl(string absoluteUrl)
+    private static string? TryGetLocalPathForImage(string absoluteUrl)
     {
         try
         {
-            var parsed = ParsedUrl.Parse(absoluteUrl);
-            return TryGetLocalPath(parsed, out string local) ? local : null;
+            return FileUrls.LocalPathFromFileUrl(ParsedUrl.Parse(absoluteUrl));
         }
         catch
         {
@@ -361,7 +261,7 @@ public class ImageCache : IDisposable
                 // (HostOpenedLocalPage OR AllowPageFileAccess) — don't
                 // duplicate it here with a narrower check that ignores
                 // the AllowPageFileAccess override.
-                var local = LocalPathFromFileUrl(absoluteUrl);
+                var local = TryGetLocalPathForImage(absoluteUrl);
                 if (local == null)
                     return MarkBroken(absoluteUrl);
 

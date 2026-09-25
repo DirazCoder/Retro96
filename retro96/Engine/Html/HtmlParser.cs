@@ -483,8 +483,12 @@ public static class HtmlParser
                         {
                             try
                             {
-                                _doc.BaseUrl = _doc.BaseUrl?.Resolve(element.GetAttr("href")!)
-                                              ?? ParsedUrl.Parse(element.GetAttr("href")!);
+                                string baseHref = element.GetAttr("href")!;
+                                _doc.BaseUrl = _doc.BaseUrl != null
+                                    ? (_doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                                        ? ParsedUrl.Parse(FileUrls.Resolve(_doc.BaseUrl, baseHref))
+                                        : _doc.BaseUrl.Resolve(baseHref))
+                                    : ParsedUrl.Parse(baseHref);
                             }
                             catch { /* invalid URL in <base href> — ignore */ }
                         }

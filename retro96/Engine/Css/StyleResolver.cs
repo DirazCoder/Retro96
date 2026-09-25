@@ -659,12 +659,23 @@ public static class StyleResolver
 
             case "hr":
                 {
-                    // SIZE thickness is read straight off the attribute by the
-                    // renderer (3-D shading needs it too) — nothing to resolve.
+                    // Netscape/IE accepted the presentational COLOR attribute
+                    // on <hr>.  Resolve it here so the renderer has a concrete
+                    // colour instead of falling back to the hard-coded grey
+                    // 3-D rule.  The element colour is also the natural base
+                    // for shaded rules that do not specify NOSHADE.
+                    var hrColor = ParseHtmlColor(elem.GetAttr("color"));
+                    if (hrColor is { } c)
+                    {
+                        style.Color = c;
+                        style.BorderTopColor = c;
+                    }
+
                     if (elem.HasAttr("noshade"))
                     {
                         style.BorderTopStyle = BorderStyleValue.Solid;
-                        style.BorderTopColor = Color.FromArgb(128, 128, 128);
+                        if (hrColor == null)
+                            style.BorderTopColor = Color.FromArgb(128, 128, 128);
                     }
                     break;
                 }

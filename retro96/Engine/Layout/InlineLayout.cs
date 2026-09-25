@@ -333,11 +333,25 @@ public static class InlineLayout
                         };
                         width = Math.Max(60f, MeasureTextWidth(label, style) + 24f);
                     }
-                    else if (type is "text" or "password" or "file")
+                    else if (type is "text" or "password")
                     {
                         int size = el.GetAttrInt("size", 0);
                         if (size > 0)
                             width = MeasureTextWidth(new string('0', size), style) + 12f;
+                    }
+                    else if (type == "file")
+                    {
+                        int size = el.GetAttrInt("size", 0);
+                        float legacyWidth = size > 0
+                            ? MeasureTextWidth(new string('0', size), style) + 12f
+                            : 0f;
+                        float buttonWidth = Math.Max(92f,
+                            MeasureTextWidth("Choose File", style) + 24f);
+                        float labelWidth = Math.Max(96f,
+                            MeasureTextWidth("No file chosen", style) + 8f);
+                        width = Math.Max(
+                            legacyWidth,
+                            buttonWidth + labelWidth + 12f);
                     }
                     else if (type is "checkbox" or "radio")
                     {
@@ -771,6 +785,10 @@ public static class InlineLayout
                     extra = Math.Max(0f, (rightEdge - leftEdge - lineW) / gaps);
                 break;
         }
+
+        Retro96.DebugLog.Write($"[flushdbg] y={y:F1} textAlign={containerStyle.TextAlign} " +
+            $"leftEdge={leftEdge:F1} rightEdge={rightEdge:F1} lineW={lineW:F1} " +
+            $"computed_x={x:F1} firstWord=\"{Truncate(items.Count > 0 ? items[0].Box.TextRun : null)}\"");
 
         for (int i = 0; i < items.Count; i++)
         {

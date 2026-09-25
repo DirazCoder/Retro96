@@ -225,11 +225,18 @@ public class PageInspector : Form
         tabs.SelectedIndexChanged += (s, e) =>
         {
             _activeTab = tabs.SelectedIndex;
-            if (_activeTab == 1 && _consoleDirty)
+
+            // Console history is retained statically so scripts that run
+            // during page load are not lost when DevTools/Inspector is opened
+            // afterwards. Always rebuild the list when the tab becomes active;
+            // the old dirty-only path left a brand-new Inspector showing an
+            // empty console even though ConsoleLines already contained entries.
+            if (_activeTab == 1)
             {
                 _consoleDirty = false;
                 RefreshConsole();
             }
+
             RefreshToolTab(_activeTab);
         };
 
@@ -264,6 +271,7 @@ public class PageInspector : Form
         };
 
         BuildTree();
+        _consoleDirty = true; // retained console entries may predate this Inspector
         RefreshToolTab(0);
         if (initialElement != null) SelectElement(initialElement);
     }

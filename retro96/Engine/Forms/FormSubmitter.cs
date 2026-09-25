@@ -69,7 +69,9 @@ public static class FormSubmitter
             if (string.IsNullOrEmpty(action))
                 resolved = baseUrl.ToAbsolute();
             else
-                resolved = baseUrl.Resolve(action).ToAbsolute();
+                resolved = baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? FileUrls.Resolve(baseUrl, action)
+                    : baseUrl.Resolve(action).ToAbsolute();
         }
 
         var pairs = CollectPairs(form, imageClick);

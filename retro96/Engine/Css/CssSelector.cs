@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Network;
 
 namespace Retro96.Engine.Css;
 
@@ -372,7 +373,9 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
         try
         {
             string abs = doc.BaseUrl != null
-                ? doc.BaseUrl.Resolve(href).ToAbsolute()
+                ? (doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? FileUrls.Resolve(doc.BaseUrl, href)
+                    : doc.BaseUrl.Resolve(href).ToAbsolute())
                 : href;
             return doc.VisitedUrls.Contains(abs) || doc.VisitedUrls.Contains(href);
         }

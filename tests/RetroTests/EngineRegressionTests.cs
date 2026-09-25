@@ -237,12 +237,32 @@ public class EngineRegressionTests
         var baseFile = ParsedUrl.Parse("file:///C:/web/dolekemp96.htm");
         Check.That(baseFile.Scheme == "file", "file: URL parses with scheme");
 
-        var resolved = baseFile.Resolve("dolekemp96org.jpg");
-        Check.That(resolved.ToAbsolute().Contains("dolekemp96org.jpg"),
-            "relative img resolves against file base", resolved.ToAbsolute());
+        var local = FileUrls.LocalPathFromFileUrl(baseFile);
+        Check.That(local == "C:\\web\\dolekemp96.htm",
+            "canonical drive file URL maps to a native Windows path", local ?? "(null)");
 
-        var rootRel = baseFile.Resolve("/images/logo.gif");
-        Check.That(rootRel.Path.Contains("logo.gif"), "root-relative path kept", rootRel.Path);
+        var resolved = FileUrls.Resolve(baseFile, "assets/photo one.gif");
+        Check.That(resolved == "file:///C:/web/assets/photo%20one.gif",
+            "relative local link resolves canonically and escapes spaces", resolved);
+
+        var fragment = FileUrls.Resolve(baseFile, "#features");
+        Check.That(fragment == "file:///C:/web/dolekemp96.htm#features",
+            "same-document file fragment keeps the canonical file URL", fragment);
+
+        var unc = FileUrls.LocalPathFromFileUrl(
+            ParsedUrl.Parse("file://server/share/sites/home.html"));
+        Check.That(unc == "\\\\server\\share\\sites\\home.html",
+            "UNC file URL maps to a UNC filesystem path", unc ?? "(null)");
+
+        var original = FileUrls.CanonicalFileUrl("C:\\Docs\\Retro Pages\\index.html");
+        Check.That(original == "file:///C:/Docs/Retro%20Pages/index.html",
+            "Windows path canonicalises to one file URL form", original);
+
+        Check.That(FileUrls.TryResolveAddressBarInput(
+                "C:\\Docs\\Retro Pages\\index.html", null, out var addressBarUrl) &&
+            addressBarUrl == "file:///C:/Docs/Retro%20Pages/index.html",
+            "absolute Windows paths are first-class address-bar navigation targets",
+            addressBarUrl);
         Check.Done();
     }
 }

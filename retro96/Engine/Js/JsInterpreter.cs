@@ -169,18 +169,33 @@ public class JsInterpreter
         }
         catch (JsTimeoutException)
         {
-            _setStatus("Script execution timed out");
+            const string message = "Script execution timed out";
+            _setStatus(message);
+            PublishConsole("error", message);
             return JsValue.Undefined;
         }
         catch (JsOutOfMemoryException)
         {
-            _setStatus("Script ran out of memory");
+            const string message = "Script ran out of memory";
+            _setStatus(message);
+            PublishConsole("error", message);
             return JsValue.Undefined;
         }
         catch (JsThrownException ex)
         {
-            // Top-level throw — report and stop THIS script only
+            // Top-level throw — report and stop THIS script only.  This used
+            // to update only the status bar, so an uncaught JS error was
+            // invisible in Inspector > Console.
+            string message = $"Uncaught {ex.Value.ToJsString()}";
             _setStatus($"Script error: {ex.Value.ToJsString()}");
+            PublishConsole("error", message);
+            return JsValue.Undefined;
+        }
+        catch (JsInterpreterException ex)
+        {
+            string message = $"Uncaught {ex.Message}";
+            _setStatus($"Script error: {ex.Message}");
+            PublishConsole("error", message);
             return JsValue.Undefined;
         }
         catch (JsBreakException) { return JsValue.Undefined; }
@@ -195,8 +210,18 @@ public class JsInterpreter
     /// <summary>Parse and run a string in the current scope.</summary>
     public JsValue ExecuteString(string source)
     {
-        var program = JsParser.Parse(source);
-        return Execute(program);
+        try
+        {
+            var program = JsParser.Parse(source);
+            return Execute(program);
+        }
+        catch (JsParserException ex)
+        {
+            string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
+            _setStatus($"Script error: {ex.Message}");
+            PublishConsole("error", message);
+            return JsValue.Undefined;
+        }
     }
 
     /// <summary>Eval a string in an explicit scope (eval()).</summary>
@@ -1552,6 +1577,11 @@ public class JsInterpreter
     /// that invoke script callbacks (sort/forEach/filter/map).  Call after
     /// JsRuntime.PopulateGlobalScope and DomBindings.RegisterAll.
     /// </summary>
+    private void PublishConsole(string level, string message)
+    {
+        ConsoleMessage?.Invoke(new ConsoleEntry(level, message, DateTime.Now));
+    }
+
     public void RegisterRuntimeBuiltins()
     {
         var console = new JsObject { Class = "Console" };

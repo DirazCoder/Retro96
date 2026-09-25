@@ -1,6 +1,7 @@
 // Step 4 unit tests — JavaScript engine contracts (via the PageHarness
 // rig: real parser + real DomBindings + canvas stub).
 using Retro96.Engine.Dom;
+using Retro96.Engine.Js;
 
 namespace RetroTests;
 
@@ -189,6 +190,45 @@ public class JsEngineTests
     }
 
     // ── error handling ───────────────────────────────────────────────
+
+    [Fact]
+    public void ConsoleMessagesAndUncaughtErrorsArePublished()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body></body></html>");
+        var entries = new List<JsInterpreter.ConsoleEntry>();
+        page.Interpreter.ConsoleMessage += entry => entries.Add(entry);
+
+        page.Eval("console.log('HELLO'); console.warn('CAUTION');");
+        Check.That(entries.Any(e => e.Level == "log" && e.Message.Contains("HELLO")),
+            "console.log reaches the interpreter console event",
+            string.Join(" | ", entries.Select(e => $"{e.Level}:{e.Message}")));
+        Check.That(entries.Any(e => e.Level == "warn" && e.Message.Contains("CAUTION")),
+            "console.warn reaches the interpreter console event",
+            string.Join(" | ", entries.Select(e => $"{e.Level}:{e.Message}")));
+
+        entries.Clear();
+        page.Eval("throw new Error('KABOOM');");
+        Check.That(entries.Any(e => e.Level == "error" && e.Message.Contains("KABOOM")),
+            "an uncaught throw is published as a console error",
+            string.Join(" | ", entries.Select(e => $"{e.Level}:{e.Message}")));
+        Check.Done();
+    }
+
+    [Fact]
+    public void ConsoleSyntaxErrorsArePublished()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body></body></html>");
+        var entries = new List<JsInterpreter.ConsoleEntry>();
+        page.Interpreter.ConsoleMessage += entry => entries.Add(entry);
+
+        page.Eval("var broken = ;");
+        Check.That(entries.Any(e => e.Level == "error" && e.Message.Contains("Syntax error")),
+            "syntax errors are published as console errors",
+            string.Join(" | ", entries.Select(e => $"{e.Level}:{e.Message}")));
+        Check.Done();
+    }
 
     [Fact]
     public void UncaughtThrowDoesNotCrashTheEngine()

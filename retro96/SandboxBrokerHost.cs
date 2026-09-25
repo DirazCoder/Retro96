@@ -784,7 +784,7 @@ internal sealed class SandboxWorkerSession : IDisposable
             return new SandboxProtocol.OpenFileReply(
                 true,
                 fullPath,
-                "file://" + fullPath.Replace('\\', '/'),
+                Retro96.Engine.Network.FileUrls.CanonicalFileUrl(fullPath),
                 Convert.ToBase64String(bytes),
                 "");
         }).ConfigureAwait(false);

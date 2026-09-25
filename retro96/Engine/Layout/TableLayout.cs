@@ -582,6 +582,13 @@ public static class TableLayout
                      ?? cell.Parent?.Element?.Style
                      ?? new ComputedStyle();
 
+        Retro96.DebugLog.Write($"[aligndbg] tag={cell.Element?.TagName} " +
+            $"align_attr={cell.Element?.GetAttr("align") ?? "(none)"} " +
+            $"styleOverride={(styleOverride == null ? "null" : styleOverride.TextAlign.ToString())} " +
+            $"cellStyle.TextAlign(before center-guard)={cellStyle.TextAlign} " +
+            $"OwnTextAlign={cellStyle.OwnTextAlign} " +
+            $"elementStyleRefEquals={ReferenceEquals(cell.Element?.Style, cellStyle)}");
+
         // A surrounding <center> controls the table's placement, but it
         // must not center ordinary cell contents. Chromium resets the cell's
         // default inline alignment to left unless the cell or its row
@@ -591,7 +598,12 @@ public static class TableLayout
         {
             cellStyle = cellStyle.Clone();
             cellStyle.TextAlign = TextAlign.Left;
+            Retro96.DebugLog.Write($"[aligndbg] tag={cell.Element?.TagName} " +
+                "=> RESET to Left by center-guard");
         }
+
+        Retro96.DebugLog.Write($"[aligndbg] tag={cell.Element?.TagName} " +
+            $"FINAL cellStyle.TextAlign={cellStyle.TextAlign}");
 
         void FlushInlineRun()
         {
@@ -618,8 +630,9 @@ public static class TableLayout
                 continue;
             }
 
-            bool isBlockLevel = child.BoxType is BoxType.Block or BoxType.ListItem
-                                              or BoxType.Anonymous or BoxType.Table;
+            bool isBlockLevel = child.Element?.TagName == "hr"
+                              || child.BoxType is BoxType.Block or BoxType.ListItem
+                                                   or BoxType.Anonymous or BoxType.Table;
 
             if (!isBlockLevel)
             {
@@ -661,6 +674,8 @@ public static class TableLayout
                                  cellStyle, floats);
             else if (child.BoxType == BoxType.Table)
                 Layout(child, contentW, floats);
+
+            AlignBlockChild(cell, child, contentX, contentW, cellStyle);
 
             currentY = child.Y
                 + child.BorderTop + child.PaddingTop
@@ -734,8 +749,9 @@ public static class TableLayout
                 continue;
             }
 
-            bool isBlockLevel = child.BoxType is BoxType.Block or BoxType.ListItem
-                                              or BoxType.Anonymous or BoxType.Table;
+            bool isBlockLevel = child.Element?.TagName == "hr"
+                              || child.BoxType is BoxType.Block or BoxType.ListItem
+                                                   or BoxType.Anonymous or BoxType.Table;
 
             if (!isBlockLevel)
             {
@@ -776,6 +792,8 @@ public static class TableLayout
             else if (child.BoxType == BoxType.Table)
                 Layout(child, contentW, floats);
 
+            AlignBlockChild(box, child, contentX, contentW, blockStyle);
+
             currentY = child.Y
                 + child.BorderTop + child.PaddingTop
                 + child.Height
@@ -787,6 +805,50 @@ public static class TableLayout
 
         if (box.Height <= 0f)
             box.Height = Math.Max(0f, currentY - contentY);
+    }
+
+    /// <summary>
+    /// Applies legacy block-level horizontal alignment inside a table cell.
+    /// The normal block formatter has the same rule, but table cells use this
+    /// dedicated mini-formatter. In particular, <center><table> and
+    /// <table align="center"> must centre a shrink-to-fit table instead of
+    /// leaving it at the cell's left edge. <hr> also follows the legacy
+    /// block-alignment path instead of being treated as inline content.
+    /// </summary>
+    private static void AlignBlockChild(
+        LayoutBox parent, LayoutBox child, float contentX, float contentW,
+        ComputedStyle parentStyle)
+    {
+        if (child.Width <= 0f) return;
+
+        string? selfAlign = child.Element?.GetAttr("align")?.Trim().ToLowerInvariant();
+        bool centerParent = parent.Element?.TagName == "center"
+                         || parentStyle.TextAlign == TextAlign.Center;
+        bool centerChild = selfAlign == "center"
+                        || (selfAlign == null && child.Element?.TagName == "hr");
+        bool hasAutoMargins = child.MarginLeftAuto || child.MarginRightAuto;
+
+        float outerW = child.MarginLeft
+                     + child.BorderLeft + child.PaddingLeft
+                     + child.Width
+                     + child.PaddingRight + child.BorderRight
+                     + child.MarginRight;
+
+        float newX = child.X;
+        if (!hasAutoMargins && (centerParent || centerChild))
+        {
+            if (outerW < contentW - 1f)
+                newX = contentX + (contentW - outerW) / 2f + child.MarginLeft;
+        }
+        else if (!hasAutoMargins && selfAlign == "right")
+        {
+            if (outerW < contentW - 1f)
+                newX = contentX + contentW - outerW + child.MarginLeft;
+        }
+
+        float dx = newX - child.X;
+        if (Math.Abs(dx) > 0.5f)
+            OffsetTree(child, dx, 0f);
     }
 
     /// <summary>Float placement inside a cell.</summary>
@@ -1321,26 +1383,94 @@ public static class TableLayout
 
         // Preferred = longest LINE, not the whole paragraph: <br> always
         // breaks (the widest br-separated line is what Netscape measured).
+        //
+        // IMPORTANT: inline whitespace at a line/run edge is collapsible and
+        // does not contribute to a shrink-to-fit table's intrinsic width. The
+        // real inline formatter already drops a leading space and collapses
+        // edge whitespace at the line boundary. Counting those anonymous
+        // indentation nodes here made indented table markup wider than the
+        // exact same markup written on one line, which showed up as phantom
+        // empty space to the right of left-aligned cells (classic case: a
+        // visitor-count badge surrounded by newlines/indentation).
         float run = 0f;
+        bool runHasContent = false;
+        float pendingSpace = 0f;
+
         foreach (var child in box.Children)
         {
             if (IsBlockLevelBox(child))
             {
                 p = Math.Max(p, run);
                 run = 0f;
+                runHasContent = false;
+                pendingSpace = 0f;
                 p = Math.Max(p, MeasurePref(child));
+                continue;
             }
-            else if (child.Element?.TagName is "br" or "wbr")
+
+            if (child.Element?.TagName is "br" or "wbr")
             {
                 p = Math.Max(p, run);
                 run = 0f;
+                runHasContent = false;
+                pendingSpace = 0f;
+                continue;
             }
-            else
+
+            // A whitespace-only inline box is a separator only when real
+            // inline content exists on BOTH sides. Delay it until the next
+            // visible child; this automatically drops leading/trailing and
+            // indentation whitespace from the intrinsic width.
+            if (child.TextRun != null && LayoutEngine.IsAsciiWhitespaceOnly(child.TextRun))
             {
-                run += MeasurePref(child);
+                if (runHasContent)
+                {
+                    var style = child.Element?.Style;
+                    pendingSpace = style != null
+                        ? Math.Max(pendingSpace, InlineLayout.MeasureTextWidth(" ", style))
+                        : Math.Max(pendingSpace, 16f * 0.55f);
+                }
+                continue;
             }
+
+            float childWidth = MeasurePref(child);
+
+            if (pendingSpace > 0f && runHasContent)
+                run += pendingSpace;
+            pendingSpace = 0f;
+
+            // Inline wrappers may themselves begin/end with collapsible
+            // whitespace. Measure their visible content without charging a
+            // phantom edge space. Most normal HTML is already flattened, but
+            // this keeps intrinsic sizing correct for any retained inline box.
+            if (child.TextRun != null && child.TextRun.Length > 0 &&
+                !LayoutEngine.IsAsciiWhitespaceOnly(child.TextRun))
+            {
+                var trimmed = TrimAsciiEdgeWhitespace(child.TextRun);
+                if (trimmed != child.TextRun)
+                {
+                    var style = child.Element?.Style;
+                    if (style != null)
+                        childWidth = MeasureFragmentedTextWidth(trimmed, style);
+                    else
+                        childWidth = trimmed.Length * (16f * 0.55f);
+                }
+            }
+
+            run += childWidth;
+            runHasContent = childWidth > 0.01f || child.Height > 0.01f;
         }
+
         return Math.Max(p, run);
+    }
+
+    private static string TrimAsciiEdgeWhitespace(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        int start = 0, end = text.Length;
+        while (start < end && LayoutEngine.IsAsciiWhitespace(text[start])) start++;
+        while (end > start && LayoutEngine.IsAsciiWhitespace(text[end - 1])) end--;
+        return start == 0 && end == text.Length ? text : text[start..end];
     }
 
     private static bool IsBlockLevelBox(LayoutBox b) =>

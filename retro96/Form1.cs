@@ -346,6 +346,15 @@ public partial class Form1 : Form
         string t = (text ?? "").Trim();
         if (t.Length == 0) return;
 
+        // Local paths/URLs get first-class treatment. This prevents Windows
+        // paths containing spaces from being sent to search, and lets a
+        // locally-opened page address another existing file beside it.
+        if (FileUrls.TryResolveAddressBarInput(t, _currentPageUrl, out string localUrl))
+        {
+            NavigateTo(localUrl);
+            return;
+        }
+
         if (LooksLikeUrl(t))
         {
             NavigateTo(t);
@@ -432,6 +441,11 @@ public partial class Form1 : Form
                                      bool replaceHistory = false)
     {
         if (string.IsNullOrWhiteSpace(rawUrl)) return;
+
+        string requestedUrl = rawUrl.Trim();
+        if (FileUrls.TryResolveAddressBarInput(requestedUrl, _currentPageUrl, out string localUrl))
+            requestedUrl = localUrl;
+        rawUrl = requestedUrl;
 
         if (rawUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
             !_hostOpenedLocalDocument && !BrowserRuntime.AllowPageFileAccess)
@@ -983,7 +997,9 @@ public partial class Form1 : Form
 
         try
         {
-            return (delay * 1000, baseUrl.Resolve(urlPart).ToAbsolute());
+            return (delay * 1000, baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                ? FileUrls.Resolve(baseUrl, urlPart)
+                : baseUrl.Resolve(urlPart).ToAbsolute());
         }
         catch
         {
@@ -1079,6 +1095,7 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
+            PageInspector.PublishConsole("error", $"Script error: {ex.Message}", DateTime.Now);
             BeginInvoke(() => _statusLabel.Text = $"Script error: {ex.Message}");
         }
 
@@ -1177,7 +1194,9 @@ public partial class Form1 : Form
                 var bgUrl = Renderer.ParseCssUrl(bgCss);
                 if (!string.IsNullOrEmpty(bgUrl))
                 {
-                    try { urls.Add(baseUrl.Resolve(bgUrl).ToAbsolute()); } catch { }
+                    try { urls.Add(baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                            ? FileUrls.Resolve(baseUrl, bgUrl)
+                            : baseUrl.Resolve(bgUrl).ToAbsolute()); } catch { }
                 }
             }
         }
@@ -1395,6 +1414,9 @@ public partial class Form1 : Form
             navUrl => BeginInvoke(() => _ = LoadFrameAsync(view, navUrl)),
             msg => BeginInvoke(() => _statusLabel.Text = msg));
 
+        interpreter.ConsoleMessage += entry =>
+            PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);
+
         var state = new DocumentBindingsState
         {
             Interpreter = interpreter,
@@ -1428,6 +1450,7 @@ public partial class Form1 : Form
         try { interpreter.ExecuteString(scriptSource); }
         catch (Exception ex)
         {
+            PageInspector.PublishConsole("error", $"Script error: {ex.Message}", DateTime.Now);
             BeginInvoke(() => _statusLabel.Text = $"Script error: {ex.Message}");
         }
 

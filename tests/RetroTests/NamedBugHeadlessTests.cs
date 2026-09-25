@@ -866,6 +866,26 @@ public class NamedBugHeadlessTests
 public class BonusContractTests
 {
     [Fact]
+    public void FileInputHasDistinctPickerAndFilenameDisplay()
+    {
+        var (doc, _) = LayoutHarness.Parse(
+            "<html><body><input type=\"file\" name=\"mugshot\" size=24></body></html>");
+        var input = doc.ElementDescendants().First(e => e.TagName == "input");
+
+        Check.That(input.GetAttrOrDefault("type", "text") == "file",
+            "the QA control remains an input type=file");
+        Check.That(InlineLayout.ControlNaturalSize(input, input.Style, out var width, out var height),
+            "file input reports a natural size");
+        Check.That(width >= 190f,
+            "file input reserves room for a Choose File button plus filename text", width.ToString());
+        Check.That(height >= 22f,
+            "file input keeps a normal form-control height", height.ToString());
+        Check.That(string.IsNullOrEmpty(input.GetAttr("data-file-name")),
+            "an unselected file input starts with the No file chosen state");
+        Check.Done();
+    }
+
+    [Fact]
     public void RootRelativeUrlsResolveAgainstThePageOrigin()
     {
         var url = ParsedUrl.Parse("http://127.0.0.1:8941/dir/page.html");
@@ -993,6 +1013,36 @@ public class BonusContractTests
                 "margin: 0 auto 0 auto CENTRES the box (shorthand form)",
                 $"left gap {leftGap:0.#} vs right gap {rightGap:0.#}");
         }
+        Check.Done();
+    }
+
+    [Fact]
+    public void HrColorAttributePaintsTheDeclaredColour()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body bgcolor=\"#000000\"><hr size=\"4\" color=\"#FF00FF\" noshade></body></html>");
+
+        var hr = doc.ElementDescendants().First(e => e.TagName == "hr");
+        Check.That(hr.Style != null && hr.Style.BorderTopColor == Retro96.Drawing.Color.FromArgb(255, 0, 255),
+            "<hr color> resolves into the computed rule colour",
+            hr.Style == null ? "NO STYLE" : hr.Style.BorderTopColor.ToString());
+
+        var box = LayoutHarness.BoxOf(root, hr);
+        Check.That(box != null && box.Width > 0 && box.Height >= 4,
+            "coloured <hr> gets a drawable layout box",
+            box == null ? "NO BOX" : $"{box.Width:0.#}x{box.Height:0.#}");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bmp = LayoutHarness.Render(doc, root, images, loader);
+        var r = box!.ContentRect;
+        int x = Math.Clamp((int)Math.Floor(r.X + r.Width / 2f), 0, bmp.Width - 1);
+        int y = Math.Clamp((int)Math.Floor(r.Y + r.Height / 2f), 0, bmp.Height - 1);
+        var pixel = bmp.GetPixel(x, y);
+
+        Check.That(pixel.R >= 240 && pixel.B >= 240 && pixel.G <= 40,
+            "<hr noshade color=\"#FF00FF\"> paints the authored colour instead of grey",
+            pixel.ToString());
         Check.Done();
     }
 

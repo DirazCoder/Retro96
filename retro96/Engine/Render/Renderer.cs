@@ -727,7 +727,21 @@ public class Renderer
     /// </summary>
     private static void PaintHr(Graphics g, LayoutBox box)
     {
-        bool noshade = box.Element!.HasAttr("noshade");
+        var elem = box.Element!;
+        var style = elem.Style;
+        bool noshade = elem.HasAttr("noshade");
+
+        // HTML COLOR is a presentational attribute, not a CSS border colour,
+        // so make it authoritative at paint time too.  This also keeps the
+        // renderer robust if a caller builds a layout tree without running
+        // the normal style-attribute pass first.
+        Color color = ParseHtmlColor(elem.GetAttr("color"));
+        if (color == Color.Empty && style != null)
+            color = style.BorderTopColor != Color.Empty
+                ? style.BorderTopColor
+                : style.Color;
+        if (color == Color.Empty)
+            color = Color.Black;
 
         var rect = box.ContentRect;
         float x1 = rect.X;
@@ -736,23 +750,38 @@ public class Renderer
 
         if (noshade)
         {
-            // Filled bar flush with the top of the box — the old pen-based
-            // draw was centred on the edge and spilled half the bar above
-            g.FillRectangle(SolidBrushFor(Color.FromArgb(0x80, 0x80, 0x80)),
+            // NOSHADE is a flat rule: paint the authored COLOR verbatim.
+            g.FillRectangle(SolidBrushFor(color),
                 x1, rect.Y, rect.Width, thick);
             return;
         }
 
-        // 3-D inset: dark top half, light bottom half
-        using var penDark = new Pen(Color.FromArgb(0x80, 0x80, 0x80), 1);
-        using var penLight = new Pen(Color.White, 1);
+        // 3-D inset: keep the authored colour while deriving a darker top and
+        // lighter bottom shade.  A coloured <hr> therefore stays coloured in
+        // both NOSHADE and the default 3-D presentation.
+        var dark = Shade(color, 0.55f);
+        var light = Tint(color, 0.65f);
         int half = (thick + 1) / 2;
+        using var penDark = new Pen(dark, 1);
+        using var penLight = new Pen(light, 1);
         for (int i = 0; i < thick; i++)
         {
             float y = rect.Y + i;
             g.DrawLine(i < half ? penDark : penLight, x1, y, x2, y);
         }
     }
+
+    private static Color Shade(Color color, float factor) =>
+        Color.FromArgb(color.A,
+            (int)Math.Round(color.R * factor),
+            (int)Math.Round(color.G * factor),
+            (int)Math.Round(color.B * factor));
+
+    private static Color Tint(Color color, float factor) =>
+        Color.FromArgb(color.A,
+            (int)Math.Round(color.R + (255 - color.R) * factor),
+            (int)Math.Round(color.G + (255 - color.G) * factor),
+            (int)Math.Round(color.B + (255 - color.B) * factor));
 
     private enum BorderSide { Top, Right, Bottom, Left }
 
@@ -1051,6 +1080,12 @@ public class Renderer
             TextTransform.Capitalize => CapitalizeWords(box.TextRun),
             _ => box.TextRun
         };
+
+        if (text.Contains("VISITOR") || text.Contains("COUNT") || text.Contains("0 0 0") || text.Contains("["))
+            Retro96.DebugLog.Write($"[paintdbg] text=\"{text}\" box.X={box.X:F1} " +
+                $"contentRect.X={contentRect.X:F1} box.Width={box.Width:F1} " +
+                $"parent.X={box.Parent?.X:F1} parent.Width={box.Parent?.Width:F1} " +
+                $"style.TextAlign={style.TextAlign}");
 
         if (style.FontVariant == FontVariantValue.SmallCaps)
             PaintSmallCapsText(g, contentRect.X, contentRect.Y, text, style, fonts, textColor, sf);
@@ -1356,7 +1391,7 @@ public class Renderer
                 return;
 
             case "file":
-                PaintTextControl(g, box, fonts, style, "_", isFocused);
+                PaintFileInput(g, box, fonts, style);
                 return;
 
             default:    // text, password, and unknown → text field
@@ -1399,6 +1434,64 @@ public class Renderer
             g.DrawLine(penDark, x0, y1, x1, y1);
             g.DrawLine(penDark, x1, y0, x1, y1);
         }
+    }
+
+    private static void PaintFileInput(Graphics g, LayoutBox box, FontCache fonts,
+                                       ComputedStyle style)
+    {
+        var rect = box.BorderRect;
+        var face = box.ContentRect;
+        if (rect.Width <= 0 || rect.Height <= 0) return;
+
+        bool disabled = box.Element?.HasAttr("disabled") == true;
+        Color outer = disabled ? Color.FromArgb(0xD0, 0xD0, 0xD0) : Color.FromArgb(0xC0, 0xC0, 0xC0);
+        Color buttonFace = disabled ? Color.FromArgb(0xD8, 0xD8, 0xD8) : Color.FromArgb(0xE0, 0xE0, 0xE0);
+        Color textColor = disabled ? Color.Gray
+            : style.OwnColor ? style.Color : Color.Black;
+
+        using (var bg = new SolidBrush(outer))
+            g.FillRectangle(bg, rect.X, rect.Y, rect.Width, rect.Height);
+        PaintSunkenRect(g, rect, 1);
+
+        const float buttonWidth = 92f;
+        float actualButtonWidth = Math.Min(buttonWidth, Math.Max(34f, rect.Width - 8f));
+        var button = new RectangleF(
+            face.X + 2, face.Y + 2,
+            actualButtonWidth, Math.Max(1f, face.Height - 4));
+
+        using (var buttonBrush = new SolidBrush(buttonFace))
+            g.FillRectangle(buttonBrush, button.X, button.Y, button.Width, button.Height);
+        PaintRaisedRect(g, button, 2);
+
+        var font = ResolveFont(fonts, style);
+        using var brush = new SolidBrush(textColor);
+        using var fmt = new StringFormat(StringFormat.GenericTypographic)
+        {
+            Alignment = StringAlignment.Center,
+            LineAlignment = StringAlignment.Center,
+            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
+            Trimming = StringTrimming.EllipsisCharacter
+        };
+
+        g.DrawString("Choose File", font, brush, button, fmt);
+
+        string chosen = box.Element?.GetAttr("data-file-name") ?? "";
+        string label = chosen.Length == 0 ? "No file chosen" : chosen;
+        var labelRect = new RectangleF(
+            button.Right + 6, face.Y + 1,
+            Math.Max(0f, face.Right - button.Right - 9), face.Height - 2);
+
+        using var labelFmt = new StringFormat(StringFormat.GenericTypographic)
+        {
+            Alignment = StringAlignment.Near,
+            LineAlignment = StringAlignment.Center,
+            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
+            Trimming = StringTrimming.EllipsisCharacter
+        };
+        var clip = g.Save();
+        g.SetClip(labelRect, CombineMode.Intersect);
+        g.DrawString(label, font, brush, labelRect, labelFmt);
+        g.Restore(clip);
     }
 
     private static void PaintTextControl(Graphics g, LayoutBox box, FontCache fonts,

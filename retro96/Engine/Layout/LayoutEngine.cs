@@ -1573,7 +1573,6 @@ public static class LayoutEngine
             var positionedContainingBlock = FindPositionedContainingBlock(box);
             LayoutBlock(child, positionedContainingBlock.Width, positionedContainingBlock.Height);
 
-            float prevX = child.X, prevY = child.Y;
             // FIX: the containing block for an absolutely positioned box is its
             // nearest positioned ancestor (position != static), not necessarily
             // its immediate parent. The old code always passed `box` (the direct
@@ -1586,11 +1585,12 @@ public static class LayoutEngine
             // call above) — sizing against one box and positioning against a
             // different one is how a percent-width dialog like this one ended
             // up both the wrong size AND in the wrong place.
+            //
+            // LayoutAbsolute applies the final offset to the entire subtree. Do
+            // not apply the resulting delta again here: doing so moved the
+            // dialog twice (30% became roughly 60%, producing the detached
+            // bottom-right gray box seen on the Acme CyberCorp page).
             LayoutAbsolute(child, positionedContainingBlock);
-            float dx = child.X - prevX;
-            float dy = child.Y - prevY;
-            if (Math.Abs(dx) > 0.01f || Math.Abs(dy) > 0.01f)
-                OffsetBoxTree(child, dx, dy);
         }
 
         // Relatively positioned children
@@ -1857,21 +1857,34 @@ public static class LayoutEngine
         float? top = style.Top ?? (style.TopPercent is { } tp ? tp / 100f * containingBlock.Height : null);
         float? bottom = style.Bottom ?? (style.BottomPercent is { } bp ? bp / 100f * containingBlock.Height : null);
 
+        // Work out the final border-box origin first, then shift the whole
+        // subtree exactly once. The box was already laid out provisionally at
+        // its static-flow position above, so descendants need the same delta.
+        // Mutating box.X/Y and then shifting the entire tree from the caller
+        // would double-apply the offset.
+        float targetX = box.X;
+        float targetY = box.Y;
+
         if (left.HasValue)
-            box.X = cbContentX + left.Value + box.MarginLeft;
+            targetX = cbContentX + left.Value + box.MarginLeft;
         else if (right.HasValue)
-            box.X = cbContentX + containingBlock.Width
-                  - right.Value
-                  - box.MarginRight - box.BorderLeft - box.BorderRight
-                  - box.PaddingLeft - box.PaddingRight - box.Width;
+            targetX = cbContentX + containingBlock.Width
+                    - right.Value
+                    - box.MarginRight - box.BorderLeft - box.BorderRight
+                    - box.PaddingLeft - box.PaddingRight - box.Width;
 
         if (top.HasValue)
-            box.Y = cbContentY + top.Value + box.MarginTop;
+            targetY = cbContentY + top.Value + box.MarginTop;
         else if (bottom.HasValue)
-            box.Y = cbContentY + containingBlock.Height
-                  - bottom.Value
-                  - box.MarginBottom - box.BorderTop - box.BorderBottom
-                  - box.PaddingTop - box.PaddingBottom - box.Height;
+            targetY = cbContentY + containingBlock.Height
+                    - bottom.Value
+                    - box.MarginBottom - box.BorderTop - box.BorderBottom
+                    - box.PaddingTop - box.PaddingBottom - box.Height;
+
+        float dx = targetX - box.X;
+        float dy = targetY - box.Y;
+        if (Math.Abs(dx) > 0.01f || Math.Abs(dy) > 0.01f)
+            OffsetBoxTree(box, dx, dy);
     }
 
     private static void LayoutRelative(LayoutBox box)

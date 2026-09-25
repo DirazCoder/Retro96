@@ -2,6 +2,7 @@ namespace Retro96;
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 using Retro96.Drawing;
@@ -2098,7 +2099,7 @@ public class BrowserCanvas : Control
         if (el.TagName == "textarea") return true;
         if (el.TagName != "input") return false;
         return el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant()
-            is "text" or "password" or "file";
+            is "text" or "password";
     }
 
     private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null)
@@ -2954,7 +2955,15 @@ public class BrowserCanvas : Control
                 return;
 
             string type = element.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
-            if (type is "text" or "password" or "file")
+            if (type == "file")
+            {
+                var clickResult = js?.FireEvent(element, "onclick");
+                if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
+                    return;
+                ChooseFileForInput(element, js);
+                return;
+            }
+            if (type is "text" or "password")
             {
                 FocusControl(element, GetFieldText(element).Length, js);
                 js?.FireEvent(element, "onclick");
@@ -3583,6 +3592,30 @@ public class BrowserCanvas : Control
     private static DomElement? FindEnclosingForm(DomElement element) =>
         Engine.Forms.FormSubmitter.FindEnclosingForm(element);
 
+    private void ChooseFileForInput(DomElement input, JsInterpreter? js)
+    {
+        if (input.HasAttr("disabled")) return;
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Choose File",
+            Filter = "All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+            RestoreDirectory = true
+        };
+
+        var owner = FindForm();
+        if (dialog.ShowDialog(owner) != DialogResult.OK)
+            return;
+
+        string fullPath = Path.GetFullPath(dialog.FileName);
+        input.SetAttr("data-file-name", Path.GetFileName(fullPath));
+        input.SetAttr("data-file-path", fullPath);
+        js?.FireEvent(input, "onchange");
+        RequestRerender();
+    }
+
     private void ResetForm(DomElement? form)
     {
         if (form == null) return;
@@ -3594,6 +3627,11 @@ public class BrowserCanvas : Control
             switch (field.TagName)
             {
                 case "input":
+                    if (field.GetAttrOrDefault("type", "text").Trim().Equals("file", StringComparison.OrdinalIgnoreCase))
+                    {
+                        field.SetAttr("data-file-name", null);
+                        field.SetAttr("data-file-path", null);
+                    }
                     if (_controlDefaults.TryGetValue(field, out var def))
                     {
                         if (def.Value == null) field.SetAttr("value", null);
