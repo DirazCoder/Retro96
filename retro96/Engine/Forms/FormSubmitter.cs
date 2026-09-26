@@ -4,14 +4,32 @@ using System.Runtime.CompilerServices;
 
 namespace Retro96.Engine.Forms;
 
-/// </summary>
-public record FormSubmitRequest(
-    string Url,
-    string QueryString,
-    string Method,
-    string? Target,
-    IReadOnlyDictionary<string, string>? MultipartFields = null,
-    IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? MultipartFiles = null);
+/// <summary>Represents a serialized form submission request.</summary>
+public record FormSubmitRequest
+{
+    public string Url { get; init; }
+    public string QueryString { get; init; }
+    public string Method { get; init; }
+    public string? Target { get; init; }
+    public IReadOnlyDictionary<string, string>? MultipartFields { get; init; }
+    public IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? MultipartFiles { get; init; }
+
+    public FormSubmitRequest(
+        string url,
+        string queryString,
+        string method,
+        string? target,
+        IReadOnlyDictionary<string, string>? multipartFields = null,
+        IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? multipartFiles = null)
+    {
+        Url = url;
+        QueryString = queryString;
+        Method = method;
+        Target = target;
+        MultipartFields = multipartFields;
+        MultipartFiles = multipartFiles;
+    }
+}
 
 public static class FormSubmitter
 {

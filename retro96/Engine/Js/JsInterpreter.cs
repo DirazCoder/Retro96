@@ -266,25 +266,29 @@ public class JsInterpreter
     public JsValue FireEvent(DomElement element, string eventName,
                              JsObject? eventObj = null)
     {
-        if (!element.EventHandlers.TryGetValue(eventName, out var handlerSource))
+        string normalizedEvent = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName.ToLowerInvariant()
+            : "on" + eventName.ToLowerInvariant();
+
+        // DOM-0 property handlers are the source of truth for
+        // `element.onclick = function () { ... }`.  Do this lookup even when
+        // EventHandlers has no sentinel: older pages and setAttribute/property
+        // mutations can legitimately create the handler without going through
+        // the HTML parser.  This also prevents a stale EventHandlers dictionary
+        // from making an otherwise valid property assignment inert.
+        var wrapperForProperty = ElementWrapperHook?.Invoke(element);
+        if (wrapperForProperty != null &&
+            wrapperForProperty.Properties.TryGetValue(normalizedEvent, out var propertyHandler) &&
+            propertyHandler.Type == JsType.Function)
+        {
+            return CallHandler(propertyHandler, JsValue.FromObject(wrapperForProperty), eventObj);
+        }
+
+        if (!element.EventHandlers.TryGetValue(normalizedEvent, out var handlerSource))
             return JsValue.Undefined;
 
         if (handlerSource == "__js_handler__")
-        {
-            var wrapper = ElementWrapperHook?.Invoke(element);
-            if (wrapper != null)
-            {
-                foreach (var kvp in wrapper.Properties)
-                {
-                    if (kvp.Value.Type == JsType.Function &&
-                        string.Equals(kvp.Key, eventName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return CallHandler(kvp.Value, JsValue.FromObject(wrapper), eventObj);
-                    }
-                }
-            }
-            return JsValue.Undefined;
-        }
+            return JsValue.Undefined; // property handler was checked above
 
         try
         {
