@@ -215,7 +215,8 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
         string queryPart = string.IsNullOrEmpty(Query) ? string.Empty : $"?{Query}";
         string fragmentPart = string.IsNullOrEmpty(Fragment) ? string.Empty : $"#{Fragment}";
 
-        return $"{Scheme}://{Host}{portPart}{Path}{queryPart}{fragmentPart}";
+        string hostPart = Host.Contains(':') && !Host.StartsWith("[") ? $"[{Host}]" : Host;
+        return $"{Scheme}://{hostPart}{portPart}{Path}{queryPart}{fragmentPart}";
     }
 
     /// <summary>The document directory of this URL (trailing slash kept).</summary>
@@ -268,11 +269,19 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
         bool trailingSlash = path.EndsWith('/');
         string[] segments = path.Split('/');
         var normalized = new List<string>();
+        bool absolute = path.StartsWith('/');
 
         foreach (string segment in segments)
         {
-            if (segment.Length == 0 || segment == ".")
+            if (segment == ".")
                 continue;
+            if (segment.Length == 0)
+            {
+                if (normalized.Count == 0 || normalized[^1].Length == 0)
+                    continue;
+                normalized.Add("");
+                continue;
+            }
             if (segment == "..")
             {
                 if (normalized.Count > 0)
@@ -282,7 +291,8 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
             normalized.Add(segment);
         }
 
-        string result = "/" + string.Join("/", normalized);
+        string result = (absolute ? "/" : "") + string.Join("/", normalized);
+        if (result.Length == 0) result = "/";
         if (trailingSlash && result != "/")
             result += "/";
 

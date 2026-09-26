@@ -377,6 +377,8 @@ public class JsObject
 
     public bool HasOwn(string name) => Properties.ContainsKey(name);
 
+    public virtual bool Delete(string name) => Properties.Remove(name);
+
     public IEnumerable<string> OwnEnumerableKeys() => Properties.Keys;
 }
 

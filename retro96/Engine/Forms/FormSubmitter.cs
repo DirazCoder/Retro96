@@ -1,17 +1,42 @@
 using Retro96.Engine.Dom;
 using Retro96.Engine.Network;
+using System.Runtime.CompilerServices;
 
 namespace Retro96.Engine.Forms;
 
 /// </summary>
 public record FormSubmitRequest(
-    string Url,          // resolved action (or the document URL for empty action)
-    string QueryString,  // percent-encoded field pairs, &-joined
-    string Method,       // "get" | "post" (lower-cased)
-    string? Target);     // form target / base target / null
+    string Url,
+    string QueryString,
+    string Method,
+    string? Target,
+    IReadOnlyDictionary<string, string>? MultipartFields = null,
+    IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? MultipartFiles = null);
 
 public static class FormSubmitter
 {
+    private sealed record FileSelection(string FullPath, string DisplayName);
+    private static readonly ConditionalWeakTable<DomElement, FileSelection> FileSelections = new();
+
+    public static void SetFileSelection(DomElement input, string fullPath)
+    {
+        FileSelections.Remove(input);
+        FileSelections.Add(input, new FileSelection(fullPath, System.IO.Path.GetFileName(fullPath)));
+    }
+
+    public static bool TryGetFileSelection(DomElement input, out string fullPath, out string displayName)
+    {
+        if (FileSelections.TryGetValue(input, out var selected))
+        {
+            fullPath = selected.FullPath;
+            displayName = selected.DisplayName;
+            return true;
+        }
+        fullPath = string.Empty; displayName = string.Empty; return false;
+    }
+
+    public static void ClearFileSelection(DomElement input) => FileSelections.Remove(input);
+
     /// <summary>Walks the DOM parent chain looking for an enclosing element.</summary>
     public static DomElement? FindAncestor(DomElement element, string tagName)
     {
@@ -83,7 +108,36 @@ public static class FormSubmitter
         if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(baseTarget))
             target = baseTarget;
 
-        return new FormSubmitRequest(resolved, qs, method, target);
+        Dictionary<string,string>? fields = null;
+        Dictionary<string,(string Filename,string ContentType,byte[] Bytes)>? files = null;
+        if (method == "post" && form.GetAttrOrDefault("enctype", "application/x-www-form-urlencoded")
+            .Equals("multipart/form-data", StringComparison.OrdinalIgnoreCase))
+        {
+            fields = new Dictionary<string,string>(StringComparer.Ordinal);
+            files = new Dictionary<string,(string,string,byte[])>(StringComparer.Ordinal);
+            foreach (var field in FieldsOf(form))
+            {
+                var n = field.GetAttr("name");
+                if (string.IsNullOrEmpty(n) || field.HasAttr("disabled")) continue;
+                if (field.TagName == "input" && field.GetAttrOrDefault("type", "text").Equals("file", StringComparison.OrdinalIgnoreCase) &&
+                    TryGetFileSelection(field, out var fullPath, out var displayName))
+                {
+                    try
+                    {
+                        var info = new System.IO.FileInfo(fullPath);
+                        if (info.Length > 8L * 1024 * 1024) continue;
+                        var bytes = System.IO.File.ReadAllBytes(fullPath);
+                        string ct = ContentTypeForPath(fullPath);
+                        files[n] = (displayName, ct, bytes);
+                    }
+                    catch { }
+                }
+                else if (field.TagName == "input" || field.TagName == "textarea")
+                    fields[n] = field.GetAttr("value") ?? field.InnerText ?? "";
+            }
+        }
+
+        return new FormSubmitRequest(resolved, qs, method, target, fields, files);
     }
 
     /// <summary>
@@ -92,6 +146,13 @@ public static class FormSubmitter
     /// or multiple selects (first option wins when none selected), and
     /// the image button's .x/.y click coordinates.
     /// </summary>
+    private static string ContentTypeForPath(string path) =>
+        System.IO.Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".gif" => "image/gif", ".jpg" or ".jpeg" => "image/jpeg", ".png" => "image/png",
+            ".txt" => "text/plain", ".html" or ".htm" => "text/html", _ => "application/octet-stream"
+        };
+
     public static List<(string, string)> CollectPairs(
         DomElement form, (string Name, int X, int Y)? imageClick = null)
     {
@@ -101,6 +162,7 @@ public static class FormSubmitter
         {
             string? name = field.GetAttr("name");
             if (string.IsNullOrEmpty(name)) continue;
+            if (field.HasAttr("disabled")) continue;
 
             switch (field.TagName)
             {
@@ -109,6 +171,10 @@ public static class FormSubmitter
                         string type = field.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
                         if (type == "hidden" || type == "text" || type == "password")
                             pairs.Add((name, field.GetAttr("value") ?? ""));
+                        else if (type is "submit" or "button" && field.HasAttr("name"))
+                            pairs.Add((name, field.GetAttr("value") ?? ""));
+                        else if (type == "file" && TryGetFileSelection(field, out _, out var displayName))
+                            pairs.Add((name, displayName));
                         else if (type is "checkbox" or "radio")
                         {
                             if (field.HasAttr("checked"))
@@ -123,20 +189,24 @@ public static class FormSubmitter
                         break;
                     }
                 case "textarea":
-                    pairs.Add((name, field.InnerText));
+                    pairs.Add((name, field.InnerText ?? ""));
+                    break;
+                case "button":
+                    if (field.GetAttrOrDefault("type", "submit").Equals("submit", StringComparison.OrdinalIgnoreCase))
+                        pairs.Add((name, field.GetAttr("value") ?? field.InnerText ?? ""));
                     break;
                 case "select":
                     {
                         var selected = field.Descendants().OfType<DomElement>()
                             .Where(o => o.TagName == "option" && o.HasAttr("selected"))
                             .ToList();
-                        if (selected.Count == 0)
+                        bool multiple = field.HasAttr("multiple");
+                        if (selected.Count == 0 && !multiple)
                         {
                             var first = field.Descendants().OfType<DomElement>()
                                 .FirstOrDefault(o => o.TagName == "option");
                             if (first != null) selected.Add(first);
                         }
-                        bool multiple = field.HasAttr("multiple");
                         foreach (var opt in multiple ? selected : selected.Take(1))
                             pairs.Add((name, opt.GetAttrOrDefault("value", (opt.InnerText ?? "").Trim())));
                         break;

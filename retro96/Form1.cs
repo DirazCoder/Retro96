@@ -621,8 +621,16 @@ public partial class Form1 : Form
                         _httpClient.BasicAuthHeader =
                             "Basic " + Convert.ToBase64String(
                                 Encoding.ASCII.GetBytes($"{creds.Value.User}:{creds.Value.Pass}"));
-                        result = await _httpClient.GetAsync(url, _cookieStore, ct);
-                        _httpClient.BasicAuthHeader = null;
+                        _httpClient.BasicAuthOrigin = $"{url.Scheme.ToLowerInvariant()}://{url.Host.ToLowerInvariant()}:{url.Port}";
+                        try
+                        {
+                            result = await _httpClient.GetAsync(url, _cookieStore, ct);
+                        }
+                        finally
+                        {
+                            _httpClient.BasicAuthHeader = null;
+                            _httpClient.BasicAuthOrigin = null;
+                        }
 
                         if (result is HttpSuccess ok2 && ok2.StatusCode == 401)
                         {
@@ -874,31 +882,7 @@ public partial class Form1 : Form
                         DebugLog.WriteException("BODY ONLOAD FireEvent", ex);
                     }
 
-                    // Some recovered body nodes can retain the attribute but
-                    // lose the normal event dispatch context. Verify the
-                    // page marker and run the preserved inline source once if
-                    // the standard dispatch did not update it.
-                    var loadMarker = document.ElementDescendants()
-                        .FirstOrDefault(e => e.GetAttr("id") == "loadMarker");
-                    DebugLog.Write($"BODY ONLOAD: marker before fallback='" +
-                                   (loadMarker?.InnerText ?? "<missing>") + "'");
-                    if (!string.IsNullOrEmpty(bodyOnload) &&
-                        loadMarker != null &&
-                        !(loadMarker.InnerText ?? "")
-                            .Contains("ONLOAD-OK", StringComparison.Ordinal))
-                    {
-                        try
-                        {
-                            interpreter.ExecuteString(bodyOnload);
-                            DebugLog.Write("BODY ONLOAD: direct fallback executed");
-                        }
-                        catch (Exception ex)
-                        {
-                            DebugLog.WriteException("BODY ONLOAD direct fallback", ex);
-                        }
-                    }
-                    DebugLog.Write($"BODY ONLOAD: marker after='" +
-                                   (loadMarker?.InnerText ?? "<missing>") + "'");
+                    // Canonical body onload dispatch is the single execution path.
                 }
                 else
                     DebugLog.Write("BODY ONLOAD: body element not found");
@@ -913,7 +897,7 @@ public partial class Form1 : Form
                 // data-URI images otherwise queued natural-size reflow
                 // against the old page before UpdatePage installed it.
                 _ = PrefetchImagesAsync(document, url, ct,
-                    reflowWhenLoaded: true, myGeneration);
+                    reflowWhenLoaded: true, myGeneration, interpreter);
                 if (BrowserRuntime.FramesEnabled)
                     _ = LoadFramesAsync(document, rootBox);
             }
@@ -1143,6 +1127,7 @@ public partial class Form1 : Form
                     if (localPath != null && File.Exists(localPath))
                     {
                         string cssText = await File.ReadAllTextAsync(localPath);
+                        cssText = await ExpandCssImportsAsync(cssText, localParsed, ct, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
                         var styleElem = new DomElement("style");
                         styleElem.AppendChild(new DomText { Data = cssText });
                         document.AppendChild(styleElem);
@@ -1154,6 +1139,7 @@ public partial class Form1 : Form
                 if (res is HttpSuccess css)
                 {
                     string cssText = DecodeBody(css);
+                    cssText = await ExpandCssImportsAsync(cssText, baseUrl, ct, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
                     var styleElem = new DomElement("style");
                     styleElem.AppendChild(new DomText { Data = cssText });
                     document.AppendChild(styleElem);
@@ -1163,9 +1149,49 @@ public partial class Form1 : Form
         }
     }
 
+    private async Task<string> ExpandCssImportsAsync(string cssText, ParsedUrl baseUrl,
+        CancellationToken ct, int depth, HashSet<string> visited)
+    {
+        if (depth >= 8 || string.IsNullOrWhiteSpace(cssText)) return cssText;
+        var (_, imports) = CssParser.Parse(cssText);
+        if (imports.Count == 0) return cssText;
+
+        var prefix = new StringBuilder();
+        foreach (var import in imports.Take(32))
+        {
+            try
+            {
+                string abs = baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? FileUrls.Resolve(baseUrl, import.Url)
+                    : baseUrl.Resolve(import.Url).ToAbsolute();
+                if (!visited.Add(abs)) continue;
+
+                string importedText;
+                var parsed = ParsedUrl.Parse(abs);
+                if (parsed.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+                {
+                    string? path = LocalPathFromFileUrl(parsed);
+                    if (path == null || !File.Exists(path)) continue;
+                    importedText = await File.ReadAllTextAsync(path, ct);
+                }
+                else if (parsed.IsHttp)
+                {
+                    var result = await _resourceLoader!.FetchAsync(abs, baseUrl, _cookieStore);
+                    if (result is not HttpSuccess imported) continue;
+                    importedText = DecodeBody(imported);
+                }
+                else continue;
+
+                prefix.AppendLine(await ExpandCssImportsAsync(importedText, parsed, ct, depth + 1, visited));
+            }
+            catch { /* one bad import must not discard the parent stylesheet */ }
+        }
+        return prefix.AppendLine(cssText).ToString();
+    }
+
     private async Task PrefetchImagesAsync(DomDocument doc, ParsedUrl baseUrl,
                                            CancellationToken ct, bool reflowWhenLoaded,
-                                           long myGeneration)
+                                           long myGeneration, JsInterpreter? js = null)
     {
         if (!BrowserRuntime.ImagesEnabled) return;
         _imageCache.HostOpenedLocalPage = _hostOpenedLocalDocument;
@@ -1209,10 +1235,26 @@ public partial class Form1 : Form
         // stalls, everything after shows the broken icon).
         var fetches = new List<Task>();
         foreach (var absoluteUrl in distinct)
-        {
             fetches.Add(FetchOneImageAsync(absoluteUrl, ct, myGeneration));
-        }
         await Task.WhenAll(fetches);
+
+        if (js != null)
+        {
+            foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
+            {
+                string? raw = elem.GetAttr("src") ?? elem.GetAttr("lowsrc");
+                if (string.IsNullOrEmpty(raw)) continue;
+                try
+                {
+                    string abs = ImageCache.ResolveUrl(raw, baseUrl.ToAbsolute());
+                    if (_imageCache.TryGetCached(abs, out var image) && image.Frames.Count > 0)
+                        js.FireEvent(elem, "onload");
+                    else
+                        js.FireEvent(elem, "onerror");
+                }
+                catch { js.FireEvent(elem, "onerror"); }
+            }
+        }
 
         if (reflowWhenLoaded && distinct.Count > 0)
         {
@@ -1903,11 +1945,19 @@ public partial class Form1 : Form
         BeginInvoke(() => _statusLabel.Text = status);
 
     private void OnFormSubmitted((string Url, string Body, string? Target,
-                                  BrowserCanvas.FrameView? Frame) submit)
+                                  BrowserCanvas.FrameView? Frame,
+                                  IReadOnlyDictionary<string,string>? MultipartFields,
+                                  IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles) submit)
     {
         if (!BrowserRuntime.FormSubmissionsEnabled)
         {
             _statusLabel.Text = "Form submission blocked by Preferences → Advanced.";
+            return;
+        }
+
+        if (submit.MultipartFields != null && submit.MultipartFiles != null)
+        {
+            _ = SubmitMultipartAsync(submit);
             return;
         }
 
@@ -1935,6 +1985,28 @@ public partial class Form1 : Form
                 _ = LoadFrameAsync(named.View, submit.Url, submit.Body);
             else
                 _ = NavigateAsync(submit.Url, submit.Body);
+        }
+    }
+
+    private async Task SubmitMultipartAsync((string Url, string Body, string? Target,
+        BrowserCanvas.FrameView? Frame,
+        IReadOnlyDictionary<string,string>? MultipartFields,
+        IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles) submit)
+    {
+        if (submit.MultipartFields == null || submit.MultipartFiles == null) return;
+        try
+        {
+            var url = ParsedUrl.Parse(submit.Url);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var result = await _httpClient.PostMultipartAsync(url, submit.MultipartFields, submit.MultipartFiles, _cookieStore, cts.Token);
+            if (result is HttpSuccess ok)
+                await ProcessSuccessAsync(ok, url, cts.Token, null, false, false, _navGeneration);
+            else
+                _statusLabel.Text = "Multipart form submission failed.";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "Multipart form submission failed: " + ex.Message;
         }
     }
 

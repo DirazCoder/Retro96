@@ -301,7 +301,9 @@ public static class FileUrls
     public static string Resolve(ParsedUrl baseUrl, string href)
     {
         if (!string.Equals(baseUrl.Scheme, "file", StringComparison.OrdinalIgnoreCase))
-            return baseUrl.Resolve(href).ToAbsolute();
+            return baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                ? FileUrls.Resolve(baseUrl, href)
+                : baseUrl.Resolve(href).ToAbsolute();
 
         string trimmed = (href ?? string.Empty).Trim();
         if (trimmed.Length == 0)
@@ -340,7 +342,9 @@ public static class FileUrls
 
         string? basePath = LocalPathFromFileUrl(baseUrl);
         if (basePath == null)
-            return baseUrl.Resolve(trimmed).ToAbsolute();
+            return baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? FileUrls.Resolve(baseUrl, trimmed)
+                    : baseUrl.Resolve(trimmed).ToAbsolute();
 
         SplitPathSuffix(trimmed, out string rawPath, out string query, out string fragment);
         string decodedPath;

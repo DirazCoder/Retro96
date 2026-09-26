@@ -26,6 +26,7 @@ public record Cookie(
 /// </summary>
 public class CookieStore
 {
+    private readonly object _sync = new();
     private readonly Dictionary<string, List<Cookie>> _cookies =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -42,11 +43,9 @@ public class CookieStore
     /// </summary>
     public void Set(string setCookieHeader, ParsedUrl requestUrl)
     {
-        if (string.IsNullOrWhiteSpace(setCookieHeader) || requestUrl == null)
-            return;
-
-        foreach (var single in SplitMultipleSetCookies(setCookieHeader))
-            SetSingle(single, requestUrl);
+        if (string.IsNullOrWhiteSpace(setCookieHeader) || requestUrl == null) return;
+        lock (_sync)
+            foreach (var single in SplitMultipleSetCookies(setCookieHeader)) SetSingle(single, requestUrl);
     }
 
     private static List<string> SplitMultipleSetCookies(string header)
@@ -242,6 +241,8 @@ public class CookieStore
     /// </summary>
     public string Get(ParsedUrl requestUrl)
     {
+        lock (_sync)
+        {
         if (requestUrl == null)
             return string.Empty;
 
@@ -281,6 +282,7 @@ public class CookieStore
         matching.Sort((a, b) => b.Path.Length.CompareTo(a.Path.Length));
 
         return string.Join("; ", matching.Select(c => $"{c.Name}={c.Value}"));
+        }
     }
 
     /// <summary>
@@ -319,26 +321,35 @@ public class CookieStore
 
     public void ClearExpired()
     {
+        lock (_sync)
+        {
+            ClearExpiredUnsafe();
+        }
+    }
+
+    private void ClearExpiredUnsafe()
+    {
         var empty = new List<string>();
         foreach (var kvp in _cookies)
         {
             RemoveExpiredCookies(kvp.Key);
-            if (kvp.Value.Count == 0)
-                empty.Add(kvp.Key);
+            if (kvp.Value.Count == 0) empty.Add(kvp.Key);
         }
-        foreach (var domain in empty)
-            _cookies.Remove(domain);
+        foreach (var domain in empty) _cookies.Remove(domain);
     }
 
     public int Count
     {
         get
         {
-            ClearExpired();
-            return _cookies.Values.Sum(l => l.Count);
+            lock (_sync)
+            {
+                ClearExpiredUnsafe();
+                return _cookies.Values.Sum(l => l.Count);
+            }
         }
     }
 
     /// <summary>Remove everything (the "clear cookies" UI action).</summary>
-    public void ClearAll() => _cookies.Clear();
+    public void ClearAll() { lock (_sync) _cookies.Clear(); }
 }

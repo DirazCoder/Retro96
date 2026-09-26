@@ -270,6 +270,9 @@ public class ImageCache : IDisposable
                 {
                     if (System.IO.File.Exists(local))
                     {
+                        var info = new System.IO.FileInfo(local);
+                        if (info.Length > 8L * 1024 * 1024)
+                            return MarkBroken(absoluteUrl);
                         byte[] bytes = await System.IO.File.ReadAllBytesAsync(local);
                         fileDecoded = ImageDecoder.Decode(bytes, ContentTypeFromPath(local));
                         if (fileDecoded.Frames.Count == 0 || fileDecoded.Frames[0].Width == 0)
@@ -434,7 +437,7 @@ public class ImageCache : IDisposable
     /// the caller refetches it.  Successful images and permanent failures
     /// never expire.
     /// </summary>
-    private bool TryGetCached(string absoluteUrl, out DecodedImage cached)
+    public bool TryGetCached(string absoluteUrl, out DecodedImage cached)
     {
         if (_cache.TryGetValue(absoluteUrl, out cached!))
         {
@@ -545,6 +548,7 @@ public static class NaturalImageSizes
 {
     private static readonly ConcurrentDictionary<string, (int Width, int Height)> _sizes =
         new(StringComparer.Ordinal);
+    private const int MaxNaturalImageSizes = 4096;
 
     /// <summary>Publish a decoded image's natural size (first frame).</summary>
     public static void Register(string absoluteUrl, DecodedImage image)
@@ -556,8 +560,13 @@ public static class NaturalImageSizes
     /// <summary>Publish a natural size directly (test rigs, known assets).</summary>
     public static void Register(string absoluteUrl, int width, int height)
     {
-        if (width > 0 && height > 0)
-            _sizes[absoluteUrl] = (width, height);
+        if (width <= 0 || height <= 0) return;
+        if (_sizes.Count >= MaxNaturalImageSizes && !_sizes.ContainsKey(absoluteUrl))
+        {
+            foreach (var key in _sizes.Keys.Take(Math.Max(1, MaxNaturalImageSizes / 16)))
+                _sizes.TryRemove(key, out _);
+        }
+        _sizes[absoluteUrl] = (width, height);
     }
 
     /// <summary>Natural size for an absolute URL, when decoded at least once.</summary>

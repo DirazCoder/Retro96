@@ -49,6 +49,15 @@ public static class HtmlTokenizer
         {
             if (rawTextTag != null)
             {
+                // PLAINTEXT is special: everything after its start tag is text,
+                // including strings that look like end tags.
+                if (rawTextTag == "plaintext")
+                {
+                    sb.Append(html.AsSpan(pos));
+                    pos = html.Length;
+                    break;
+                }
+
                 // In raw text mode: accumulate until </tagname (case-insensitive),
                 // allowing whitespace/attributes inside the end tag.
                 if (html[pos] == '<' && pos + 1 < html.Length && html[pos + 1] == '/' &&
@@ -228,9 +237,9 @@ public static class HtmlTokenizer
             return false;
         }
 
-        // Allow attributes / whitespace before '>'
-        while (i < html.Length && html[i] != '>')
-            i++;
+        // Closing raw-text tags may contain whitespace before '>', but not
+        // arbitrary attributes/junk (</script foo> must remain text).
+        while (i < html.Length && char.IsWhiteSpace(html[i])) i++;
 
         if (i < html.Length && html[i] == '>')
         {

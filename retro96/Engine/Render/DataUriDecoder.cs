@@ -27,8 +27,11 @@ public static class DataUriDecoder
         int comma = uri.IndexOf(',');
         if (comma < 5) return null;                    // "data:" alone — junk
 
+        const int MaxEncodedPayload = 16 * 1024 * 1024;
+        const int MaxDecodedPayload = 8 * 1024 * 1024;
         string header = uri[5..comma].Trim();
         string payload = uri[(comma + 1)..];
+        if (payload.Length > MaxEncodedPayload) return null;
 
         bool isBase64 = header.EndsWith(";base64", StringComparison.OrdinalIgnoreCase)
                          || header.Contains(";base64;", StringComparison.OrdinalIgnoreCase);
@@ -45,7 +48,9 @@ public static class DataUriDecoder
                 // tolerate URL-encoding noise inside base64 segments
                 string b64 = Uri.UnescapeDataString(payload)
                                 .Replace(" ", "").Replace("\n", "").Replace("\r", "");
+                if (b64.Length > MaxEncodedPayload) return null;
                 bytes = Convert.FromBase64String(b64);
+                if (bytes.Length > MaxDecodedPayload) return null;
             }
             else
             {
@@ -53,6 +58,7 @@ public static class DataUriDecoder
                         mediaType.Contains("svg")
                     ? Encoding.UTF8.GetBytes(Uri.UnescapeDataString(payload))
                     : Encoding.Latin1.GetBytes(Uri.UnescapeDataString(payload));
+                if (bytes.Length > MaxDecodedPayload) return null;
             }
         }
         catch

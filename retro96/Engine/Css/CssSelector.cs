@@ -306,16 +306,13 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
 
         return op switch
         {
-            '=' => elemValue.Equals(attrValue, StringComparison.OrdinalIgnoreCase),
-            '~' => elemValue.Split().Contains(attrValue, StringComparer.OrdinalIgnoreCase),
-            '|' => elemValue.Equals(attrValue, StringComparison.OrdinalIgnoreCase) ||
-                    elemValue.StartsWith(attrValue + "-", StringComparison.OrdinalIgnoreCase),
-            '^' => attrValue.Length > 0 &&
-                    elemValue.StartsWith(attrValue, StringComparison.OrdinalIgnoreCase),
-            '$' => attrValue.Length > 0 &&
-                    elemValue.EndsWith(attrValue, StringComparison.OrdinalIgnoreCase),
-            '*' => attrValue.Length > 0 &&
-                    elemValue.Contains(attrValue, StringComparison.OrdinalIgnoreCase),
+            '=' => elemValue.Equals(attrValue, StringComparison.Ordinal),
+            '~' => elemValue.Split().Contains(attrValue, StringComparer.Ordinal),
+            '|' => elemValue.Equals(attrValue, StringComparison.Ordinal) ||
+                    elemValue.StartsWith(attrValue + "-", StringComparison.Ordinal),
+            '^' => attrValue.Length > 0 && elemValue.StartsWith(attrValue, StringComparison.Ordinal),
+            '$' => attrValue.Length > 0 && elemValue.EndsWith(attrValue, StringComparison.Ordinal),
+            '*' => attrValue.Length > 0 && elemValue.Contains(attrValue, StringComparison.Ordinal),
             _ => false
         };
     }
@@ -375,7 +372,7 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
             string abs = doc.BaseUrl != null
                 ? (doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
                     ? FileUrls.Resolve(doc.BaseUrl, href)
-                    : doc.BaseUrl.Resolve(href).ToAbsolute())
+                    : doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase) ? FileUrls.Resolve(doc.BaseUrl, href) : doc.BaseUrl.Resolve(href).ToAbsolute())
                 : href;
             return doc.VisitedUrls.Contains(abs) || doc.VisitedUrls.Contains(href);
         }

@@ -38,12 +38,12 @@ public class JsScope
         var scope = this;
         while (scope != null)
         {
+            if (scope.Parent == null && scope.GlobalFallback != null && scope.GlobalFallback.Has(name))
+                return scope.GlobalFallback.Get(name);
             if (scope._vars.TryGetValue(name, out var value))
                 return value;
             if (scope.Parent == null)
-                return scope.GlobalFallback != null
-                    ? scope.GlobalFallback.Get(name)
-                    : JsValue.Undefined;
+                return JsValue.Undefined;
             scope = scope.Parent;
         }
         return JsValue.Undefined;
@@ -66,10 +66,8 @@ public class JsScope
             }
             if (scope.Parent == null)
             {
-                if (scope.GlobalFallback != null)
-                    scope.GlobalFallback.Set(name, value);   // implicit global → window
-                else
-                    scope._vars[name] = value;               // root scope = global
+                scope._vars[name] = value;
+                scope.GlobalFallback?.Set(name, value);       // root global and window share bindings
                 return;
             }
             scope = scope.Parent;
@@ -80,6 +78,8 @@ public class JsScope
     public void Define(string name, JsValue value)
     {
         _vars[name] = value;
+        if (Parent == null)
+            GlobalFallback?.Set(name, value);
     }
 
     /// <summary>True if the name is visible from this scope (own, ancestor,
@@ -92,7 +92,7 @@ public class JsScope
             if (scope._vars.ContainsKey(name))
                 return true;
             if (scope.Parent == null)
-                return scope.GlobalFallback != null && scope.GlobalFallback.Has(name);
+                return scope._vars.ContainsKey(name) || (scope.GlobalFallback != null && scope.GlobalFallback.Has(name));
             scope = scope.Parent;
         }
         return false;
@@ -104,5 +104,11 @@ public class JsScope
     public IEnumerable<string> OwnKeys() => _vars.Keys;
 
     /// <summary>Delete from this scope only (JS 1.1: delete on vars fails).</summary>
-    public bool Delete(string name) => _vars.Remove(name);
+    public bool Delete(string name)
+    {
+        bool removed = _vars.Remove(name);
+        if (Parent == null && GlobalFallback != null)
+            removed |= GlobalFallback.Delete(name);
+        return removed;
+    }
 }

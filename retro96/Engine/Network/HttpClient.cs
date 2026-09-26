@@ -41,7 +41,7 @@ public class HttpClient
 {
     private readonly bool _allowInvalidCertificates;
 
-    public HttpClient(bool allowInvalidCertificates = true)
+    public HttpClient(bool allowInvalidCertificates = false)
     {
         _allowInvalidCertificates = allowInvalidCertificates;
     }
@@ -59,6 +59,7 @@ public class HttpClient
 
     // Basic-auth credentials the shell installs after a 401 challenge
     public string? BasicAuthHeader { get; set; }
+    public string? BasicAuthOrigin { get; set; }
 
     // Virtual so test rigs can sandbox the network (the VisualDiff rig
     // derives a loopback-only client so external-host luck can never
@@ -75,7 +76,7 @@ public class HttpClient
 
     public virtual Task<HttpResult> PostAsync(ParsedUrl url, string formData,
                                              CookieStore cookies, CancellationToken ct, ResourceKind resourceKind) =>
-        SendRequestAsync("POST", url, Encoding.ASCII.GetBytes(formData), cookies, ct, resourceKind: resourceKind);
+        SendRequestAsync("POST", url, Encoding.UTF8.GetBytes(formData), cookies, ct, resourceKind: resourceKind);
 
     /// <summary>
     /// POST with multipart/form-data — file upload encoding.
@@ -184,6 +185,13 @@ public class HttpClient
             if (url.Scheme == "https" && newUrl.Scheme == "http")
                 return new HttpError("HTTPS to HTTP downgrade not allowed");
 
+            // Never carry HTTP Basic credentials across an origin change.
+            if (BasicAuthOrigin != null && !SameOrigin(url, newUrl))
+            {
+                BasicAuthHeader = null;
+                BasicAuthOrigin = null;
+            }
+
             // Era conversion: 301/302/303 → GET; keep method only for 307/308
             bool useGet = success.StatusCode is 301 or 302 or 303;
             return await SendRequestAsync(
@@ -226,6 +234,12 @@ public class HttpClient
             cookies.Set(setCookie, url);
     }
 
+    private static string OriginKey(ParsedUrl url) =>
+        $"{url.Scheme.ToLowerInvariant()}://{url.Host.ToLowerInvariant()}:{url.Port}";
+
+    private static bool SameOrigin(ParsedUrl a, ParsedUrl b) =>
+        string.Equals(OriginKey(a), OriginKey(b), StringComparison.OrdinalIgnoreCase);
+
     private static bool IsRedirect(int statusCode) =>
         statusCode is 301 or 302 or 303 or 307 or 308;
 
@@ -256,7 +270,9 @@ public class HttpClient
         if (!string.IsNullOrEmpty(cookieValues))
             sb.Append("Cookie: ").Append(cookieValues).Append("\r\n");
 
-        if (BasicAuthHeader != null)
+        if (BasicAuthHeader != null &&
+            BasicAuthOrigin != null &&
+            string.Equals(BasicAuthOrigin, OriginKey(url), StringComparison.OrdinalIgnoreCase))
             sb.Append("Authorization: ").Append(BasicAuthHeader).Append("\r\n");
 
         if (BrowserRuntime.ReferrerEnabled && !string.IsNullOrWhiteSpace(ReferrerOverride))
@@ -463,7 +479,14 @@ public class HttpClient
             if (contentLength > MaxBodySize)
                 return new HttpError($"Response body too large: {contentLength} bytes");
 
-            body = await ReadExactAsync(stream, contentLength, ct);
+            try
+            {
+                body = await ReadExactAsync(stream, contentLength, ct);
+            }
+            catch (EndOfStreamException)
+            {
+                return new HttpError("Truncated HTTP response body");
+            }
         }
         else if (headers.TryGetValue("transfer-encoding", out var transferEncoding) &&
                  transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
@@ -518,11 +541,10 @@ public class HttpClient
         while (totalRead < length)
         {
             int bytesRead = await stream.ReadAsync(buffer.AsMemory(totalRead, length - totalRead), ct);
-            if (bytesRead == 0) break;   // short body — return what we got
+            if (bytesRead == 0)
+                throw new EndOfStreamException("HTTP response ended before Content-Length bytes were received.");
             totalRead += bytesRead;
         }
-        if (totalRead < length)
-            Array.Resize(ref buffer, totalRead);
         return buffer;
     }
 

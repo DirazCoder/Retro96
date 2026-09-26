@@ -92,8 +92,8 @@ public static class GlyphSubstitution
         // typeface can expose a .notdef box for U+2022 instead of doing
         // per-glyph font fallback, so keep this common era glyph in the
         // Latin-1-safe range that the selected western fonts reliably paint.
-        ['•'] = LegacyBulletMarker.ToString(),
-        ['\u0095'] = LegacyBulletMarker.ToString(),
+        ['•'] = "\uE000",
+        ['\u0095'] = "\uE000",
     };
 
     /// <summary>

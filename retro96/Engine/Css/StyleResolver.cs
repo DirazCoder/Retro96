@@ -166,7 +166,12 @@ public static class StyleResolver
             if (!string.IsNullOrEmpty(inlineStyle))
             {
                 foreach (var decl in CssParser.ParseInlineStyle(inlineStyle))
-                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+                {
+                    if (decl.Important)
+                        importantDecls.Add((decl, (1_000_000, 0, 0), int.MaxValue));
+                    else
+                        style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+                }
             }
 
             // 3b. !important tier — beats every non-important declaration,

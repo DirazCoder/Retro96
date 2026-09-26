@@ -86,7 +86,9 @@ public static class JsRuntime
         {
             if (args.Length == 0) return JsValue.From(false);
             if (self.Type is not (JsType.Object or JsType.Function)) return JsValue.From(false);
-            return JsValue.From(self.GetObjectOrFunction().HasOwn(args[0].ToJsString()));
+            string key = args[0].ToJsString();
+            if (!self.GetObjectOrFunction().HasOwn(key)) return JsValue.From(false);
+            return JsValue.From(key is not ("length" or "name" or "prototype" or "constructor"));
         }));
 
         objProto.Set("propertyIsEnumerable", Fn(scope, "propertyIsEnumerable", (self, args) =>
@@ -101,6 +103,17 @@ public static class JsRuntime
             if (args.Length > 0 && args[0].Type == JsType.Object)
                 return args[0];
             var o = new JsObject { Prototype = objProto };
+            if (args.Length > 0)
+            {
+                o.Class = args[0].Type switch
+                {
+                    JsType.String => "String",
+                    JsType.Number => "Number",
+                    JsType.Boolean => "Boolean",
+                    _ => "Object"
+                };
+                o.Set("value", args[0]);
+            }
             return JsValue.FromObject(o);
         }, scope, "Object");
         objectCtor.Set("prototype", JsValue.FromObject(objProto));
@@ -309,7 +322,10 @@ public static class JsRuntime
 
             if (args.Length == 1 && args[0].Type == JsType.Number)
             {
-                length = Math.Max((int)args[0].ToNumber(), 0);
+                double n = args[0].ToNumber();
+                if (double.IsNaN(n) || double.IsInfinity(n) || n < 0 || n != Math.Truncate(n) || n > int.MaxValue)
+                    throw new JsInterpreterException("Invalid array length");
+                length = (int)n;
             }
             else
             {
@@ -484,7 +500,7 @@ public static class JsRuntime
             {
                 // Non-global: single-match array or null
                 var m = new Regex(source, options).Match(str);
-                return m.Success ? MatchArray(scope, m) : JsValue.Null;
+                return m.Success ? MatchArray(scope, m, str) : JsValue.Null;
             }
 
             var matches = new Regex(source, options).Matches(str);
@@ -605,6 +621,18 @@ public static class JsRuntime
         return (v.ToJsString(), "");
     }
 
+    private static int NormalizeLastIndex(JsValue value)
+    {
+        if (value.Type != JsType.Number) return 0;
+        double n = value.GetNumber();
+        if (double.IsNaN(n) || n <= 0) return 0;
+        if (double.IsInfinity(n) || n > int.MaxValue) return int.MaxValue;
+        return (int)Math.Truncate(n);
+    }
+
+    private static int AdvanceLastIndex(int index, int length, int inputLength) =>
+        Math.Min(inputLength, length == 0 ? index + 1 : index + length);
+
     private static RegexOptions RegexOptionsFor(string flags)
     {
         var options = RegexOptions.None;
@@ -613,7 +641,7 @@ public static class JsRuntime
         return options;
     }
 
-    private static JsValue MatchArray(JsScope scope, Match m)
+    private static JsValue MatchArray(JsScope scope, Match m, string input)
     {
         var result = NewArray(scope);
         int n = 0;
@@ -621,7 +649,7 @@ public static class JsRuntime
             result.Set((n++).ToString(), JsValue.From(g.Value));
         result.Set("length", JsValue.From(n));
         result.Set("index", JsValue.From(m.Index));
-        result.Set("input", JsValue.From(m.ToString()));
+        result.Set("input", JsValue.From(input));
         return JsValue.FromObject(result);
     }
 
@@ -907,14 +935,18 @@ public static class JsRuntime
                 int second = args.Length > 5 ? (int)args[5].ToNumber() : 0;
                 try
                 {
-                    var d = new DateTime(year, month + 1, Math.Max(day, 1), hour, minute, second,
-                        DateTimeKind.Local);
+                    // ECMAScript normalizes month/day overflow (e.g. month 12
+                    // becomes January of the following year) rather than
+                    // treating it as an invalid Date.
+                    var d = new DateTime(year, 1, 1, 0, 0, 0, DateTimeKind.Local)
+                        .AddMonths(month)
+                        .AddDays(day - 1)
+                        .AddHours(hour)
+                        .AddMinutes(minute)
+                        .AddSeconds(second);
                     ms = (d.ToUniversalTime() - Epoch).TotalMilliseconds;
                 }
-                catch
-                {
-                    ms = double.NaN;
-                }
+                catch { ms = double.NaN; }
             }
 
             JsObject dateObj = self.Type is (JsType.Object or JsType.Function)
@@ -951,9 +983,6 @@ public static class JsRuntime
         if (DateTime.TryParse(s, CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out date))
             return true;
-        if (DateTime.TryParse(s, CultureInfo.CurrentCulture,
-                DateTimeStyles.None, out date))
-            return true;
         return false;
     }
 
@@ -970,14 +999,15 @@ public static class JsRuntime
             if (args.Length == 0) return JsValue.From(false);
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
-            int lastIndex = o.Get("lastIndex") is { Type: JsType.Number } li
-                ? (int)li.GetNumber() : 0;
+            int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
+            string input = args[0].ToJsString();
+            if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.From(false); }
 
-            var m = new Regex(source, RegexOptionsFor(flags)).Match(args[0].ToJsString(), lastIndex);
+            var m = new Regex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (m.Success)
             {
                 if (flags.Contains('g'))
-                    o.Set("lastIndex", JsValue.From(m.Index + m.Length));
+                    o.Set("lastIndex", JsValue.From(AdvanceLastIndex(m.Index, m.Length, input.Length)));
                 return JsValue.From(true);
             }
             o.Set("lastIndex", JsValue.From(0));
@@ -989,19 +1019,20 @@ public static class JsRuntime
             if (args.Length == 0) return JsValue.Null;
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
-            int lastIndex = o.Get("lastIndex") is { Type: JsType.Number } li
-                ? (int)li.GetNumber() : 0;
+            int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
+            string input = args[0].ToJsString();
+            if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.Null; }
 
-            var m = new Regex(source, RegexOptionsFor(flags)).Match(args[0].ToJsString(), lastIndex);
+            var m = new Regex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (!m.Success)
             {
                 o.Set("lastIndex", JsValue.From(0));
                 return JsValue.Null;
             }
 
-            var result = MatchArray(scope, m);
+            var result = MatchArray(scope, m, input);
             o.Set("lastIndex", JsValue.From(
-                flags.Contains('g') ? m.Index + m.Length : 0));
+                flags.Contains('g') ? AdvanceLastIndex(m.Index, m.Length, input.Length) : 0));
             return result;
         }));
 
@@ -1034,7 +1065,11 @@ public static class JsRuntime
 
             var valid = new StringBuilder();
             foreach (char c in flags)
-                if (c is 'g' or 'i' or 'm') valid.Append(c);
+            {
+                if (c is not ('g' or 'i' or 'm') || valid.ToString().Contains(c))
+                    throw new JsInterpreterException("Invalid or duplicate RegExp flag");
+                valid.Append(c);
+            }
 
             JsObject regexObj = self.Type is (JsType.Object or JsType.Function)
                 ? self.GetObjectOrFunction()

@@ -15,6 +15,9 @@ public static class HitTester
     /// <summary>Deepest element whose border box contains the point.</summary>
     public static DomElement? ElementAt(LayoutBox box, float x, float y)
     {
+        if (box.Element?.Style is { } style &&
+            (style.Visibility == Retro96.Engine.Css.VisibilityValue.Hidden || style.Display == Retro96.Engine.Css.DisplayValue.None))
+            return null;
         bool contains = box.BorderRect.Contains(x, y);
 
         // Do not prune the subtree just because the parent box misses the
@@ -36,6 +39,9 @@ public static class HitTester
     /// <summary>Deepest box (any kind) whose border box contains the point.</summary>
     public static LayoutBox? DeepestBoxAt(LayoutBox box, float x, float y)
     {
+        if (box.Element?.Style is { } style &&
+            (style.Visibility == Retro96.Engine.Css.VisibilityValue.Hidden || style.Display == Retro96.Engine.Css.DisplayValue.None))
+            return null;
         bool contains = box.BorderRect.Contains(x, y);
 
         // See ElementAt: descendant geometry can legitimately extend outside

@@ -227,7 +227,15 @@ public class JsInterpreter
     /// <summary>Eval a string in an explicit scope (eval()).</summary>
     public JsValue EvalString(string source, JsScope scope)
     {
-        var program = JsParser.Parse(source);
+        ProgramNode program;
+        try { program = JsParser.Parse(source); }
+        catch (JsParserException ex)
+        {
+            string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
+            _setStatus($"Script error: {ex.Message}");
+            PublishConsole("error", message);
+            return JsValue.Undefined;
+        }
         var old = _currentScope;
         _currentScope = scope;
         try
@@ -332,7 +340,9 @@ public class JsInterpreter
         }
         catch (Exception ex)
         {
-            _setStatus($"Error in {eventName} handler: {ex.Message}");
+            string message = $"Error in {eventName} handler: {ex.Message}";
+            _setStatus(message);
+            PublishConsole("error", message);
             return JsValue.Undefined;
         }
     }
@@ -381,7 +391,9 @@ public class JsInterpreter
         }
         catch (Exception ex)
         {
-            _setStatus($"Error in event handler: {ex.Message}");
+            string message = $"Error in event handler: {ex.Message}";
+            _setStatus(message);
+            PublishConsole("error", message);
             return JsValue.Undefined;
         }
         finally
@@ -450,6 +462,7 @@ public class JsInterpreter
 
         foreach (var timer in due)
         {
+            if (!_timers.Contains(timer)) continue; // cleared after due-list snapshot
             if (now < timer.NextTick) continue;   // cleared/re-armed meanwhile
             if (_isExecuting) break;               // a timer callback below opened its own modal; stop for this tick
 
@@ -467,6 +480,7 @@ public class JsInterpreter
                     ? ex.Message[7..]
                     : ex.Message;
                 _setStatus($"Page timer exception was caught; the browser continued running: {message}");
+                PublishConsole("error", $"Timer error: {message}");
             }
             finally
             {
@@ -939,6 +953,7 @@ public class JsInterpreter
                 objId.Name is "window" or "document" or "self" or "top" or "parent")
             {
                 _onNavigate(newValue.GetString());
+                return newValue;
             }
 
             SetProperty(objVal, name, newValue);

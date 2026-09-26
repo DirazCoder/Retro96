@@ -91,8 +91,17 @@ public static class CssParser
     {
         var sb = new StringBuilder(css.Length);
         int pos = 0;
+        char quote = '\0';
         while (pos < css.Length)
         {
+            if (quote != '\0')
+            {
+                sb.Append(css[pos]);
+                if (css[pos] == '\\' && pos + 1 < css.Length) { sb.Append(css[++pos]); }
+                else if (css[pos] == quote) quote = '\0';
+                pos++; continue;
+            }
+            if (css[pos] == '\'' || css[pos] == '"') { quote = css[pos]; sb.Append(css[pos++]); continue; }
             if (pos + 1 < css.Length && css[pos] == '/' && css[pos + 1] == '*')
             {
                 pos += 2;
@@ -157,25 +166,17 @@ public static class CssParser
 
             case "media":
                 {
-                    // @media screen, all { … } — only screen/all blocks apply.
+                    // @media screen, all { … } — apply if any positive media
+                    // query names this renderer; explicit `not` negates it.
                     SkipWhitespace(css, ref pos);
-                    bool apply = false;
-                    var mediaSb = new StringBuilder();
-                    while (pos < css.Length && css[pos] != '{')
+                    string media = ReadUntil(css, ref pos, '{').Trim().ToLowerInvariant();
+                    bool hasNot = media.Split(new[] {' ', '\t', ','}, StringSplitOptions.RemoveEmptyEntries)
+                        .FirstOrDefault() == "not";
+                    bool apply = !hasNot && media.Split(',').Any(part =>
                     {
-                        char c = css[pos];
-                        if (!char.IsWhiteSpace(c) && c != ',')
-                            mediaSb.Append(char.ToLowerInvariant(c));
-                        else if (mediaSb.Length > 0)
-                        {
-                            if (mediaSb.ToString() is "screen" or "all")
-                                apply = true;
-                            mediaSb.Clear();
-                        }
-                        pos++;
-                    }
-                    if (mediaSb.Length > 0 && mediaSb.ToString() is "screen" or "all")
-                        apply = true;
+                        string token = part.Trim().Split(new[] {' ', '\t'}, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                        return token is "screen" or "all";
+                    });
 
                     if (pos < css.Length && css[pos] == '{')
                     {
@@ -435,15 +436,23 @@ public static class CssParser
             // Value: up to ';' or '}' at paren-depth 0
             var valueSb = new StringBuilder();
             int parenDepth = 0;
+            char quote = '\0';
             while (pos < css.Length)
             {
                 char v = css[pos];
-                if ((v == ';' || v == '}') && parenDepth == 0)
-                    break;
+                if (quote != '\0')
+                {
+                    valueSb.Append(v);
+                    if (v == '\\' && pos + 1 < css.Length) valueSb.Append(css[++pos]);
+                    else if (v == quote) quote = '\0';
+                    pos++;
+                    continue;
+                }
+                if (v is '\'' or '"') { quote = v; valueSb.Append(v); pos++; continue; }
+                if ((v == ';' || v == '}') && parenDepth == 0) break;
                 if (v == '(') parenDepth++;
                 else if (v == ')') parenDepth = Math.Max(0, parenDepth - 1);
-                valueSb.Append(v);
-                pos++;
+                valueSb.Append(v); pos++;
             }
 
             if (pos < css.Length && css[pos] == ';')
@@ -755,6 +764,13 @@ public static class CssParser
             pos++;
         }
         return bareSb.ToString();
+    }
+
+    private static string ReadUntil(string css, ref int pos, char terminator)
+    {
+        int start = pos;
+        while (pos < css.Length && css[pos] != terminator) pos++;
+        return css[start..pos];
     }
 
     private static void SkipToSemicolon(string css, ref int pos)

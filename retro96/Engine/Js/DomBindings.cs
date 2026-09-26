@@ -59,6 +59,15 @@ public sealed class DocumentBindingsState
 /// </summary>
 public static class DomBindings
 {
+    // HTML void elements that never receive an explicit closing tag.
+    // Keep this aligned with HtmlParser.IsVoidElement for DOM serialization.
+    private static readonly HashSet<string> VoidElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "area", "base", "basefont", "bgsound", "br", "col", "embed",
+        "frame", "hr", "img", "input", "isindex", "link", "meta",
+        "param", "spacer", "wbr"
+    };
+
     // ─────────────────────────────────────────────────────────────────────
     // Registration
     // ─────────────────────────────────────────────────────────────────────
@@ -996,6 +1005,7 @@ public static class DomBindings
                                     .Replace("\"", "&quot;"))
                   .Append('"');
             sb.Append('>');
+            if (VoidElements.Contains(e.TagName)) return;
 
             // script/style keep their raw text (no escaping, no children markup)
             if (e.TagName is "script" or "style")
@@ -1137,7 +1147,7 @@ public static class DomBindings
                                 if (o.HasAttr("selected")) return JsValue.From(i);
                                 i++;
                             }
-                            return JsValue.From(0);
+                            return JsValue.From(-1);
                         }
                     case "options":
                         {
@@ -1305,7 +1315,8 @@ public static class DomBindings
         {
             if (name == "innerHTML")
             {
-                _element.Children.Clear();
+                foreach (var oldChild in _element.Children.ToList())
+                    _element.RemoveChild(oldChild);
                 var doc = _element.OwnerDocument();
                 if (doc != null)
                 {

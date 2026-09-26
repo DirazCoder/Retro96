@@ -3088,7 +3088,9 @@ public class BrowserCanvas : Control
 
             if (document.BaseUrl != null)
             {
-                string abs = document.BaseUrl.Resolve(href).ToAbsolute();
+                string abs = document.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? Engine.Network.FileUrls.Resolve(document.BaseUrl, href)
+                    : document.BaseUrl.Resolve(href).ToAbsolute();
 
                 string? target = anchor.GetAttr("target");
                 if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(document.BaseTarget))
@@ -3131,7 +3133,9 @@ public class BrowserCanvas : Control
                 var box = FindBoxForElement(layoutRoot, element);
                 float relX = box != null ? x - box.X : 0;
                 float relY = box != null ? y - box.Y : 0;
-                string abs = document.BaseUrl.Resolve(href).ToAbsolute();
+                string abs = document.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? Engine.Network.FileUrls.Resolve(document.BaseUrl, href)
+                    : document.BaseUrl.Resolve(href).ToAbsolute();
                 string sep = abs.Contains('?') ? "&" : "?";
                 NavigateRequested?.Invoke($"{abs}{sep}{(int)relX},{(int)relY}");
                 return;
@@ -3610,8 +3614,10 @@ public class BrowserCanvas : Control
             return;
 
         string fullPath = Path.GetFullPath(dialog.FileName);
+        Engine.Forms.FormSubmitter.SetFileSelection(input, fullPath);
+        // Only expose the browser-visible filename, never the native absolute path.
         input.SetAttr("data-file-name", Path.GetFileName(fullPath));
-        input.SetAttr("data-file-path", fullPath);
+        input.SetAttr("data-file-path", null);
         js?.FireEvent(input, "onchange");
         RequestRerender();
     }
@@ -3629,6 +3635,7 @@ public class BrowserCanvas : Control
                 case "input":
                     if (field.GetAttrOrDefault("type", "text").Trim().Equals("file", StringComparison.OrdinalIgnoreCase))
                     {
+                        Engine.Forms.FormSubmitter.ClearFileSelection(field);
                         field.SetAttr("data-file-name", null);
                         field.SetAttr("data-file-path", null);
                     }
@@ -3679,21 +3686,33 @@ public class BrowserCanvas : Control
 
         if (req.Method == "post")
         {
-            FormSubmitRequested?.Invoke((req.Url, req.QueryString, req.Target, sourceFrame));
+            FormSubmitRequested?.Invoke((req.Url, req.QueryString, req.Target, sourceFrame,
+                req.MultipartFields, req.MultipartFiles));
         }
         else
         {
-            string url = string.IsNullOrEmpty(req.QueryString) ? req.Url : $"{req.Url}?{req.QueryString}";
+            string url = req.Url;
+            if (!string.IsNullOrEmpty(req.QueryString))
+            {
+                int hash = url.IndexOf('#');
+                string fragment = hash >= 0 ? url[hash..] : "";
+                string withoutFragment = hash >= 0 ? url[..hash] : url;
+                url = withoutFragment + (withoutFragment.Contains('?') ? "&" : "?") + req.QueryString + fragment;
+            }
             NavigateWithTarget(url, req.Target, sourceFrame);
         }
     }
 
-    public event Action<(string Url, string Body, string? Target, FrameView? Frame)>? FormSubmitRequested;
+    public event Action<(string Url, string Body, string? Target, FrameView? Frame,
+        IReadOnlyDictionary<string,string>? MultipartFields,
+        IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles)>? FormSubmitRequested;
 
     public void SubmitForm(DomElement? form, object? clickCoords)
     {
         if (form == null || _document == null) return;
-        SubmitFormInternal(form, _document, _jsInterpreter, null, null);
+        (string Name, int X, int Y)? coords = null;
+        if (clickCoords is ValueTuple<string,int,int> tuple) coords = tuple;
+        SubmitFormInternal(form, _document, _jsInterpreter, coords, null);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -3744,7 +3763,9 @@ public class BrowserCanvas : Control
         {
             try
             {
-                string abs = document.BaseUrl.Resolve(href).ToAbsolute();
+                string abs = document.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                    ? Engine.Network.FileUrls.Resolve(document.BaseUrl, href)
+                    : document.BaseUrl.Resolve(href).ToAbsolute();
                 NavigateWithTarget(abs, hit.GetAttr("target"), null);
             }
             catch { }

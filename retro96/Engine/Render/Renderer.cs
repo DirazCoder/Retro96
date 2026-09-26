@@ -1023,7 +1023,10 @@ public class Renderer
                 {
                     visited = href != null &&
                         ownerDoc.VisitedUrls.Contains(
-                            ownerDoc.BaseUrl?.Resolve(href).ToAbsolute() ?? href);
+                            ownerDoc.BaseUrl == null ? href :
+                            (ownerDoc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                                ? FileUrls.Resolve(ownerDoc.BaseUrl, href)
+                                : ownerDoc.BaseUrl.Resolve(href).ToAbsolute()));
                 }
                 catch
                 {
