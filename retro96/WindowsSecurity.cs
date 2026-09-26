@@ -433,7 +433,8 @@ internal static class WindowsSecurity
         string workerExecutable,
         string workerWorkingDirectory,
         bool useLpac,
-        bool ownsRuntimeDirectory)
+        bool ownsRuntimeDirectory,
+        string? workerArguments = null)
     {
         StartupDiagnostics.Step("HOST", "StartWorker called. Mode=" + mode + " exe=" + workerExecutable + " cwd=" + workerWorkingDirectory + " LPAC=" + useLpac);
         if ((mode is TrustMode.High or TrustMode.Medium) && string.IsNullOrWhiteSpace(appContainerSid))
@@ -568,7 +569,10 @@ internal static class WindowsSecurity
             }
 
             StartupDiagnostics.Step("HOST", "Creating suspended worker process.");
-            var commandLine = new System.Text.StringBuilder($"\"{workerExecutable}\" --sandbox-worker \"{pipeName}\" {mode}");
+            string commandLineText = string.IsNullOrWhiteSpace(workerArguments)
+                ? $"\"{workerExecutable}\" --sandbox-worker \"{pipeName}\" {mode}"
+                : $"\"{workerExecutable}\" {workerArguments}";
+            var commandLine = new System.Text.StringBuilder(commandLineText);
             var startup = new STARTUPINFOEX
             {
                 StartupInfo = new STARTUPINFO

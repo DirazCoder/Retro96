@@ -44,6 +44,11 @@ public sealed class DocumentBindingsState
     /// <summary>Element wrapper cache — one JsObject identity per element so
     /// property writes (rollover swaps) survive across script accesses.</summary>
     public readonly Dictionary<DomElement, JsObject> ElementWrappers = new();
+
+    /// <summary>One stable document host per page. Parser-time RegisterAll calls
+    /// rebind this object to the same live DOM instead of replacing the JS
+    /// document object before every script.</summary>
+    public JsObject? DocumentObject;
 }
 
 /// <summary>
@@ -340,7 +345,16 @@ public static class DomBindings
         // they were stored as property VALUES, so document.title read back
         // the wrapper object itself ("[object Object]") and an assignment
         // merely replaced the wrapper.
-        var d = new DocumentObject(doc, canvas, state);
+        var d = state.DocumentObject as DocumentObject;
+        if (d == null)
+        {
+            d = new DocumentObject(doc, canvas, state);
+            state.DocumentObject = d;
+        }
+        else
+        {
+            d.Rebind(doc);
+        }
 
         d.Set("URL", JsValue.From(doc.BaseUrl?.ToAbsolute() ?? "about:blank"));
         d.Set("location", scope.Has("location") ? scope.Get("location") : JsValue.Undefined);
@@ -385,11 +399,23 @@ public static class DomBindings
         // died with "'getElementById' is not a function" before this.
         d.Set("getElementById", Fn(scope, "getElementById", (self, args) =>
         {
-            string id = args.Length > 0 ? args[0].ToJsString() : "";
-            if (string.IsNullOrEmpty(id)) return JsValue.Null;
-            var el = doc.ElementDescendants()
+            string id = args.Length > 0 ? args[0].ToJsString().Trim() : "";
+            if (id.Length == 0) return JsValue.Null;
+
+            // Always search the page's current DOM. The parser calls
+            // RegisterAll before each inline script; capturing the callback's
+            // document here made this binding fragile when the live document
+            // object was replaced/rebound during streaming or document.write.
+            var liveDoc = state.Document ?? doc;
+            var el = liveDoc.ElementDescendants()
                 .FirstOrDefault(e => string.Equals(
                     e.GetAttr("id"), id, StringComparison.Ordinal));
+            // Legacy pages occasionally vary ID casing; keep the exact HTML
+            // match first, then provide the forgiving fallback older UAs used.
+            el ??= liveDoc.ElementDescendants()
+                .FirstOrDefault(e => string.Equals(
+                    e.GetAttr("id"), id, StringComparison.OrdinalIgnoreCase));
+
             return el == null ? JsValue.Null
                 : JsValue.FromObject(WrapElement(el, state));
         }));
@@ -717,7 +743,7 @@ public static class DomBindings
     /// </summary>
     private sealed class DocumentObject : JsObject
     {
-        private readonly DomDocument _doc;
+        private DomDocument _doc;
         private readonly BrowserCanvas _canvas;
         private readonly DocumentBindingsState? _state;
 
@@ -728,6 +754,8 @@ public static class DomBindings
             _canvas = canvas;
             _state = state;
         }
+
+        public void Rebind(DomDocument doc) => _doc = doc;
 
         private DomElement? Body => _doc.ElementDescendants()
             .FirstOrDefault(e => e.TagName == "body");

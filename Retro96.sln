@@ -4,6 +4,8 @@ VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Retro96", "retro96\Retro96.csproj", "{577CBD60-6150-9449-D13E-75025835BBD8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Retro96.SamplePlugin", "examples\Retro96.SamplePlugin\Retro96.SamplePlugin.csproj", "{A2D7C9B5-5D4A-4B0C-8E2E-3D9EE40F96B0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,6 +16,10 @@ Global
 		{577CBD60-6150-9449-D13E-75025835BBD8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{577CBD60-6150-9449-D13E-75025835BBD8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{577CBD60-6150-9449-D13E-75025835BBD8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A2D7C9B5-5D4A-4B0C-8E2E-3D9EE40F96B0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A2D7C9B5-5D4A-4B0C-8E2E-3D9EE40F96B0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A2D7C9B5-5D4A-4B0C-8E2E-3D9EE40F96B0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A2D7C9B5-5D4A-4B0C-8E2E-3D9EE40F96B0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

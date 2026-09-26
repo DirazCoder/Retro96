@@ -2,6 +2,7 @@ namespace Retro96;
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
@@ -86,6 +87,19 @@ public class BrowserCanvas : Control
     private int _fieldClickCount;
 
     private DomElement? _contextElement;
+    private string _findText = "";
+    private bool _findCaseSensitive;
+    private bool _findWrap;
+    private List<DomElement> _findMatches = new();
+    private int _findIndex = -1;
+    private float _pluginZoom = 1f;
+
+    private DomElement? _embeddedMidiElement;
+    private string _embeddedMidiLabel = "MIDI";
+    private bool _embeddedMidiPlaying;
+    private bool _embeddedMidiLoop;
+    private RectangleF _embeddedMidiRect;
+    private string? _embeddedMidiPressedAction;
 
     private readonly Dictionary<LayoutBox, FrameView> _frames = new();
     private readonly Dictionary<DomElement, int> _selectRangeAnchors = new();
@@ -131,6 +145,8 @@ public class BrowserCanvas : Control
     public event Action? ForwardRequested;
     public event Action? ReloadRequested;
     public event Action? PageChanged;
+    public event Action<System.Windows.Forms.ContextMenuStrip, Retro96.Plugins.ContextMenuContext>? PluginContextMenuRequested;
+    public event Action<string>? EmbeddedMidiControlRequested;
 
     public LayoutBox? RootBox => _rootBox;
     public DomDocument? PageDocument => _document;
@@ -685,6 +701,9 @@ public class BrowserCanvas : Control
         _pendingSelectionAnchor = null;
         _pendingSelectionFrame = null;
         _selecting = false;
+        _embeddedMidiElement = null;
+        _embeddedMidiPressedAction = null;
+        _embeddedMidiRect = RectangleF.Empty;
         _scrollOffset = PointF.Empty;
         UpdateScrollBars();
         Invalidate();
@@ -869,6 +888,9 @@ public class BrowserCanvas : Control
 
         int vw = Math.Max(1, ClientSize.Width);
         int vh = Math.Max(1, ClientSize.Height);
+        float zoom = _pluginZoom;
+        float logicalVw = vw / zoom;
+        float logicalVh = vh / zoom;
 
         // Compose the whole frame on the Skia screen surface; ShellPaint
         // hands the finished composite to WinForms through the single
@@ -884,22 +906,26 @@ public class BrowserCanvas : Control
         // scroll notch never smears glyphs.
         // FIX: a failed page render (null bitmap) used to skip frames and
         // the selection overlay entirely — now only the main blit is skipped.
+        // Compose in logical document coordinates, then scale the whole
+        // composition for browser zoom. Keeping the bitmap at 1x avoids
+        // expensive full-document re-renders when the plugin changes zoom.
+        var zoomState = g.Save();
+        if (Math.Abs(zoom - 1f) > 0.001f)
+            g.ScaleTransform(zoom, zoom);
+
         if (_renderedBitmap != null)
         {
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
 
-            // IMPORTANT PERF: the page bitmap can be many thousands of
-            // pixels tall.  Passing the whole bitmap with a translated
-            // destination makes the raster backend consider the full source
-            // image on every scroll paint.  Give Skia the exact source slice
-            // that is visible instead.  Scrolling then costs roughly one
-            // viewport, not one whole document.
+            // IMPORTANT PERF: give Skia only the logical source slice that is
+            // visible. The ScaleTransform expands that slice to the physical
+            // viewport without rescanning the entire document bitmap.
             int sourceX = Math.Clamp((int)_scrollOffset.X, 0,
                 Math.Max(0, _renderedBitmap.Width - 1));
             int sourceY = Math.Clamp((int)_scrollOffset.Y, 0,
                 Math.Max(0, _renderedBitmap.Height - 1));
-            int sourceW = Math.Min(vw, _renderedBitmap.Width - sourceX);
-            int sourceH = Math.Min(vh, _renderedBitmap.Height - sourceY);
+            int sourceW = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVw)), _renderedBitmap.Width - sourceX);
+            int sourceH = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVh)), _renderedBitmap.Height - sourceY);
             if (sourceW > 0 && sourceH > 0)
             {
                 g.DrawImage(_renderedBitmap,
@@ -909,7 +935,7 @@ public class BrowserCanvas : Control
             }
         }
 
-        var viewportRect = new RectangleF(0, 0, vw, vh);
+        var viewportRect = new RectangleF(0, 0, logicalVw, logicalVh);
         foreach (var (box, view) in _frames)
         {
             if (view.Rendered == null) continue;
@@ -1035,6 +1061,9 @@ public class BrowserCanvas : Control
         if (_focusedInput != null && _rootBox != null)
             PaintFieldOverlay(g);
 
+        PaintEmbeddedMidiControls(g);
+
+        g.Restore(zoomState);
         _painter.Blit(e.Graphics);
     }
 
@@ -1368,6 +1397,107 @@ public class BrowserCanvas : Control
             face.Width - 1, face.Height - 1);
     }
 
+    private void PaintEmbeddedMidiControls(Graphics g)
+    {
+        if (_embeddedMidiElement == null || _rootBox == null) return;
+        var box = FindBoxForElement(_rootBox, _embeddedMidiElement);
+        if (box == null) return;
+
+        int attrWidth = _embeddedMidiElement.GetAttrInt("width", 0);
+        int attrHeight = _embeddedMidiElement.GetAttrInt("height", 0);
+        float width = Math.Max(box.BorderRect.Width, attrWidth);
+        float height = Math.Max(box.BorderRect.Height, attrHeight);
+        width = Math.Max(220f, width);
+        height = Math.Max(34f, height);
+        var rect = new RectangleF(box.BorderRect.X, box.BorderRect.Y, width, height);
+        _embeddedMidiRect = rect;
+
+        using var background = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var border = new Pen(Color.FromArgb(0x40, 0x40, 0x40));
+        var screenRect = new RectangleF(rect.X - _scrollOffset.X, rect.Y - _scrollOffset.Y, rect.Width, rect.Height);
+        g.FillRectangle(background, screenRect);
+        g.DrawRectangle(border, screenRect.X, screenRect.Y, screenRect.Width - 1, screenRect.Height - 1);
+
+        using var labelFont = new Font(FontFamily.GenericSansSerif, 8f, FontStyle.Regular, GraphicsUnit.Pixel);
+        using var labelBrush = new SolidBrush(Color.Black);
+        string label = string.IsNullOrWhiteSpace(_embeddedMidiLabel) ? "MIDI" : _embeddedMidiLabel;
+        g.DrawString(label.Length > 28 ? label[..28] : label, labelFont, labelBrush,
+            screenRect.X + 8, screenRect.Y + 7);
+
+        float x = screenRect.X + Math.Min(Math.Max(84f, screenRect.Width * 0.38f), screenRect.Width - 142f);
+        float buttonY = screenRect.Y + 5;
+        float buttonH = Math.Max(22f, screenRect.Height - 10f);
+        string[] names = { _embeddedMidiPlaying ? "Pause" : "Play", "Stop", _embeddedMidiLoop ? "Loop ✓" : "Loop" };
+        string[] actions = { _embeddedMidiPlaying ? "pause" : "play", "stop", "loop" };
+        float remaining = Math.Max(120f, screenRect.Right - x - 8);
+        float buttonW = Math.Max(42f, (remaining - 8f) / 3f);
+
+        using var buttonFont = new Font(FontFamily.GenericSansSerif, 8f, FontStyle.Regular, GraphicsUnit.Pixel);
+        for (int i = 0; i < 3; i++)
+        {
+            float bx = x + i * (buttonW + 4f);
+            var button = new RectangleF(bx, buttonY, buttonW, buttonH);
+            using var b = new SolidBrush(Color.FromArgb(0xF0, 0xF0, 0xF0));
+            using var p = new Pen(Color.FromArgb(0x70, 0x70, 0x70));
+            g.FillRectangle(b, button);
+            g.DrawRectangle(p, button.X, button.Y, button.Width - 1, button.Height - 1);
+            var textSize = g.MeasureString(names[i], buttonFont);
+            using var tb = new SolidBrush(Color.Black);
+            g.DrawString(names[i], buttonFont, tb,
+                button.X + Math.Max(2f, (button.Width - textSize.Width) / 2f),
+                button.Y + Math.Max(1f, (button.Height - textSize.Height) / 2f));
+        }
+    }
+
+    public void SetEmbeddedMidiControls(DomElement element, string label, bool loop, bool playing)
+    {
+        _embeddedMidiElement = element;
+        _embeddedMidiLabel = label ?? "MIDI";
+        _embeddedMidiLoop = loop;
+        _embeddedMidiPlaying = playing;
+        Invalidate();
+    }
+
+    public void UpdateEmbeddedMidiControls(bool loop, bool playing)
+    {
+        if (_embeddedMidiElement == null) return;
+        _embeddedMidiLoop = loop;
+        _embeddedMidiPlaying = playing;
+        Invalidate();
+    }
+
+    public void ClearEmbeddedMidiControls()
+    {
+        _embeddedMidiElement = null;
+        _embeddedMidiPressedAction = null;
+        _embeddedMidiRect = RectangleF.Empty;
+        Invalidate();
+    }
+
+    private bool TryBeginEmbeddedMidiControl(float x, float y)
+    {
+        if (_embeddedMidiElement == null || !_embeddedMidiRect.Contains(x, y)) return false;
+        float localX = x - _embeddedMidiRect.X;
+        float labelWidth = Math.Min(Math.Max(84f, _embeddedMidiRect.Width * 0.38f), _embeddedMidiRect.Width - 142f);
+        float buttonStart = labelWidth;
+        float remaining = Math.Max(120f, _embeddedMidiRect.Width - buttonStart - 8f);
+        float buttonW = Math.Max(42f, (remaining - 8f) / 3f);
+        if (y < _embeddedMidiRect.Y + 4f || y > _embeddedMidiRect.Bottom - 4f) return false;
+        for (int i = 0; i < 3; i++)
+        {
+            float bx = buttonStart + i * (buttonW + 4f);
+            if (localX < bx || localX > bx + buttonW) continue;
+            _embeddedMidiPressedAction = i switch
+            {
+                0 => _embeddedMidiPlaying ? "pause" : "play",
+                1 => "stop",
+                _ => "loop"
+            };
+            return true;
+        }
+        return true;
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Scroll
     // ─────────────────────────────────────────────────────────────────────
@@ -1395,8 +1525,8 @@ public class BrowserCanvas : Control
         // the two ranges could drift apart (most visibly on long pages: the
         // thumb would stop before the document's real bottom while the canvas
         // still had content below it).
-        int vpW = Math.Max(0, ClientSize.Width);
-        int vpH = Math.Max(0, ClientSize.Height);
+        int vpW = Math.Max(1, (int)Math.Floor(ClientSize.Width / _pluginZoom));
+        int vpH = Math.Max(1, (int)Math.Floor(ClientSize.Height / _pluginZoom));
 
         bool needV = docH > vpH;
         if (needV) vpW = Math.Max(0, vpW - _vScroll.Width);
@@ -1510,8 +1640,8 @@ public class BrowserCanvas : Control
         if (_renderedBitmap == null) return;
         CloseMenusOnScroll();
         var vp = GetViewportSize();
-        float maxX = Math.Max(0, _renderedBitmap.Width - vp.Width);
-        float maxY = Math.Max(0, _renderedBitmap.Height - vp.Height);
+        float maxX = Math.Max(0, _renderedBitmap.Width - vp.Width / _pluginZoom);
+        float maxY = Math.Max(0, _renderedBitmap.Height - vp.Height / _pluginZoom);
         _scrollOffset.X = Math.Max(0, Math.Min(x, maxX));
         _scrollOffset.Y = Math.Max(0, Math.Min(y, maxY));
         if (_vScroll.Visible) _vScroll.Value = Math.Clamp((int)_scrollOffset.Y,
@@ -1531,8 +1661,8 @@ public class BrowserCanvas : Control
     {
         base.OnMouseWheel(e);
 
-        float x = e.X + _scrollOffset.X;
-        float y = e.Y + _scrollOffset.Y;
+        float x = e.X / _pluginZoom + _scrollOffset.X;
+        float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
         if (_focusedInput?.TagName == "textarea" &&
             TryGetFocusedTextareaBox(x, y, out var textareaBox))
@@ -1581,7 +1711,7 @@ public class BrowserCanvas : Control
 
         // Update immediately. Repainting the existing bitmap is cheap.
         CloseMenusOnScroll();
-        float max = Math.Max(0, _renderedBitmap.Height - GetViewportSize().Height);
+        float max = Math.Max(0, _renderedBitmap.Height - GetViewportSize().Height / _pluginZoom);
         _scrollOffset.Y = Math.Clamp(_scrollOffset.Y - (e.Delta / 120f) * 80f, 0f, max);
         if (_vScroll.Visible)
             _vScroll.Value = Math.Clamp((int)_scrollOffset.Y,
@@ -2242,7 +2372,7 @@ public class BrowserCanvas : Control
             _fieldValueAtFocus = GetFieldText(el);
             var focusDoc = _document;
             if (focusDoc != null)
-                UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el);
+                UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el, relayout: false);
             js?.FireEvent(el, "onfocus");   // FIX: clicking a field never fired onfocus
 
             // A newly focused control starts at the top/left. Re-clicking an
@@ -2290,7 +2420,8 @@ public class BrowserCanvas : Control
 
     private void UpdateCssInteractionState(DomDocument doc, DomElement? hovered = null,
                                            DomElement? active = null,
-                                           DomElement? focused = null)
+                                           DomElement? focused = null,
+                                           bool relayout = true)
     {
         bool changed = !ReferenceEquals(doc.HoveredElement, hovered) ||
                        !ReferenceEquals(doc.ActiveElement, active) ||
@@ -2300,6 +2431,18 @@ public class BrowserCanvas : Control
         doc.HoveredElement = hovered;
         doc.ActiveElement = active;
         doc.FocusedElement = focused;
+
+        // Editable-field focus/hover is painted as a live overlay. Rebuilding
+        // the whole document for every mouse move/down/up changes the textarea
+        // content-box rounding after the page has been scrolled, so the live
+        // text layer can move by a pixel even though the page bitmap did not.
+        // Keep those state transitions paint-only; ordinary links/buttons
+        // still take the full dynamic-CSS relayout path.
+        if (!relayout)
+        {
+            RequestRerender();
+            return;
+        }
 
         // Dynamic selectors participate in the cascade. Re-resolve and
         // rebuild this document so :hover/:active/:focus visibly alter
@@ -2346,8 +2489,14 @@ public class BrowserCanvas : Control
         if (e.Button != MouseButtons.Left || _rootBox == null || _document == null)
             return;
 
-        float x = e.X + _scrollOffset.X;
-        float y = e.Y + _scrollOffset.Y;
+        float x = e.X / _pluginZoom + _scrollOffset.X;
+        float y = e.Y / _pluginZoom + _scrollOffset.Y;
+
+        if (e.Button == MouseButtons.Left && TryBeginEmbeddedMidiControl(x, y))
+        {
+            Capture = true;
+            return;
+        }
 
         if (e.Button == MouseButtons.Left &&
             _focusedInput?.TagName == "textarea" &&
@@ -2451,31 +2600,8 @@ public class BrowserCanvas : Control
 
         var deepest = HitTestDeepestBox(_rootBox, x, y);
         var el = deepest?.Element;
-        UpdateCssInteractionState(_document, _lastHoveredElement, el, _focusedInput);
-
-        // DIAGNOSTIC (remove once the input-click bug is found): list every
-        // box under the cursor, outermost first, so an overlay that covers a
-        // control shows up by name and rect.
-        try
-        {
-            var chain = new System.Text.StringBuilder();
-            void Walk(LayoutBox b, int depth)
-            {
-                var r = b.BorderRect;
-                bool hit = r.Contains(x, y);
-                bool zero = b.Width == 0f && b.Height == 0f;
-                if (!hit && !zero) return;
-                if (hit)
-                    chain.Append($"\n    {new string(' ', depth * 2)}<{b.Element?.TagName ?? b.BoxType.ToString()}> " +
-                                 $"type={b.BoxType} rect=({r.X:0.#},{r.Y:0.#} {r.Width:0.#}x{r.Height:0.#})");
-                foreach (var c in b.Children) Walk(c, depth + 1);
-            }
-            Walk(_rootBox, 0);
-            DebugLog.Write($"CLICK client=({e.X},{e.Y}) doc=({x:0.#},{y:0.#}) scroll=({_scrollOffset.X:0.#},{_scrollOffset.Y:0.#})" +
-                           $" deepest=<{el?.TagName ?? "null"}> isControl={IsControlElement(el)} " +
-                           $"frameBoxAtPoint={(FrameBoxAtPoint(x, y) != null)}{chain}");
-        }
-        catch (Exception ex) { DebugLog.WriteException("click diagnostic", ex); }
+        UpdateCssInteractionState(_document, _lastHoveredElement, el, _focusedInput,
+            relayout: !IsEditableField(el));
 
         // Clicking anywhere other than the focused control itself blurs it.
         if (_focusedInput != null && !ReferenceEquals(el, _focusedInput))
@@ -2579,8 +2705,8 @@ public class BrowserCanvas : Control
 
         if (_fieldDragging && _focusedInput != null && _rootBox != null)
         {
-            float x = e.X + _scrollOffset.X;
-            float y = e.Y + _scrollOffset.Y;
+            float x = e.X / _pluginZoom + _scrollOffset.X;
+            float y = e.Y / _pluginZoom + _scrollOffset.Y;
             var box = FindBoxForElement(_rootBox, _focusedInput);
             if (box == null && _focusedFrame != null &&
                 _frames.TryGetValue(_focusedFrame, out var frameView))
@@ -2603,8 +2729,8 @@ public class BrowserCanvas : Control
 
         if (_selecting)
         {
-            float x = e.X + _scrollOffset.X;
-            float y = e.Y + _scrollOffset.Y;
+            float x = e.X / _pluginZoom + _scrollOffset.X;
+            float y = e.Y / _pluginZoom + _scrollOffset.Y;
             LayoutBox? f = null;
             var selectionView = _selectionFrame ?? _pendingSelectionFrame;
             if (selectionView != null)
@@ -2643,8 +2769,8 @@ public class BrowserCanvas : Control
 
         if (_rootBox == null || _document == null) return;
 
-        float mx = e.X + _scrollOffset.X;
-        float my = e.Y + _scrollOffset.Y;
+        float mx = e.X / _pluginZoom + _scrollOffset.X;
+        float my = e.Y / _pluginZoom + _scrollOffset.Y;
 
         DomElement? element;
         DomDocument doc = _document;
@@ -2666,7 +2792,9 @@ public class BrowserCanvas : Control
             ? element
             : element != null ? FindAncestor(element, "a") : null;
 
-        UpdateCssInteractionState(doc, element, doc.ActiveElement, doc.FocusedElement);
+        bool fieldInteraction = IsEditableField(element) || IsEditableField(doc.FocusedElement);
+        UpdateCssInteractionState(doc, element, doc.ActiveElement, doc.FocusedElement,
+            relayout: !fieldInteraction);
         if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
         {
             Cursor = Cursors.Hand;
@@ -2709,6 +2837,16 @@ public class BrowserCanvas : Control
     {
         base.OnMouseUp(e);
 
+        if (_embeddedMidiPressedAction != null)
+        {
+            string action = _embeddedMidiPressedAction;
+            _embeddedMidiPressedAction = null;
+            Capture = false;
+            if (e.Button == MouseButtons.Left && action != "none")
+                EmbeddedMidiControlRequested?.Invoke(action);
+            return;
+        }
+
         // FIX: releasing the mouse OFF a pressed button used to activate it
         // anyway — browsers cancel the click in that case.
         var pressedEl = _pressedControl;
@@ -2725,14 +2863,20 @@ public class BrowserCanvas : Control
             RerenderNow();
         }
 
-        if (_document != null && _document.ActiveElement != null)
-            UpdateCssInteractionState(_document, _document.HoveredElement, null, _document.FocusedElement);
-
         if (_fieldDragging)
         {
             _fieldDragging = false;
-            return;   // field click fully handled at mouse-down
+            // The field click was fully handled at mouse-down. Do not clear
+            // the active state through a second full relayout here; doing so
+            // moved textarea geometry after a page scroll.
+            if (_document != null && _document.ActiveElement != null)
+                UpdateCssInteractionState(_document, _document.HoveredElement,
+                    null, _document.FocusedElement, relayout: false);
+            return;
         }
+
+        if (_document != null && _document.ActiveElement != null)
+            UpdateCssInteractionState(_document, _document.HoveredElement, null, _document.FocusedElement);
 
         if (e.Button == MouseButtons.Right)
         {
@@ -2767,8 +2911,8 @@ public class BrowserCanvas : Control
 
         if (wasPressed)
         {
-            float ux = e.X + _scrollOffset.X;
-            float uy = e.Y + _scrollOffset.Y;
+            float ux = e.X / _pluginZoom + _scrollOffset.X;
+            float uy = e.Y / _pluginZoom + _scrollOffset.Y;
             var upEl = _rootBox != null ? HitTestDeepestBox(_rootBox, ux, uy)?.Element : null;
             if (upEl == null || !IsElementWithin(upEl, pressedEl!))
                 return;   // released off the control — cancel activation
@@ -2789,8 +2933,8 @@ public class BrowserCanvas : Control
         if (_rootBox == null || e.Button != MouseButtons.Left)
             return;
 
-        float x = e.X + _scrollOffset.X;
-        float y = e.Y + _scrollOffset.Y;
+        float x = e.X / _pluginZoom + _scrollOffset.X;
+        float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
         // Double-click inside an editable field: the primary mouse-down path
         // already performs the selection. Keep this WinForms event as a
@@ -2998,8 +3142,8 @@ public class BrowserCanvas : Control
 
     private void ShowContextMenu(System.Drawing.Point clientPoint)
     {
-        float x = clientPoint.X + _scrollOffset.X;
-        float y = clientPoint.Y + _scrollOffset.Y;
+        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
+        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
         _contextElement = _rootBox != null ? HitTestElement(_rootBox, x, y) : null;
 
         var menu = new ContextMenuStrip();
@@ -3015,6 +3159,12 @@ public class BrowserCanvas : Control
         menu.Items.Add("Inspect Element", null, (s, e) =>
             new PageInspector(this, _contextElement).Show(this));
 
+        string? targetUrl = _contextElement?.GetAttr("href") ?? _contextElement?.GetAttr("src");
+        string? targetText = _contextElement?.InnerText;
+        bool isLink = (_contextElement?.TagName == "a" || _contextElement?.TagName == "area") && !string.IsNullOrWhiteSpace(_contextElement?.GetAttr("href"));
+        bool isImage = _contextElement?.TagName == "img";
+        PluginContextMenuRequested?.Invoke(menu, new Retro96.Plugins.ContextMenuContext(targetUrl, targetText, isLink, isImage));
+
         TrackMenu(menu);
         menu.Show(this, clientPoint);
     }
@@ -3023,8 +3173,8 @@ public class BrowserCanvas : Control
     {
         if (_rootBox == null || _document == null) return;
 
-        float x = clientPoint.X + _scrollOffset.X;
-        float y = clientPoint.Y + _scrollOffset.Y;
+        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
+        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
         var frameBox = FrameBoxAtPoint(x, y);
         if (frameBox != null && _frames.TryGetValue(frameBox, out var view))
         {
@@ -4123,9 +4273,10 @@ public class BrowserCanvas : Control
         if (box == null) return;
         var br = box.BorderRect;
         var r = new System.Drawing.Rectangle(
-            (int)Math.Ceiling(br.X), (int)Math.Ceiling(br.Y),
-            (int)Math.Ceiling(br.Width), (int)Math.Ceiling(br.Height));
-        r.Offset(-(int)_scrollOffset.X, -(int)_scrollOffset.Y);
+            (int)Math.Ceiling((br.X - _scrollOffset.X) * _pluginZoom),
+            (int)Math.Ceiling((br.Y - _scrollOffset.Y) * _pluginZoom),
+            Math.Max(1, (int)Math.Ceiling(br.Width * _pluginZoom)),
+            Math.Max(1, (int)Math.Ceiling(br.Height * _pluginZoom)));
         r.Inflate(2, 2);
         Invalidate(r);
     }
@@ -4163,6 +4314,82 @@ public class BrowserCanvas : Control
         var status = _jsInterpreter?.WindowObject?.Get("status");
         if (status?.Type == JsType.String && status.GetString().Length > 0)
             SetStatus(status.GetString());
+    }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    [Browsable(false)]
+    public float ZoomFactor
+    {
+        get => _pluginZoom;
+        set
+        {
+            float next = Math.Clamp(value, 0.5f, 3f);
+            if (Math.Abs(next - _pluginZoom) < 0.001f) return;
+            _pluginZoom = next;
+            UpdateScrollBars();
+            Invalidate();
+        }
+    }
+
+    public byte[] CaptureViewportPng()
+    {
+        int width = Math.Max(1, GetViewportSize().Width);
+        int height = Math.Max(1, GetViewportSize().Height);
+        using var bmp = new Retro96.Drawing.Bitmap(width, height, Retro96.Drawing.PixelFormat.Format32bppArgb);
+        using var g = Retro96.Drawing.Graphics.FromImage(bmp);
+        g.Clear(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        g.InterpolationMode = Retro96.Drawing.InterpolationMode.NearestNeighbor;
+        if (_renderedBitmap != null)
+        {
+            int sx = Math.Clamp((int)_scrollOffset.X, 0, Math.Max(0, _renderedBitmap.Width - 1));
+            int sy = Math.Clamp((int)_scrollOffset.Y, 0, Math.Max(0, _renderedBitmap.Height - 1));
+            int sw = Math.Min((int)Math.Ceiling(width / _pluginZoom), _renderedBitmap.Width - sx);
+            int sh = Math.Min((int)Math.Ceiling(height / _pluginZoom), _renderedBitmap.Height - sy);
+            if (sw > 0 && sh > 0)
+            {
+                g.InterpolationMode = _pluginZoom < 1f
+                    ? Retro96.Drawing.InterpolationMode.HighQualityBicubic
+                    : Retro96.Drawing.InterpolationMode.NearestNeighbor;
+                g.DrawImage(_renderedBitmap, new Rectangle(0, 0, width, height), new Rectangle(sx, sy, sw, sh), GraphicsUnit.Pixel);
+            }
+        }
+        return bmp.EncodePng();
+    }
+
+    public void FindInPage(string text, bool caseSensitive, bool wrapAround)
+    {
+        _findText = text ?? string.Empty; _findCaseSensitive = caseSensitive; _findWrap = wrapAround;
+        _findMatches = new List<DomElement>(); _findIndex = -1;
+        if (_document == null || string.IsNullOrEmpty(_findText)) { Invalidate(); return; }
+        StringComparison comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+        foreach (var element in _document.ElementDescendants())
+            if (element.InnerText.IndexOf(_findText, comparison) >= 0) _findMatches.Add(element);
+        FindNext();
+    }
+
+    public void FindNext()
+    {
+        if (_findMatches.Count == 0) return;
+        int next = _findIndex + 1;
+        if (next >= _findMatches.Count)
+        {
+            if (!_findWrap) return;
+            next = 0;
+        }
+        _findIndex = next;
+        var element = _findMatches[_findIndex];
+        var box = _rootBox == null ? null : FindBoxForElement(_rootBox, element);
+        if (box != null)
+        {
+            _selAnchor = _selFocus = null;
+            ScrollTo((int)_scrollOffset.X, Math.Max(0, (int)box.Y - 20));
+        }
+        Invalidate();
+    }
+
+    public void FindClear()
+    {
+        _findText = string.Empty; _findMatches.Clear(); _findIndex = -1; _selAnchor = _selFocus = null; Invalidate();
     }
 
     // ─────────────────────────────────────────────────────────────────────

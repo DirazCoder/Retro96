@@ -7,12 +7,20 @@ namespace Retro96;
 static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
-        // ISO-8859-1 and friends are NOT included in .NET Core/5+ by
-        // default — without this registration every GetEncoding("iso-8859-1")
-        // call throws and no 1996 page would ever decode.
+        // Register legacy code-page encodings for both the browser host and
+        // the isolated plugin worker.
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        if (Retro96.Plugins.PluginSandboxWorker.IsInvocation(args))
+        {
+            Retro96.Plugins.PluginSandboxWorker.RunAsync(args).GetAwaiter().GetResult();
+            return;
+        }
+
+        // ISO-8859-1 and other legacy code pages are now registered above
+        // before either the browser or plugin worker starts.
 
         Application.ThreadException += (sender, e) =>
         {

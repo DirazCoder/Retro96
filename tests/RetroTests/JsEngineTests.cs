@@ -129,6 +129,41 @@ public class JsEngineTests
     }
 
     [Fact]
+    public void OnclickWiring_RealInputControlsInFormTable()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><form name='clickForm'><table border='1'><tr><td>" +
+                      "<input type='button' id='b2' value='B2'>" +
+                      "<input type='button' id='b3' value='B3'>" +
+                      "</td></tr></table></form><div id='result'>idle</div>" +
+                      "<script>" +
+                      "var b2=document.getElementById('b2');" +
+                      "var b3=document.getElementById('b3');" +
+                      "if (b2 && b2.setAttribute) b2.setAttribute('onclick', \"document.getElementById('result').innerHTML='PATH2';\");" +
+                      "if (b3) b3.onclick=function(){document.getElementById('result').innerHTML='PATH3';};" +
+                      "</script></body></html>");
+
+        string found = page.EvalString("document.getElementById('b2') ? 'found' : 'missing'");
+        Check.That(found == "found", "getElementById finds real <input> controls in the form/table", found);
+        string setAttrType = page.EvalString("typeof document.getElementById('b2').setAttribute");
+        Check.That(setAttrType == "function", "input.setAttribute is exposed as a callable DOM method", setAttrType);
+
+        var inputs = page.Document.AllTags("input").ToList();
+        var b2 = inputs.FirstOrDefault(e => e.GetAttr("id") == "b2");
+        var b3 = inputs.FirstOrDefault(e => e.GetAttr("id") == "b3");
+        Check.That(b2 != null && b3 != null, "both dynamic-wiring input controls exist in the DOM");
+
+        if (b2 != null) page.FireEvent(b2, "onclick");
+        string path2 = page.EvalString("document.getElementById('result').innerHTML");
+        Check.That(path2 == "PATH2", "setAttribute onclick wiring fires on <input>", path2);
+
+        if (b3 != null) page.FireEvent(b3, "onclick");
+        string path3 = page.EvalString("document.getElementById('result').innerHTML");
+        Check.That(path3 == "PATH3", "element.onclick=function wiring fires on <input>", path3);
+        Check.Done();
+    }
+
+    [Fact]
     public void OnclickFiresOnFormControls()
     {
         var page = new PageHarness();

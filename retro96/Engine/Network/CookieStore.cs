@@ -338,6 +338,29 @@ public class CookieStore
         foreach (var domain in empty) _cookies.Remove(domain);
     }
 
+
+    public string? GetCookieValue(string name, ParsedUrl requestUrl)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        string header = Get(requestUrl);
+        foreach (string part in header.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int eq = part.IndexOf('=');
+            if (eq > 0 && part[..eq].Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) return part[(eq + 1)..].Trim();
+        }
+        return null;
+    }
+
+    public void SetCookieValue(string name, string value, ParsedUrl requestUrl, string? path = null, string? domain = null, DateTimeOffset? expires = null, bool secure = false)
+    {
+        string header = name + "=" + value;
+        if (!string.IsNullOrWhiteSpace(path)) header += "; path=" + path;
+        if (!string.IsNullOrWhiteSpace(domain)) header += "; domain=" + domain;
+        if (expires.HasValue) header += "; expires=" + expires.Value.UtcDateTime.ToString("R", CultureInfo.InvariantCulture);
+        if (secure) header += "; secure";
+        Set(header, requestUrl);
+    }
+
     public int Count
     {
         get

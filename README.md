@@ -48,6 +48,16 @@ not "frames mostly load." frames LOAD. nested iframes load. scripts run inside f
 
 ---
 
+### Plugins
+
+Retro96 has a real plugin system, and it's a separate SDK, not some internal hook I bolted on and called extensible. The [Retro96 Plugin SDK](https://github.com/DirazCoder/Retro96-plugin-sdk) is a standalone C#/.NET 11 project — the browser host doesn't contain the SDK source and doesn't build it as part of the host solution. A plugin is a `.r96p` package: a manifest plus a DLL, nothing else, and it's installed disabled until you approve it.
+
+The sandbox is what you'd expect from something running arbitrary third-party code next to a browser engine: separate worker process, Windows AppContainer isolation, Job Object resource limits, a named-pipe broker, and permission checks at both the worker and broker boundary. No plugin gets a real host filesystem path — file dialogs copy into the plugin's own sandbox on open and stream out on save, so the plugin never sees where things actually live on disk.
+
+What a plugin can touch, gated behind explicit manifest permissions: reading and navigating the browser, adding UI (menu items, toolbar buttons, panels — constrained widgets, not raw WinForms controls handed to a stranger's code), making network requests, sandboxed file storage, key/value storage, clipboard access, sandbox-relative audio playback, OS notifications, and file pickers. Nineteen permission strings total, and the host only grants what a plugin actually asked for in `plugin.json` and what you actually approved.
+
+---
+
 Chrome won't add `<blink>` back. people have asked. the issues are closed. Retro96 did not ask
 
 ---

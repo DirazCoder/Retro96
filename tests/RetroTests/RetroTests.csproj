@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -54,12 +54,14 @@
     <Compile Include="../../retro96/Engine/NavigationHistory.cs" />
     <Compile Include="../../retro96/Engine/Forms/FormSubmitter.cs" />
     <Compile Include="../../retro96/Engine/Forms/HitTester.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginApi.cs" />
     <!-- test sources -->
     <Compile Include="TestHelpers.cs" />
     <Compile Include="EngineRegressionTests.cs" />
     <Compile Include="HtmlParserTests.cs" />
     <Compile Include="CssParserTests.cs" />
     <Compile Include="JsEngineTests.cs" />
+    <Compile Include="PluginApiTests.cs" />
     <Compile Include="FormDomTests.cs" />
     <Compile Include="FrameLinkDomTests.cs" />
     <Compile Include="../../retro96/Engine/Layout/InlineLayout.cs" />

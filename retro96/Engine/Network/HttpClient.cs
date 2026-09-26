@@ -118,9 +118,21 @@ public class HttpClient
             contentType: $"multipart/form-data; boundary={boundary}");
     }
 
+    public Task<HttpResult> SendPluginAsync(
+        string method, ParsedUrl url, byte[]? body, IReadOnlyDictionary<string, string>? headers,
+        string? contentType, CookieStore cookies, CancellationToken ct)
+    {
+        if (method is null) throw new ArgumentNullException(nameof(method));
+        string normalized = method.Trim().ToUpperInvariant();
+        if (normalized is not ("GET" or "POST" or "HEAD" or "PUT" or "DELETE" or "OPTIONS"))
+            throw new ArgumentException("Unsupported plugin HTTP method.", nameof(method));
+        return SendRequestAsync(normalized, url, body, cookies, ct, extraHeaders: headers, contentType: contentType, resourceKind: ResourceKind.Other);
+    }
+
     private async Task<HttpResult> SendRequestAsync(
         string method, ParsedUrl url, byte[]? body, CookieStore cookies,
-        CancellationToken ct, int redirectCount = 0, string? contentType = null, ResourceKind resourceKind = ResourceKind.Document)
+        CancellationToken ct, int redirectCount = 0, string? contentType = null, ResourceKind resourceKind = ResourceKind.Document,
+        IReadOnlyDictionary<string, string>? extraHeaders = null)
     {
         if (redirectCount > MaxRedirects)
             return new TooManyRedirects();
@@ -205,7 +217,7 @@ public class HttpClient
                 useGet ? "GET" : method,
                 newUrl,
                 useGet ? null : body,
-                cookies, ct, redirectCount + 1, contentType, resourceKind);
+                cookies, ct, redirectCount + 1, contentType, resourceKind, extraHeaders);
         }
 
         return success;
@@ -257,7 +269,8 @@ public class HttpClient
     /// ASCII + raw body bytes appended, so binary uploads survive).</summary>
     private (string Text, byte[] Wire) BuildRequestHeaders(
         string method, ParsedUrl url, string path,
-        string cookieValues, byte[]? body, string? contentType)
+        string cookieValues, byte[]? body, string? contentType,
+        IReadOnlyDictionary<string, string>? extraHeaders = null)
     {
         var sb = new StringBuilder(256);
 
@@ -296,6 +309,22 @@ public class HttpClient
             sb.Append("Content-Length: ")
               .Append(body.Length)
               .Append("\r\n");
+        }
+
+        if (extraHeaders != null)
+        {
+            foreach (var pair in extraHeaders)
+            {
+                string key = pair.Key?.Trim() ?? string.Empty;
+                string value = pair.Value ?? string.Empty;
+                if (key.Length == 0 || key.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                    key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                    key.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                    key.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ||
+                    key.Equals("Authorization", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                sb.Append(key).Append(": ").Append(value.Replace("\r", "").Replace("\n", "")).Append("\r\n");
+            }
         }
 
         sb.Append("Connection: close\r\n");

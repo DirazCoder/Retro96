@@ -1,0 +1,328 @@
+using System.Drawing;
+using System.Diagnostics;
+
+namespace Retro96;
+
+public enum DownloadStatus { Downloading, Complete, Failed, Cancelled }
+
+public sealed class DownloadItem
+{
+    public string FileName { get; internal set; } = "download";
+    public string Url { get; internal set; } = "";
+    public string? FilePath { get; internal set; }
+    public long? TotalBytes { get; internal set; }
+    public long BytesDownloaded { get; internal set; }
+    public DownloadStatus Status { get; internal set; } = DownloadStatus.Downloading;
+    public string? Error { get; internal set; }
+    internal CancellationTokenSource Cancellation { get; } = new();
+    public double? Progress => TotalBytes is > 0 ? Math.Min(1d, (double)BytesDownloaded / TotalBytes.Value) : null;
+}
+
+internal sealed class DownloadManager : IDisposable
+{
+    private readonly object _sync = new();
+    private readonly List<DownloadItem> _items = new();
+    public IReadOnlyList<DownloadItem> Items { get { lock (_sync) return _items.ToArray(); } }
+    public event EventHandler? Changed;
+
+    public DownloadItem Start(string url, byte[] bytes, string suggestedName, string path)
+    {
+        var item = new DownloadItem { Url = url, FileName = Path.GetFileName(suggestedName), FilePath = path, TotalBytes = bytes.LongLength };
+        lock (_sync) _items.Insert(0, item);
+        Changed?.Invoke(this, EventArgs.Empty);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                await using var file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read,
+                    64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                const int chunk = 64 * 1024;
+                for (int offset = 0; offset < bytes.Length; offset += chunk)
+                {
+                    item.Cancellation.Token.ThrowIfCancellationRequested();
+                    int count = Math.Min(chunk, bytes.Length - offset);
+                    await file.WriteAsync(bytes.AsMemory(offset, count), item.Cancellation.Token).ConfigureAwait(false);
+                    item.BytesDownloaded += count;
+                    Changed?.Invoke(this, EventArgs.Empty);
+                }
+                await file.FlushAsync(item.Cancellation.Token).ConfigureAwait(false);
+                item.Status = DownloadStatus.Complete;
+            }
+            catch (OperationCanceledException)
+            {
+                item.Status = DownloadStatus.Cancelled;
+                try { if (File.Exists(path)) File.Delete(path); } catch { }
+            }
+            catch (Exception ex)
+            {
+                item.Status = DownloadStatus.Failed; item.Error = ex.Message;
+            }
+            Changed?.Invoke(this, EventArgs.Empty);
+        });
+        return item;
+    }
+
+    public void Cancel(DownloadItem item)
+    {
+        try { item.Cancellation.Cancel(); } catch { }
+    }
+
+    public void Remove(DownloadItem item)
+    {
+        lock (_sync) _items.Remove(item);
+        try { item.Cancellation.Dispose(); } catch { }
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void Dispose()
+    {
+        foreach (var item in Items) Cancel(item);
+        lock (_sync) _items.Clear();
+    }
+}
+
+internal sealed class DownloadsDialog : Form
+{
+    private readonly DownloadManager _manager;
+    private readonly DataGridView _grid = new();
+    private readonly System.Windows.Forms.Timer _refresh = new() { Interval = 250 };
+    private readonly EventHandler _changedHandler;
+    private readonly ContextMenuStrip _contextMenu = new();
+
+    public DownloadsDialog(DownloadManager manager)
+    {
+        _manager = manager;
+        Text = "Retro96 Downloads";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(760, 460);
+        ClientSize = new Size(980, 600);
+        AutoScaleMode = AutoScaleMode.Font;
+
+        _grid.Dock = DockStyle.Fill;
+        _grid.ReadOnly = true;
+        _grid.AllowUserToAddRows = false;
+        _grid.RowHeadersVisible = false;
+        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _grid.AutoGenerateColumns = false;
+        _grid.MultiSelect = false;
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "File", DataPropertyName = nameof(DownloadItem.FileName), Width = 210 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "URL", DataPropertyName = nameof(DownloadItem.Url), Width = 380 });
+        _grid.Columns.Add(new DownloadProgressColumn { HeaderText = "Progress", Width = 180, SortMode = DataGridViewColumnSortMode.NotSortable });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Status", DataPropertyName = nameof(DownloadItem.Status), Width = 110 });
+        _grid.CellDoubleClick += (_, _) => OpenSelected();
+
+        _contextMenu.Items.Add("Open").Click += (_, _) => OpenSelected();
+        _contextMenu.Items.Add("Open Folder").Click += (_, _) => OpenFolderSelected();
+        _contextMenu.Items.Add("Copy URL").Click += (_, _) => CopySelectedUrl();
+        _contextMenu.Items.Add(new ToolStripSeparator());
+        _contextMenu.Items.Add("Cancel").Click += (_, _) => CancelSelected();
+        _contextMenu.Items.Add("Remove").Click += (_, _) => RemoveSelected();
+        _contextMenu.Opening += (_, _) => RefreshContextMenuState();
+        _grid.ContextMenuStrip = _contextMenu;
+        _grid.MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var hit = _grid.HitTest(e.X, e.Y);
+            if (hit.RowIndex >= 0 && hit.RowIndex < _grid.Rows.Count)
+            {
+                _grid.ClearSelection();
+                _grid.Rows[hit.RowIndex].Selected = true;
+                _grid.CurrentCell = _grid.Rows[hit.RowIndex].Cells[Math.Max(0, hit.ColumnIndex)];
+            }
+        };
+
+        var close = new Button { Text = "Close", Width = 94, Height = 30 };
+        var remove = new Button { Text = "Remove", Width = 94, Height = 30 };
+        var folder = new Button { Text = "Open Folder", Width = 104, Height = 30 };
+        var open = new Button { Text = "Open", Width = 94, Height = 30 };
+        var cancel = new Button { Text = "Cancel", Width = 94, Height = 30 };
+        cancel.Click += (_, _) => CancelSelected();
+        open.Click += (_, _) => OpenSelected();
+        folder.Click += (_, _) => OpenFolderSelected();
+        remove.Click += (_, _) => RemoveSelected();
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(10, 8, 10, 10),
+            Margin = Padding.Empty
+        };
+        buttons.Controls.Add(close);
+        buttons.Controls.Add(remove);
+        buttons.Controls.Add(folder);
+        buttons.Controls.Add(open);
+        buttons.Controls.Add(cancel);
+
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 58, Padding = Padding.Empty };
+        bottom.Controls.Add(buttons);
+
+        Controls.Add(_grid);
+        Controls.Add(bottom);
+        close.Click += (_, _) => Close();
+
+        _changedHandler = (_, _) =>
+        {
+            if (IsDisposed || Disposing) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action(RefreshGrid)); } catch (InvalidOperationException) { }
+            }
+            else RefreshGrid();
+        };
+        _manager.Changed += _changedHandler;
+        FormClosed += (_, _) => { _manager.Changed -= _changedHandler; _refresh.Stop(); _refresh.Dispose(); };
+        _refresh.Tick += (_, _) => RefreshGrid();
+        _refresh.Start();
+        Resize += (_, _) => UpdateGridColumns();
+        Shown += (_, _) => UpdateGridColumns();
+        RefreshGrid();
+    }
+
+    private sealed class DownloadProgressColumn : DataGridViewColumn
+    {
+        public DownloadProgressColumn() : base(new DownloadProgressCell())
+        {
+            HeaderText = "Progress";
+            Width = 180;
+            SortMode = DataGridViewColumnSortMode.NotSortable;
+        }
+    }
+
+    private sealed class DownloadProgressCell : DataGridViewCell
+    {
+        public override Type ValueType => typeof(double);
+        public override Type FormattedValueType => typeof(double);
+        public override object Clone() => new DownloadProgressCell();
+
+        protected override void Paint(Graphics graphics, Rectangle clipBounds, Rectangle cellBounds, int rowIndex,
+            DataGridViewElementStates cellState, object? value, object? formattedValue, string? errorText,
+            DataGridViewCellStyle cellStyle, DataGridViewAdvancedBorderStyle advancedBorderStyle,
+            DataGridViewPaintParts paintParts)
+        {
+            base.Paint(graphics, clipBounds, cellBounds, rowIndex, cellState, null, null, errorText,
+                cellStyle, advancedBorderStyle, paintParts & ~DataGridViewPaintParts.ContentForeground);
+
+            double? progress = value is double d ? d : formattedValue is double f ? f : null;
+            int x = cellBounds.X + 6;
+            int y = cellBounds.Y + Math.Max(4, (cellBounds.Height - 16) / 2);
+            int w = Math.Max(10, cellBounds.Width - 12);
+            int h = 14;
+            using var border = new Pen(SystemColors.ControlDark);
+            using var back = new SolidBrush(SystemColors.Window);
+            using var fill = new SolidBrush(SystemColors.Highlight);
+            graphics.FillRectangle(back, x, y, w, h);
+            graphics.DrawRectangle(border, x, y, w - 1, h - 1);
+            if (progress.HasValue)
+            {
+                int fillWidth = (int)Math.Round(Math.Clamp(progress.Value, 0d, 1d) * (w - 2));
+                if (fillWidth > 0) graphics.FillRectangle(fill, x + 1, y + 1, fillWidth, h - 2);
+            }
+            else
+            {
+                using var brush = new SolidBrush(SystemColors.GrayText);
+                graphics.DrawString("…", cellStyle.Font ?? SystemFonts.DefaultFont, brush, x + w / 2f - 4, y - 2);
+            }
+        }
+    }
+
+    private void UpdateGridColumns()
+    {
+        if (_grid.Columns.Count < 4) return;
+        int available = Math.Max(520, _grid.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 8);
+        int progress = Math.Min(190, Math.Max(140, available / 5));
+        int status = 108;
+        int file = Math.Min(260, Math.Max(170, available / 4));
+        _grid.Columns[0].Width = file;
+        _grid.Columns[2].Width = progress;
+        _grid.Columns[3].Width = status;
+        _grid.Columns[1].Width = Math.Max(220, available - file - progress - status);
+    }
+
+    private DownloadItem? SelectedItem() => _grid.SelectedRows.Count == 0 ? null : _grid.SelectedRows[0].Tag as DownloadItem;
+
+    private void RefreshContextMenuState()
+    {
+        var item = SelectedItem();
+        bool has = item != null;
+        bool complete = item?.Status == DownloadStatus.Complete && !string.IsNullOrWhiteSpace(item.FilePath);
+        bool hasPath = item != null && !string.IsNullOrWhiteSpace(item.FilePath);
+        _contextMenu.Items[0].Enabled = complete;
+        _contextMenu.Items[1].Enabled = hasPath;
+        _contextMenu.Items[2].Enabled = has;
+        _contextMenu.Items[4].Enabled = item?.Status == DownloadStatus.Downloading;
+        _contextMenu.Items[5].Enabled = has && item?.Status != DownloadStatus.Downloading;
+    }
+
+    private void OpenSelected()
+    {
+        var item = SelectedItem();
+        if (item?.Status != DownloadStatus.Complete || string.IsNullOrWhiteSpace(item.FilePath)) return;
+        try { Process.Start(new ProcessStartInfo(item.FilePath) { UseShellExecute = true }); }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Open Download", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+    }
+
+    private void OpenFolderSelected()
+    {
+        var item = SelectedItem();
+        if (string.IsNullOrWhiteSpace(item?.FilePath)) return;
+        try { Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + item.FilePath + "\"") { UseShellExecute = true }); }
+        catch { }
+    }
+
+    private void CopySelectedUrl()
+    {
+        var item = SelectedItem();
+        if (item == null) return;
+        try { Clipboard.SetText(item.Url); } catch { }
+    }
+
+    private void CancelSelected()
+    {
+        var item = SelectedItem();
+        if (item?.Status == DownloadStatus.Downloading) _manager.Cancel(item);
+    }
+
+    private void RemoveSelected()
+    {
+        var item = SelectedItem();
+        if (item != null && item.Status != DownloadStatus.Downloading) _manager.Remove(item);
+    }
+
+    private void RefreshGrid()
+    {
+        if (IsDisposed || Disposing) return;
+        var previous = SelectedItem();
+        var items = _manager.Items;
+        _grid.SuspendLayout();
+        try
+        {
+            _grid.Rows.Clear();
+            foreach (var item in items)
+            {
+                int rowIndex = _grid.Rows.Add(item.FileName, item.Url, item.Progress.HasValue ? (object)item.Progress.Value : null!, item.Status.ToString());
+                var row = _grid.Rows[rowIndex];
+                row.Tag = item;
+                row.Cells[3].ToolTipText = item.Error ?? string.Empty;
+            }
+
+            if (previous != null)
+            {
+                foreach (DataGridViewRow row in _grid.Rows)
+                {
+                    if (ReferenceEquals(row.Tag, previous))
+                    {
+                        row.Selected = true;
+                        _grid.CurrentCell = row.Cells[0];
+                        break;
+                    }
+                }
+            }
+        }
+        finally { _grid.ResumeLayout(); }
+        _grid.InvalidateColumn(2);
+        UpdateGridColumns();
+    }
+}

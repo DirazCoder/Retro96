@@ -59,6 +59,8 @@ public sealed class Graphics : IDisposable
 
     public void TranslateTransform(float dx, float dy) => _canvas.Translate(dx, dy);
 
+    public void ScaleTransform(float sx, float sy) => _canvas.Scale(sx, sy);
+
     public void ResetTransform() => _canvas.ResetMatrix();
 
     public void SetClip(RectangleF rect, CombineMode combineMode = CombineMode.Replace) =>

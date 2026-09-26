@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net11.0-windows</TargetFramework>
@@ -8,6 +8,9 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <AssemblyName>Retro96</AssemblyName>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
     <RootNamespace>Retro96</RootNamespace>
     <Deterministic>true</Deterministic>
     <WarningLevel>5</WarningLevel>
@@ -30,6 +33,12 @@
     <!-- Partial trimming maintains critical WinForms drawing plumbing -->
     <TrimMode>partial</TrimMode>
     <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Transitional compatibility: the broker protocol still serializes a broader
+         set of runtime payload types with reflection. Plugin manifests use the
+         source-generated context below; keep reflection enabled until the whole
+         broker protocol is converted to source generation. -->
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
 
     <!-- ========================================== -->
     <!-- CLOSED SOURCE & HARDENED AOT CONFIG        -->
@@ -66,6 +75,11 @@
     <Using Remove="System.Drawing" />
   </ItemGroup>
 
+  <!-- The public plugin contract is compiled directly into the Retro96 host.
+       The standalone Retro96 Plugin SDK repository contains the same source contract
+       for plugin authors, but the host build never restores, builds, or requires the SDK.
+       Keeping the contract in the host also means the sandbox worker can hand the host
+       assembly to PluginAssemblyLoadContext for the shared API type identity. -->
   <ItemGroup>
     <PackageReference Include="SkiaSharp" Version="3.116.1" />
   </ItemGroup>

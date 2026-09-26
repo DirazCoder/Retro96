@@ -19,6 +19,7 @@ using Retro96.Engine.Js;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
 using Retro96.Engine.Render;
+using Retro96.Plugins;
 using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 
 /// <summary>
@@ -120,11 +121,22 @@ public partial class Form1 : Form
     private JsInterpreter? _jsInterpreter;
     private DocumentBindingsState? _jsState;
 
+    // C# plugin host. Plugins are loaded after the shell/engine are initialized
+    // so their APIs can safely target the live browser window.
+    private PluginManager? _pluginManager;
+    private ToolStripMenuItem? _pluginCommandsMenu;
+
+    internal string? PluginCurrentUrl => _currentPageUrl;
+    internal string PluginCurrentTitle => Text.EndsWith(" — Retro96", StringComparison.Ordinal)
+        ? Text[..^10] : Text;
+
     public Form1()
     {
         BrowserRuntime.Apply(_settings);
         InitializeComponent();
         InitializeBrowser();
+        InitializeBuiltInFeatures();
+        _pluginManager = new PluginManager(this);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -147,6 +159,10 @@ public partial class Form1 : Form
                 _canvas.ClearForNavigation();
                 _cookieStore.ClearAll();
             }
+            _pluginManager?.RaiseHostShuttingDown();
+            _pluginManager?.Dispose();
+            _pluginManager = null;
+            DisposeBuiltInFeatures();
             _resourceLoader?.Dispose();
             _imageCache?.Dispose();
             _fontCache?.Dispose();
@@ -175,9 +191,14 @@ public partial class Form1 : Form
         _btnForward.Enabled = false;
         _btnStop.Enabled = false;
 
+        _btnFile.DropDownItems.Add("Plugin Addons\u2026").Click += (s, e) => _pluginManager?.OpenManager(this);
+        _btnFile.DropDownItems.Add(new ToolStripSeparator());
         _btnFile.DropDownItems.Add("Open Local HTML\u2026").Click += (s, e) => OpenHtmlFile();
         _btnFile.DropDownItems.Add("Open New Window").Click += (s, e) => OpenNewBrowserWindow("about:blank");
         _btnFile.DropDownItems.Add("Preferences\u2026").Click += (s, e) => ShowPreferencesDialog();
+        _pluginCommandsMenu = new ToolStripMenuItem("Plugin Commands");
+        _pluginCommandsMenu.Visible = false;
+        _btnFile.DropDownItems.Add(_pluginCommandsMenu);
 
         _throbberBox.BorderStyle = BorderStyle.None;
         _throbberBox.Anchor = AnchorStyles.Top | AnchorStyles.Right;
@@ -462,6 +483,9 @@ public partial class Form1 : Form
 
         long myGeneration = ++_navGeneration;
         _canvas.ClearForNavigation();
+        _midiPlayer.Stop();
+        _midiUiSuppressed = false;
+        UpdateMidiUi();
         _pendingCertRetryUrl = null;   // a fresh navigation invalidates any stale acceptCertRisk hook
         DebugLog.Write($"NavigateAsync ENTER gen={myGeneration} rawUrl='{rawUrl}' postData={(postData != null ? "yes" : "no")} replaceHistory={replaceHistory}");
 
@@ -788,6 +812,9 @@ public partial class Form1 : Form
             await RenderHtmlAsync(errorHtml, url.ToAbsolute(), replaceHistory, myGeneration);
             return;
         }
+
+        if (await TryHandleBinaryNavigationAsync(success, url, ct, myGeneration).ConfigureAwait(true))
+            return;
 
         // ── Content-Type drives interpretation (checklist): standalone
         //    images display in a page, plain text wraps in <pre> — the
@@ -1817,10 +1844,14 @@ public partial class Form1 : Form
     {
         DebugLog.Write($"UpdatePage APPLIED gen={_navGeneration} url='{url}' title='{document.Title}' rootBoxChildren={rootBox.Children?.Count ?? -1}");
         _currentPageUrl = url;
+        _pluginManager?.RaiseNavigation(url);
 
         if (_history.Current != url)
             _history.Push(entry);
 
+        _historyStore.Record(document.Title, url);
+        BuildHistoryMenu();
+        BuildBookmarksMenu();
         UpdateNavigationButtons();
 
         _canvas.SetPage(document, rootBox, _jsInterpreter!, _fontCache, _imageCache);
@@ -1833,6 +1864,8 @@ public partial class Form1 : Form
         _btnStop.Enabled = false;
         _isLoading = false;
         _throbberBox.Invalidate();
+        _pluginManager?.RaisePageLoaded(url, PluginCurrentTitle);
+        _ = StartEmbeddedMidiAsync(document, ParsedUrl.Parse(url), _loadCts?.Token ?? CancellationToken.None, _navGeneration);
 
         int hash = url.IndexOf('#');
         if (hash >= 0 && hash + 1 < url.Length)
@@ -2165,6 +2198,71 @@ public partial class Form1 : Form
         if (form.ShowDialog(this) == DialogResult.OK && txtUser.Text.Length > 0)
             return (txtUser.Text, txtPass.Text);
         return null;
+    }
+
+    internal IDisposable AddPluginFileMenuItem(string pluginId, string text, Action callback)
+    {
+        if (_pluginCommandsMenu == null)
+            throw new InvalidOperationException("Plugin menu is not initialized.");
+
+        var item = new ToolStripMenuItem(text);
+        item.Click += OnPluginMenuItemClick;
+        item.Tag = new PluginMenuRegistration(pluginId, callback);
+        _pluginCommandsMenu.DropDownItems.Add(item);
+        _pluginCommandsMenu.Visible = _pluginCommandsMenu.DropDownItems.Count > 0;
+        return new DelegateDisposable(() =>
+        {
+            if (item.IsDisposed) return;
+            item.Click -= OnPluginMenuItemClick;
+            if (_pluginCommandsMenu.DropDownItems.Contains(item))
+                _pluginCommandsMenu.DropDownItems.Remove(item);
+            item.Dispose();
+            _pluginCommandsMenu.Visible = _pluginCommandsMenu.DropDownItems.Count > 0;
+        });
+    }
+
+    internal void RemovePluginFileMenuItems(string pluginId)
+    {
+        if (_pluginCommandsMenu == null) return;
+        foreach (ToolStripItem item in _pluginCommandsMenu.DropDownItems.Cast<ToolStripItem>().ToArray())
+        {
+            if (item.Tag is PluginMenuRegistration registration &&
+                registration.PluginId.Equals(pluginId, StringComparison.OrdinalIgnoreCase))
+            {
+                _pluginCommandsMenu.DropDownItems.Remove(item);
+                item.Dispose();
+            }
+        }
+        _pluginCommandsMenu.Visible = _pluginCommandsMenu.DropDownItems.Count > 0;
+    }
+
+    internal void SetPluginStatus(string pluginId, string text)
+    {
+        _statusLabel.Text = $"{text}";
+    }
+
+    internal void OpenPluginWindow(string url) => OpenNewBrowserWindow(url);
+    internal void PluginScrollTo(int x, int y) => _canvas.ScrollTo(x, y);
+
+    private void OnPluginMenuItemClick(object? sender, EventArgs e)
+    {
+        if (sender is not ToolStripMenuItem item || item.Tag is not PluginMenuRegistration registration)
+            return;
+        try { registration.Callback(); }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException($"Plugin menu '{registration.PluginId}'", ex);
+            MessageBox.Show(this, ex.Message, "Plugin Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private sealed record PluginMenuRegistration(string PluginId, Action Callback);
+
+    private sealed class DelegateDisposable : IDisposable
+    {
+        private Action? _dispose;
+        public DelegateDisposable(Action dispose) => _dispose = dispose;
+        public void Dispose() => Interlocked.Exchange(ref _dispose, null)?.Invoke();
     }
 
     private void OpenNewBrowserWindow(string url)
