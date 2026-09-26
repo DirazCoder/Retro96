@@ -269,6 +269,97 @@ public class NamedBugHeadlessTests
 
     // 5 ───────────────────────────────────────────────────────────────
     [Fact]
+    public void Bug_ListMarkersInsideTableCellsReserveListGutter()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body bgcolor=\"#ffffff\"><table border=\"1\" cellpadding=\"6\" cellspacing=\"2\">" +
+            "<tr><th>cell holds a ul</th><th>cell holds an ol</th></tr>" +
+            "<tr><td><ul><li>bullet inside a cell</li>" +
+            "<li>another bullet, wrapping onto a second line to check the indent width inside the narrower cell</li></ul></td>" +
+            "<td><ol type=\"I\"><li>ROMAN ONE in a cell</li><li>ROMAN TWO in a cell</li></ol></td></tr>" +
+            "</table></body></html>");
+
+        var table = doc.FirstTag("table");
+        var tableBox = table != null ? LayoutHarness.BoxOf(root, table) : null;
+        var ul = doc.FirstTag("ul");
+        var ol = doc.FirstTag("ol");
+        var ulBox = ul != null ? LayoutHarness.BoxOf(root, ul) : null;
+        var olBox = ol != null ? LayoutHarness.BoxOf(root, ol) : null;
+
+        Check.That(tableBox != null && tableBox.BorderRect.Width > 80f,
+            "list-containing table keeps a usable positive width",
+            tableBox == null ? "NO TABLE BOX" : $"width={tableBox.BorderRect.Width:0.#}");
+        Check.That(ulBox != null && ulBox.Width > 10f,
+            "UL inside a table cell gets a real content width",
+            ulBox == null ? "NO UL BOX" : $"width={ulBox.Width:0.#}");
+        Check.That(olBox != null && olBox.Width > 10f,
+            "OL inside a table cell gets a real content width",
+            olBox == null ? "NO OL BOX" : $"width={olBox.Width:0.#}");
+
+        var cellBoxes = tableBox?.Descendants().Where(b => b.BoxType == BoxType.TableCell).ToList()
+                        ?? new List<LayoutBox>();
+        Check.That(cellBoxes.Count == 4,
+            "the two header cells and two list cells remain valid table cells",
+            $"cells={cellBoxes.Count}");
+        Check.That(cellBoxes.All(c => c.BorderRect.Width > 20f),
+            "list marker gutters are included in intrinsic column sizing",
+            string.Join(", ", cellBoxes.Select(c => $"{c.BorderRect.Width:0.#}px")));
+
+        if (ulBox != null && olBox != null && cellBoxes.Count == 4)
+        {
+            var ulLi = ulBox.Descendants().FirstOrDefault(b => b.BoxType == BoxType.ListItem);
+            var olLi = olBox.Descendants().FirstOrDefault(b => b.BoxType == BoxType.ListItem);
+            Check.That(ulLi != null && olLi != null,
+                "list items survive table-cell layout",
+                $"ulLi={(ulLi != null)}, olLi={(olLi != null)}");
+
+            if (ulLi != null && olLi != null)
+            {
+                var ulCell = cellBoxes[2];
+                var olCell = cellBoxes[3];
+                float ulMarkerLeft = ulLi.X - 15f;
+                float olMarkerLeft = olLi.X - 22f;
+                Check.That(ulMarkerLeft >= ulCell.BorderRect.Left - 1f,
+                    "UL bullet marker stays inside its table cell",
+                    $"markerLeft={ulMarkerLeft:0.#}, cellLeft={ulCell.BorderRect.Left:0.#}");
+                Check.That(olMarkerLeft >= olCell.BorderRect.Left - 1f,
+                    "OL number marker stays inside its table cell",
+                    $"markerLeft={olMarkerLeft:0.#}, cellLeft={olCell.BorderRect.Left:0.#}");
+
+                using var images = new ImageCache { CookieStore = new CookieStore() };
+                using var loader = new ResourceLoader(new CookieStore());
+                using var bmp = LayoutHarness.Render(doc, root, images, loader);
+
+                static bool HasInkIn(LayoutBox box, float left, float right, float top, float bottom, Bitmap bmp)
+                {
+                    int x0 = Math.Clamp((int)Math.Floor(left), 0, bmp.Width - 1);
+                    int x1 = Math.Clamp((int)Math.Ceiling(right), 0, bmp.Width - 1);
+                    int y0 = Math.Clamp((int)Math.Floor(top), 0, bmp.Height - 1);
+                    int y1 = Math.Clamp((int)Math.Ceiling(bottom), 0, bmp.Height - 1);
+                    for (int y = y0; y <= y1; y++)
+                        for (int x = x0; x <= x1; x++)
+                        {
+                            var c = bmp.GetPixel(x, y);
+                            if (c.A > 40 && (c.R < 120 || c.G < 120 || c.B < 120))
+                                return true;
+                        }
+                    return false;
+                }
+
+                bool ulMarkerInk = HasInkIn(ulLi, ulLi.X - 22f, ulLi.X - 2f,
+                    ulLi.Y, ulLi.Y + Math.Max(12f, ulLi.Height + 6f), bmp);
+                bool olMarkerInk = HasInkIn(olLi, olLi.X - 28f, olLi.X - 2f,
+                    olLi.Y, olLi.Y + Math.Max(12f, olLi.Height + 6f), bmp);
+                Check.That(ulMarkerInk,
+                    "UL bullet is actually painted inside the table cell");
+                Check.That(olMarkerInk,
+                    "OL number marker is actually painted inside the table cell");
+            }
+        }
+        Check.Done();
+    }
+
+    [Fact]
     public async Task Bug_ImageCachePermanentFailure()
     {
         string Base = TestOrigin.Base;
@@ -306,6 +397,69 @@ public class NamedBugHeadlessTests
     }
 
     // 6 ───────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_BulletLinksInsideTableHitTesting()
+    {
+        // Exact shape of the Acme CyberCorp sidebar regression: literal bullet
+        // text followed by an anchor inside a table cell.  The renderer may
+        // legitimately move/overflow the inline descendant during table
+        // layout, so hit-testing must use the descendant's own geometry rather
+        // than clipping it to every ancestor box.
+        const string html = @"<html><body>
+            <table border='1' width='220'><tr><td width='25%'>
+              <font face='Geneva, Arial' size='2'>
+                &#149; <a href='#news' id='newsLink'>Corporate News</a><br>
+                &#149; <a href='#intranet' id='intranetLink'>Intranet Login</a><br>
+                &#149; <a href='#ftp' id='ftpLink'>FTP Archive</a><br>
+                &#149; <a href='#press' id='pressLink'>Press Releases</a>
+              </font>
+            </td></tr></table>
+          </body></html>";
+
+        var (doc, root) = LayoutHarness.Parse(html);
+        foreach (var id in new[] { "newsLink", "intranetLink", "ftpLink", "pressLink" })
+        {
+            var anchor = doc.ElementDescendants().First(e => e.GetAttr("id") == id);
+            var box = LayoutHarness.BoxOf(root, anchor);
+            Check.That(box != null, $"{id} produced a layout box");
+            if (box == null) continue;
+
+            var r = box.BorderRect;
+            float x = r.X + Math.Max(1f, r.Width / 2f);
+            float y = r.Y + Math.Max(1f, r.Height / 2f);
+            var hit = HitTester.ElementAt(root, x, y);
+            Check.That(hit == anchor,
+                $"{id} is clickable inside its table cell",
+                hit == null ? "hit=<null>" : $"hit=<{hit.TagName}> id={hit.GetAttr(\"id\")}");
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_HitTestingCanReachOverflowedTableDescendant()
+    {
+        // Structural regression guard for table layout moves: a visible child
+        // may sit just outside the measured parent border box after legacy
+        // table/inline alignment.  The child is still a hit target.
+        var root = new LayoutBox(new DomElement("body"), BoxType.Block)
+        { X = 0, Y = 0, Width = 100, Height = 40 };
+        var cell = new LayoutBox(new DomElement("td"), BoxType.TableCell)
+        { X = 0, Y = 0, Width = 20, Height = 20, Parent = root };
+        root.Children.Add(cell);
+        var anchor = new DomElement("a");
+        anchor.SetAttr("href", "#x");
+        var link = new LayoutBox(anchor, BoxType.Inline)
+        { X = 40, Y = 5, Width = 50, Height = 12, Parent = cell, TextRun = "Corporate News" };
+        cell.Children.Add(link);
+
+        var hit = HitTester.ElementAt(root, 55, 10);
+        Check.That(hit == anchor,
+            "an overflowed descendant remains clickable even when its table-cell ancestor misses the point",
+            hit == null ? "hit=<null>" : $"hit=<{hit.TagName}>");
+        Check.Done();
+    }
+
+    // 7 ───────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_InputButtonsIntermittent()
     {
@@ -865,6 +1019,26 @@ public class NamedBugHeadlessTests
 
 public class BonusContractTests
 {
+    [Fact]
+    public void LegacyNumericBulletIsPaintableThroughGlyphFallback()
+    {
+        var decoded = Retro96.Engine.Html.HtmlEntities.Decode("&#149;");
+        Check.That(decoded == "\u2022",
+            "legacy numeric bullet decodes to U+2022 before rendering",
+            $"decoded U+{(decoded.Length > 0 ? (int)decoded[0] : 0):X4}");
+
+        var mapped = Retro96.Engine.Render.GlyphSubstitution.MapGlyphs(decoded);
+        Check.That(mapped == Retro96.Engine.Render.GlyphSubstitution.LegacyBulletMarker.ToString(),
+            "U+2022 is converted to the renderer's private bullet marker instead of a font glyph",
+            $"mapped U+{(mapped.Length > 0 ? (int)mapped[0] : 0):X4}");
+
+        var remapped = Retro96.Engine.Render.GlyphSubstitution.MapGlyphs(mapped);
+        Check.That(remapped == mapped,
+            "the private bullet marker is idempotent when glyph mapping runs twice",
+            $"second-pass U+{(remapped.Length > 0 ? (int)remapped[0] : 0):X4}");
+        Check.Done();
+    }
+
     [Fact]
     public void FileInputHasDistinctPickerAndFilenameDisplay()
     {

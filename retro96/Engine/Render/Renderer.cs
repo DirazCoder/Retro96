@@ -735,7 +735,7 @@ public class Renderer
         // so make it authoritative at paint time too.  This also keeps the
         // renderer robust if a caller builds a layout tree without running
         // the normal style-attribute pass first.
-        Color color = ParseHtmlColor(elem.GetAttr("color"));
+        Color color = ParseHtmlColor(elem.GetAttr("color") ?? string.Empty);
         if (color == Color.Empty && style != null)
             color = style.BorderTopColor != Color.Empty
                 ? style.BorderTopColor

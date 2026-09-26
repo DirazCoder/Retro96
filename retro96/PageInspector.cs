@@ -60,7 +60,6 @@ public class PageInspector : Form
     private DomDocument? _sourceDocument;
     private DomDocument? _inspectedDocument;
     private int _activeTab;
-    private bool _consoleDirty;
 
     private static readonly HashSet<string> VoidElements = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -233,7 +232,6 @@ public class PageInspector : Form
             // empty console even though ConsoleLines already contained entries.
             if (_activeTab == 1)
             {
-                _consoleDirty = false;
                 RefreshConsole();
             }
 
@@ -263,7 +261,6 @@ public class PageInspector : Form
             _consoleCoalesce.Stop();
             if (IsDisposed) return;
             if (_activeTab == 1) RefreshConsole();
-            else _consoleDirty = true;
         };
         FormClosed += (s, e) =>
         {
@@ -271,7 +268,6 @@ public class PageInspector : Form
         };
 
         BuildTree();
-        _consoleDirty = true; // retained console entries may predate this Inspector
         RefreshToolTab(0);
         if (initialElement != null) SelectElement(initialElement);
     }
@@ -505,7 +501,6 @@ public class PageInspector : Form
     {
         if (tabIndex == 1)
         {
-            _consoleDirty = false;
             RefreshConsole();
         }
         else if (tabIndex == 2)
@@ -568,7 +563,6 @@ public class PageInspector : Form
 
     private void RefreshConsole()
     {
-        _consoleDirty = false;
         string filter = _consoleFilter.Text.Trim();
         ConsoleLine[] lines;
         lock (ConsoleLock) lines = ConsoleLines.ToArray();

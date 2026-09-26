@@ -22,12 +22,17 @@ namespace Retro96.Engine.Render;
 /// Latin-1 and typographic-punctuation code point the core fonts DO have
 /// (— – ‘ ’ “ ” • … ™ © ® ° ± × ÷ ¼ ½ ¾ ¹ ² ³) passes through untouched.
 ///
-/// Idempotent: substitutes are plain ASCII/Latin-1, so a second pass over
-/// already-mapped text is a no-op — safe to apply at both the layout
-/// (TextRun creation) and paint (control labels) sides.
+/// Idempotent: substitutions are ordinary western text or engine-private
+/// sentinels, and a second pass over already-mapped text is a no-op — safe
+/// to apply at both the layout (TextRun creation) and paint sides.
 /// </summary>
 public static class GlyphSubstitution
 {
+    // Private-use sentinel consumed by the text renderer as a real round
+    // bullet. Keeping it out of the selected western font avoids platform-
+    // dependent missing-glyph boxes while preserving the bullet's advance.
+    public const char LegacyBulletMarker = '\uE000';
+
     private static readonly Dictionary<char, string> Map = new()
     {
         // ── Box drawing (U+2500–U+257F): the BBS/terminal frame charset ──
@@ -82,6 +87,13 @@ public static class GlyphSubstitution
 
         // ── CJK-adjacent full-width forms that leak onto western pages ──
         ['　'] = " ",
+
+        // Windows-1252/1990s inline bullet. The engine's resolved Skia
+        // typeface can expose a .notdef box for U+2022 instead of doing
+        // per-glyph font fallback, so keep this common era glyph in the
+        // Latin-1-safe range that the selected western fonts reliably paint.
+        ['•'] = LegacyBulletMarker.ToString(),
+        ['\u0095'] = LegacyBulletMarker.ToString(),
     };
 
     /// <summary>
@@ -98,14 +110,22 @@ public static class GlyphSubstitution
         bool needsMapping = false;
         foreach (char c in text)
         {
-            if (c < '\u2190')
+            // Keep engine-private sentinels intact when MapGlyphs is called
+            // twice by a control/paint path.
+            if (c == LegacyBulletMarker)
             {
-                // Below the arrow block everything is either core-font
-                // material or handled elsewhere — except the few map
-                // entries under 0x2190 (none today).
                 continue;
             }
+
+            // Check explicit substitutions before the fast-path cutoff.
+            // U+2022 BULLET is intentionally handled here because a
+            // resolved western typeface is not guaranteed to provide Skia
+            // glyph fallback even when the system has a symbol font.
             if (Map.ContainsKey(c)) { needsMapping = true; break; }
+            if (c < '\u2190')
+            {
+                continue;
+            }
             if (c >= '\u2190' && c <= '\u27BF') { needsMapping = true; break; }
             if (c >= '\u2E80') { needsMapping = true; break; }   // CJK etc.
         }
@@ -116,10 +136,14 @@ public static class GlyphSubstitution
         var sb = new StringBuilder(text.Length + 8);
         foreach (char c in text)
         {
-            if (c < '\u2190')
+            if (c == LegacyBulletMarker)
+            {
                 sb.Append(c);
+            }
             else if (Map.TryGetValue(c, out var sub))
                 sb.Append(sub);
+            else if (c < '\u2190')
+                sb.Append(c);
             else if (c >= '\u2E80')
                 sb.Append('?');            // genuinely foreign glyph
             else

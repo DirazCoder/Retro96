@@ -1296,6 +1296,19 @@ public static class TableLayout
                 if (EndsEdgeWhitespace(child)) { m = Math.Max(m, run); run = 0f; }
             }
         }
+        if (box.Element?.TagName is "ul" or "ol" or "menu" or "dir")
+        {
+            m = Math.Max(m, run);
+            // The list's own padding is the marker gutter in the engine's
+            // Navigator-style UA rules.  Include it in min-content sizing so
+            // an auto table column cannot become narrower than the marker
+            // area plus the first item's unbreakable content.
+            m += box.PaddingLeft + box.PaddingRight
+               + box.BorderLeft + box.BorderRight
+               + box.MarginLeft + box.MarginRight;
+            return m;
+        }
+
         return Math.Max(m, run);
     }
 
@@ -1459,6 +1472,27 @@ public static class TableLayout
 
             run += childWidth;
             runHasContent = childWidth > 0.01f || child.Height > 0.01f;
+        }
+
+        // List containers carry their bullet/number gutter in the UA stylesheet
+        // (40px of left padding in Retro96).  That padding is part of the
+        // list box's horizontal footprint even though the generic intrinsic
+        // measurement above intentionally measures only its line content.
+        //
+        // When a list lives directly in an auto-sized <td>, omitting this
+        // chrome lets the table column collapse around the text alone.  The
+        // LI marker is then laid out in space the table never reserved for it:
+        // bullets/numbers can be pushed outside the cell or visually lost,
+        // while an adjacent column absorbs the missing width.
+        // Count the list container's own horizontal padding/border/margins in
+        // its intrinsic width so the table grid reserves the marker gutter.
+        if (box.Element?.TagName is "ul" or "ol" or "menu" or "dir")
+        {
+            p = Math.Max(p, run);
+            p += box.PaddingLeft + box.PaddingRight
+               + box.BorderLeft + box.BorderRight
+               + box.MarginLeft + box.MarginRight;
+            return p;
         }
 
         return Math.Max(p, run);

@@ -200,6 +200,23 @@ public sealed class Graphics : IDisposable
 
     // ── Text ───────────────────────────────────────────────────────────
 
+    // U+E000 is an engine-private text marker emitted for legacy HTML
+    // bullets (for example Windows-1252 character 0x95 / &#149;).  It must
+    // never reach Skia as a real glyph: some installed western faces paint
+    // it as a square .notdef box.  Measurement treats it like a middle-dot
+    // advance; point/rect text drawing replaces it with a small vector circle.
+    private const char LegacyBulletMarker = '\uE000';
+
+    private static string NormalizeSpecialGlyphsForMeasurement(string text)
+    {
+        if (string.IsNullOrEmpty(text) || text.IndexOf(LegacyBulletMarker) < 0)
+            return text;
+        return text.Replace(LegacyBulletMarker, '·');
+    }
+
+    private static float MeasureAdvance(Font font, string text) =>
+        font.MeasureText(NormalizeSpecialGlyphsForMeasurement(text));
+
     private void ApplyEdging(Font font)
     {
         font.SkFont.Edging = TextRenderingHint switch
@@ -217,11 +234,56 @@ public sealed class Graphics : IDisposable
         if (string.IsNullOrEmpty(text) || font == null || brush is not SolidBrush sb) return;
         ApplyEdging(font);
         float baseline = y + font.AscentPx;
+        if (text.IndexOf(LegacyBulletMarker) >= 0)
+        {
+            DrawTextWithSpecialGlyphs(text, font, sb, x, baseline);
+            return;
+        }
         _canvas.DrawText(text, x, baseline, font.SkFont, sb.Prepare(antialias: true));
     }
 
     public void DrawString(string? text, Font font, Brush brush, float x, float y)
         => DrawString(text, font, brush, x, y, null);
+
+    private void DrawTextWithSpecialGlyphs(string text, Font font, SolidBrush brush,
+                                           float x, float baseline)
+    {
+        var paint = brush.Prepare(antialias: true);
+        float cursor = x;
+        int start = 0;
+        float lineHeight = font.GetHeight();
+        float bulletAdvance = Math.Max(1f, MeasureAdvance(font, "·"));
+        float diameter = Math.Clamp(lineHeight * 0.30f, 2.5f, 5.5f);
+        float centerY = baseline - font.AscentPx + lineHeight * 0.52f;
+
+        for (int i = 0; i <= text.Length; i++)
+        {
+            if (i < text.Length && text[i] != LegacyBulletMarker)
+                continue;
+
+            if (i > start)
+            {
+                string normal = text[start..i];
+                _canvas.DrawText(normal, cursor, baseline, font.SkFont, paint);
+                cursor += MeasureAdvance(font, normal);
+            }
+
+            if (i < text.Length)
+            {
+                float left = cursor + (bulletAdvance - diameter) * 0.5f;
+                using var dot = new SKPaint
+                {
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Fill,
+                    Color = paint.Color
+                };
+                _canvas.DrawOval(SKRect.Create(left, centerY - diameter * 0.5f,
+                    diameter, diameter), dot);
+                cursor += bulletAdvance;
+                start = i + 1;
+            }
+        }
+    }
 
     /// <summary>Rect draw with alignment, wrapping, clipping and ellipsis.</summary>
     public void DrawString(string? text, Font font, Brush brush, RectangleF layoutRect, StringFormat? format)
@@ -246,7 +308,7 @@ public sealed class Graphics : IDisposable
         {
             for (int i = 0; i < lines.Count; i++)
             {
-                while (lines[i].Length > 1 && font.MeasureText(Ellipsize(lines[i])) > layoutRect.Width)
+                while (lines[i].Length > 1 && MeasureAdvance(font, Ellipsize(lines[i])) > layoutRect.Width)
                     lines[i] = lines[i][..^2];
             }
         }
@@ -254,7 +316,7 @@ public sealed class Graphics : IDisposable
         {
             for (int i = 0; i < lines.Count; i++)
             {
-                while (lines[i].Length > 1 && font.MeasureText(lines[i]) > layoutRect.Width)
+                while (lines[i].Length > 1 && MeasureAdvance(font, lines[i]) > layoutRect.Width)
                     lines[i] = lines[i][..^1];
             }
         }
@@ -277,15 +339,18 @@ public sealed class Graphics : IDisposable
 
             for (int i = 0; i < lines.Count; i++)
             {
-                float w = font.MeasureText(lines[i]);
+                float w = MeasureAdvance(font, lines[i]);
                 float x = sf.Alignment switch
                 {
                     StringAlignment.Center => layoutRect.X + (layoutRect.Width - w) / 2f,
                     StringAlignment.Far => layoutRect.Right - w,
                     _ => layoutRect.X,
                 };
-                _canvas.DrawText(lines[i], x, top + i * lineHeight + font.AscentPx,
-                    font.SkFont, paint);
+                float baseline = top + i * lineHeight + font.AscentPx;
+                if (lines[i].IndexOf(LegacyBulletMarker) >= 0)
+                    DrawTextWithSpecialGlyphs(lines[i], font, sb, x, baseline);
+                else
+                    _canvas.DrawText(lines[i], x, baseline, font.SkFont, paint);
             }
         }
         finally
@@ -309,11 +374,11 @@ public sealed class Graphics : IDisposable
 
         var current = new StringBuilder();
         float currentW = 0f;
-        float spaceW = font.MeasureText(" ");
+        float spaceW = MeasureAdvance(font, " ");
 
         foreach (var word in text.Split(' '))
         {
-            float wordW = font.MeasureText(word);
+            float wordW = MeasureAdvance(font, word);
             if (wordW > maxWidth)
             {
                 if (current.Length > 0)
@@ -326,7 +391,7 @@ public sealed class Graphics : IDisposable
                 float w = 0f;
                 foreach (var ch in word)
                 {
-                    float cw = font.MeasureText(ch.ToString());
+                    float cw = MeasureAdvance(font, ch.ToString());
                     if (w + cw > maxWidth && part.Length > 0)
                     {
                         lines.Add(part.ToString());
@@ -373,7 +438,7 @@ public sealed class Graphics : IDisposable
     {
         if (string.IsNullOrEmpty(text) || font == null)
             return SizeF.Empty;
-        return new SizeF(font.MeasureText(text), font.GetHeight());
+        return new SizeF(MeasureAdvance(font, text), font.GetHeight());
     }
 
     public SizeF MeasureString(string? text, Font font, SizeF layoutArea, StringFormat? format)
@@ -408,11 +473,11 @@ public sealed class Graphics : IDisposable
         if (noWrap || maxWidth <= 0f)
         {
             charsFitted = text.Length;
-            _lastWrapSize = new SizeF(font.MeasureText(text), lineHeight);
+            _lastWrapSize = new SizeF(MeasureAdvance(font, text), lineHeight);
             return _lastWrapSize;
         }
 
-        float spaceW = font.MeasureText(" ");
+        float spaceW = MeasureAdvance(font, " ");
 
         int lineStart = 0;          // index of the first char on the current line
         float width = 0f;           // width of the current line so far
@@ -427,7 +492,7 @@ public sealed class Graphics : IDisposable
             if (ch == '\n' || ch == '\r')
                 continue;           // callers split hard breaks themselves
 
-            float cw = font.MeasureText(ch.ToString());
+            float cw = MeasureAdvance(font, ch.ToString());
             if (width + cw > maxWidth && i > lineStart)
             {
                 maxLineWidth = Math.Max(maxLineWidth, width);
@@ -441,7 +506,7 @@ public sealed class Graphics : IDisposable
                 lines++;
                 lineStart = breakAt;
                 // rebuild the carried-over width
-                width = font.MeasureText(text[lineStart..i]) + cw;
+                width = MeasureAdvance(font, text[lineStart..i]) + cw;
                 lastSpace = -1;
                 lastSpaceWidth = 0f;
                 continue;

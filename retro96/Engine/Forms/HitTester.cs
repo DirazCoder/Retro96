@@ -16,9 +16,15 @@ public static class HitTester
     public static DomElement? ElementAt(LayoutBox box, float x, float y)
     {
         bool contains = box.BorderRect.Contains(x, y);
-        if (!contains && !(box.Width == 0f && box.Height == 0f))
-            return null;
 
+        // Do not prune the subtree just because the parent box misses the
+        // point.  Legacy layout is allowed to move/overflow descendants
+        // independently of a parent's measured border box (tables, inline
+        // fragments, centered nested tables, list markers and absolutely
+        // positioned content all exercise this).  The old containment guard
+        // therefore made visible descendants unclickable even though their
+        // own geometry was correct.  Children still have to contain the point
+        // themselves before they can win the hit-test.
         for (int i = box.Children.Count - 1; i >= 0; i--)
         {
             var result = ElementAt(box.Children[i], x, y);
@@ -31,9 +37,10 @@ public static class HitTester
     public static LayoutBox? DeepestBoxAt(LayoutBox box, float x, float y)
     {
         bool contains = box.BorderRect.Contains(x, y);
-        if (!contains && !(box.Width == 0f && box.Height == 0f))
-            return null;
 
+        // See ElementAt: descendant geometry can legitimately extend outside
+        // the parent's measured border box in this renderer.  Search the
+        // children first instead of clipping hit-testing to parent geometry.
         for (int i = box.Children.Count - 1; i >= 0; i--)
         {
             var hit = DeepestBoxAt(box.Children[i], x, y);
@@ -52,9 +59,10 @@ public static class HitTester
             rect.Inflate(0, 2);
             contains = rect.Contains(x, y);
         }
-        if (!contains && !(box.Width == 0f && box.Height == 0f))
-            return null;
 
+        // Text selection must use the same unclipped descendant search as
+        // normal hit-testing, otherwise text inside a table/list child that
+        // overflows its parent becomes impossible to select.
         for (int i = box.Children.Count - 1; i >= 0; i--)
         {
             var hit = TextBoxAt(box.Children[i], x, y);

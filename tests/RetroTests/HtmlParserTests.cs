@@ -55,6 +55,22 @@ public class HtmlParserTests
     }
 
     [Fact]
+    public void LegacyWindows1252NumericEntitiesDecodeToVisibleUnicode()
+    {
+        // Many 1990s pages wrote a Windows-1252 bullet as &#149; before links.
+        // U+0095 is a C1 control in Unicode, but the historical browser/content
+        // compatibility mapping treats it as Windows-1252 U+2022 BULLET.
+        Check.That(HtmlEntities.Decode("&#149;") == "\u2022",
+            "legacy &#149; decodes to U+2022 BULLET",
+            $"got U+{(int)HtmlEntities.Decode("&#149;")[0]:X4}");
+        Check.That(HtmlEntities.Decode("&#146;") == "\u2019",
+            "legacy &#146; decodes to U+2019 RIGHT SINGLE QUOTATION MARK");
+        Check.That(HtmlEntities.Decode("&#150;") == "\u2013",
+            "legacy &#150; decodes to U+2013 EN DASH");
+        Check.Done();
+    }
+
+    [Fact]
     public void EntitiesDecodeThroughFullParse()
     {
         var doc = Parse("<html><body><p>caf&eacute; &amp; cr&egrave;me</p></body></html>");
