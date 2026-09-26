@@ -223,10 +223,10 @@ public static class InlineLayout
     static InlineLayout()
     {
         _measureG = Graphics.FromImage(_measureBmp);
-        // MUST match the Renderer's hint (now ClearTypeGridFit) — a
-        // measure/draw hint mismatch produces wrong advance widths, which
-        // is itself a spacing bug.
-        _measureG.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        // ClearType did not exist in the 1996 target. Use grayscale
+        // antialiasing so measurement and drawing match the era-oriented
+        // renderer without introducing sub-pixel colour fringes.
+        _measureG.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
     }
 
     public static void SetFontCache(Render.FontCache fc) => _fontCache = fc;
@@ -247,7 +247,11 @@ public static class InlineLayout
 
         var font = ResolveRunFont(style);
         var sz = _measureG.MeasureString(text, font, int.MaxValue, _sf);
-        return (float)Math.Ceiling(sz.Width);
+        float width = (float)sz.Width;
+        if (text.Length > 1) width += Math.Max(0f, text.Length - 1) * style.LetterSpacing;
+        int spaces = text.Count(c => char.IsWhiteSpace(c));
+        if (spaces > 0) width += spaces * style.WordSpacing;
+        return Math.Max(0f, (float)Math.Ceiling(width));
     }
 
     private static float MeasureSmallCapsWidth(string text, ComputedStyle style)
@@ -282,7 +286,9 @@ public static class InlineLayout
             width += _measureG.MeasureString(draw, fullFont, int.MaxValue, _sf).Width;
         }
 
-        return (float)Math.Ceiling(width);
+        if (text.Length > 1) width += Math.Max(0f, text.Length - 1) * style.LetterSpacing;
+        width += text.Count(c => char.IsWhiteSpace(c)) * style.WordSpacing;
+        return Math.Max(0f, (float)Math.Ceiling(width));
     }
 
     private static Font ResolveRunFont(ComputedStyle style)
@@ -414,6 +420,7 @@ public static class InlineLayout
             "top" => VAlignMode.Top,
             "texttop" => VAlignMode.Top,
             "middle" => VAlignMode.Middle,
+            "center" => VAlignMode.Middle,
             "absmiddle" => VAlignMode.Middle,
             "absbottom" => VAlignMode.Bottom,
             "baseline" => VAlignMode.Baseline,
@@ -472,6 +479,7 @@ public static class InlineLayout
         bool nowrap = containerStyle.WhiteSpace is WhiteSpaceValue.Nowrap
                                                 or WhiteSpaceValue.Pre;
         float availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
+        if (firstLine) availW = Math.Max(0f, availW - ResolveTextIndent(containerStyle, containerWidth));
         LayoutTrace.Log($"  initial availW at y={currentY:F1} => {availW:F1} " +
             $"(containerWidth={containerWidth:F1})");
 
@@ -520,6 +528,7 @@ public static class InlineLayout
                 if (!hadLineContent)
                     currentY += brH;
                 availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
+                if (firstLine) availW = Math.Max(0f, availW - ResolveTextIndent(containerStyle, containerWidth));
                 continue;
             }
 
@@ -603,6 +612,7 @@ public static class InlineLayout
                 }
             }
 
+            if (lineItems.Count > 0) lineW += InterItemLetterSpacing(lineItems[^1].Box, it.Box);
             lineItems.Add(it);
             lineW += outerW;
         }
@@ -765,6 +775,7 @@ public static class InlineLayout
             $"=> leftEdge={leftEdge:F1} rightEdge={rightEdge:F1} lineW={lineW:F1} " +
             $"firstWord=\"{Truncate(items.Count > 0 ? items[0].Box.TextRun : null)}\"");
 
+        if (firstLine) leftEdge += ResolveTextIndent(containerStyle, containerWidth);
         float x = leftEdge;
         float extra = 0f;
 
@@ -794,6 +805,8 @@ public static class InlineLayout
         {
             var it = items[i];
             var box = it.Box;
+
+            if (i > 0) x += InterItemLetterSpacing(items[i - 1].Box, box);
 
             if (firstLine && box.Element?.Style?.FirstLineStyle != null &&
                 box.Element == containerStyleElement(box, containerStyle))
@@ -844,6 +857,19 @@ public static class InlineLayout
         }
 
         return lineH;
+    }
+
+    private static float ResolveTextIndent(ComputedStyle style, float containingWidth) =>
+        style.TextIndentPercent.HasValue
+            ? containingWidth * style.TextIndentPercent.Value / 100f
+            : style.TextIndent;
+
+    private static float InterItemLetterSpacing(LayoutBox previous, LayoutBox current)
+    {
+        if (string.IsNullOrEmpty(previous.TextRun) || string.IsNullOrEmpty(current.TextRun))
+            return 0f;
+        var style = current.StyleOverride ?? current.Element?.Style;
+        return style?.LetterSpacing ?? 0f;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -906,18 +932,14 @@ public static class InlineLayout
                 var font = ResolveRunFont(style);
 
                 var measuredText = TransformText(box.TextRun, style.TextTransform);
-                var sz = _measureG.MeasureString(measuredText, font, int.MaxValue, _sf);
-                width = (float)Math.Ceiling(sz.Width);
+                width = MeasureTextWidth(measuredText, style);
 
-                // line-height: 'normal' (LineHeight==0) = the font's natural
-                // line height (ascent+descent+leading) — Chromium's normal.
-                // An authored number/% is an EM multiplier per CSS1/2.1:
-                // applied against font-size, not stacked on GetHeight (the
-                // old code multiplied the natural height by another 1.2,
-                // inflating every line box ~20% and drifting whole pages).
-                height = style.LineHeight > 0f
-                    ? (float)Math.Ceiling(style.LineHeight * style.FontSize)
-                    : (float)Math.Ceiling(font.GetHeight(_measureG));
+                height = style.LineHeightMode switch
+                {
+                    LineHeightMode.Number => (float)Math.Ceiling(Math.Max(0f, style.LineHeight) * style.FontSize),
+                    LineHeightMode.Absolute => (float)Math.Ceiling(Math.Max(0f, style.LineHeightPixels)),
+                    _ => (float)Math.Ceiling(font.GetHeight(_measureG))
+                };
 
 
                 // FIX: guard the em-unit ratio — GetLineSpacing can return 0

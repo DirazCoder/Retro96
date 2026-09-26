@@ -172,17 +172,18 @@ public static class LayoutEngine
         float attrT = tm >= 0 ? tm : DefaultBodyMarginV;
         float attrB = bm >= 0 ? bm : DefaultBodyMarginV;
 
-        // Author CSS margins override the HTML attributes (NN4 behaviour)
+        // Author CSS margins override the HTML attributes (NN4 behaviour).
+        // Resolve percentage values against the containing block (the viewport for BODY).
         var style = body.Style;
-        float marginL = (style != null && style.MarginLeft >= 0) ? style.MarginLeft : attrL;
-        float marginR = (style != null && style.MarginRight >= 0) ? style.MarginRight : attrR;
-        float marginT = (style != null && style.MarginTop >= 0) ? style.MarginTop : attrT;
-        float marginB = (style != null && style.MarginBottom >= 0) ? style.MarginBottom : attrB;
+        float marginL = ResolveStyleLength(style?.MarginLeft ?? -1f, style?.MarginLeftPercent ?? -1f, attrL, viewportWidth);
+        float marginR = ResolveStyleLength(style?.MarginRight ?? -1f, style?.MarginRightPercent ?? -1f, attrR, viewportWidth);
+        float marginT = ResolveStyleLength(style?.MarginTop ?? -1f, style?.MarginTopPercent ?? -1f, attrT, viewportWidth);
+        float marginB = ResolveStyleLength(style?.MarginBottom ?? -1f, style?.MarginBottomPercent ?? -1f, attrB, viewportWidth);
 
-        float padL = Math.Max(0f, style?.PaddingLeft ?? 0f);
-        float padR = Math.Max(0f, style?.PaddingRight ?? 0f);
-        float padT = Math.Max(0f, style?.PaddingTop ?? 0f);
-        float padB = Math.Max(0f, style?.PaddingBottom ?? 0f);
+        float padL = ResolveStyleLength(style?.PaddingLeft ?? 0f, style?.PaddingLeftPercent ?? -1f, 0f, viewportWidth);
+        float padR = ResolveStyleLength(style?.PaddingRight ?? 0f, style?.PaddingRightPercent ?? -1f, 0f, viewportWidth);
+        float padT = ResolveStyleLength(style?.PaddingTop ?? 0f, style?.PaddingTopPercent ?? -1f, 0f, viewportWidth);
+        float padB = ResolveStyleLength(style?.PaddingBottom ?? 0f, style?.PaddingBottomPercent ?? -1f, 0f, viewportWidth);
 
         float borL = Math.Max(0f, style?.BorderLeftWidth ?? 0f);
         float borR = Math.Max(0f, style?.BorderRightWidth ?? 0f);
@@ -212,6 +213,13 @@ public static class LayoutEngine
             BorderLeft = borL,
             Parent = rootBox
         };
+    }
+
+    private static float ResolveStyleLength(float absolute, float percent, float fallback, float containingWidth)
+    {
+        if (percent >= 0f) return Math.Max(0f, containingWidth * percent / 100f);
+        if (absolute >= 0f) return Math.Max(0f, absolute);
+        return Math.Max(0f, fallback);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -646,6 +654,10 @@ public static class LayoutEngine
         box.MarginRight = style.MarginRight;
         box.MarginBottom = style.MarginBottom;
         box.MarginLeft = style.MarginLeft;
+        box.MarginTopPercent = style.MarginTopPercent;
+        box.MarginRightPercent = style.MarginRightPercent;
+        box.MarginBottomPercent = style.MarginBottomPercent;
+        box.MarginLeftPercent = style.MarginLeftPercent;
 
         // CSS1 auto margins (margin-left/right: auto) — the values flatten
         // to 0 above; the flags carry the centring intent into layout.
@@ -659,6 +671,12 @@ public static class LayoutEngine
         box.PaddingRight = Math.Max(0f, style.PaddingRight);
         box.PaddingBottom = Math.Max(0f, style.PaddingBottom);
         box.PaddingLeft = Math.Max(0f, style.PaddingLeft);
+        box.PaddingTopPercent = style.PaddingTopPercent;
+        box.PaddingRightPercent = style.PaddingRightPercent;
+        box.PaddingBottomPercent = style.PaddingBottomPercent;
+        box.PaddingLeftPercent = style.PaddingLeftPercent;
+        box.ListMarkerInside = style.ListStylePosition == ListStylePosition.Inside &&
+                               style.ListStyleType != ListStyleType.None;
 
         box.BorderTop = Math.Max(0f, style.BorderTopWidth);
         box.BorderRight = Math.Max(0f, style.BorderRightWidth);
@@ -673,6 +691,19 @@ public static class LayoutEngine
         // CSS1 percentage width — resolved at layout against the containing
         // block (never the viewport).
         box.StyleWidthPercent = style.WidthPercent;
+    }
+
+    private static void ResolveBoxPercentages(LayoutBox box, float containingWidth)
+    {
+        float basis = Math.Max(0f, containingWidth);
+        if (box.MarginTopPercent.HasValue) box.MarginTop = basis * box.MarginTopPercent.Value / 100f;
+        if (box.MarginRightPercent.HasValue) box.MarginRight = basis * box.MarginRightPercent.Value / 100f;
+        if (box.MarginBottomPercent.HasValue) box.MarginBottom = basis * box.MarginBottomPercent.Value / 100f;
+        if (box.MarginLeftPercent.HasValue) box.MarginLeft = basis * box.MarginLeftPercent.Value / 100f;
+        if (box.PaddingTopPercent.HasValue) box.PaddingTop = Math.Max(0f, basis * box.PaddingTopPercent.Value / 100f);
+        if (box.PaddingRightPercent.HasValue) box.PaddingRight = Math.Max(0f, basis * box.PaddingRightPercent.Value / 100f);
+        if (box.PaddingBottomPercent.HasValue) box.PaddingBottom = Math.Max(0f, basis * box.PaddingBottomPercent.Value / 100f);
+        if (box.PaddingLeftPercent.HasValue) box.PaddingLeft = Math.Max(0f, basis * box.PaddingLeftPercent.Value / 100f);
     }
 
     /// <summary>
@@ -1178,6 +1209,7 @@ public static class LayoutEngine
         LayoutBox box, float containingWidth, float containingHeight,
         FloatContext? inheritedFloats = null)
     {
+        ResolveBoxPercentages(box, containingWidth);
         if (box.BoxType == BoxType.Table)
         {
             ResolvePercentWidth(box, containingWidth);
@@ -1297,6 +1329,7 @@ public static class LayoutEngine
         FloatContext? inheritedFloats = null)
     {
         float contentX = box.X + box.BorderLeft + box.PaddingLeft;
+        if (box.ListMarkerInside) contentX += 20f;
         float contentY = box.Y + box.BorderTop + box.PaddingTop;
 
         // currentY tracks the BORDER-BOX END of the last placed in-flow
@@ -1350,6 +1383,7 @@ public static class LayoutEngine
 
         foreach (var child in box.Children)
         {
+            ResolveBoxPercentages(child, box.Width);
             if (child.IsAbsolutelyPositioned)
                 continue;   // second pass below
 
@@ -2152,7 +2186,7 @@ public static class LayoutEngine
         // The document viewport is screen-width constrained. Descendants may
         // paint beyond it, but that overflow is clipped by the canvas rather
         // than turning the whole page into a wider horizontal scroll surface.
-        root.Width = viewportWidth;
+        root.Width = Math.Max(viewportWidth, maxRight);
         root.Height = Math.Max(viewportHeight, maxBottom);
     }
 

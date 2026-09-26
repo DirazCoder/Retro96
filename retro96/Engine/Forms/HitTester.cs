@@ -1,63 +1,102 @@
+using System;
+using System.Linq;
+using System.Drawing;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Css;
 
 namespace Retro96.Engine.Layout;
 
-/// <summary>
-/// Pure layout-tree hit-testing — the geometric half of click dispatch,
-/// extracted from the WinForms canvas so clicks can be simulated
-/// headlessly.  Behaviour is byte-identical to the canvas originals:
-/// zero-size boxes (tr/tbody wrappers stay 0,0,0,0) are transparent,
-/// the DEEPEST box wins, and text boxes inflate by 2px vertically for
-/// easier word selection.
-/// </summary>
+/// <summary>Layout hit-testing using the same overflow clip and z-order rules as painting.</summary>
 public static class HitTester
 {
-    /// <summary>Deepest element whose border box contains the point.</summary>
-    public static DomElement? ElementAt(LayoutBox box, float x, float y)
+    private static RectangleF? IntersectClip(RectangleF? a, RectangleF b)
     {
-        if (box.Element?.Style is { } style &&
-            (style.Visibility == Retro96.Engine.Css.VisibilityValue.Hidden || style.Display == Retro96.Engine.Css.DisplayValue.None))
-            return null;
-        bool contains = box.BorderRect.Contains(x, y);
-
-        // Do not prune the subtree just because the parent box misses the
-        // point.  Legacy layout is allowed to move/overflow descendants
-        // independently of a parent's measured border box (tables, inline
-        // fragments, centered nested tables, list markers and absolutely
-        // positioned content all exercise this).  The old containment guard
-        // therefore made visible descendants unclickable even though their
-        // own geometry was correct.  Children still have to contain the point
-        // themselves before they can win the hit-test.
-        for (int i = box.Children.Count - 1; i >= 0; i--)
-        {
-            var result = ElementAt(box.Children[i], x, y);
-            if (result != null) return result;
-        }
-        return contains ? box.Element : null;
+        if (!a.HasValue) return b;
+        var r = a.Value;
+        float l = Math.Max(r.Left, b.Left), t = Math.Max(r.Top, b.Top);
+        float rr = Math.Min(r.Right, b.Right), bb = Math.Min(r.Bottom, b.Bottom);
+        return rr <= l || bb <= t ? null : new RectangleF(l, t, rr - l, bb - t);
     }
 
-    /// <summary>Deepest box (any kind) whose border box contains the point.</summary>
-    public static LayoutBox? DeepestBoxAt(LayoutBox box, float x, float y)
+    private static bool VisibleAt(RectangleF? clip, float x, float y) => !clip.HasValue || clip.Value.Contains(x, y);
+
+    private static RectangleF? ChildClip(LayoutBox box, RectangleF? clip)
+    {
+        var overflow = box.Element?.Style?.Overflow ?? OverflowValue.Visible;
+        if (overflow == OverflowValue.Visible) return clip;
+        return IntersectClip(clip, new RectangleF(
+            box.X + box.BorderLeft,
+            box.Y + box.BorderTop,
+            box.Width + box.PaddingLeft + box.PaddingRight,
+            box.Height + box.PaddingTop + box.PaddingBottom));
+    }
+
+    private static IOrderedEnumerable<LayoutBox> PaintOrder(LayoutBox box) =>
+        box.Children.Select((child, index) => (child, index))
+            .OrderBy(p => p.child.Element?.Style?.ZIndex ?? 0)
+            .ThenBy(p => p.index)
+            .Select(p => p.child)
+            .OrderByDescending(c => c.Element?.Style?.ZIndex ?? 0)
+            .ThenByDescending(c => box.Children.IndexOf(c));
+
+    public static DomElement? ElementAt(LayoutBox box, float x, float y) => ElementAtCore(box, x, y, null);
+
+    private static DomElement? ElementAtCore(LayoutBox box, float x, float y, RectangleF? clip)
     {
         if (box.Element?.Style is { } style &&
-            (style.Visibility == Retro96.Engine.Css.VisibilityValue.Hidden || style.Display == Retro96.Engine.Css.DisplayValue.None))
+            (style.Visibility == VisibilityValue.Hidden || style.Display == DisplayValue.None))
             return null;
-        bool contains = box.BorderRect.Contains(x, y);
+        if (!VisibleAt(clip, x, y)) return null;
+        var childClip = ChildClip(box, clip);
+        if (childClip == null && (box.Element?.Style?.Overflow ?? OverflowValue.Visible) != OverflowValue.Visible)
+            return box.BorderRect.Contains(x, y) ? box.Element : null;
 
-        // See ElementAt: descendant geometry can legitimately extend outside
-        // the parent's measured border box in this renderer.  Search the
-        // children first instead of clipping hit-testing to parent geometry.
-        for (int i = box.Children.Count - 1; i >= 0; i--)
+        foreach (var child in PaintOrder(box))
         {
-            var hit = DeepestBoxAt(box.Children[i], x, y);
+            var hit = ElementAtCore(child, x, y, childClip);
             if (hit != null) return hit;
         }
-        return contains ? box : null;
+        return box.BorderRect.Contains(x, y) && VisibleAt(clip, x, y) ? box.Element : null;
     }
 
-    /// <summary>Deepest text-run box at the point (2px vertical tolerance).</summary>
-    public static LayoutBox? TextBoxAt(LayoutBox box, float x, float y)
+    public static LayoutBox? DeepestBoxAt(LayoutBox box, float x, float y) => DeepestCore(box, x, y, null);
+
+    private static LayoutBox? DeepestCore(LayoutBox box, float x, float y, RectangleF? clip)
     {
+        if (box.Element?.Style is { } style &&
+            (style.Visibility == VisibilityValue.Hidden || style.Display == DisplayValue.None))
+            return null;
+        if (!VisibleAt(clip, x, y)) return null;
+        var childClip = ChildClip(box, clip);
+        if (childClip == null && (box.Element?.Style?.Overflow ?? OverflowValue.Visible) != OverflowValue.Visible)
+            return box.BorderRect.Contains(x, y) ? box : null;
+
+        foreach (var child in PaintOrder(box))
+        {
+            var hit = DeepestCore(child, x, y, childClip);
+            if (hit != null) return hit;
+        }
+        return box.BorderRect.Contains(x, y) && VisibleAt(clip, x, y) ? box : null;
+    }
+
+    public static LayoutBox? TextBoxAt(LayoutBox box, float x, float y) => TextCore(box, x, y, null);
+
+    private static LayoutBox? TextCore(LayoutBox box, float x, float y, RectangleF? clip)
+    {
+        if (box.Element?.Style is { } style &&
+            (style.Visibility == VisibilityValue.Hidden || style.Display == DisplayValue.None))
+            return null;
+        if (!VisibleAt(clip, x, y)) return null;
+        var childClip = ChildClip(box, clip);
+        if (childClip == null && (box.Element?.Style?.Overflow ?? OverflowValue.Visible) != OverflowValue.Visible)
+            return null;
+
+        foreach (var child in PaintOrder(box))
+        {
+            var hit = TextCore(child, x, y, childClip);
+            if (hit != null) return hit;
+        }
+
         var rect = box.BorderRect;
         bool contains = rect.Contains(x, y);
         if (!contains && !string.IsNullOrEmpty(box.TextRun))
@@ -65,19 +104,9 @@ public static class HitTester
             rect.Inflate(0, 2);
             contains = rect.Contains(x, y);
         }
-
-        // Text selection must use the same unclipped descendant search as
-        // normal hit-testing, otherwise text inside a table/list child that
-        // overflows its parent becomes impossible to select.
-        for (int i = box.Children.Count - 1; i >= 0; i--)
-        {
-            var hit = TextBoxAt(box.Children[i], x, y);
-            if (hit != null) return hit;
-        }
-        return contains && !string.IsNullOrEmpty(box.TextRun) ? box : null;
+        return contains && !string.IsNullOrEmpty(box.TextRun) && VisibleAt(clip, x, y) ? box : null;
     }
 
-    /// <summary>First box in document order bound to the given element.</summary>
     public static LayoutBox? BoxForElement(LayoutBox root, DomElement element)
     {
         foreach (var b in root.Descendants())

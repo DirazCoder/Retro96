@@ -220,10 +220,12 @@ public static class StyleResolver
             if (elem.TagName == "basefont")
                 activeBaseFontSize = doc.BaseFontSize;
 
+            style.ResolvePendingLineHeight();
+
             ApplyPseudoStyle(style, pseudoNormalDecls, pseudoImportantDecls,
-                "first-line", s => style.FirstLineStyle = s);
+                "first-line", viewportWidth, s => style.FirstLineStyle = s);
             ApplyPseudoStyle(style, pseudoNormalDecls, pseudoImportantDecls,
-                "first-letter", s => style.FirstLetterStyle = s);
+                "first-letter", viewportWidth, s => style.FirstLetterStyle = s);
 
             foreach (var child in elem.Children)
                 ResolveNode(child, style, authorRules, doc, viewportWidth, ref activeBaseFontSize);
@@ -240,7 +242,7 @@ public static class StyleResolver
         ComputedStyle baseStyle,
         Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>> normal,
         Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>> important,
-        string name,
+        string name, float viewportWidth,
         Action<ComputedStyle> assign)
     {
         normal.TryGetValue(name, out var normalList);
@@ -251,10 +253,10 @@ public static class StyleResolver
         var pseudo = baseStyle.Clone();
         if (normalList != null)
             foreach (var (decl, _, _) in normalList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, 800f, baseStyle.FontWeight);
+                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight);
         if (importantList != null)
             foreach (var (decl, _, _) in importantList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, 800f, baseStyle.FontWeight);
+                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight);
         assign(pseudo);
     }
 

@@ -1047,9 +1047,27 @@ public partial class Form1 : Form
         var document = HtmlParser.Parse(html, url, _cookieStore,
             BrowserRuntime.JavaScriptEnabled
                 ? (doc, src) => RunInlineScript(doc, src, _jsInterpreter!, _jsState!)
-                : null);
+                : null,
+            BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
 
         return (document, _jsInterpreter, _jsState);
+    }
+
+    private string? LoadExternalScript(DomDocument document, string sourceUrl)
+    {
+        if (_resourceLoader == null || document.BaseUrl == null) return null;
+        try
+        {
+            // The HTML parser is intentionally synchronous because classic
+            // script execution blocks tokenization at its source position.
+            // Await the asynchronous, deduplicated resource loader from a
+            // worker so a WinForms synchronization context cannot deadlock.
+            var task = Task.Run(() => _resourceLoader.FetchAsync(
+                sourceUrl, document.BaseUrl, _cookieStore));
+            var result = task.GetAwaiter().GetResult();
+            return result is HttpSuccess ok ? DecodeBody(ok) : null;
+        }
+        catch { return null; }
     }
 
     private string RunInlineScript(DomDocument document, string scriptSource,
@@ -1338,6 +1356,32 @@ public partial class Form1 : Form
     /// placeholder forever because only the TOP document's frames were
     /// ever walked.
     /// </summary>
+    private static BrowserCanvas.FrameScrollMode ParseFrameScrollMode(string value) =>
+        value.Trim().ToLowerInvariant() switch
+        {
+            "yes" => BrowserCanvas.FrameScrollMode.Yes,
+            "no" => BrowserCanvas.FrameScrollMode.No,
+            _ => BrowserCanvas.FrameScrollMode.Auto
+        };
+
+    private static FrameContent ApplyFramePresentation(DomElement frameElem, FrameContent content,
+                                                        int frameW, int frameH)
+    {
+        var body = content.Document.ElementDescendants().FirstOrDefault(e => e.TagName == "body");
+        if (body != null)
+        {
+            int mw = frameElem.GetAttrInt("marginwidth", -1);
+            int mh = frameElem.GetAttrInt("marginheight", -1);
+            if (mw >= 0) body.SetAttr("marginwidth", mw.ToString());
+            if (mh >= 0) body.SetAttr("marginheight", mh.ToString());
+        }
+
+        StyleResolver.Resolve(content.Document, Math.Max(1, frameW));
+        var root = LayoutEngineApi.BuildLayoutTree(content.Document,
+            Math.Max(1, frameW), Math.Max(1, frameH));
+        return new FrameContent(content.Document, root, content.AbsoluteUrl);
+    }
+
     private async Task LoadFrameLevelAsync(DomDocument document, LayoutBox rootBox,
                                            BrowserCanvas.FrameView? parentView, long gen)
     {
@@ -1363,8 +1407,13 @@ public partial class Form1 : Form
                     blankDoc, (int)frameBox.Width, (int)frameBox.Height),
                 Name = frameElem.GetAttr("name") ?? "",
                 Url = "",
-                ScrollingEnabled = frameElem.GetAttrOrDefault("scrolling", "auto")
-                    .ToLowerInvariant() != "no"
+                ScrollMode = ParseFrameScrollMode(frameElem.GetAttrOrDefault("scrolling", "auto")),
+                ScrollingEnabled = !frameElem.GetAttrOrDefault("scrolling", "auto")
+                    .Equals("no", StringComparison.OrdinalIgnoreCase),
+                FrameBorder = frameElem.GetAttrOrDefault("frameborder", "1") != "0",
+                NoResize = frameElem.HasAttr("noresize"),
+                MarginWidth = frameElem.GetAttrInt("marginwidth", -1),
+                MarginHeight = frameElem.GetAttrInt("marginheight", -1)
             };
 
             // Per-frame scripting context, created BEFORE the load so
@@ -1398,11 +1447,14 @@ public partial class Form1 : Form
                     _httpClient, _cookieStore, frameCts.Token,
                     BrowserRuntime.JavaScriptEnabled
                         ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, frameInterpreter, frameState)
-                        : null);
+                        : null,
+                    BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
                 if (gen != _navGeneration) return;
 
                 if (content != null)
                 {
+                    content = ApplyFramePresentation(frameElem, content,
+                        (int)frameBox.Width, (int)frameBox.Height);
                     ApplyFrameContent(view, content, frameInterpreter, frameState);
                     if (parentView == null)
                         SetFrameOnLiveBox(frameElem, frameBox, view);
@@ -1687,7 +1739,8 @@ public partial class Form1 : Form
                     _httpClient, _cookieStore, CancellationToken.None,
                     BrowserRuntime.JavaScriptEnabled
                         ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
-                        : null);
+                        : null,
+                    BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
             }
             else
             {
@@ -1699,11 +1752,15 @@ public partial class Form1 : Form
                 if (result is HttpSuccess s && s.StatusCode == 200)
                 {
                     string html = DecodeBody(s);
+                    var frameBoxForScriptedPost = _canvas.Frames
+                        .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+                    int scriptedPostWidth = (int)(frameBoxForScriptedPost?.Width ?? 300f);
                     var doc = HtmlParser.Parse(html, parsed, _cookieStore,
                         BrowserRuntime.JavaScriptEnabled
                             ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
-                            : null);
-                    StyleResolver.Resolve(doc);
+                            : null,
+                        BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+                    StyleResolver.Resolve(doc, Math.Max(1, scriptedPostWidth));
 
                     var frameBox = _canvas.Frames
                         .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
@@ -1718,6 +1775,11 @@ public partial class Form1 : Form
             if (gen != _navGeneration) return;
             if (content != null)
             {
+                var liveFrameBox = _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+                if (liveFrameBox == null) return;
+                var frameElem = liveFrameBox.Element!;
+                content = ApplyFramePresentation(frameElem, content,
+                    (int)liveFrameBox.Width, (int)liveFrameBox.Height);
                 view.Scroll = default;
                 ApplyFrameContent(view, content, interpreter, state);
 
@@ -1946,8 +2008,8 @@ public partial class Form1 : Form
 
     private void OnFormSubmitted((string Url, string Body, string? Target,
                                   BrowserCanvas.FrameView? Frame,
-                                  IReadOnlyDictionary<string,string>? MultipartFields,
-                                  IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles) submit)
+                                  IReadOnlyList<Engine.Forms.MultipartField>? MultipartFields,
+                                  IReadOnlyList<Engine.Forms.MultipartFile>? MultipartFiles) submit)
     {
         if (!BrowserRuntime.FormSubmissionsEnabled)
         {
@@ -1990,8 +2052,8 @@ public partial class Form1 : Form
 
     private async Task SubmitMultipartAsync((string Url, string Body, string? Target,
         BrowserCanvas.FrameView? Frame,
-        IReadOnlyDictionary<string,string>? MultipartFields,
-        IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles) submit)
+        IReadOnlyList<Engine.Forms.MultipartField>? MultipartFields,
+        IReadOnlyList<Engine.Forms.MultipartFile>? MultipartFiles) submit)
     {
         if (submit.MultipartFields == null || submit.MultipartFiles == null) return;
         try
@@ -1999,15 +2061,77 @@ public partial class Form1 : Form
             var url = ParsedUrl.Parse(submit.Url);
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var result = await _httpClient.PostMultipartAsync(url, submit.MultipartFields, submit.MultipartFiles, _cookieStore, cts.Token);
-            if (result is HttpSuccess ok)
-                await ProcessSuccessAsync(ok, url, cts.Token, null, false, false, _navGeneration);
-            else
+            if (result is not HttpSuccess ok)
+            {
                 _statusLabel.Text = "Multipart form submission failed.";
+                return;
+            }
+
+            string target = submit.Target ?? "";
+            if (submit.Frame != null &&
+                (target.Length == 0 || target.Equals("_self", StringComparison.OrdinalIgnoreCase)))
+            {
+                await ApplyMultipartResponseToFrameAsync(submit.Frame, ok, url, cts.Token);
+            }
+            else if (submit.Frame != null && target.Equals("_parent", StringComparison.OrdinalIgnoreCase) &&
+                     _canvas.TryFindParentFrame(submit.Frame, out var parent, out _ ) && parent != null)
+            {
+                await ApplyMultipartResponseToFrameAsync(parent, ok, url, cts.Token);
+            }
+            else if (!string.IsNullOrEmpty(target) && !target.Equals("_top", StringComparison.OrdinalIgnoreCase))
+            {
+                var named = _canvas.Frames.FirstOrDefault(f =>
+                    string.Equals(f.View.Name, target, StringComparison.OrdinalIgnoreCase));
+                if (named.View != null)
+                    await ApplyMultipartResponseToFrameAsync(named.View, ok, url, cts.Token);
+                else if (target.Equals("_blank", StringComparison.OrdinalIgnoreCase))
+                    OpenNewBrowserWindow(submit.Url);
+                else
+                    await ProcessSuccessAsync(ok, url, cts.Token, null, false, false, _navGeneration);
+            }
+            else
+            {
+                await ProcessSuccessAsync(ok, url, cts.Token, null, false, false, _navGeneration);
+            }
         }
         catch (Exception ex)
         {
             _statusLabel.Text = "Multipart form submission failed: " + ex.Message;
         }
+    }
+
+    private async Task ApplyMultipartResponseToFrameAsync(
+        BrowserCanvas.FrameView view, HttpSuccess response, ParsedUrl responseUrl,
+        CancellationToken ct)
+    {
+        var frameInfo = _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view));
+        var frameBox = frameInfo.Box;
+        int frameW = (int)(frameBox?.Width ?? view.RootBox.Width);
+        int frameH = (int)(frameBox?.Height ?? view.RootBox.Height);
+        var (interpreter, state) = CreateFrameContext(view);
+
+        string html = DecodeBody(response);
+        var doc = HtmlParser.Parse(html, responseUrl, _cookieStore,
+            BrowserRuntime.JavaScriptEnabled
+                ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+                : null,
+            BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+        if (BrowserRuntime.StylesheetsEnabled)
+            await FetchStylesheetsAsync(doc, responseUrl, ct);
+
+        var content = new FrameContent(doc,
+            LayoutEngineApi.BuildLayoutTree(doc, Math.Max(1, frameW), Math.Max(1, frameH)),
+            response.EffectiveUrl.Length > 0 ? response.EffectiveUrl : responseUrl.ToAbsolute());
+        if (frameBox?.Element != null)
+            content = ApplyFramePresentation(frameBox.Element, content, frameW, frameH);
+
+        ApplyFrameContent(view, content, interpreter, state);
+        view.Scroll = Retro96.Drawing.PointF.Empty;
+
+        if (frameBox != null)
+            _canvas.SetFrame(frameBox, view);
+        else if (_canvas.TryFindParentFrame(view, out var parent, out var childBox) && parent != null && childBox != null)
+            _canvas.RefreshChildFrame(parent, childBox, view);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2204,59 +2328,40 @@ public partial class Form1 : Form
         return @"<!DOCTYPE HTML PUBLIC ""-//W3C//DTD HTML 3.2 Final//EN"">
 <HTML>
 <HEAD>
-<TITLE>Retro96 Home Page</TITLE>
+<TITLE>Retro96</TITLE>
 </HEAD>
 <BODY BGCOLOR=""#FFFFFF"" TEXT=""#000000"" LINK=""#0000EE"" VLINK=""#551A8B"" ALINK=""#FF0000"">
 <CENTER>
-<TABLE WIDTH=""560"" BORDER=""0"" CELLPADDING=""0"" CELLSPACING=""0"">
-<TR><TD ALIGN=""CENTER"" BGCOLOR=""#000080"">
-<FONT COLOR=""#FFFFFF"" SIZE=""6"" FACE=""Arial, Helvetica""><B>Retro96</B></FONT><BR>
-<FONT COLOR=""#FFFF00"" SIZE=""2"" FACE=""Arial, Helvetica"">Your window on the World Wide Web</FONT>
+<TABLE WIDTH=""600"" BORDER=""0"" CELLPADDING=""0"" CELLSPACING=""0"">
+<TR><TD ALIGN=""LEFT"">
+<FONT COLOR=""#000080"" SIZE=""6"" FACE=""Arial, Helvetica""><B>Retro96</B></FONT><BR>
+<FONT COLOR=""#666666"" SIZE=""2"" FACE=""Arial, Helvetica"">A small browser for the 1996 web.</FONT>
 </TD></TR>
 </TABLE>
+
 <BR>
 
-<TABLE WIDTH=""560"" BORDER=""2"" CELLPADDING=""8"" CELLSPACING=""0"" BGCOLOR=""#C0C0C0"">
-<TR><TD ALIGN=""CENTER"">
+<TABLE WIDTH=""600"" BORDER=""1"" CELLPADDING=""10"" CELLSPACING=""0"" BGCOLOR=""#F2F2F2"">
+<TR><TD ALIGN=""LEFT"">
+<FONT SIZE=""3"" FACE=""Arial, Helvetica""><B>Search</B></FONT><BR>
 <FORM ACTION=""http://frogfind.com"" METHOD=""GET"">
-<B>Search the Web</B><BR>
-<INPUT TYPE=""TEXT"" NAME=""q"" SIZE=""32"" MAXLENGTH=""128"">
-<INPUT TYPE=""SUBMIT"" VALUE=""Search"">
-<BR>
-<FONT SIZE=""1"">Powered by <A HREF=""http://frogfind.com"">FrogFind</A></FONT>
+<INPUT TYPE=""TEXT"" NAME=""q"" SIZE=""42"" MAXLENGTH=""128""><INPUT TYPE=""SUBMIT"" VALUE=""Search"">
 </FORM>
 </TD></TR>
 </TABLE>
-<BR>
-<HR WIDTH=""560"" SIZE=""2"">
 
-<TABLE WIDTH=""560"" BORDER=""0"" CELLPADDING=""6"" CELLSPACING=""0"">
-<TR><TD COLSPAN=""2"" ALIGN=""LEFT""><B>Places to go</B></TD></TR>
-<TR VALIGN=""TOP"">
-<TD WIDTH=""50%"">
-<UL>
-<LI><A HREF=""http://frogfind.com"">FrogFind</A> - search engine for old browsers
-<LI><A HREF=""http://theoldnet.com/"">The Old Net</A> - browse the web as it was
-<LI><A HREF=""http://web.archive.org/"">Internet Archive</A>
-</UL>
-</TD>
-<TD WIDTH=""50%"">
-<UL>
-<LI><A HREF=""http://www.w3.org/"">W3C</A> - the Web standards folks
-<LI><A HREF=""http://info.cern.ch/"">CERN</A> - where the Web began
-<LI><A HREF=""http://textfiles.com/"">textfiles.com</A>
-</UL>
-</TD>
-</TR>
+<BR>
+
+<TABLE WIDTH=""600"" BORDER=""0"" CELLPADDING=""6"" CELLSPACING=""0"">
+<TR><TD ALIGN=""LEFT""><FONT SIZE=""3"" FACE=""Arial, Helvetica""><B>Explore</B></FONT></TD></TR>
+<TR><TD ALIGN=""LEFT""><A HREF=""https://web.archive.org/web/19961020015116/http://www3.netscape.com/""><B>Netscape</B></A><BR><FONT SIZE=""2"">Netscape's home page, preserved from October 1996.</FONT></TD></TR>
+<TR><TD ALIGN=""LEFT""><A HREF=""https://web.archive.org/web/19961220034419/http://www.ncsa.uiuc.edu/SDG/Software/Mosaic/NCSAMosaicHome.html""><B>NCSA Mosaic</B></A><BR><FONT SIZE=""2"">The Mosaic home page as captured on December 20, 1996.</FONT></TD></TR>
+<TR><TD ALIGN=""LEFT""><A HREF=""https://web.archive.org/web/19970414062947/http://www.hendrix.edu/""><B>Hendrix College</B></A><BR><FONT SIZE=""2"">The Summer 1996 version of the Hendrix College site.</FONT></TD></TR>
 </TABLE>
 
-<HR WIDTH=""560"" SIZE=""2"">
-<FONT SIZE=""2"">
-This page is best viewed with any browser at 640x480 or better.<BR>
-Type a web address or search words in the box at the top of the window.
-</FONT>
-<BR><BR>
-<FONT SIZE=""1"">Last updated 1996</FONT>
+<BR>
+<HR WIDTH=""600"" SIZE=""1"">
+<FONT SIZE=""2"" COLOR=""#666666"">The links above open preserved period pages from the Web's 1996 era.</FONT>
 </CENTER>
 </BODY>
 </HTML>";

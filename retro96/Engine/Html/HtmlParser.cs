@@ -16,6 +16,7 @@ namespace Retro96.Engine.Html;
 /// Return an empty string when nothing was written.
 /// </summary>
 public delegate string InlineScriptExecutor(DomDocument document, string scriptSource);
+public delegate string? ExternalScriptLoader(DomDocument document, string sourceUrl);
 
 /// <summary>
 /// HTML 3.2-era tag-soup parser.  Builds a DOM from a token stream while
@@ -60,7 +61,8 @@ public static class HtmlParser
         };
 
     public static DomDocument Parse(string html, ParsedUrl baseUrl, CookieStore cookies,
-                                    InlineScriptExecutor? onScript = null)
+                                    InlineScriptExecutor? onScript = null,
+                                    ExternalScriptLoader? loadExternalScript = null)
     {
         var doc = new DomDocument(cookies)
         {
@@ -71,7 +73,7 @@ public static class HtmlParser
             ScriptingEnabled = onScript != null
         };
 
-        var builder = new TreeBuilder(doc, onScript);
+        var builder = new TreeBuilder(doc, onScript, loadExternalScript);
         builder.Build(HtmlTokenizer.Tokenize(html ?? "").ToList());
 
         // Everything from here on is post-parse: document.write calls made
@@ -89,6 +91,7 @@ public static class HtmlParser
     {
         private readonly DomDocument _doc;
         private readonly InlineScriptExecutor? _onScript;
+        private readonly ExternalScriptLoader? _loadExternalScript;
 
         private readonly Stack<DomElement> _open = new();
         private DomElement? _current;
@@ -107,10 +110,12 @@ public static class HtmlParser
         // we mirror that via DomElement.FormOwner.
         private DomElement? _formPointer;
 
-        public TreeBuilder(DomDocument doc, InlineScriptExecutor? onScript)
+        public TreeBuilder(DomDocument doc, InlineScriptExecutor? onScript,
+                           ExternalScriptLoader? loadExternalScript)
         {
             _doc = doc;
             _onScript = onScript;
+            _loadExternalScript = loadExternalScript;
         }
 
         public void Build(List<HtmlToken> tokens)
@@ -1053,9 +1058,28 @@ public static class HtmlParser
             if (_onScript == null)
                 return "";
 
-            // External scripts (src=) are out of scope for this engine.
+            // Classic browsers execute an external script synchronously at
+            // the point where the parser encounters </script>. Resolve and
+            // fetch through the shell's scheme-aware resource pipeline, then
+            // feed the resulting source into the same JS executor as inline
+            // script. A failed external resource is simply skipped, matching
+            // the existing non-fatal script-error policy.
             if (scriptElement.HasAttr("src"))
-                return "";
+            {
+                if (_loadExternalScript == null) return "";
+                string src = scriptElement.GetAttrOrDefault("src", "").Trim();
+                if (src.Length == 0) return "";
+                try
+                {
+                    string? external = _loadExternalScript(_doc, src);
+                    if (string.IsNullOrEmpty(external)) return "";
+                    return _onScript(_doc, external) ?? "";
+                }
+                catch
+                {
+                    return "";
+                }
+            }
 
             string language = scriptElement.GetAttrOrDefault("language", "").ToLowerInvariant();
             string type = scriptElement.GetAttrOrDefault("type", "").ToLowerInvariant();

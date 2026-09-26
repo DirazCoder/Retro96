@@ -76,9 +76,19 @@ public class BrowserCanvas : Control
     private long _lastTextClickTicks;
     private int _textClickCount;
 
+    // Editable-field click tracking is separate from page-text selection.
+    // A custom canvas does not get native TextBox selection semantics, so we
+    // reproduce the familiar double-click word / triple-click all behaviour
+    // here for both <input> and <textarea>.
+    private DomElement? _lastFieldClickElement;
+    private System.Drawing.Point _lastFieldClickPoint;
+    private long _lastFieldClickTicks;
+    private int _fieldClickCount;
+
     private DomElement? _contextElement;
 
     private readonly Dictionary<LayoutBox, FrameView> _frames = new();
+    private readonly Dictionary<DomElement, int> _selectRangeAnchors = new();
     private LayoutBox? _focusedFrame;
     private bool _showBoxOutlines;
 
@@ -127,6 +137,8 @@ public class BrowserCanvas : Control
     public bool ShowBoxOutlines => _showBoxOutlines;
     public ResourceLoader? ResourceLoader => _resourceLoader;
 
+    public enum FrameScrollMode { Auto, Yes, No }
+
     public sealed class FrameView
     {
         public required DomDocument Document;
@@ -135,7 +147,12 @@ public class BrowserCanvas : Control
         public PointF Scroll = PointF.Empty;
         public string Name = "";
         public string Url = "";
+        public FrameScrollMode ScrollMode = FrameScrollMode.Auto;
         public bool ScrollingEnabled = true;
+        public bool FrameBorder = true;
+        public bool NoResize;
+        public int MarginWidth = -1;
+        public int MarginHeight = -1;
 
         /// <summary>
         /// Per-frame JS interpreter (frames carry their own scripting
@@ -259,9 +276,15 @@ public class BrowserCanvas : Control
         // blur/change handlers from inside SetPage re-enters navigation.
         _focusedInput = null;
         _fieldDragging = false;
+        _lastFieldClickElement = null;
+        _fieldClickCount = 0;
+        var focusDoc = _document;
+        if (focusDoc != null)
+            UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, null);
         _fieldValueAtFocus = null;
         _pressedControl = null;
         _controlDefaults.Clear();
+        _selectRangeAnchors.Clear();
         _contextElement = null;
 
         _selAnchor = _selFocus = null;
@@ -603,6 +626,37 @@ public class BrowserCanvas : Control
         }
     }
 
+    public bool TryFindParentFrame(FrameView target, out FrameView? parent, out LayoutBox? childBox)
+    {
+        foreach (var (_, view) in _frames)
+        {
+            if (TryFindParentFrameRecursive(view, target, out parent, out childBox))
+                return true;
+        }
+        parent = null;
+        childBox = null;
+        return false;
+    }
+
+    private static bool TryFindParentFrameRecursive(FrameView current, FrameView target,
+                                                    out FrameView? parent, out LayoutBox? childBox)
+    {
+        foreach (var (box, child) in current.ChildFrames)
+        {
+            if (ReferenceEquals(child, target))
+            {
+                parent = current;
+                childBox = box;
+                return true;
+            }
+            if (TryFindParentFrameRecursive(child, target, out parent, out childBox))
+                return true;
+        }
+        parent = null;
+        childBox = null;
+        return false;
+    }
+
     public System.Drawing.Size GetViewportSize()
     {
         int w = ClientSize.Width;
@@ -660,7 +714,7 @@ public class BrowserCanvas : Control
                 _rootBox, _document,
                 fontCache, imageCache,
                 rw, rh,
-                0f, 0f,
+                _scrollOffset.X, _scrollOffset.Y,
                 _lastHoveredElement,
                 _blinkVisible,
                 _showBoxOutlines,
@@ -699,7 +753,7 @@ public class BrowserCanvas : Control
                 view.RootBox, view.Document,
                 _fontCache, _imageCache,
                 frameBox.Width, frameBox.Height,
-                0f, 0f,
+                view.Scroll.X, view.Scroll.Y,
                 _lastHoveredElement,
                 _blinkVisible,
                 focusedElement: _focusedInput != null &&
@@ -708,6 +762,16 @@ public class BrowserCanvas : Control
 
             view.Rendered?.Dispose();
             view.Rendered = bmp;
+
+            bool overflow = view.RootBox.Width > frameBox.Width + 0.5f ||
+                            view.RootBox.Height > frameBox.Height + 0.5f;
+            view.ScrollingEnabled = view.ScrollMode switch
+            {
+                FrameScrollMode.Yes => true,
+                FrameScrollMode.No => false,
+                _ => overflow
+            };
+            if (!view.ScrollingEnabled) view.Scroll = PointF.Empty;
         }
         catch (Exception ex)
         {
@@ -884,6 +948,11 @@ public class BrowserCanvas : Control
                     GraphicsUnit.Pixel);
             }
 
+            if (view.FrameBorder && visible.Width > 0 && visible.Height > 0)
+            {
+                PaintFrameBorder(g, destRect);
+            }
+
             if (_focusedFrame == box && visible.Width > 0 && visible.Height > 0)
             {
                 using var focusPen = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 1);
@@ -1057,6 +1126,16 @@ public class BrowserCanvas : Control
             face.Width - 1, face.Height - 1);
     }
 
+    private static void PaintFrameBorder(Graphics g, RectangleF rect)
+    {
+        if (rect.Width < 2 || rect.Height < 2) return;
+        using var light = new Pen(Color.FromArgb(0xF0, 0xF0, 0xF0), 1);
+        using var dark = new Pen(Color.FromArgb(0x40, 0x40, 0x40), 1);
+        g.DrawRectangle(light, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
+        g.DrawLine(dark, rect.Left, rect.Bottom - 2, rect.Right - 1, rect.Bottom - 2);
+        g.DrawLine(dark, rect.Right - 2, rect.Top, rect.Right - 2, rect.Bottom - 2);
+    }
+
     private void PaintFrameFieldOverlay(Graphics g, LayoutBox frameBox, FrameView view)
     {
         var el = _focusedInput;
@@ -1103,8 +1182,13 @@ public class BrowserCanvas : Control
             if (geo != null)
             {
                 float lineHeight = geo.Font.GetHeight(g);
-                int scrollLine = EnsureTextareaScrollLine(geo.Lines, lineHeight,
-                    face.Height, caret);
+                int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+                int maxScrollLine = Math.Max(0, geo.Lines.Count - visibleLines);
+                int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
+                // Drawing must not mutate the textarea scroll position. The
+                // old paint-time EnsureTextareaScrollLine call could change
+                // the internal scroll merely because focus caused a repaint,
+                // making the text visibly jump when the page was scrolled.
                 // DrawLines applies the textarea scroll offset itself. Keep the
                 // base origin unscrolled here so text, selection, and caret each
                 // apply (line - scrollLine) exactly once.
@@ -1216,7 +1300,9 @@ public class BrowserCanvas : Control
         float textY = face.Y + 2 - _scrollOffset.Y;
         float textBottom = face.Bottom - 2 - _scrollOffset.Y;
         float lineHeight = font.GetHeight(g);
-        int scrollLine = EnsureTextareaScrollLine(lines, lineHeight, face.Height, _fieldCaret);
+        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+        int maxScrollLine = Math.Max(0, lines.Count - visibleLines);
+        int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
         using var noWrap = NewFieldFormat(noWrap: true);
 
         float Measure(int start, int end) => end <= start ? 0f
@@ -1721,6 +1807,7 @@ public class BrowserCanvas : Control
                 break;
         }
 
+        EnsureFocusedTextareaCaretVisible();
         RequestRerender();
         e.Handled = true;
     }
@@ -1772,6 +1859,7 @@ public class BrowserCanvas : Control
             FieldInsertText(e.KeyChar.ToString());
         }
 
+        EnsureFocusedTextareaCaretVisible();
         RequestRerender();
         e.Handled = true;
     }
@@ -1801,6 +1889,7 @@ public class BrowserCanvas : Control
         if (s.Length == 0) return;
         SetFieldText(el, text.Insert(pos, s));
         _fieldCaret = _fieldSelAnchor = pos + s.Length;
+        EnsureFocusedTextareaCaretVisible();
     }
 
     private void DeleteFieldSelection()
@@ -1813,6 +1902,7 @@ public class BrowserCanvas : Control
         if (s == e2) return;
         SetFieldText(el, text.Remove(s, e2 - s));
         _fieldCaret = _fieldSelAnchor = s;
+        EnsureFocusedTextareaCaretVisible();
     }
 
     private void CopyFieldSelectionToClipboard()
@@ -1961,6 +2051,16 @@ public class BrowserCanvas : Control
         return _textareaScrollLine;
     }
 
+    private void EnsureFocusedTextareaCaretVisible()
+    {
+        var el = _focusedInput;
+        if (el?.TagName != "textarea") return;
+        var geo = GetTextareaGeometry(el);
+        if (geo == null) return;
+        EnsureTextareaScrollLine(geo.Lines, geo.Font.GetHeight(MeasureGraphics),
+            geo.Box.ContentRect.Height, _fieldCaret);
+    }
+
     /// <summary>
     /// Caret index inside [start,end) whose x-edge is closest to relX.
     /// PERF: prefix widths are non-decreasing, so a binary search replaces
@@ -2102,6 +2202,27 @@ public class BrowserCanvas : Control
             is "text" or "password";
     }
 
+    private static void SelectFieldWord(DomElement el, ref int caret, ref int anchor)
+    {
+        string text = GetFieldText(el);
+        caret = Math.Clamp(caret, 0, text.Length);
+        int start = caret;
+        int end = caret;
+        while (start > 0 && !char.IsWhiteSpace(text[start - 1])) start--;
+        while (end < text.Length && !char.IsWhiteSpace(text[end])) end++;
+        anchor = start;
+        caret = end;
+    }
+
+    private void SelectFieldAll(DomElement el)
+    {
+        int length = GetFieldText(el).Length;
+        _fieldSelAnchor = 0;
+        _fieldCaret = length;
+        _fieldClickCount = 0;
+        Invalidate();
+    }
+
     private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null)
     {
         ArgumentNullException.ThrowIfNull(el);
@@ -2112,18 +2233,27 @@ public class BrowserCanvas : Control
             return;
 
         js ??= _jsInterpreter;
+        bool alreadyFocused = ReferenceEquals(_focusedInput, el);
 
-        if (!ReferenceEquals(_focusedInput, el))
+        if (!alreadyFocused)
         {
             BlurField();
             _focusedInput = el;
             _fieldValueAtFocus = GetFieldText(el);
+            var focusDoc = _document;
+            if (focusDoc != null)
+                UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el);
             js?.FireEvent(el, "onfocus");   // FIX: clicking a field never fired onfocus
+
+            // A newly focused control starts at the top/left. Re-clicking an
+            // already focused control must NOT reset its internal scroll, or
+            // the textarea text visibly jumps when the page itself is scrolled.
+            _fieldScrollX = 0f;
+            _textareaScrollLine = 0;
         }
+
         RememberDefault(el);
         _fieldCaret = _fieldSelAnchor = Math.Clamp(caretPos, 0, GetFieldText(el).Length);
-        _fieldScrollX = 0f;
-        _textareaScrollLine = 0;
         RequestRerender();
     }
 
@@ -2141,6 +2271,8 @@ public class BrowserCanvas : Control
             js?.FireEvent(el, "onchange");
         js?.FireEvent(el, "onblur");
         _fieldValueAtFocus = null;
+        _lastFieldClickElement = null;
+        _fieldClickCount = 0;
 
         RequestRerender();
     }
@@ -2148,6 +2280,59 @@ public class BrowserCanvas : Control
     // ─────────────────────────────────────────────────────────────────────
     // Mouse
     // ─────────────────────────────────────────────────────────────────────
+
+    private static bool IsSameOrAncestor(DomElement candidate, DomElement? stateElement)
+    {
+        for (DomNode? node = stateElement; node != null; node = node.Parent)
+            if (ReferenceEquals(node, candidate)) return true;
+        return false;
+    }
+
+    private void UpdateCssInteractionState(DomDocument doc, DomElement? hovered = null,
+                                           DomElement? active = null,
+                                           DomElement? focused = null)
+    {
+        bool changed = !ReferenceEquals(doc.HoveredElement, hovered) ||
+                       !ReferenceEquals(doc.ActiveElement, active) ||
+                       !ReferenceEquals(doc.FocusedElement, focused);
+        if (!changed) return;
+
+        doc.HoveredElement = hovered;
+        doc.ActiveElement = active;
+        doc.FocusedElement = focused;
+
+        // Dynamic selectors participate in the cascade. Re-resolve and
+        // rebuild this document so :hover/:active/:focus visibly alter
+        // colors, borders and display exactly like normal CSS rules.
+        try
+        {
+            var framePair = _frames.FirstOrDefault(x => ReferenceEquals(x.Value.Document, doc));
+            var frameKey = framePair.Key;
+            var vp = doc == _document ? GetViewportSize() :
+                new System.Drawing.Size(
+                    Math.Max(1, frameKey == null ? 800 : (int)frameKey.Width),
+                    Math.Max(1, frameKey == null ? 600 : (int)frameKey.Height));
+            StyleResolver.Resolve(doc, Math.Max(1, vp.Width));
+
+            if (ReferenceEquals(doc, _document) && _rootBox != null)
+            {
+                var newRoot = LayoutEngineApi.BuildLayoutTree(doc, vp.Width, vp.Height);
+                ApplyRelayout(doc, newRoot);
+            }
+            else
+            {
+                foreach (var (box, view) in _frames)
+                {
+                    if (!ReferenceEquals(view.Document, doc)) continue;
+                    view.RootBox = LayoutEngineApi.BuildLayoutTree(doc,
+                        Math.Max(1, (int)box.Width), Math.Max(1, (int)box.Height));
+                    RenderFrameBitmap(box, view);
+                    break;
+                }
+            }
+        }
+        catch { RequestRerender(); }
+    }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
@@ -2266,6 +2451,7 @@ public class BrowserCanvas : Control
 
         var deepest = HitTestDeepestBox(_rootBox, x, y);
         var el = deepest?.Element;
+        UpdateCssInteractionState(_document, _lastHoveredElement, el, _focusedInput);
 
         // DIAGNOSTIC (remove once the input-click bug is found): list every
         // box under the cursor, outermost first, so an overlay that covers a
@@ -2303,7 +2489,34 @@ public class BrowserCanvas : Control
             string type = el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
             if (IsEditableField(el))
             {
-                FocusControl(el, FieldCaretFromPoint(el, deepest!, x, y));
+                long fieldNow = Environment.TickCount64;
+                bool continuingFieldClick =
+                    ReferenceEquals(el, _lastFieldClickElement) &&
+                    fieldNow - _lastFieldClickTicks <= SystemInformation.DoubleClickTime &&
+                    Math.Abs(e.X - _lastFieldClickPoint.X) <= SystemInformation.DoubleClickSize.Width &&
+                    Math.Abs(e.Y - _lastFieldClickPoint.Y) <= SystemInformation.DoubleClickSize.Height;
+
+                _fieldClickCount = continuingFieldClick ? _fieldClickCount + 1 : 1;
+                _lastFieldClickElement = el;
+                _lastFieldClickPoint = e.Location;
+                _lastFieldClickTicks = fieldNow;
+
+                int caret = FieldCaretFromPoint(el, deepest!, x, y);
+                FocusControl(el, caret);
+
+                if (_fieldClickCount >= 3)
+                {
+                    // Triple-click: select the entire value, matching the
+                    // page-text selection convention used by Retro96 and the
+                    // common desktop browser interaction users expect.
+                    SelectFieldAll(el);
+                }
+                else if (_fieldClickCount == 2)
+                {
+                    // Double-click: select the current whitespace-delimited word.
+                    SelectFieldWord(el, ref _fieldCaret, ref _fieldSelAnchor);
+                }
+
                 _fieldDragging = true;
                 Capture = true;   // FIX: drag-selection lost the mouse past the field edge
                 return;
@@ -2452,6 +2665,8 @@ public class BrowserCanvas : Control
         var hoverAnchor = element != null && element.TagName == "a"
             ? element
             : element != null ? FindAncestor(element, "a") : null;
+
+        UpdateCssInteractionState(doc, element, doc.ActiveElement, doc.FocusedElement);
         if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
         {
             Cursor = Cursors.Hand;
@@ -2509,6 +2724,9 @@ public class BrowserCanvas : Control
             _pressedControl = null;
             RerenderNow();
         }
+
+        if (_document != null && _document.ActiveElement != null)
+            UpdateCssInteractionState(_document, _document.HoveredElement, null, _document.FocusedElement);
 
         if (_fieldDragging)
         {
@@ -2574,19 +2792,18 @@ public class BrowserCanvas : Control
         float x = e.X + _scrollOffset.X;
         float y = e.Y + _scrollOffset.Y;
 
-        // Double-click inside an editable field: select the word
-        if (_focusedInput != null)
+        // Double-click inside an editable field: the primary mouse-down path
+        // already performs the selection. Keep this WinForms event as a
+        // compatibility fallback, but never let it overwrite a triple-click
+        // that has just selected the entire field.
+        if (_focusedInput != null && _fieldClickCount == 2)
         {
             var box = FindBoxForElement(_rootBox, _focusedInput);
             if (box != null && box.BorderRect.Contains(x, y))
             {
-                string text = GetFieldText(_focusedInput);
                 int caret = FieldCaretFromPoint(_focusedInput, box, x, y);
-                int s = caret, e2 = caret;
-                while (s > 0 && !char.IsWhiteSpace(text[s - 1])) s--;
-                while (e2 < text.Length && !char.IsWhiteSpace(text[e2])) e2++;
-                _fieldSelAnchor = s;
-                _fieldCaret = e2;
+                SelectFieldWord(_focusedInput, ref caret, ref _fieldSelAnchor);
+                _fieldCaret = caret;
                 Invalidate();
                 return;
             }
@@ -3012,7 +3229,7 @@ public class BrowserCanvas : Control
                             imageClick = (element.GetAttr("name")!,
                                 (int)(x - imgBox.X), (int)(y - imgBox.Y));
                     }
-                    SubmitFormInternal(form, document, js, imageClick, frameView);
+                    SubmitFormInternal(form, document, js, imageClick, frameView, element);
                 }
                 return;
             }
@@ -3042,7 +3259,7 @@ public class BrowserCanvas : Control
                 var form = FindEnclosingForm(element);
                 if (form != null)
                 {
-                    SubmitFormInternal(form, document, js, null, frameView);
+                    SubmitFormInternal(form, document, js, null, frameView, element);
                 }
                 return;
             }
@@ -3165,15 +3382,33 @@ public class BrowserCanvas : Control
 
         var captured = options[index];
         bool toggle = (ModifierKeys & Keys.Control) == Keys.Control;
-        if (!toggle)
+        int anchorIndex = 0;
+        bool range = (ModifierKeys & Keys.Shift) == Keys.Shift &&
+                     select.HasAttr("multiple") &&
+                     _selectRangeAnchors.TryGetValue(select, out anchorIndex);
+
+        if (range)
+        {
+            int lo = Math.Min(anchorIndex, index);
+            int hi = Math.Max(anchorIndex, index);
             foreach (var option in options)
                 option.SetAttr("selected", null);
-
-        if (toggle && captured.HasAttr("selected"))
-            captured.SetAttr("selected", null);
+            for (int i = lo; i <= hi; i++)
+                options[i].SetAttr("selected", "");
+        }
         else
-            captured.SetAttr("selected", "");
+        {
+            if (!toggle)
+                foreach (var option in options)
+                    option.SetAttr("selected", null);
 
+            if (toggle && captured.HasAttr("selected"))
+                captured.SetAttr("selected", null);
+            else
+                captured.SetAttr("selected", "");
+        }
+
+        _selectRangeAnchors[select] = index;
         js?.FireEvent(select, "change");
         RequestRerender();
     }
@@ -3672,7 +3907,7 @@ public class BrowserCanvas : Control
     private void SubmitFormInternal(DomElement form, DomDocument document,
                                     JsInterpreter? js,
                                     (string Name, int X, int Y)? imageClick,
-                                    FrameView? sourceFrame)
+                                    FrameView? sourceFrame, DomElement? submitter = null)
     {
         // Only an explicit `return false` cancels the submit.  FireEvent
         // returns JsValue.Undefined when the form has no onsubmit handler,
@@ -3682,7 +3917,7 @@ public class BrowserCanvas : Control
         if (result is { Type: JsType.Boolean } && !result.ToBoolean()) return;
 
         var req = Engine.Forms.FormSubmitter.BuildRequest(
-            form, document.BaseUrl, document.BaseTarget, imageClick);
+            form, document.BaseUrl, document.BaseTarget, imageClick, submitter);
 
         if (req.Method == "post")
         {
@@ -3704,8 +3939,8 @@ public class BrowserCanvas : Control
     }
 
     public event Action<(string Url, string Body, string? Target, FrameView? Frame,
-        IReadOnlyDictionary<string,string>? MultipartFields,
-        IReadOnlyDictionary<string,(string Filename,string ContentType,byte[] Bytes)>? MultipartFiles)>? FormSubmitRequested;
+        IReadOnlyList<Engine.Forms.MultipartField>? MultipartFields,
+        IReadOnlyList<Engine.Forms.MultipartFile>? MultipartFiles)>? FormSubmitRequested;
 
     public void SubmitForm(DomElement? form, object? clickCoords)
     {
@@ -3917,7 +4152,12 @@ public class BrowserCanvas : Control
 
         // Frame scripts run on their own interpreters — tick those too, or
         // a setTimeout loop inside an iframe (a clock widget) never fires.
-        foreach (var (_, view) in _frames)
+        // A timer callback can navigate/rebuild the frame tree, which mutates
+        // _frames while this callback is running. Snapshot the views first so
+        // that navigation from a timer cannot invalidate the dictionary
+        // enumerator and crash the WinForms UI timer.
+        var frameViews = _frames.Values.ToArray();
+        foreach (var view in frameViews)
             view.Interpreter?.TickTimers();
 
         var status = _jsInterpreter?.WindowObject?.Get("status");

@@ -36,7 +36,7 @@ static string FindRepoRoot(string start)
 {
     var dir = new DirectoryInfo(start);
     for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
-        if (Directory.Exists(Path.Combine(dir.FullName, "Retro96-fixed")) &&
+        if (Directory.Exists(Path.Combine(dir.FullName, "retro96")) &&
             Directory.Exists(Path.Combine(dir.FullName, "tests")))
             return dir.FullName;
     throw new InvalidOperationException("repo root not found above " + start);

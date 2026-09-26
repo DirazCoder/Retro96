@@ -67,7 +67,8 @@ public static class FrameLoader
         string? baseUrl, string src,
         int frameW, int frameH,
         HttpClient? http, CookieStore cookies, CancellationToken ct,
-        InlineScriptExecutor? runScript = null)
+        InlineScriptExecutor? runScript = null,
+        ExternalScriptLoader? loadExternalScript = null)
     {
         if (string.IsNullOrWhiteSpace(src)) return null;
 
@@ -118,7 +119,7 @@ public static class FrameLoader
                         byte[] bytes = await File.ReadAllBytesAsync(local, ct);
                         string html = BodyDecoder.Decode(bytes, declaredCharset: null);
                         return BuildContent(html, parsed, abs, frameW, frameH,
-                            cookies, runScript);
+                            cookies, runScript, loadExternalScript);
                     }
 
                 case "http":
@@ -136,7 +137,7 @@ public static class FrameLoader
                         return result switch
                         {
                             HttpSuccess { StatusCode: 200 } ok =>
-                                BuildLoggedContent(ok, parsed, abs, frameW, frameH, cookies, runScript),
+                                BuildLoggedContent(ok, parsed, abs, frameW, frameH, cookies, runScript, loadExternalScript),
                             HttpSuccess err => ErrorContent(
                                 HttpStatusPage(err.StatusCode, abs), abs, frameW, frameH),
                             HttpError e => ErrorContent(
@@ -168,10 +169,11 @@ public static class FrameLoader
 
     private static FrameContent BuildLoggedContent(
         HttpSuccess response, ParsedUrl parsed, string abs,
-        int frameW, int frameH, CookieStore cookies, InlineScriptExecutor? runScript)
+        int frameW, int frameH, CookieStore cookies, InlineScriptExecutor? runScript,
+        ExternalScriptLoader? loadExternalScript)
     {
         string html = BodyDecoder.Decode(response.Body, response.Charset);
-        var content = BuildContent(html, parsed, abs, frameW, frameH, cookies, runScript);
+        var content = BuildContent(html, parsed, abs, frameW, frameH, cookies, runScript, loadExternalScript);
         Retro96.DebugLog.Write($"[FRAME] parsed resolved='{abs}' title='{content.Document.Title}' " +
             $"root={content.RootBox.Width:0.#}x{content.RootBox.Height:0.#} " +
             $"frames={content.RootBox.Descendants().Count(b => b.BoxType == BoxType.Frame)}");
@@ -180,9 +182,9 @@ public static class FrameLoader
 
     private static FrameContent BuildContent(
         string html, ParsedUrl url, string abs, int frameW, int frameH,
-        CookieStore cookies, InlineScriptExecutor? runScript)
+        CookieStore cookies, InlineScriptExecutor? runScript, ExternalScriptLoader? loadExternalScript)
     {
-        var doc = HtmlParser.Parse(html, url, cookies, runScript);
+        var doc = HtmlParser.Parse(html, url, cookies, runScript, loadExternalScript);
         StyleResolver.Resolve(doc, Math.Max(1, frameW));
         var root = LayoutEngine.BuildLayoutTree(doc, Math.Max(1, frameW), Math.Max(1, frameH));
         return new FrameContent(doc, root, abs);
@@ -191,7 +193,7 @@ public static class FrameLoader
     private static FrameContent ErrorContent(string errorHtml, string abs,
                                               int frameW, int frameH) =>
         BuildContent(errorHtml, ParsedUrl.Parse("about:blank"), abs, frameW, frameH,
-            new CookieStore(), null);
+            new CookieStore(), null, null);
 
     /// <summary>Same status-code → error-page mapping the top-level
     /// navigation uses, so a 404 inside a frame reads identically to a
@@ -527,18 +529,28 @@ public static class FileUrls
 public static class BodyDecoder
 {
     /// <summary>
-    /// Decodes a response body.  Order: BOM sniff → strict UTF-8 sniff →
-    /// declared charset → iso-8859-1 (the 1996 default).  If the sniffed
-    /// result declares a different charset in a meta tag, the body is
-    /// re-decoded with it.
+    /// Decodes a response body with deterministic precedence: BOM, explicit
+    /// transport/override charset, then a conservative UTF-8/Latin-1 sniff.
+    /// A meta declaration is used only when no stronger external declaration
+    /// was supplied, so a page cannot silently reinterpret an explicit
+    /// non-UTF-8 HTTP charset.
     /// </summary>
     public static string Decode(byte[] body, string? declaredCharset,
                                 string? overrideCharset = null)
     {
-        string? charset = (overrideCharset ?? declaredCharset)
+        string? explicitCharset = (overrideCharset ?? declaredCharset)
             ?.Trim().Trim('"', '\'');
+        bool hasExplicitCharset = !string.IsNullOrEmpty(explicitCharset) &&
+                                  !explicitCharset.Equals("unknown", StringComparison.OrdinalIgnoreCase);
 
-        if (string.IsNullOrEmpty(charset) || charset == "unknown")
+        string charset;
+        if (HasUtf8Bom(body))
+            charset = "utf-8";
+        else if (body.Length >= 2 && (body[0] == 0xFF && body[1] == 0xFE || body[0] == 0xFE && body[1] == 0xFF))
+            charset = "unicode";
+        else if (hasExplicitCharset)
+            charset = explicitCharset!;
+        else
             charset = SniffCharset(body);
 
         string text;
@@ -549,18 +561,28 @@ public static class BodyDecoder
             catch { text = Encoding.Latin1.GetString(body); }
         }
 
-        // Meta charset inside the document overrides the sniff when it
-        // names a genuinely different encoding (the top-level path has
-        // always done this; frames now match).
-        string? meta = ScanMetaCharset(text);
-        if (meta?.Length > 0 &&
-            !meta.Equals(charset, StringComparison.OrdinalIgnoreCase))
+        // Meta charset is a fallback when transport did not supply a usable
+        // declaration. BOM/transport charset always wins.
+        if (!hasExplicitCharset && !HasAnyBom(body))
         {
-            try { return Encoding.GetEncoding(meta).GetString(body); }
-            catch { /* keep the first decode */ }
+            string? meta = ScanMetaCharset(text);
+            if (meta?.Length > 0 &&
+                !meta.Equals(charset, StringComparison.OrdinalIgnoreCase))
+            {
+                try { return Encoding.GetEncoding(meta).GetString(body); }
+                catch { /* keep the first decode */ }
+            }
         }
         return text;
     }
+
+    private static bool HasUtf8Bom(byte[] body) =>
+        body.Length >= 3 && body[0] == 0xEF && body[1] == 0xBB && body[2] == 0xBF;
+
+    private static bool HasAnyBom(byte[] body) =>
+        HasUtf8Bom(body) ||
+        (body.Length >= 2 && ((body[0] == 0xFF && body[1] == 0xFE) ||
+                              (body[0] == 0xFE && body[1] == 0xFF)));
 
     /// <summary>
     /// BOM → utf-8/utf-16; else strict UTF-8 validation with a multi-byte

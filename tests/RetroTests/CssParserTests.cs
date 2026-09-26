@@ -18,6 +18,30 @@ public class CssParserTests
         return doc;
     }
 
+
+    [Fact]
+    public void DynamicPseudoClassesUseDocumentInteractionState()
+    {
+        var doc = ParseAndResolve("<a id='go' href='/x'><span>go</span></a>");
+        var link = doc.AllTags("a")[0];
+        var child = doc.AllTags("span")[0];
+        var hover = CssSelector.ParseSelector("a:hover")[0];
+        var active = CssSelector.ParseSelector("a:active")[0];
+        var focus = CssSelector.ParseSelector("a:focus")[0];
+
+        doc.HoveredElement = child;
+        Check.That(hover.Matches(link), "a:hover follows the hovered descendant");
+        doc.ActiveElement = link;
+        Check.That(active.Matches(link), "a:active follows document active state");
+        doc.ActiveElement = null;
+        doc.FocusedElement = link;
+        Check.That(focus.Matches(link), "a:focus follows document focus state");
+        doc.HoveredElement = null;
+        doc.FocusedElement = null;
+        Check.That(!hover.Matches(link), "hover clears when document state clears");
+        Check.Done();
+    }
+
     // ── shorthand expansion ──────────────────────────────────────────
 
     [Fact]

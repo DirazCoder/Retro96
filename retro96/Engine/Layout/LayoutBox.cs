@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Retro96.Drawing;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Css;
@@ -47,13 +48,16 @@ public class LayoutBox
 
     // Spacing (px)
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;
+    public float? MarginTopPercent, MarginRightPercent, MarginBottomPercent, MarginLeftPercent;
     public float PaddingTop, PaddingRight, PaddingBottom, PaddingLeft;
+    public float? PaddingTopPercent, PaddingRightPercent, PaddingBottomPercent, PaddingLeftPercent;
     public float BorderTop, BorderRight, BorderBottom, BorderLeft;
 
     // CSS1 auto margins / percentage sizes — resolved during layout (see
     // LayoutEngine.ApplyStylesToBox and LayoutBlockChildren).
     public bool MarginLeftAuto, MarginRightAuto;
     public float? StyleWidthPercent;
+    public bool ListMarkerInside;
 
     public RectangleF ContentRect => new(
         X + BorderLeft + PaddingLeft,
@@ -125,9 +129,13 @@ public class LayoutBox
         // Later siblings paint on top of earlier ones (no z-index in 1996),
         // so test children in REVERSE document order — the topmost-painted
         // box wins any overlap, e.g. absolutely positioned content.
-        for (int i = Children.Count - 1; i >= 0; i--)
+        foreach (var child in Children
+            .Select((c, i) => (Box: c, Index: i))
+            .OrderBy(p => p.Box.Element?.Style?.ZIndex ?? 0)
+            .ThenBy(p => p.Index)
+            .Reverse())
         {
-            var found = Children[i].BoxAtPoint(px, py);
+            var found = child.Box.BoxAtPoint(px, py);
             if (found != null)
                 return found;
         }

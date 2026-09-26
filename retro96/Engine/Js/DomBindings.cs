@@ -902,6 +902,35 @@ public static class DomBindings
             _scope = scope ?? new JsScope();
             _state = state;
             Class = "Element";
+
+            // Expose the core DOM mutation methods as real own properties.
+            // The virtual Get() path remains for compatibility, but making
+            // these methods concrete on the wrapper avoids pages seeing
+            // `element.setAttribute` as undefined during parse-time feature
+            // probes such as javascript-basic.html.
+            Properties["setAttribute"] = JsValue.FromFunction(
+                new JsFunction((self, args) =>
+                {
+                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
+                    if (attrName.Length == 0) return JsValue.Undefined;
+                    string attrValue = args.Length > 1 ? args[1].ToJsString() : "";
+                    _element.SetAttr(attrName, attrValue);
+                    if (attrName.StartsWith("on", StringComparison.OrdinalIgnoreCase) &&
+                        attrName.Length > 2)
+                    {
+                        _element.EventHandlers[attrName.ToLowerInvariant()] = attrValue;
+                    }
+                    _canvas?.RequestRerender();
+                    return JsValue.Undefined;
+                }, _scope, "setAttribute"));
+
+            Properties["getAttribute"] = JsValue.FromFunction(
+                new JsFunction((self, args) =>
+                {
+                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
+                    var value = _element.GetAttr(attrName);
+                    return value == null ? JsValue.Null : JsValue.From(value);
+                }, _scope, "getAttribute"));
         }
 
         public DomElement Element => _element;

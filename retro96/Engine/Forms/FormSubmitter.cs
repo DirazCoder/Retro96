@@ -1,26 +1,30 @@
 using Retro96.Engine.Dom;
 using Retro96.Engine.Network;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace Retro96.Engine.Forms;
 
 /// <summary>Represents a serialized form submission request.</summary>
+public sealed record MultipartField(string Name, string Value);
+public sealed record MultipartFile(string Name, string Filename, string ContentType, byte[] Bytes);
+
 public record FormSubmitRequest
 {
     public string Url { get; init; }
     public string QueryString { get; init; }
     public string Method { get; init; }
     public string? Target { get; init; }
-    public IReadOnlyDictionary<string, string>? MultipartFields { get; init; }
-    public IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? MultipartFiles { get; init; }
+    public IReadOnlyList<MultipartField>? MultipartFields { get; init; }
+    public IReadOnlyList<MultipartFile>? MultipartFiles { get; init; }
 
     public FormSubmitRequest(
         string url,
         string queryString,
         string method,
         string? target,
-        IReadOnlyDictionary<string, string>? multipartFields = null,
-        IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)>? multipartFiles = null)
+        IReadOnlyList<MultipartField>? multipartFields = null,
+        IReadOnlyList<MultipartFile>? multipartFiles = null)
     {
         Url = url;
         QueryString = queryString;
@@ -101,7 +105,7 @@ public static class FormSubmitter
         DomElement form,
         ParsedUrl? baseUrl,
         string? baseTarget,
-        (string Name, int X, int Y)? imageClick = null)
+        (string Name, int X, int Y)? imageClick = null, DomElement? submitter = null)
     {
         string action = form.GetAttrOrDefault("action", "");
         string method = form.GetAttrOrDefault("method", "get").Trim().ToLowerInvariant();
@@ -117,7 +121,7 @@ public static class FormSubmitter
                     : baseUrl.Resolve(action).ToAbsolute();
         }
 
-        var pairs = CollectPairs(form, imageClick);
+        var pairs = CollectPairs(form, imageClick, submitter, includeFileDisplayNames: true);
 
         string qs = string.Join("&", pairs.Select(p =>
             $"{ParsedUrl.PercentEncode(p.Item1)}={ParsedUrl.PercentEncode(p.Item2)}"));
@@ -126,13 +130,21 @@ public static class FormSubmitter
         if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(baseTarget))
             target = baseTarget;
 
-        Dictionary<string,string>? fields = null;
-        Dictionary<string,(string Filename,string ContentType,byte[] Bytes)>? files = null;
+        List<MultipartField>? fields = null;
+        List<MultipartFile>? files = null;
         if (method == "post" && form.GetAttrOrDefault("enctype", "application/x-www-form-urlencoded")
             .Equals("multipart/form-data", StringComparison.OrdinalIgnoreCase))
         {
-            fields = new Dictionary<string,string>(StringComparer.Ordinal);
-            files = new Dictionary<string,(string,string,byte[])>(StringComparer.Ordinal);
+            fields = new List<MultipartField>();
+            files = new List<MultipartFile>();
+            // Reuse successful-control ordering so repeated names,
+            // checkboxes, radios and selects are preserved exactly. File
+            // inputs are emitted as MIME file parts below, so omit only the
+            // synthetic display-name pair for those controls.
+            var nonFilePairs = CollectPairs(form, imageClick, submitter, includeFileDisplayNames: false);
+            foreach (var (name, value) in nonFilePairs)
+                if (!string.IsNullOrEmpty(name)) fields.Add(new MultipartField(name, value));
+
             foreach (var field in FieldsOf(form))
             {
                 var n = field.GetAttr("name");
@@ -144,14 +156,11 @@ public static class FormSubmitter
                     {
                         var info = new System.IO.FileInfo(fullPath);
                         if (info.Length > 8L * 1024 * 1024) continue;
-                        var bytes = System.IO.File.ReadAllBytes(fullPath);
-                        string ct = ContentTypeForPath(fullPath);
-                        files[n] = (displayName, ct, bytes);
+                        files.Add(new MultipartFile(n, displayName, ContentTypeForPath(fullPath),
+                            System.IO.File.ReadAllBytes(fullPath)));
                     }
                     catch { }
                 }
-                else if (field.TagName == "input" || field.TagName == "textarea")
-                    fields[n] = field.GetAttr("value") ?? field.InnerText ?? "";
             }
         }
 
@@ -172,7 +181,8 @@ public static class FormSubmitter
         };
 
     public static List<(string, string)> CollectPairs(
-        DomElement form, (string Name, int X, int Y)? imageClick = null)
+        DomElement form, (string Name, int X, int Y)? imageClick = null,
+        DomElement? submitter = null, bool includeFileDisplayNames = true)
     {
         var pairs = new List<(string, string)>();
 
@@ -189,9 +199,10 @@ public static class FormSubmitter
                         string type = field.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
                         if (type == "hidden" || type == "text" || type == "password")
                             pairs.Add((name, field.GetAttr("value") ?? ""));
-                        else if (type is "submit" or "button" && field.HasAttr("name"))
+                        else if (type is "submit" or "button" && field.HasAttr("name") && ReferenceEquals(field, submitter))
                             pairs.Add((name, field.GetAttr("value") ?? ""));
-                        else if (type == "file" && TryGetFileSelection(field, out _, out var displayName))
+                        else if (type == "file" && includeFileDisplayNames &&
+                                 TryGetFileSelection(field, out _, out var displayName))
                             pairs.Add((name, displayName));
                         else if (type is "checkbox" or "radio")
                         {
@@ -210,7 +221,8 @@ public static class FormSubmitter
                     pairs.Add((name, field.InnerText ?? ""));
                     break;
                 case "button":
-                    if (field.GetAttrOrDefault("type", "submit").Equals("submit", StringComparison.OrdinalIgnoreCase))
+                    if (field.GetAttrOrDefault("type", "submit").Equals("submit", StringComparison.OrdinalIgnoreCase) &&
+                        ReferenceEquals(field, submitter))
                         pairs.Add((name, field.GetAttr("value") ?? field.InnerText ?? ""));
                     break;
                 case "select":

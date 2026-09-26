@@ -112,16 +112,11 @@ public static class ImageDecoder
         var frames = new List<Bitmap>(frameCount);
         var delays = new List<int>(frameCount);
 
-        // The compositing canvas the frames accumulate on.
-        using var compositor = new SKBitmap(info);
-        using var surface = SKSurface.Create(info, compositor.GetPixels(), info.RowBytes);
-        if (surface == null)
-            return Broken();
-        using var canvas = surface.Canvas;
-
-        // Snapshot saved before the current frame drew (RestoreToPrevious).
-        SKBitmap? previous = null;
-
+        // Skia's codec performs the required-frame composition and disposal
+        // handling when a frame is decoded with its FrameIndex.  Decoding
+        // each logical frame through the codec avoids treating a partial GIF
+        // frame as a full-canvas update (the old manual compositor cleared
+        // the entire canvas for RestoreBackgroundColor).
         for (int i = 0; i < frameCount; i++)
         {
             var frame = new SKBitmap(info);
@@ -132,37 +127,7 @@ public static class ImageDecoder
                 break;
             }
 
-            // Save the pre-draw state when this frame wants it restored.
-            var disposal = codec.FrameInfo[i].DisposalMethod;
-            if (disposal == SKCodecAnimationDisposalMethod.RestorePrevious)
-            {
-                previous?.Dispose();
-                previous = compositor.Copy();
-            }
-
-            if (i == 0)
-                canvas.Clear(SKColors.Transparent);
-            canvas.DrawBitmap(frame, 0, 0);
-            frame.Dispose();
-
-            frames.Add(new Bitmap(compositor.Copy()));
-
-            // Disposal AFTER the snapshot: erase the frame's area or roll
-            // the whole canvas back to the pre-frame state.
-            switch (disposal)
-            {
-                case SKCodecAnimationDisposalMethod.RestoreBackgroundColor:
-                    canvas.Clear(SKColors.Transparent);
-                    break;
-                case SKCodecAnimationDisposalMethod.RestorePrevious:
-                    if (previous != null)
-                    {
-                        canvas.Clear(SKColors.Transparent);
-                        canvas.DrawBitmap(previous, 0, 0);
-                    }
-                    break;
-            }
-
+            frames.Add(new Bitmap(frame));
             int dur = codec.FrameInfo[i].Duration;
             delays.Add(dur > 0 ? dur : 100);
         }

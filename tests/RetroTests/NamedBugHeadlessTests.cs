@@ -143,6 +143,18 @@ public class NamedBugHeadlessTests
     private static string Img1x1(int w, int h) =>
         $"<img src=\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\" width=\"{w}\" height=\"{h}\">";
 
+
+    [Fact]
+    public void Bug_WideRootKeepsDocumentOverflowSurface()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><div style='width:1200px'>wide</div></body></html>", 800);
+        Check.That(root.Width >= 1199f,
+            "root expands to the authored wide descendant instead of clipping at the viewport",
+            $"root width = {root.Width:0.#}");
+        Check.Done();
+    }
+
     // 1 ───────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_ImagesInTableCellZeroHeight()

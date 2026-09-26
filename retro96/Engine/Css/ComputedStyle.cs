@@ -26,7 +26,11 @@ public class ComputedStyle
     public TextDecoration TextDecoration { get; set; } = TextDecoration.None;
     public TextAlign TextAlign { get; set; } = TextAlign.Left;
     public float TextIndent { get; set; } = 0f;
-    public float LineHeight { get; set; } = 0f;          // 0 = 'normal' (font's natural line height); authored values are em multipliers
+    public float? TextIndentPercent { get; set; }
+    public LineHeightMode LineHeightMode { get; set; } = LineHeightMode.Normal;
+    public float LineHeight { get; set; } = 0f;
+    public float LineHeightPixels { get; set; } = 0f;
+    private string? PendingLineHeight { get; set; }
     public float LetterSpacing { get; set; } = 0f;
     public float WordSpacing { get; set; } = 0f;
     public TextTransform TextTransform { get; set; } = TextTransform.None;
@@ -38,7 +42,9 @@ public class ComputedStyle
     public string? BackgroundImage { get; set; }           // URL or null
     public BackgroundRepeat BackgroundRepeat { get; set; } = BackgroundRepeat.Repeat;
     public bool BackgroundFixed { get; set; }
-    public PointF BackgroundPosition { get; set; } = PointF.Empty;
+    public PointF BackgroundPosition { get; set; } = new PointF(0, 0);
+    public float? BackgroundPositionXLength { get; set; }
+    public float? BackgroundPositionYLength { get; set; }
 
     /// <summary>Authored (vs inherited) colour flags — set ONLY by
     /// declarations this element's own inline STYLE or matched CSS rules
@@ -48,10 +54,13 @@ public class ComputedStyle
     /// colour must never turn input text invisible-on-white.</summary>
     public bool OwnColor, OwnBackground, OwnTextAlign, OwnMarginLeft, OwnPaddingLeft;
     public bool OwnListStyleType, OwnListStyleImage;
+    public bool OwnBorderTopStyle, OwnBorderRightStyle, OwnBorderBottomStyle, OwnBorderLeftStyle;
 
     // === BOX MODEL (px) ===
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;
+    public float? MarginTopPercent, MarginRightPercent, MarginBottomPercent, MarginLeftPercent;
     public float PaddingTop, PaddingRight, PaddingBottom, PaddingLeft;
+    public float? PaddingTopPercent, PaddingRightPercent, PaddingBottomPercent, PaddingLeftPercent;
     public float BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth;
     public BorderStyleValue BorderTopStyle, BorderRightStyle,
                             BorderBottomStyle, BorderLeftStyle;
@@ -141,7 +150,10 @@ public class ComputedStyle
         child.Color = parent.Color;
         child.TextAlign = parent.TextAlign;
         child.TextIndent = parent.TextIndent;
+        child.TextIndentPercent = parent.TextIndentPercent;
+        child.LineHeightMode = parent.LineHeightMode;
         child.LineHeight = parent.LineHeight;
+        child.LineHeightPixels = parent.LineHeightPixels;
         child.LetterSpacing = parent.LetterSpacing;
         child.WordSpacing = parent.WordSpacing;
         child.TextTransform = parent.TextTransform;
@@ -158,8 +170,9 @@ public class ComputedStyle
         if (own != null)
         {
             foreach (var decl in own)
-                child.Apply(decl, parent.FontSize, 800f, parent.FontWeight);
+                child.Apply(decl, parent.FontSize, 0f, parent.FontWeight);
         }
+        child.ResolvePendingLineHeight();
 
         return child;
     }
@@ -186,8 +199,12 @@ public class ComputedStyle
             case "color": Color = ParseColor(value, Color); OwnColor = true; break;
             case "text-decoration": TextDecoration = ParseTextDecoration(value); break;
             case "text-align": TextAlign = ParseTextAlign(value); OwnTextAlign = true; break;
-            case "text-indent": TextIndent = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "line-height": LineHeight = ParseLineHeight(value); break;
+            case "text-indent":
+                (TextIndent, TextIndentPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth);
+                break;
+            case "line-height":
+                SetLineHeight(value);
+                break;
             case "letter-spacing": LetterSpacing = ParseLength(value, parentFontSize, viewportWidth); break;
             case "word-spacing": WordSpacing = ParseLength(value, parentFontSize, viewportWidth); break;
             case "text-transform": TextTransform = ParseTextTransform(value); break;
@@ -199,36 +216,36 @@ public class ComputedStyle
             case "background-image": BackgroundImage = ParseUrl(value); break;
             case "background-repeat": BackgroundRepeat = ParseBackgroundRepeat(value); break;
             case "background-attachment": BackgroundFixed = value.Equals("fixed", StringComparison.OrdinalIgnoreCase); break;
-            case "background-position": BackgroundPosition = ParseBackgroundPosition(value); break;
-            case "background": ParseBackgroundShorthand(value); OwnBackground = true; break;
+            case "background-position": ParseAndSetBackgroundPosition(value, parentFontSize, viewportWidth); break;
+            case "background": ParseBackgroundShorthand(value, parentFontSize, viewportWidth); OwnBackground = true; break;
 
             // === BOX MODEL ===
-            case "margin-top": MarginTop = ParseLength(value, parentFontSize, viewportWidth); break;
+            case "margin-top": (MarginTop, MarginTopPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
             case "margin-right":
-                MarginRight = ParseLength(value, parentFontSize, viewportWidth);
+                (MarginRight, MarginRightPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth);
                 MarginRightAuto = IsAutoKeyword(value); break;
-            case "margin-bottom": MarginBottom = ParseLength(value, parentFontSize, viewportWidth); break;
+            case "margin-bottom": (MarginBottom, MarginBottomPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
             case "margin-left":
-                MarginLeft = ParseLength(value, parentFontSize, viewportWidth);
+                (MarginLeft, MarginLeftPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth);
                 MarginLeftAuto = IsAutoKeyword(value);
                 OwnMarginLeft = true;
                 break;
             case "margin": ParseMarginShorthand(value, parentFontSize, viewportWidth); OwnMarginLeft = true; break;
 
-            case "padding-top": PaddingTop = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "padding-right": PaddingRight = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "padding-bottom": PaddingBottom = ParseLength(value, parentFontSize, viewportWidth); break;
-            case "padding-left": PaddingLeft = ParseLength(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
+            case "padding-top": (PaddingTop, PaddingTopPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
+            case "padding-right": (PaddingRight, PaddingRightPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
+            case "padding-bottom": (PaddingBottom, PaddingBottomPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
+            case "padding-left": (PaddingLeft, PaddingLeftPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
             case "padding": ParsePaddingShorthand(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
 
             case "border-top-width": BorderTopWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
             case "border-right-width": BorderRightWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
             case "border-bottom-width": BorderBottomWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
             case "border-left-width": BorderLeftWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
-            case "border-top-style": BorderTopStyle = ParseBorderStyle(value); break;
-            case "border-right-style": BorderRightStyle = ParseBorderStyle(value); break;
-            case "border-bottom-style": BorderBottomStyle = ParseBorderStyle(value); break;
-            case "border-left-style": BorderLeftStyle = ParseBorderStyle(value); break;
+            case "border-top-style": BorderTopStyle = ParseBorderStyle(value); OwnBorderTopStyle = true; break;
+            case "border-right-style": BorderRightStyle = ParseBorderStyle(value); OwnBorderRightStyle = true; break;
+            case "border-bottom-style": BorderBottomStyle = ParseBorderStyle(value); OwnBorderBottomStyle = true; break;
+            case "border-left-style": BorderLeftStyle = ParseBorderStyle(value); OwnBorderLeftStyle = true; break;
             case "border-top-color": BorderTopColor = ParseColor(value, BorderTopColor); break;
             case "border-right-color": BorderRightColor = ParseColor(value, BorderRightColor); break;
             case "border-bottom-color": BorderBottomColor = ParseColor(value, BorderBottomColor); break;
@@ -407,7 +424,7 @@ public class ComputedStyle
                 {
                     size = bits[0];
                     if (bits.Length > 1)
-                        LineHeight = ParseLineHeight(bits[1]);
+                        SetLineHeight(bits[1]);
                     if (i + 1 < parts.Count)
                         family = string.Join(" ", parts.Skip(i + 1));
                 }
@@ -429,7 +446,7 @@ public class ComputedStyle
                 int next = i + 1;
                 if (next < parts.Count && parts[next].StartsWith("/"))
                 {
-                    LineHeight = ParseLineHeight(parts[next][1..]);
+                    SetLineHeight(parts[next][1..]);
                     next++;
                 }
                 if (next < parts.Count)
@@ -546,21 +563,71 @@ public class ComputedStyle
         };
     }
 
-    internal static float ParseLineHeight(string value)
+    private void SetLineHeight(string value)
     {
-        string v = value.Trim();
-        if (v == "normal")
-            return 0f;                    // 0 = 'normal' — let the font's natural metrics decide
-        if (v.EndsWith('%'))
+        var v = value.Trim();
+        if (v.Equals("normal", StringComparison.OrdinalIgnoreCase) || v.Length == 0)
         {
-            if (TryParseFloat(v[..^1], out float pct))
-                return pct / 100f;        // em multiplier
+            LineHeightMode = LineHeightMode.Normal;
+            LineHeight = 0f;
+            LineHeightPixels = 0f;
+            PendingLineHeight = null;
+            return;
         }
-        else if (TryParseFloat(v, out float num))
+
+        if (TryParseFloat(v, out float number) && !LooksLikeLengthToken(v))
         {
-            return num;                   // unitless em multiplier
+            LineHeightMode = LineHeightMode.Number;
+            LineHeight = number;
+            LineHeightPixels = 0f;
+            PendingLineHeight = null;
+            return;
         }
-        return 0f;                        // fallback: 'normal', must NOT silently re-introduce the bug
+
+        PendingLineHeight = v;
+        LineHeightMode = LineHeightMode.Absolute;
+        LineHeight = 0f;
+    }
+
+    internal void ResolvePendingLineHeight()
+    {
+        if (PendingLineHeight == null) return;
+        string v = PendingLineHeight.Trim();
+        if (v.EndsWith('%') && TryParseFloat(v[..^1], out float pct))
+        {
+            LineHeightMode = LineHeightMode.Absolute;
+            LineHeightPixels = Math.Max(0f, FontSize * pct / 100f);
+            LineHeight = 0f;
+        }
+        else
+        {
+            LineHeightMode = LineHeightMode.Absolute;
+            LineHeightPixels = Math.Max(0f, ParseLength(v, FontSize, 0f));
+            LineHeight = 0f;
+        }
+        PendingLineHeight = null;
+    }
+
+    private static bool LooksLikeLengthToken(string v)
+    {
+        v = v.Trim().ToLowerInvariant();
+        return v.EndsWith("px") || v.EndsWith("pt") || v.EndsWith("em") || v.EndsWith("ex") || v.EndsWith("%") ||
+               v is "0px" or "0pt" or "0em" or "0%";
+    }
+
+    /// <summary>
+    /// Parse a CSS length while retaining percentage intent for properties
+    /// whose percentage basis is the containing block, not the viewport.
+    /// </summary>
+    private static (float Pixels, float? Percent) ParseLengthOrPercent(
+        string value, float parentFontSize, float viewportWidth)
+    {
+        string t = value.Trim();
+        if (t.Length == 0 || t.Equals("auto", StringComparison.OrdinalIgnoreCase) || t.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return (0f, null);
+        if (t.EndsWith('%') && TryParseFloat(t[..^1], out float pct))
+            return (0f, pct);
+        return (ParseLength(t, parentFontSize, viewportWidth), null);
     }
 
     private static TextTransform ParseTextTransform(string value)
@@ -738,32 +805,71 @@ public class ComputedStyle
         };
     }
 
-    private static PointF ParseBackgroundPosition(string value)
+    private static (float? Length, float Percent) ParseBackgroundPositionComponent(string token, float fontSize)
     {
-        var parts = SplitTopLevel(value);
-        float x = 0, y = 0;
-        bool sawX = false;
-
-        foreach (var part in parts)
+        string t = token.Trim().ToLowerInvariant();
+        return t switch
         {
-            switch (part.ToLowerInvariant())
-            {
-                case "left": x = 0; sawX = true; break;
-                case "center": if (!sawX) { x = 50; sawX = true; } else { y = 50; } break;
-                case "right": x = 100; sawX = true; break;
-                case "top": y = 0; break;
-                case "bottom": y = 100; break;
-                default:
-                    if (!sawX && TryParseFloat(part.TrimEnd('%'), out var px)) { x = px; sawX = true; }
-                    else if (TryParseFloat(part.TrimEnd('%'), out var py)) { y = py; }
-                    break;
-            }
-        }
-        return new PointF(x, y);
+            "left" => (null, 0f),
+            "center" => (null, 50f),
+            "right" => (null, 100f),
+            "top" => (null, 0f),
+            "bottom" => (null, 100f),
+            _ when t.EndsWith("%") && TryParseFloat(t[..^1], out var pct) => (null, pct),
+            _ => (ParseLength(t, fontSize, 0f), 0f)
+        };
     }
 
-    private void ParseBackgroundShorthand(string value)
+    private void ParseAndSetBackgroundPosition(string value, float parentFontSize, float viewportWidth)
     {
+        BackgroundPositionXLength = null;
+        BackgroundPositionYLength = null;
+        var parts = SplitTopLevel(value);
+        if (parts.Count == 0) { BackgroundPosition = new PointF(0, 0); return; }
+        if (parts.Count == 1)
+        {
+            string t = parts[0].Trim().ToLowerInvariant();
+            if (t is "top" or "bottom")
+            {
+                BackgroundPosition = new PointF(50f, t == "top" ? 0f : 100f);
+                return;
+            }
+            var (len, pct) = ParseBackgroundPositionComponent(t, parentFontSize);
+            if (t is "left" or "right" or "center" || t.EndsWith('%'))
+                BackgroundPosition = new PointF(pct, 50f);
+            else
+            {
+                BackgroundPositionXLength = len;
+                BackgroundPosition = new PointF(0f, 50f);
+            }
+            return;
+        }
+
+        string a = parts[0].Trim().ToLowerInvariant();
+        string b = parts[1].Trim().ToLowerInvariant();
+        bool aVertical = a is "top" or "bottom";
+        bool bHorizontal = b is "left" or "center" or "right";
+        if (aVertical && bHorizontal) (a, b) = (b, a);
+
+        var (xLen, xPct) = ParseBackgroundPositionComponent(a, parentFontSize);
+        var (yLen, yPct) = ParseBackgroundPositionComponent(b, parentFontSize);
+        BackgroundPosition = new PointF(xPct, yPct);
+        BackgroundPositionXLength = xLen;
+        BackgroundPositionYLength = yLen;
+    }
+
+    private void ParseBackgroundShorthand(string value, float parentFontSize, float viewportWidth)
+    {
+        // CSS shorthand resets omitted subproperties to their initial values.
+        BackgroundColor = Color.Transparent;
+        BackgroundImage = null;
+        BackgroundRepeat = BackgroundRepeat.Repeat;
+        BackgroundFixed = false;
+        BackgroundPosition = new PointF(0f, 0f);
+        BackgroundPositionXLength = null;
+        BackgroundPositionYLength = null;
+
+        var position = new List<string>();
         foreach (var part in SplitTopLevel(value))
         {
             var lower = part.ToLowerInvariant();
@@ -774,22 +880,23 @@ public class ComputedStyle
             else if (lower is "fixed" or "scroll")
                 BackgroundFixed = lower == "fixed";
             else if (lower is "top" or "bottom" or "center" or "left" or "right" ||
-                     lower.EndsWith("px") || lower.EndsWith("%"))
-                BackgroundPosition = ParseBackgroundPosition(value);
+                     lower.EndsWith("px") || lower.EndsWith("pt") || lower.EndsWith("em") || lower.EndsWith("%"))
+                position.Add(part);
             else
                 BackgroundColor = ParseColor(part, BackgroundColor);
         }
+        if (position.Count > 0)
+            ParseAndSetBackgroundPosition(string.Join(" ", position.Take(2)), parentFontSize, viewportWidth);
     }
 
     private void ParseMarginShorthand(string value, float fs, float vw)
     {
         var p = BoxShorthand(SplitTopLevel(value));
         if (p == null) return;
-        MarginTop = ParseLength(p[0], fs, vw);
-        MarginRight = ParseLength(p[1], fs, vw);
-        MarginBottom = ParseLength(p[2], fs, vw);
-        MarginLeft = ParseLength(p[3], fs, vw);
-        // margin: 0 auto 0 auto — the classic centring shorthand.
+        (MarginTop, MarginTopPercent) = ParseLengthOrPercent(p[0], fs, vw);
+        (MarginRight, MarginRightPercent) = ParseLengthOrPercent(p[1], fs, vw);
+        (MarginBottom, MarginBottomPercent) = ParseLengthOrPercent(p[2], fs, vw);
+        (MarginLeft, MarginLeftPercent) = ParseLengthOrPercent(p[3], fs, vw);
         MarginRightAuto = IsAutoKeyword(p[1]);
         MarginLeftAuto = IsAutoKeyword(p[3]);
     }
@@ -798,10 +905,10 @@ public class ComputedStyle
     {
         var p = BoxShorthand(SplitTopLevel(value));
         if (p == null) return;
-        PaddingTop = ParseLength(p[0], fs, vw);
-        PaddingRight = ParseLength(p[1], fs, vw);
-        PaddingBottom = ParseLength(p[2], fs, vw);
-        PaddingLeft = ParseLength(p[3], fs, vw);
+        (PaddingTop, PaddingTopPercent) = ParseLengthOrPercent(p[0], fs, vw);
+        (PaddingRight, PaddingRightPercent) = ParseLengthOrPercent(p[1], fs, vw);
+        (PaddingBottom, PaddingBottomPercent) = ParseLengthOrPercent(p[2], fs, vw);
+        (PaddingLeft, PaddingLeftPercent) = ParseLengthOrPercent(p[3], fs, vw);
     }
 
     private static string[]? BoxShorthand(List<string> parts)
@@ -859,6 +966,7 @@ public class ComputedStyle
         BorderRightStyle = ParseBorderStyle(p[1]);
         BorderBottomStyle = ParseBorderStyle(p[2]);
         BorderLeftStyle = ParseBorderStyle(p[3]);
+        OwnBorderTopStyle = OwnBorderRightStyle = OwnBorderBottomStyle = OwnBorderLeftStyle = true;
     }
 
     private void ParseBorderColorShorthand(string value)
@@ -873,6 +981,7 @@ public class ComputedStyle
 
     private void ParseBorderShorthand(string value, float fs, float vw)
     {
+        OwnBorderTopStyle = OwnBorderRightStyle = OwnBorderBottomStyle = OwnBorderLeftStyle = true;
         foreach (var part in SplitTopLevel(value))
         {
             var lower = part.ToLowerInvariant();
@@ -1059,6 +1168,7 @@ public enum FontStyleValue { Normal, Italic, Oblique }
 public enum FontVariantValue { Normal, SmallCaps }
 public enum TextDecoration { None = 0, Underline = 1, Overline = 2, LineThrough = 4, Blink = 8 }
 public enum TextAlign { Left, Center, Right, Justify }
+public enum LineHeightMode { Normal, Number, Absolute }
 public enum TextTransform { None, Capitalize, Uppercase, Lowercase }
 public enum WhiteSpaceValue { Normal, Pre, Nowrap, PreWrap, PreLine }
 public enum VerticalAlign { Baseline, Top, Middle, Bottom, TextTop, TextBottom, Super, Sub }

@@ -159,6 +159,14 @@ public class DomDocument : DomNode
     /// visible with JS off) in the style resolver.</summary>
     public bool ScriptingEnabled { get; set; }
 
+    // Dynamic CSS interaction state. BrowserCanvas updates these references
+    // as the pointer/focus/press state changes; selectors walk ancestors so
+    // a:hover also matches when a descendant span/text node is under the
+    // pointer.
+    public DomElement? HoveredElement { get; set; }
+    public DomElement? ActiveElement { get; set; }
+    public DomElement? FocusedElement { get; set; }
+
     /// <summary>
     /// Set by HtmlParser.Parse just before it returns.  While false (the
     /// parse is still streaming), document.write output is handed back to

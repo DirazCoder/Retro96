@@ -14,9 +14,7 @@ namespace Retro96.Engine.Render;
 /// Paints the LayoutBox tree into a Bitmap using GDI+.
 ///
 /// The whole document is rendered at document size (no viewport culling —
-/// the shell blits the visible region).  Text is ClearTypeGridFit (matching
-/// InlineLayout's measurement hint so advances agree); shapes are
-/// anti-aliased; nothing else is resampled.  The output bitmap is capped
+/// the shell blits the visible region).  Text uses ClearType antialiasing; thin era rules remain pixel-crisp; nothing else is resampled.  The output bitmap is capped
 /// (see MaxSurfaceDimension/MaxSurfacePixels) so hostile markup cannot turn
 /// into a multi-gigabyte allocation.
 ///
@@ -106,6 +104,7 @@ public class Renderer
 
     private readonly ResourceLoader _resourceLoader;
     private string? _baseUrl;
+    private float _scrollX, _scrollY;
 
     // fontCache/imageCache are accepted for shell API compatibility; the
     // per-call Render(...) arguments are the ones used for painting.
@@ -121,7 +120,7 @@ public class Renderer
     public Bitmap Render(LayoutBox rootBox, DomDocument document,
                           FontCache fonts, ImageCache images,
                           float viewportWidth, float viewportHeight,
-                          float scrollX, float scrollY,   // unused: whole-document render, shell blits
+                          float scrollX, float scrollY,
                           DomElement? hoveredElement,
                           bool blinkVisible,
                           bool showBoxOutlines = false,
@@ -131,6 +130,8 @@ public class Renderer
             return new Bitmap(1, 1);
 
         _baseUrl = document?.BaseUrl?.ToAbsolute();
+        _scrollX = scrollX;
+        _scrollY = scrollY;
 
         float docWidth = Math.Max(rootBox.Width, viewportWidth);
         float docHeight = Math.Max(rootBox.Height, viewportHeight);
@@ -226,45 +227,31 @@ public class Renderer
         if (!BrowserRuntime.ImagesEnabled ||
             BrowserRuntime.Settings.BackgroundMode == BackgroundMode.Force) return;
 
-        var body = doc?.ElementDescendants()
-                       .FirstOrDefault(e => e.TagName == "body");
+        var body = doc?.ElementDescendants().FirstOrDefault(e => e.TagName == "body");
         if (body == null) return;
 
         string? bgAttr = body.GetAttr("background");
-        string? bgImg = !string.IsNullOrEmpty(bgAttr)
-            ? bgAttr
+        string? bgImg = !string.IsNullOrEmpty(bgAttr) ? bgAttr
             : ParseCssUrl(body.Style?.BackgroundImage);
-        if (string.IsNullOrEmpty(bgImg))
-            return;
-
-        // A failed BODY background image falls back to a clean white page;
-        // never expose the broken-image placeholder as a page-wide pattern.
-        g.FillRectangle(Brushes.White, 0, 0, w, h);
+        if (string.IsNullOrEmpty(bgImg)) return;
 
         try
         {
             string absolute = ImageCache.ResolveUrl(bgImg, _baseUrl);
             var task = images.GetAsync(absolute, _resourceLoader, default);
-            // A failed image fetch is represented by the shared broken-image
-            // frame so normal <img> elements can keep their reserved box.
-            // A BODY/CSS background must not tile that placeholder across the
-            // whole document.
-            if (images.IsBroken(absolute)) return;
-            if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
-            {
-                var frame = images.GetCurrentFrame(absolute) ?? task.Result.Frames[0];
-                // FIX: a decoded 0×0 frame made the tiling loops below run
-                // forever (y += 0) — a hard hang on a corrupt image.
-                if (frame.Width <= 0 || frame.Height <= 0) return;
+            if (images.IsBroken(absolute) || !task.IsCompletedSuccessfully)
+                return;
+            var decoded = task.Result;
+            if (decoded == null || decoded.Frames.Count <= 0)
+                return;
+            var frame = images.GetCurrentFrame(absolute) ?? decoded.Frames[0];
+            if (frame.Width <= 0 || frame.Height <= 0) return;
 
-                int drawn = 0;
-                for (float y = 0; y < h && drawn < MaxBackgroundTiles; y += frame.Height)
-                    for (float x = 0; x < w && drawn < MaxBackgroundTiles; x += frame.Width)
-                    {
-                        g.DrawImage(frame, x, y);
-                        drawn++;
-                    }
-            }
+            var style = body.Style?.Clone() ?? new ComputedStyle();
+            style.BackgroundImage = bgImg;
+            if (string.IsNullOrEmpty(body.Style?.BackgroundImage))
+                style.BackgroundRepeat = BackgroundRepeat.Repeat;
+            PaintBackgroundImage(g, new RectangleF(0, 0, w, h), frame, style);
         }
         catch { }
     }
@@ -272,6 +259,21 @@ public class Renderer
     // ─────────────────────────────────────────────────────────────────────
     // Box painting
     // ─────────────────────────────────────────────────────────────────────
+
+    private static bool IsSameOrAncestor(DomElement candidate, DomElement? stateElement)
+    {
+        for (DomNode? node = stateElement; node != null; node = node.Parent)
+            if (ReferenceEquals(node, candidate)) return true;
+        return false;
+    }
+
+    private static IEnumerable<LayoutBox> PaintOrder(LayoutBox box)
+    {
+        return box.Children.Select((child, index) => (child, index))
+            .OrderBy(p => p.child.Element?.Style?.ZIndex ?? 0)
+            .ThenBy(p => p.index)
+            .Select(p => p.child);
+    }
 
     private void PaintBox(Graphics g, LayoutBox box, FontCache fonts,
                           ImageCache images, DomElement? hoveredElement,
@@ -335,7 +337,7 @@ public class Renderer
                 CombineMode.Intersect);
         }
 
-        foreach (var child in box.Children)
+        foreach (var child in PaintOrder(box))
         {
             // FIX: one bad subtree used to abort every sibling after it
             // (the exception unwound straight to the root catch).  Skip the
@@ -368,7 +370,7 @@ public class Renderer
                                      bool blinkVisible, DomElement? focusedElement)
     {
         var elem = box.Element!;
-        var rect = box.BorderRect;
+        var rect = box.ContentRect;
         if (rect.Width <= 0f || rect.Height <= 0f) return;
 
         // BGCOLOR face (era default: no fill unless given)
@@ -454,7 +456,7 @@ public class Renderer
         try
         {
             g.TranslateTransform(baseX - originX, 0f);
-            foreach (var child in box.Children)
+            foreach (var child in PaintOrder(box))
                 PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
 
             if (dual)
@@ -541,15 +543,24 @@ public class Renderer
         catch { }
     }
 
-    private static void PaintBackgroundImage(Graphics g, RectangleF rect,
+    private void PaintBackgroundImage(Graphics g, RectangleF rect,
                                              Image image, ComputedStyle style)
     {
         float iw = image.Width;
         float ih = image.Height;
         if (iw <= 0 || ih <= 0) return;
 
-        float anchorX = rect.X + (style.BackgroundPosition.X / 100f) * (rect.Width - iw);
-        float anchorY = rect.Y + (style.BackgroundPosition.Y / 100f) * (rect.Height - ih);
+        float anchorX = style.BackgroundPositionXLength.HasValue
+            ? rect.X + style.BackgroundPositionXLength.Value
+            : rect.X + (style.BackgroundPosition.X / 100f) * (rect.Width - iw);
+        float anchorY = style.BackgroundPositionYLength.HasValue
+            ? rect.Y + style.BackgroundPositionYLength.Value
+            : rect.Y + (style.BackgroundPosition.Y / 100f) * (rect.Height - ih);
+        if (style.BackgroundFixed)
+        {
+            anchorX += _scrollX;
+            anchorY += _scrollY;
+        }
 
         var state = g.Save();
         try
@@ -1034,18 +1045,18 @@ public class Renderer
                     // the whole paint down — treat as unvisited.
                 }
 
-                bool hovered = linkAnchor == hoveredElement;
+                bool active = IsSameOrAncestor(linkAnchor!, ownerDoc.ActiveElement);
 
-                // Author CSS (a:link { color: ... }) beats the engine's link
-                // palette. OwnColor is tracked by the cascade, so this does
-                // not depend on comparing the authored colour with a fallback
-                // that may happen to be identical.
+                // Author CSS (a:hover/a:active/a:visited) is represented in
+                // the computed style and therefore wins naturally. Legacy
+                // BODY ALINK, however, means the pressed/active link color —
+                // it is NOT a general pointer-hover color.
                 Color docLink = StyleResolver.GetLinkColor(ownerDoc);
                 bool authorStyled = linkAnchor!.Style?.OwnColor == true;
 
                 if (!authorStyled)
                 {
-                    if (hovered)
+                    if (active)
                         textColor = StyleResolver.GetALinkColor(ownerDoc);
                     else if (visited)
                         textColor = StyleResolver.GetVLinkColor(ownerDoc);
@@ -1092,6 +1103,8 @@ public class Renderer
 
         if (style.FontVariant == FontVariantValue.SmallCaps)
             PaintSmallCapsText(g, contentRect.X, contentRect.Y, text, style, fonts, textColor, sf);
+        else if (Math.Abs(style.LetterSpacing) > 0.001f || Math.Abs(style.WordSpacing) > 0.001f)
+            PaintSpacedText(g, contentRect.X, contentRect.Y, text, font, brush, style, sf);
         else
             g.DrawString(text, font, brush, contentRect.X, contentRect.Y, sf);
 
@@ -1135,6 +1148,29 @@ public class Renderer
                 g.DrawLine(decoP, contentRect.X, contentRect.Y,
                     lineRight, contentRect.Y);
             }
+        }
+    }
+
+    private static void PaintSpacedText(Graphics g, float x, float y, string text,
+                                        Font font, Brush brush, ComputedStyle style, StringFormat sf)
+    {
+        // Draw glyphs individually when CSS1 tracking is non-zero. A single
+        // DrawString call can report the expanded advance to layout while
+        // still painting the original untracked glyph positions. Keeping the
+        // rasterized positions in lock-step with measurement makes headings,
+        // nav labels and buttons line up with the box geometry.
+        float drawX = x;
+        for (int i = 0; i < text.Length; i++)
+        {
+            string glyph = text[i].ToString();
+            g.DrawString(glyph, font, brush, drawX, y, sf);
+
+            float advance = g.MeasureString(glyph, font, int.MaxValue, sf).Width;
+            if (i + 1 < text.Length)
+                advance += style.LetterSpacing;
+            if (char.IsWhiteSpace(text[i]))
+                advance += style.WordSpacing;
+            drawX += advance;
         }
     }
 
@@ -1793,13 +1829,15 @@ public class Renderer
         Color markerColor = EffectiveTextColor(style);
 
         float markerY = box.Y + box.BorderTop + box.PaddingTop;
+        bool inside = box.ListMarkerInside;
+        float insideX = box.X + box.BorderLeft + box.PaddingLeft + 2f;
 
         if (listStyle.ListStyleImage is { Length: > 0 } imageUrl)
         {
             string absolute = ImageCache.ResolveUrl(imageUrl, _baseUrl);
             if (TryGetFrame(images, absolute, out var frame) && frame != null)
             {
-                float markerX = box.X - frame.Width - 4f;
+                float markerX = inside ? insideX : box.X - frame.Width - 4f;
                 g.DrawImage(frame, markerX, markerY,
                     frame.Width, frame.Height);
                 return;
@@ -1840,7 +1878,7 @@ public class Renderer
             string label = marker + ".";
             using var sf = new StringFormat(StringFormat.GenericTypographic);
             var size = g.MeasureString(label, font, int.MaxValue, sf);
-            float markerRight = box.X - 4;
+            float markerRight = inside ? insideX + 16f : box.X - 4;
             g.DrawString(label, font, brush, markerRight - size.Width, markerY, sf);
             return;
         }

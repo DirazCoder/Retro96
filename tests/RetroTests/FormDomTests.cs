@@ -123,6 +123,29 @@ public class FormDomTests
         Check.Done();
     }
 
+
+    [Fact]
+    public void MultipartPreservesRepeatedNamesAndOnlyActivatedSubmitter()
+    {
+        var doc = Parse(
+            "<form method=post enctype='multipart/form-data' action=/upload>" +
+            "<input type=text name=tag value=a><input type=text name=tag value=b>" +
+            "<input type=submit name=go value=One><input type=submit name=go value=Two>" +
+            "</form>");
+        var form = doc.FirstTag("form")!;
+        var submitter = form.Descendants().OfType<DomElement>()
+            .First(e => e.TagName == "input" && e.GetAttr("value") == "Two");
+        var req = FormSubmitter.BuildRequest(form, doc.BaseUrl, null, null, submitter);
+
+        Check.That(req.MultipartFields != null && req.MultipartFields.Count(f => f.Name == "tag") == 2,
+            "multipart fields preserve repeated names", req.MultipartFields?.Count.ToString() ?? "null");
+        Check.That(req.MultipartFields != null && req.MultipartFields.Count(f => f.Name == "go" && f.Value == "Two") == 1,
+            "only the activated submit button is included");
+        Check.That(req.MultipartFields != null && req.MultipartFields.All(f => f.Name != "go" || f.Value != "One"),
+            "inactive submit buttons are excluded");
+        Check.Done();
+    }
+
     [Fact]
     public void ControlsInsideTablesAreCollected()
     {

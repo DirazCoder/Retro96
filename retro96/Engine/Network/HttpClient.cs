@@ -7,6 +7,7 @@ using System.Security.Authentication;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Retro96.Engine.Forms;
 
 namespace Retro96.Engine.Network;
 
@@ -22,7 +23,8 @@ public record HttpSuccess(
     string ContentType,
     string Charset,
     byte[] Body,
-    string EffectiveUrl) : HttpResult;
+    string EffectiveUrl,
+    IReadOnlyList<string>? SetCookieHeaders = null) : HttpResult;
 
 public record HttpError(string Message, Exception? Inner = null) : HttpResult;
 
@@ -78,14 +80,17 @@ public class HttpClient
                                              CookieStore cookies, CancellationToken ct, ResourceKind resourceKind) =>
         SendRequestAsync("POST", url, Encoding.UTF8.GetBytes(formData), cookies, ct, resourceKind: resourceKind);
 
+    private static string EscapeQuoted(string value) =>
+        (value ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"");
+
     /// <summary>
     /// POST with multipart/form-data — file upload encoding.
     /// fields: name → value; files: name → (filename, contentType, bytes).
     /// </summary>
     public async Task<HttpResult> PostMultipartAsync(
         ParsedUrl url,
-        IReadOnlyDictionary<string, string> fields,
-        IReadOnlyDictionary<string, (string Filename, string ContentType, byte[] Bytes)> files,
+        IReadOnlyList<MultipartField> fields,
+        IReadOnlyList<MultipartFile> files,
         CookieStore cookies, CancellationToken ct)
     {
         string boundary = "----Retro96Boundary" + Guid.NewGuid().ToString("N")[..12];
@@ -93,16 +98,16 @@ public class HttpClient
 
         foreach (var (name, value) in fields)
         {
-            var part = Encoding.ASCII.GetBytes(
-                $"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
+            var part = Encoding.UTF8.GetBytes(
+                $"--{boundary}\r\nContent-Disposition: form-data; name=\"{EscapeQuoted(name)}\"\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{value}\r\n");
             await body.WriteAsync(part, ct);
         }
 
-        foreach (var (name, file) in files)
+        foreach (var file in files)
         {
-            await body.WriteAsync(Encoding.ASCII.GetBytes(
-                $"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; " +
-                $"filename=\"{file.Filename}\"\r\nContent-Type: {file.ContentType}\r\n\r\n"), ct);
+            await body.WriteAsync(Encoding.UTF8.GetBytes(
+                $"--{boundary}\r\nContent-Disposition: form-data; name=\"{EscapeQuoted(file.Name)}\"; " +
+                $"filename=\"{EscapeQuoted(file.Filename)}\"\r\nContent-Type: {file.ContentType}\r\n\r\n"), ct);
             await body.WriteAsync(file.Bytes, ct);
             await body.WriteAsync(Encoding.ASCII.GetBytes("\r\n"), ct);
         }
@@ -162,7 +167,9 @@ public class HttpClient
         if (result is not HttpSuccess success)
             return result;
 
-        // Set-Cookie on ANY response (including redirects)
+        // Set-Cookie on ANY response (including redirects). Keep each field
+        // separate because Expires=... contains commas and HTTP does not
+        // define Set-Cookie as a comma-combinable header.
         if (BrowserRuntime.CookiesEnabled)
             StoreCookies(success, url, cookies);
 
@@ -228,8 +235,11 @@ public class HttpClient
 
     private static void StoreCookies(HttpSuccess success, ParsedUrl url, CookieStore cookies)
     {
-        // The header dictionary joins duplicates with ", " — CookieStore's
-        // splitter separates them again (date commas excepted).
+        if (success.SetCookieHeaders is { Count: > 0 })
+        {
+            foreach (var header in success.SetCookieHeaders) cookies.Set(header, url);
+            return;
+        }
         if (success.Headers.TryGetValue("set-cookie", out var setCookie))
             cookies.Set(setCookie, url);
     }
@@ -437,6 +447,7 @@ public class HttpClient
 
         // Headers
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var setCookies = new List<string>();
         string? headerLine;
         while (!string.IsNullOrEmpty(headerLine = await ReadRawLineAsync(stream, ct)))
         {
@@ -445,10 +456,11 @@ public class HttpClient
             {
                 string key = headerLine[..colonIdx].Trim();
                 string value = headerLine[(colonIdx + 1)..].Trim();
-                // Duplicate headers join with ", " — the old overwrite kept
-                // only the LAST Set-Cookie of a multi-cookie response.
-                // Joining is exactly what CookieStore's comma-splitter is
-                // there for.
+                if (key.Equals("set-cookie", StringComparison.OrdinalIgnoreCase))
+                {
+                    setCookies.Add(value);
+                    continue;
+                }
                 headers[key] = headers.TryGetValue(key, out var existing)
                     ? existing + ", " + value
                     : value;
@@ -531,7 +543,7 @@ public class HttpClient
         }
 
         return new HttpSuccess(statusCode, headers, contentType, charset, body,
-            url.ToAbsolute());
+            url.ToAbsolute(), setCookies);
     }
 
     private static async Task<byte[]> ReadExactAsync(Stream stream, int length, CancellationToken ct)
@@ -556,42 +568,35 @@ public class HttpClient
     private static async Task<byte[]> ReadChunkedAsync(Stream stream, CancellationToken ct)
     {
         using var ms = new MemoryStream();
-
         while (true)
         {
             string? sizeLine = await ReadRawLineAsync(stream, ct);
-            if (string.IsNullOrEmpty(sizeLine))
-                break;
-
+            if (sizeLine == null) throw new EndOfStreamException("Truncated chunked response.");
             int semi = sizeLine.IndexOf(';');
             string sizeStr = (semi >= 0 ? sizeLine[..semi] : sizeLine).Trim();
-            if (!int.TryParse(sizeStr,
-                    System.Globalization.NumberStyles.HexNumber,
-                    System.Globalization.CultureInfo.InvariantCulture, out int chunkSize))
-                break;
+            if (!int.TryParse(sizeStr, System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out int chunkSize) || chunkSize < 0)
+                throw new InvalidDataException("Malformed chunk size.");
 
             if (chunkSize == 0)
-                break;
+            {
+                while (true)
+                {
+                    string? trailer = await ReadRawLineAsync(stream, ct);
+                    if (trailer == null) throw new EndOfStreamException("Truncated chunk trailer block.");
+                    if (trailer.Length == 0) return ms.ToArray();
+                }
+            }
 
             if (ms.Length + chunkSize > MaxBodySize)
-                break;   // refuse absurd bodies
+                throw new InvalidDataException("Chunked response body too large.");
 
             byte[] chunk = await ReadExactAsync(stream, chunkSize, ct);
             await ms.WriteAsync(chunk, ct);
-
-            // Trailing CRLF after each chunk (raw — no StreamReader)
-            await ReadRawLineAsync(stream, ct);
+            string? terminator = await ReadRawLineAsync(stream, ct);
+            if (terminator == null || terminator.Length != 0)
+                throw new EndOfStreamException("Malformed chunk terminator.");
         }
-
-        // Trailer headers until blank line (raw)
-        while (true)
-        {
-            string? trailer = await ReadRawLineAsync(stream, ct);
-            if (string.IsNullOrEmpty(trailer))
-                break;
-        }
-
-        return ms.ToArray();
     }
 
     private async Task<byte[]> ReadUntilCloseAsync(Stream stream, CancellationToken ct)
@@ -605,7 +610,7 @@ public class HttpClient
             await ms.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
 
             if (ms.Length > MaxBodySize)
-                break;   // return what we have
+                throw new InvalidDataException("Response body too large before connection close.");
         }
         return ms.ToArray();
     }

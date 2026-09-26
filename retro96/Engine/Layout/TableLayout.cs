@@ -378,10 +378,19 @@ public static class TableLayout
 
                 // Keep CSS borders declared on the cell. The table border is
                 // only the fallback for cells without their own CSS border.
-                float cellBorderLeft = box.BorderLeft > 0f ? box.BorderLeft : borderWidth;
-                float cellBorderRight = box.BorderRight > 0f ? box.BorderRight : borderWidth;
-                float cellBorderTop = box.BorderTop > 0f ? box.BorderTop : borderWidth;
-                float cellBorderBottom = box.BorderBottom > 0f ? box.BorderBottom : borderWidth;
+                var cellStyle = box.Element?.Style;
+                float cellBorderLeft = cellStyle?.OwnBorderLeftStyle == true &&
+                                       cellStyle.BorderLeftStyle == BorderStyleValue.None
+                    ? 0f : (box.BorderLeft > 0f ? box.BorderLeft : borderWidth);
+                float cellBorderRight = cellStyle?.OwnBorderRightStyle == true &&
+                                        cellStyle.BorderRightStyle == BorderStyleValue.None
+                    ? 0f : (box.BorderRight > 0f ? box.BorderRight : borderWidth);
+                float cellBorderTop = cellStyle?.OwnBorderTopStyle == true &&
+                                      cellStyle.BorderTopStyle == BorderStyleValue.None
+                    ? 0f : (box.BorderTop > 0f ? box.BorderTop : borderWidth);
+                float cellBorderBottom = cellStyle?.OwnBorderBottomStyle == true &&
+                                         cellStyle.BorderBottomStyle == BorderStyleValue.None
+                    ? 0f : (box.BorderBottom > 0f ? box.BorderBottom : borderWidth);
 
                 box.X = tableBox.X + colX[cell.Col];
                 box.Y = provisionalY;

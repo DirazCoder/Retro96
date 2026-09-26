@@ -346,11 +346,30 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
             case "visited":
                 return element.TagName == "a" && element.HasAttr("href") &&
                        IsVisited(element);
+            case "hover":
+                return IsDynamicStateFor(element, element.OwnerDocument()?.HoveredElement);
+            case "active":
+                return IsDynamicStateFor(element, element.OwnerDocument()?.ActiveElement);
+            case "focus":
+                return IsDynamicStateFor(element, element.OwnerDocument()?.FocusedElement);
             default:
-                // :hover/:active/:focus are dynamic — not part of static
-                // style resolution; unknown pseudo-classes simply never match.
                 return false;
         }
+    }
+
+    private static bool IsDynamicStateFor(DomElement selectorElement, DomElement? stateElement)
+    {
+        if (stateElement == null) return false;
+        if (ReferenceEquals(selectorElement, stateElement)) return true;
+
+        // :hover/:active/:focus apply to an ancestor while a descendant is
+        // the actual hit/focus target. Walk the target upward through the
+        // DOM so a:hover still matches for nested spans/images.
+        for (DomNode? node = stateElement.Parent; node != null; node = node.Parent)
+        {
+            if (ReferenceEquals(node, selectorElement)) return true;
+        }
+        return false;
     }
 
     private static bool IsVisited(DomElement element)
