@@ -62,6 +62,13 @@ public class JsScope
             if (scope._vars.ContainsKey(name))
             {
                 scope._vars[name] = value;
+                // The root scope and the window/global object represent the
+                // same global binding in legacy JavaScript.  Keep the
+                // fallback synchronized when a global `var` is reassigned;
+                // otherwise Get() can read a stale window property instead
+                // of the newly assigned variable value.
+                if (scope.Parent == null)
+                    scope.GlobalFallback?.Set(name, value);
                 return;
             }
             if (scope.Parent == null)

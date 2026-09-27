@@ -672,28 +672,39 @@ public class Renderer
         }
 
         bool isTableCell = elem.TagName is "td" or "th";
+        Color localBackground = ResolveLocalBackground(elem, Color.White);
 
         // Paint from the box's layout-resolved widths — they include HTML
         // border attributes the CSS style may know nothing about.
         PaintBorderSide(g, box.BorderRect, box.BorderTop, style.BorderTopStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderTopColor), isTableCell),
-                        BorderSide.Top);
+                        BorderColorFor(BorderColorOrBlack(style.BorderTopColor), isTableCell, localBackground),
+                        BorderSide.Top, localBackground);
         PaintBorderSide(g, box.BorderRect, box.BorderRight, style.BorderRightStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell),
-                        BorderSide.Right);
+                        BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell, localBackground),
+                        BorderSide.Right, localBackground);
         PaintBorderSide(g, box.BorderRect, box.BorderBottom, style.BorderBottomStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell),
-                        BorderSide.Bottom);
+                        BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell, localBackground),
+                        BorderSide.Bottom, localBackground);
         PaintBorderSide(g, box.BorderRect, box.BorderLeft, style.BorderLeftStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell),
-                        BorderSide.Left);
+                        BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell, localBackground),
+                        BorderSide.Left, localBackground);
     }
 
-    /// <summary>Table cell rules were grey (#808080), not text-black.</summary>
-    private static Color BorderColorFor(Color cssColor, bool isTableCell) =>
-        isTableCell && cssColor == Color.Black
+    /// <summary>Table cell rules were grey (#808080), not text-black.
+    /// When an authored cell border is itself too close to the cell's local
+    /// background, give the rule enough contrast to remain visible.</summary>
+    private static Color BorderColorFor(Color cssColor, bool isTableCell, Color background)
+    {
+        var color = isTableCell && cssColor == Color.Black
             ? Color.FromArgb(0x80, 0x80, 0x80)
             : cssColor;
+        if (!isTableCell) return color;
+
+        return LuminanceDistance(color, background) >= 0.14f
+            ? color
+            : EnsureBevelContrast(color, background,
+                preferLighter: RelativeLuminance(color) >= RelativeLuminance(background));
+    }
 
     /// <summary>An unset border colour paints black (an Empty colour makes an invisible pen).</summary>
     private static Color BorderColorOrBlack(Color c) => c == Color.Empty ? Color.Black : c;
@@ -704,8 +715,16 @@ public class Renderer
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         float w = Math.Max(1, box.BorderTop);
-        using var penDark = new Pen(Color.FromArgb(0x80, 0x80, 0x80), 1);
-        using var penLight = new Pen(Color.White, 1);
+        Color background = ResolveLocalBackground(box.Element, Color.White);
+        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
+        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
+        using var penDark = new Pen(dark, 1);
+        using var penLight = new Pen(light, 1);
+        if (NeedsStrongBevelOutline(background))
+        {
+            using var outline = new Pen(BevelOutlineColor(background), 1);
+            g.DrawRectangle(outline, rect.X, rect.Y, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
+        }
 
         // Outset: light top/left, dark bottom/right
         for (int i = 0; i < w; i++)
@@ -729,7 +748,7 @@ public class Renderer
 
         using var bg = new SolidBrush(Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(bg, rect);
-        PaintSunkenRect(g, rect, 2);
+        PaintSunkenRect(g, rect, 2, Color.FromArgb(0xC0, 0xC0, 0xC0));
     }
 
     /// <summary>
@@ -770,8 +789,9 @@ public class Renderer
         // 3-D inset: keep the authored colour while deriving a darker top and
         // lighter bottom shade.  A coloured <hr> therefore stays coloured in
         // both NOSHADE and the default 3-D presentation.
-        var dark = Shade(color, 0.55f);
-        var light = Tint(color, 0.65f);
+        var background = ResolveLocalBackground(elem, Color.White);
+        var dark = EnsureBevelContrast(Shade(color, 0.55f), background, preferLighter: false);
+        var light = EnsureBevelContrast(Tint(color, 0.65f), background, preferLighter: true);
         int half = (thick + 1) / 2;
         using var penDark = new Pen(dark, 1);
         using var penLight = new Pen(light, 1);
@@ -797,7 +817,7 @@ public class Renderer
     private enum BorderSide { Top, Right, Bottom, Left }
 
     private static void PaintBorderSide(Graphics g, RectangleF rect, float width,
-        BorderStyleValue bStyle, Color color, BorderSide side)
+        BorderStyleValue bStyle, Color color, BorderSide side, Color background)
     {
         if (width <= 0) return;
 
@@ -817,7 +837,7 @@ public class Renderer
         if (bStyle is BorderStyleValue.Groove or BorderStyleValue.Ridge
                    or BorderStyleValue.Inset or BorderStyleValue.Outset)
         {
-            Paint3DBorder(g, rect, bStyle, w, color, side);
+            Paint3DBorder(g, rect, bStyle, w, color, side, background);
             return;
         }
 
@@ -857,14 +877,14 @@ public class Renderer
     }
 
     private static void Paint3DBorder(Graphics g, RectangleF rect,
-        BorderStyleValue style, int w, Color baseColor, BorderSide side)
+        BorderStyleValue style, int w, Color baseColor, BorderSide side, Color background)
     {
         if (w < 1) return;
 
-        Color light = ControlPaint.LightLight(baseColor);
-        Color midLight = ControlPaint.Light(baseColor);
-        Color dark = ControlPaint.Dark(baseColor);
-        Color darkDark = ControlPaint.DarkDark(baseColor);
+        Color light = EnsureBevelContrast(ControlPaint.LightLight(baseColor), background, preferLighter: true);
+        Color midLight = EnsureBevelContrast(ControlPaint.Light(baseColor), background, preferLighter: true);
+        Color dark = EnsureBevelContrast(ControlPaint.Dark(baseColor), background, preferLighter: false);
+        Color darkDark = EnsureBevelContrast(ControlPaint.DarkDark(baseColor), background, preferLighter: false);
 
         bool topLeft = side is BorderSide.Top or BorderSide.Left;
         bool raised = style is BorderStyleValue.Ridge or BorderStyleValue.Outset;
@@ -872,6 +892,8 @@ public class Renderer
         if (style is BorderStyleValue.Inset or BorderStyleValue.Outset)
         {
             Color shade = (raised == topLeft) ? light : darkDark;
+            if (NeedsStrongBevelOutline(background))
+                shade = raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
             using var brush = new SolidBrush(shade);
             switch (side)
             {
@@ -888,6 +910,11 @@ public class Renderer
         bool outerLight = raised == topLeft;
         Color outer = outerLight ? light : darkDark;
         Color inner = outerLight ? midLight : dark;
+        if (NeedsStrongBevelOutline(background))
+        {
+            outer = outerLight ? BevelHighlightColor(background) : BevelShadowColor(background);
+            inner = outerLight ? BevelShadowColor(background) : BevelHighlightColor(background);
+        }
         int first = Math.Max(1, w / 2);
         int second = Math.Max(1, w - first);
         using var outerBrush = new SolidBrush(outer);
@@ -999,6 +1026,18 @@ public class Renderer
                         }
                     case "hr":
                         return;   // painted as border
+                    case "embed":
+                        // Legacy MIDI <embed> controls are painted by
+                        // BrowserCanvas. Do not leave the generic plugin
+                        // placeholder underneath them (or underneath a
+                        // hidden/zero-sized embed). Non-MIDI embeds retain the
+                        // historic fallback surface.
+                        string? embedSrc = box.Element.GetAttr("src");
+                        string embedPath = embedSrc?.Split('?', '#')[0] ?? string.Empty;
+                        bool isMidiEmbed = embedPath.EndsWith(".mid", StringComparison.OrdinalIgnoreCase) ||
+                            embedPath.EndsWith(".midi", StringComparison.OrdinalIgnoreCase);
+                        if (!isMidiEmbed) PaintFallbackContent(g, box);
+                        return;
                     default:
                         PaintFallbackContent(g, box);
                         return;
@@ -1441,11 +1480,150 @@ public class Renderer
         }
     }
 
-    /// <summary>2-tone sunken (inset) rectangle frame, `size` px thick.</summary>
-    private static void PaintSunkenRect(Graphics g, RectangleF rect, int size)
+    // ── Adaptive 3-D chrome ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Finds the nearest opaque background that is actually painted behind an
+    /// element. Background is not inherited in CSS, so walking ancestors until
+    /// an explicit background is found is a better approximation of the local
+    /// pixel than using one document-wide colour.
+    /// </summary>
+    private static Color ResolveLocalBackground(DomElement? element, Color fallback)
     {
-        using var penDark = new Pen(Color.FromArgb(0x80, 0x80, 0x80), 1);
-        using var penLight = new Pen(Color.White, 1);
+        for (DomNode? node = element; node != null; node = node.Parent)
+        {
+            if (node is not DomElement elem) continue;
+
+            string? attr = elem.GetAttr("bgcolor");
+            if (!string.IsNullOrWhiteSpace(attr))
+            {
+                Color parsed = ParseHtmlColor(attr);
+                if (parsed != Color.Empty && parsed != Color.Transparent)
+                    return parsed;
+            }
+
+            var style = elem.Style;
+            if (style != null && style.BackgroundColor != Color.Empty &&
+                style.BackgroundColor != Color.Transparent)
+                return style.BackgroundColor;
+        }
+
+        return fallback;
+    }
+
+    private static float RelativeLuminance(Color color)
+    {
+        static float Channel(int c)
+        {
+            float s = c / 255f;
+            return s <= 0.04045f ? s / 12.92f : MathF.Pow((s + 0.055f) / 1.055f, 2.4f);
+        }
+        return 0.2126f * Channel(color.R) +
+               0.7152f * Channel(color.G) +
+               0.0722f * Channel(color.B);
+    }
+
+    private static float LuminanceDistance(Color a, Color b) =>
+        MathF.Abs(RelativeLuminance(a) - RelativeLuminance(b));
+
+    private static Color Mix(Color from, Color to, float amount)
+    {
+        amount = Math.Clamp(amount, 0f, 1f);
+        return Color.FromArgb(from.A,
+            (int)Math.Round(from.R + (to.R - from.R) * amount),
+            (int)Math.Round(from.G + (to.G - from.G) * amount),
+            (int)Math.Round(from.B + (to.B - from.B) * amount));
+    }
+
+    /// <summary>
+    /// Keeps the classic white/gray bevel on normal Windows-grey faces but
+    /// moves either tone far enough away from the element's real local
+    /// background when the normal tone would disappear into it.
+    /// </summary>
+    private static bool NeedsStrongBevelOutline(Color background)
+    {
+        float l = RelativeLuminance(background);
+        return l >= 0.82f || l <= 0.12f;
+    }
+
+    private static Color BevelShadowColor(Color background)
+    {
+        float l = RelativeLuminance(background);
+        if (l >= 0.82f) return Color.FromArgb(0x58, 0x58, 0x58);
+        if (l <= 0.12f) return Color.FromArgb(0x28, 0x28, 0x28);
+        return Color.FromArgb(0x60, 0x60, 0x60);
+    }
+
+    private static Color BevelHighlightColor(Color background)
+    {
+        float l = RelativeLuminance(background);
+
+        // On white/near-white surfaces, a near-white highlight is effectively
+        // invisible.  Keep it light enough to read as a raised edge, but make
+        // it a definite neutral grey so the bevel remains visible.
+        if (l >= 0.90f) return Color.FromArgb(0xC8, 0xC8, 0xC8);
+        if (l >= 0.72f) return Color.FromArgb(0xD0, 0xD0, 0xD0);
+        if (l >= 0.50f) return Color.FromArgb(0xD8, 0xD8, 0xD8);
+        if (l <= 0.12f) return Color.FromArgb(0xF8, 0xF8, 0xF8);
+        return Color.FromArgb(0xF0, 0xF0, 0xF0);
+    }
+
+    private static Color BevelOutlineColor(Color background)
+    {
+        float l = RelativeLuminance(background);
+        if (l >= 0.82f) return Color.FromArgb(0x70, 0x70, 0x70);
+        if (l <= 0.12f) return Color.FromArgb(0xD8, 0xD8, 0xD8);
+        return Color.FromArgb(0x70, 0x70, 0x70);
+    }
+
+    /// <summary>
+    /// Keeps the classic white/gray bevel on normal Windows-grey faces, but
+    /// deliberately increases the tone separation when a near-white or
+    /// near-black local background would wash the bevel out.
+    /// </summary>
+    private static Color EnsureBevelContrast(Color candidate, Color background, bool preferLighter)
+    {
+        if (candidate == Color.Empty || candidate == Color.Transparent)
+            candidate = preferLighter ? Color.White : Color.FromArgb(0x80, 0x80, 0x80);
+
+        float bg = RelativeLuminance(background);
+
+        // A white highlight technically has enough luminance distance from a
+        // light-grey control face, but it still disappears against the page
+        // when the chrome sits on a white/near-white surface.  Force the
+        // light edge into a visible neutral-grey range on light backgrounds.
+        if (preferLighter && bg >= 0.50f && RelativeLuminance(candidate) >= 0.90f)
+            return BevelHighlightColor(background);
+
+        if (NeedsStrongBevelOutline(background))
+            return preferLighter ? BevelHighlightColor(background) : BevelShadowColor(background);
+
+        const float MinimumLuminanceContrast = 0.22f;
+        if (LuminanceDistance(candidate, background) >= MinimumLuminanceContrast)
+            return candidate;
+
+        if (preferLighter)
+            return bg > 0.72f ? Mix(background, Color.Black, 0.20f)
+                              : Mix(background, Color.White, 0.78f);
+
+        return bg < 0.28f ? Mix(background, Color.White, 0.55f)
+                          : Mix(background, Color.Black, 0.78f);
+    }
+
+    /// <summary>2-tone sunken (inset) rectangle frame, `size` px thick.</summary>
+    private static void PaintSunkenRect(Graphics g, RectangleF rect, int size, Color background = default)
+    {
+        if (background == Color.Empty || background == Color.Transparent)
+            background = Color.White;
+        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
+        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
+        using var penDark = new Pen(dark, 1);
+        using var penLight = new Pen(light, 1);
+        if (NeedsStrongBevelOutline(background))
+        {
+            using var outline = new Pen(BevelOutlineColor(background), 1);
+            g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
+        }
         for (int i = 0; i < size; i++)
         {
             float x0 = rect.Left + i, y0 = rect.Top + i;
@@ -1459,10 +1637,19 @@ public class Renderer
     }
 
     /// <summary>2-tone raised (outset) rectangle frame, `size` px thick.</summary>
-    private static void PaintRaisedRect(Graphics g, RectangleF rect, int size)
+    private static void PaintRaisedRect(Graphics g, RectangleF rect, int size, Color background = default)
     {
-        using var penLight = new Pen(Color.White, 1);
-        using var penDark = new Pen(Color.FromArgb(0x80, 0x80, 0x80), 1);
+        if (background == Color.Empty || background == Color.Transparent)
+            background = Color.White;
+        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
+        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
+        using var penLight = new Pen(light, 1);
+        using var penDark = new Pen(dark, 1);
+        if (NeedsStrongBevelOutline(background))
+        {
+            using var outline = new Pen(BevelOutlineColor(background), 1);
+            g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
+        }
         for (int i = 0; i < size; i++)
         {
             float x0 = rect.Left + i, y0 = rect.Top + i;
@@ -1490,7 +1677,7 @@ public class Renderer
 
         using (var bg = new SolidBrush(outer))
             g.FillRectangle(bg, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 1);
+        PaintSunkenRect(g, rect, 1, outer);
 
         const float buttonWidth = 92f;
         float actualButtonWidth = Math.Min(buttonWidth, Math.Max(34f, rect.Width - 8f));
@@ -1500,7 +1687,7 @@ public class Renderer
 
         using (var buttonBrush = new SolidBrush(buttonFace))
             g.FillRectangle(buttonBrush, button.X, button.Y, button.Width, button.Height);
-        PaintRaisedRect(g, button, 2);
+        PaintRaisedRect(g, button, 2, buttonFace);
 
         var font = ResolveFont(fonts, style);
         using var brush = new SolidBrush(textColor);
@@ -1554,7 +1741,7 @@ public class Renderer
 
         using (var faceBrush = new SolidBrush(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2);
+        PaintSunkenRect(g, rect, 2, bgColor);
 
         // Focused fields get a dark ring just inside the bevel — otherwise
         // there is no visual difference between focused and unfocused.
@@ -1640,10 +1827,11 @@ public class Renderer
             .Where(o => o.TagName == "option")
             .ToList();
 
-        using var faceBrush = new SolidBrush(disabled
-            ? Color.FromArgb(0xE0, 0xE0, 0xE0) : Color.White);
+        Color selectFaceColor = disabled
+            ? Color.FromArgb(0xE0, 0xE0, 0xE0) : Color.White;
+        using var faceBrush = new SolidBrush(selectFaceColor);
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2);
+        PaintSunkenRect(g, rect, 2, selectFaceColor);
 
         if (isListbox && options.Count > 0)
         {
@@ -1719,7 +1907,7 @@ public class Renderer
 
         using (var faceBrush = new SolidBrush(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2);
+        PaintSunkenRect(g, rect, 2, bgColor);
 
         if (isFocused)
         {
@@ -1782,10 +1970,13 @@ public class Renderer
             ? Color.FromArgb(0xE0, 0xE0, 0xE0)
             : Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
+        var bevelFace = disabled
+            ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+            : Color.FromArgb(0xC0, 0xC0, 0xC0);
         if (pressed)
-            PaintSunkenRect(g, rect, 2);
+            PaintSunkenRect(g, rect, 2, bevelFace);
         else
-            PaintRaisedRect(g, rect, 2);
+            PaintRaisedRect(g, rect, 2, bevelFace);
 
         var font = ResolveFont(fonts, style);
         using var brush = new SolidBrush(disabled ? Color.Gray : Color.Black);
@@ -1893,15 +2084,28 @@ public class Renderer
             if (listStyle.ListStyleType == ListStyleType.None)
                 return;
 
-            string shape = listStyle.ListStyleType switch
-            {
-                ListStyleType.Circle => "circle",
-                ListStyleType.Square => "square",
-                ListStyleType.Disc => "disc",
-                _ => (type ?? "").ToLowerInvariant()
-            };
+            // HTML TYPE and CSS list-style-type are explicit choices.  When
+            // neither is present, use the historical nested-list convention
+            // (disc -> circle -> square).  The old code could never reach its
+            // depth fallback because every <ul>/<menu>/<dir> received the UA
+            // ListStyleType.Disc value during style resolution, so even
+            // TYPE=circle/square collapsed to a filled disc at paint time.
+            bool explicitHtmlType = !string.IsNullOrWhiteSpace(type);
+            bool explicitCssType = style.OwnListStyleType ||
+                                   parent.Style?.OwnListStyleType == true;
 
-            if (shape.Length == 0)
+            string shape;
+            if (explicitHtmlType || explicitCssType)
+            {
+                shape = listStyle.ListStyleType switch
+                {
+                    ListStyleType.Circle => "circle",
+                    ListStyleType.Square => "square",
+                    ListStyleType.Disc => "disc",
+                    _ => (type ?? "").ToLowerInvariant()
+                };
+            }
+            else
             {
                 int depth = 0;
                 var p = elem.Parent;

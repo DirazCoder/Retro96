@@ -23,6 +23,11 @@ public partial class Form1
     private readonly ToolStripProgressBar _pluginProgress = new() { Width = 120, Visible = false };
     private bool _builtInsInitialized;
     private bool _midiUiSuppressed;
+    private byte[]? _embeddedMidiBytes;
+    private string? _embeddedMidiName;
+    private DomElement? _embeddedMidiElement;
+    private int _embeddedMidiRepeatCount = 1;
+    private int _embeddedMidiVolume = 100;
 
     private void InitializeBuiltInFeatures()
     {
@@ -140,15 +145,35 @@ public partial class Form1
         _midiBar.Visible = visible;
         _midiLabel.Text = visible ? "MIDI: " + _midiPlayer.CurrentFileName : "MIDI";
         _midiLoop.Checked = _midiPlayer.Loop;
-        _canvas.UpdateEmbeddedMidiControls(_midiPlayer.Loop, _midiPlayer.IsPlaying);
+        _canvas.UpdateEmbeddedMidiControls(_midiPlayer.Loop, _midiPlayer.IsPlaying,
+            _embeddedMidiElement != null ? _embeddedMidiVolume : (int)Math.Round(_midiPlayer.Volume * 100f));
     }
 
     private void HandleEmbeddedMidiControl(string action)
     {
+        if (action.StartsWith("volume:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (int.TryParse(action[7..], out int volume))
+            {
+                _embeddedMidiVolume = Math.Clamp(volume, 0, 100);
+                _midiPlayer.Volume = _embeddedMidiVolume / 100f;
+                UpdateMidiUi();
+            }
+            return;
+        }
+
         switch (action)
         {
             case "play":
-                _midiPlayer.Resume();
+                if (_midiPlayer.CurrentFileName != null)
+                {
+                    _midiPlayer.Resume();
+                }
+                else if (_embeddedMidiBytes != null && _embeddedMidiName != null)
+                {
+                    _ = StartStoredEmbeddedMidiAsync();
+                    return;
+                }
                 break;
             case "pause":
                 _midiPlayer.Pause();
@@ -161,6 +186,18 @@ public partial class Form1
                 break;
         }
         UpdateMidiUi();
+    }
+
+    private async Task StartStoredEmbeddedMidiAsync()
+    {
+        if (_embeddedMidiBytes == null || _embeddedMidiName == null) return;
+        try
+        {
+            _midiPlayer.Volume = _embeddedMidiVolume / 100f;
+            await _midiPlayer.PlayBytesAsync(_embeddedMidiBytes, _embeddedMidiName, _embeddedMidiRepeatCount).ConfigureAwait(false);
+            BeginInvokeSafe(UpdateMidiUi);
+        }
+        catch { }
     }
 
     private void BeginInvokeSafe(Action action)
@@ -211,6 +248,9 @@ public partial class Form1
     {
         if (LooksLikeMidi(url, success))
         {
+            _embeddedMidiBytes = null;
+            _embeddedMidiName = null;
+            _embeddedMidiElement = null;
             _midiUiSuppressed = false;
             string name = SuggestDownloadFileName(url.ToAbsolute(), success.Headers);
             if (generation != _navGeneration) return true;
@@ -233,39 +273,109 @@ public partial class Form1
 
     private async Task StartEmbeddedMidiAsync(DomDocument document, ParsedUrl baseUrl, CancellationToken ct, long generation)
     {
-        foreach (var element in document.ElementDescendants().Where(e => e.TagName is "bgsound" or "embed"))
+        // A new page owns the audio session. Stop the previous page's sound,
+        // but keep the browser's top-level MIDI toolbar semantics unchanged.
+        _midiPlayer.Stop();
+        _embeddedMidiBytes = null;
+        _embeddedMidiName = null;
+        _embeddedMidiElement = null;
+        _embeddedMidiRepeatCount = 1;
+        _embeddedMidiVolume = 100;
+        _midiUiSuppressed = false;
+        BeginInvokeSafe(() => _canvas.ClearEmbeddedMidiControls());
+
+        var candidates = document.ElementDescendants()
+            .Where(e => e.TagName is "bgsound" or "embed")
+            .Where(e => !string.IsNullOrWhiteSpace(e.GetAttr("src")))
+            .ToList();
+
+        // Pages often contained both declarations. Use the first tag that
+        // would actually start in this browser, avoiding double playback.
+        var selected = candidates.FirstOrDefault(ShouldLegacyMidiAutostart)
+                    ?? candidates.FirstOrDefault(e => e.TagName == "embed");
+        if (selected == null)
         {
-            string? src = element.GetAttr("src");
-            if (string.IsNullOrWhiteSpace(src)) continue;
-            string lower = src.ToLowerInvariant();
-            if (!lower.EndsWith(".mid") && !lower.EndsWith(".midi")) continue;
-            try
-            {
-                string absolute = baseUrl.Resolve(src).ToAbsolute();
-                var result = await _httpClient.GetAsync(ParsedUrl.Parse(absolute), _cookieStore, ct, ResourceKind.Other).ConfigureAwait(false);
-                if (result is not HttpSuccess success) continue;
-                if (generation != _navGeneration) return;
-                bool isBackgroundSound = string.Equals(element.TagName, "bgsound", StringComparison.OrdinalIgnoreCase);
-                bool loop = isBackgroundSound &&
-                    ((element.GetAttr("loop") ?? "").Equals("infinite", StringComparison.OrdinalIgnoreCase) || element.GetAttrInt("loop", 1) != 1);
-                _midiUiSuppressed = true;
-                string name = SuggestDownloadFileName(absolute, success.Headers);
-                await _midiPlayer.PlayBytesAsync(success.Body, name, loop).ConfigureAwait(false);
-                if (generation == _navGeneration)
-                {
-                    BeginInvokeSafe(() =>
-                    {
-                        if (isBackgroundSound)
-                            _canvas.ClearEmbeddedMidiControls();
-                        else
-                            _canvas.SetEmbeddedMidiControls(element, name, loop, _midiPlayer.IsPlaying);
-                        UpdateMidiUi();
-                    });
-                }
-                return;
-            }
-            catch { }
+            UpdateMidiUi();
+            return;
         }
+
+        string? src = selected.GetAttr("src");
+        if (!TryResolveMidiSource(baseUrl, src, out string absolute))
+        {
+            UpdateMidiUi();
+            return;
+        }
+
+        try
+        {
+            var result = await _httpClient.GetAsync(ParsedUrl.Parse(absolute), _cookieStore, ct, ResourceKind.Other).ConfigureAwait(false);
+            if (result is not HttpSuccess success || generation != _navGeneration)
+                return;
+
+            bool isBackgroundSound = selected.TagName == "bgsound";
+            int repeatCount = isBackgroundSound
+                ? LegacyMidiLoop.ParseBgSoundLoop(selected.GetAttr("loop"))
+                : LegacyMidiLoop.ParseEmbedLoop(selected.GetAttr("loop"));
+            bool autostart = isBackgroundSound || LegacyMidiLoop.ParseAutoStart(selected.GetAttr("autostart"));
+            int volume = isBackgroundSound ? 100 : LegacyMidiLoop.ParseVolume(selected.GetAttr("volume"));
+            bool showControls = !isBackgroundSound && EmbedHasVisibleControls(selected);
+
+            _embeddedMidiBytes = success.Body;
+            _embeddedMidiName = SuggestDownloadFileName(absolute, success.Headers);
+            _embeddedMidiElement = showControls ? selected : null;
+            _embeddedMidiRepeatCount = repeatCount;
+            _embeddedMidiVolume = volume;
+            _midiUiSuppressed = true;
+            _midiPlayer.Volume = volume / 100f;
+            _midiPlayer.RepeatCount = repeatCount;
+
+            if (autostart)
+                await _midiPlayer.PlayBytesAsync(success.Body, _embeddedMidiName, repeatCount).ConfigureAwait(false);
+
+            if (generation == _navGeneration)
+            {
+                BeginInvokeSafe(() =>
+                {
+                    if (showControls)
+                        _canvas.SetEmbeddedMidiControls(selected, _embeddedMidiName!, repeatCount != 1, _midiPlayer.IsPlaying, volume);
+                    else
+                        _canvas.ClearEmbeddedMidiControls();
+                    UpdateMidiUi();
+                });
+            }
+        }
+        catch { }
+    }
+
+    private static bool ShouldLegacyMidiAutostart(DomElement element) =>
+        element.TagName == "bgsound" || LegacyMidiLoop.ParseAutoStart(element.GetAttr("autostart"));
+
+    private static bool EmbedHasVisibleControls(DomElement element)
+    {
+        if (LegacyMidiLoop.IsTrue(element.GetAttr("hidden"))) return false;
+        string? width = element.GetAttr("width");
+        string? height = element.GetAttr("height");
+        if (string.IsNullOrWhiteSpace(width) && string.IsNullOrWhiteSpace(height)) return false;
+        if (int.TryParse(width, out int w) && w == 0) return false;
+        if (int.TryParse(height, out int h) && h == 0) return false;
+        return true;
+    }
+
+    private static bool TryResolveMidiSource(ParsedUrl baseUrl, string? src, out string absolute)
+    {
+        absolute = string.Empty;
+        if (string.IsNullOrWhiteSpace(src)) return false;
+        try
+        {
+            var resolved = baseUrl.Resolve(src);
+            string path = resolved.Path ?? string.Empty;
+            if (!path.EndsWith(".mid", StringComparison.OrdinalIgnoreCase) &&
+                !path.EndsWith(".midi", StringComparison.OrdinalIgnoreCase))
+                return false;
+            absolute = resolved.ToAbsolute();
+            return true;
+        }
+        catch { return false; }
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)

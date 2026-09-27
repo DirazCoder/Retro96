@@ -304,6 +304,14 @@ public static class LayoutEngine
                         ApplyStylesToBox(box, style);
                         ApplyHtmlPresentationalAttrs(box, elem, containingWidth);
 
+                        // Definition descriptions have a visible hanging
+                        // indent in the HTML 3.2 UA presentation. Keep that
+                        // invariant on the actual layout box as well as in the
+                        // computed style so no fallback path can flatten <dd>
+                        // back onto the <dt> column.
+                        if (elem.TagName == "dd")
+                            box.MarginLeft = Math.Max(box.MarginLeft, 40f);
+
                         // CSS1 width/height (CSS beats the HTML attribute — the
                         // CSS1 cascade puts presentational attributes below author
                         // styles, exactly like NN4).  Percentage widths wait for
@@ -588,7 +596,11 @@ public static class LayoutEngine
 
     private static LayoutBox? CreateSpacerBox(DomElement elem, LayoutBox parentBox)
     {
-        string type = elem.GetAttrOrDefault("type", "horizontal");
+        // SPACER TYPE values were case-insensitive in Netscape's extension.
+        // Without trimming/normalising, a page using TYPE="BLOCK" or
+        // surrounding whitespace falls through to the null case and silently
+        // contributes no layout space.
+        string type = elem.GetAttrOrDefault("type", "horizontal").Trim().ToLowerInvariant();
         int size = Math.Max(0, elem.GetAttrInt("size", 0));
         int width = Math.Max(0, elem.GetAttrInt("width", size));
         int height = Math.Max(0, elem.GetAttrInt("height", size));
@@ -798,6 +810,24 @@ public static class LayoutEngine
         // CSS sizing in GenerateBoxes — see the FIX note there.)
         switch (elem.TagName)
         {
+            case "embed":
+                // LiveAudio was a plugin box. When neither dimension is
+                // supplied, the requested compatibility mode treats the tag
+                // as hidden/no-UI. If only one dimension is supplied, use the
+                // era's common 145×60 control-box fallback for the missing side.
+                if (box.Width <= 0f && box.Height <= 0f &&
+                    !elem.HasAttr("width") && !elem.HasAttr("height"))
+                {
+                    box.Width = 0f;
+                    box.Height = 0f;
+                }
+                else
+                {
+                    if (box.Width <= 0f && !elem.HasAttr("width")) box.Width = 145f;
+                    if (box.Height <= 0f && !elem.HasAttr("height")) box.Height = 60f;
+                }
+                break;
+
             case "iframe":
                 // No WIDTH/HEIGHT → the period default frame size; without
                 // this the frame rect is 0×0 and the child document is
@@ -1142,26 +1172,23 @@ public static class LayoutEngine
             case "var":
                 s.Display = DisplayValue.Inline; break;
 
+            // StyleResolver is authoritative for the semantic formatting
+            // defaults above.  Do not re-apply them here: the layout pass
+            // must preserve author CSS such as `font-weight: lighter` on
+            // <b>/<strong>, `font-style: normal` on <i>/<em>, and explicit
+            // text-decoration overrides.  These formatting defaults remain
+            // available through FallbackStyleFor() for synthetic documents
+            // where no resolved style exists.
             case "b":
             case "strong":
-                s.Display = DisplayValue.Inline;
-                s.FontWeight = FontWeightValue.Bold; break;
-
             case "i":
             case "em":
-                s.Display = DisplayValue.Inline;
-                s.FontStyle = FontStyleValue.Italic; break;
-
             case "u":
             case "ins":
-                s.Display = DisplayValue.Inline;
-                s.TextDecoration |= TextDecoration.Underline; break;
-
             case "s":
             case "strike":
             case "del":
-                s.Display = DisplayValue.Inline;
-                s.TextDecoration |= TextDecoration.LineThrough; break;
+                s.Display = DisplayValue.Inline; break;
 
             // ── NN2/3 + IE extensions ──────────────────────────────────────
             case "font": s.Display = DisplayValue.Inline; break;   // NN-FONT
@@ -1186,6 +1213,7 @@ public static class LayoutEngine
             // ── Non-visual elements (produce no box) ────────────────────────
             case "map":
             case "area":
+            case "bgsound":
                 return null;
 
             // ── Unknown elements → inline (NN2 default) ────────────────────

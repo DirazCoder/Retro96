@@ -931,34 +931,12 @@ public static class DomBindings
             _state = state;
             Class = "Element";
 
-            // Expose the core DOM mutation methods as real own properties.
-            // The virtual Get() path remains for compatibility, but making
-            // these methods concrete on the wrapper avoids pages seeing
-            // `element.setAttribute` as undefined during parse-time feature
-            // probes such as javascript-basic.html.
-            Properties["setAttribute"] = JsValue.FromFunction(
-                new JsFunction((self, args) =>
-                {
-                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
-                    if (attrName.Length == 0) return JsValue.Undefined;
-                    string attrValue = args.Length > 1 ? args[1].ToJsString() : "";
-                    _element.SetAttr(attrName, attrValue);
-                    if (attrName.StartsWith("on", StringComparison.OrdinalIgnoreCase) &&
-                        attrName.Length > 2)
-                    {
-                        _element.EventHandlers[attrName.ToLowerInvariant()] = attrValue;
-                    }
-                    _canvas?.RequestRerender();
-                    return JsValue.Undefined;
-                }, _scope, "setAttribute"));
-
-            Properties["getAttribute"] = JsValue.FromFunction(
-                new JsFunction((self, args) =>
-                {
-                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
-                    var value = _element.GetAttr(attrName);
-                    return value == null ? JsValue.Null : JsValue.From(value);
-                }, _scope, "getAttribute"));
+            // Keep the legacy DOM methods as own properties as well as virtual
+            // Get() members. This matters for JS code that first probes the
+            // member (`if (el.setAttribute)`) before calling it. Some old DOM
+            // code paths only inspect the wrapper's own property map.
+            Properties["setAttribute"] = MakeSetAttributeFunction();
+            Properties["getAttribute"] = MakeGetAttributeFunction();
         }
 
         public DomElement Element => _element;
@@ -1079,8 +1057,46 @@ public static class DomBindings
             sb.Append("</").Append(e.TagName).Append('>');
         }
 
+        private JsValue MakeSetAttributeFunction() => JsValue.FromFunction(
+            new JsFunction((self, args) =>
+            {
+                string attrName = args.Length > 0 ? args[0].ToJsString() : "";
+                if (attrName.Length == 0) return JsValue.Undefined;
+
+                string attrValue = args.Length > 1 ? args[1].ToJsString() : "";
+                _element.SetAttr(attrName, attrValue);
+
+                if (attrName.StartsWith("on", StringComparison.OrdinalIgnoreCase) &&
+                    attrName.Length > 2)
+                {
+                    string eventName = attrName.ToLowerInvariant();
+                    _state?.Interpreter?.ClearDomEventProperty(_element, eventName);
+                    _element.EventHandlers[eventName] = attrValue;
+                }
+
+                _canvas?.RequestRerender();
+                return JsValue.Undefined;
+            }, _scope, "setAttribute"));
+
+        private JsValue MakeGetAttributeFunction() => JsValue.FromFunction(
+            new JsFunction((self, args) =>
+            {
+                string attrName = args.Length > 0 ? args[0].ToJsString() : "";
+                var value = _element.GetAttr(attrName);
+                return value == null ? JsValue.Null : JsValue.From(value);
+            }, _scope, "getAttribute"));
+
         public override JsValue Get(string name)
         {
+            // DOM Level 0 methods are real built-ins, not HTML attributes.
+            // Keep them ahead of routed-attribute handling so `typeof
+            // element.setAttribute` and `typeof element.getAttribute` are
+            // always functions, matching the legacy DOM surface.
+            if (string.Equals(name, "setAttribute", StringComparison.OrdinalIgnoreCase))
+                return MakeSetAttributeFunction();
+            if (string.Equals(name, "getAttribute", StringComparison.OrdinalIgnoreCase))
+                return MakeGetAttributeFunction();
+
             // ── node identity / tree navigation (era scripts probed these) ──
             switch (name)
             {
@@ -1168,9 +1184,36 @@ public static class DomBindings
                     return JsValue.FromObject(BuildElementCollection(_scope, matches, _state));
                 }, _scope, "getElementsByTagName"));
 
-            // Event handlers live as plain properties (assigned functions)
-            if (name.StartsWith("on", StringComparison.OrdinalIgnoreCase))
-                return Properties.TryGetValue(name, out var h) ? h : JsValue.Undefined;
+            // DOM-0 event properties are live properties of the underlying
+            // element. There are two sources in the DOM: a function assigned
+            // by script, and an inline HTML event-source string. Expose both
+            // through the same property surface; the latter must read back as
+            // a function just like a real 1996 DOM did.
+            if (name.StartsWith("on", StringComparison.OrdinalIgnoreCase) && name.Length > 2)
+            {
+                string eventName = name.ToLowerInvariant();
+                if (_state?.Interpreter?.TryGetDomEventProperty(
+                        _element, eventName, out var h) == true &&
+                    h.Type == JsType.Function)
+                    return h;
+
+                if (Properties.TryGetValue(name, out h) && h.Type == JsType.Function)
+                    return h;
+
+                if (_element.EventHandlers.TryGetValue(eventName, out var source) &&
+                    source != "__js_handler__")
+                {
+                    var interpreter = _state?.Interpreter;
+                    if (interpreter != null)
+                    {
+                        return JsValue.FromFunction(new JsFunction(
+                            (self, args) => interpreter.FireEvent(_element, eventName),
+                            _scope, eventName));
+                    }
+                }
+
+                return JsValue.Undefined;
+            }
 
             if (name == "form")
             {
@@ -1323,33 +1366,6 @@ public static class DomBindings
                     return JsValue.FromObject(WrapElement(child, _state!));
                 }, _scope, "removeChild"));
 
-            // setAttribute / getAttribute — the generic attribute surface
-            // era scripts used for late wiring.  setAttribute on an "on*"
-            // name routes into EventHandlers exactly like the parser's
-            // onclick="..." path, so one dispatch mechanism serves inline
-            // attributes, element.onclick = fn, AND setAttribute.
-            if (name == "setAttribute")
-                return JsValue.FromFunction(new JsFunction((self, args) =>
-                {
-                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
-                    if (attrName.Length == 0) return JsValue.Undefined;
-                    string attrValue = args.Length > 1 ? args[1].ToJsString() : "";
-                    _element.SetAttr(attrName, attrValue);
-                    if (attrName.StartsWith("on", StringComparison.OrdinalIgnoreCase) &&
-                        attrName.Length > 2)
-                        _element.EventHandlers[attrName.ToLowerInvariant()] = attrValue;
-                    _canvas?.RequestRerender();
-                    return JsValue.Undefined;
-                }, _scope, "setAttribute"));
-
-            if (name == "getAttribute")
-                return JsValue.FromFunction(new JsFunction((self, args) =>
-                {
-                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
-                    var value = _element.GetAttr(attrName);
-                    return value == null ? JsValue.Null : JsValue.From(value);
-                }, _scope, "getAttribute"));
-
             // DOM-0 NAMED CONTROL ACCESS — form.digits (the era's field
             // idiom, document.clockForm.digits.value = ...).  Named controls
             // live directly on the form object, exactly like on
@@ -1393,13 +1409,26 @@ public static class DomBindings
 
             if (name.StartsWith("on", StringComparison.OrdinalIgnoreCase))
             {
-                // Handler assignment: element.onclick = function() {...}
+                // Handler assignment is a live DOM property. Store it in the
+                // per-element interpreter state so a newly-created wrapper
+                // still observes and dispatches the same function.
+                string eventName = name.ToLowerInvariant();
                 Properties[name] = value;
-
-                // Mirror into the element's EventHandlers as source too, so
-                // the shell's single dispatch path works for both forms
                 if (value.Type == JsType.Function)
-                    _element.EventHandlers[name.ToLowerInvariant()] = "__js_handler__";
+                {
+                    _state?.Interpreter?.SetDomEventProperty(_element, eventName, value);
+                    _element.EventHandlers[eventName] = "__js_handler__";
+                }
+                else if (value.Type == JsType.String)
+                {
+                    _state?.Interpreter?.ClearDomEventProperty(_element, eventName);
+                    _element.EventHandlers[eventName] = value.GetString();
+                }
+                else
+                {
+                    _state?.Interpreter?.ClearDomEventProperty(_element, eventName);
+                    _element.EventHandlers.Remove(eventName);
+                }
                 return;
             }
 

@@ -61,6 +61,61 @@ public class JsEngineTests
     // ── event wiring (the three onclick paths) ───────────────────────
 
     [Fact]
+    public void JavaScriptBasicPage_DOM0MethodsAndDynamicHandlersWork()
+    {
+        var page = new PageHarness();
+        page.LoadFile(Path.Combine(TestPaths.Testdata, "..", "tests", "html-websites", "javascript-basic.html"));
+
+        Check.That(page.ScriptErrors.Count == 0,
+            "javascript-basic.html parse scripts run without fatal errors",
+            string.Join(" | ", page.ScriptErrors.Take(5)));
+
+        Check.That(page.EvalString("typeof document.getElementById") == "function",
+            "javascript-basic exposes document.getElementById as a function");
+        Check.That(page.EvalString("document.getElementById('btnSetAttr') ? 'found' : 'missing'") == "found",
+            "getElementById resolves #btnSetAttr during/after the real page parse");
+        Check.That(page.EvalString("document.getElementById('btnAssign') ? 'found' : 'missing'") == "found",
+            "getElementById resolves #btnAssign during/after the real page parse");
+        Check.That(page.EvalString("typeof document.getElementById('btnSetAttr').setAttribute") == "function",
+            "javascript-basic exposes input.setAttribute as a function");
+        Check.That(page.EvalString("typeof document.getElementById('btnSetAttr').getAttribute") == "function",
+            "javascript-basic exposes input.getAttribute as a function");
+        Check.That(page.EvalString("typeof document.getElementById('btnInline').onclick") == "function",
+            "inline onclick reads back as a function-valued DOM property");
+        Check.That(page.EvalString("document.getElementById('btnSetAttr').setAttribute('data-jsb', 'ok'); document.getElementById('btnSetAttr').getAttribute('data-jsb')") == "ok",
+            "setAttribute/getAttribute round-trip an ordinary DOM attribute");
+
+        var inline = page.Document.AllTags("input").First(e => e.GetAttr("id") == "btnInline");
+        Check.That(page.EvalString("document.getElementById('btnInline').getAttribute('onclick')") == "clickInline()",
+            "getAttribute reads the inline onclick source");
+
+        var setAttr = page.Document.AllTags("input").First(e => e.GetAttr("id") == "btnSetAttr");
+        var assigned = page.Document.AllTags("input").First(e => e.GetAttr("id") == "btnAssign");
+
+        Check.That(setAttr.EventHandlers.TryGetValue("onclick", out var setAttrSource) &&
+                   setAttrSource == "clickSetAttr()",
+            "setAttribute('onclick', ...) installs the handler source", setAttrSource ?? "<missing>");
+        // Force a fresh wrapper lookup. Before the engine fix, JS-assigned DOM0
+        // handlers lived only in ElementWrapper.Properties, so recreating the
+        // wrapper silently lost element.onclick. The handler belongs to the
+        // actual DomElement, not to one wrapper instance.
+        page.State.ElementWrappers.Clear();
+        Check.That(page.EvalString("typeof document.getElementById('btnAssign').onclick") == "function",
+            "element.onclick survives DOM wrapper recreation");
+
+        page.FireEvent(setAttr, "onclick");
+        string path2 = page.EvalString("document.getElementById('cell2').innerHTML");
+        Check.That(path2.Contains("PATH-2"),
+            "setAttribute onclick handler fires from javascript-basic.html", path2);
+
+        page.FireEvent(assigned, "onclick");
+        string path3 = page.EvalString("document.getElementById('cell3').innerHTML");
+        Check.That(path3.Contains("PATH-3"),
+            "element.onclick=function handler fires from javascript-basic.html", path3);
+        Check.Done();
+    }
+
+    [Fact]
     public void OnclickFires_InlineHtmlAttributeWiring()
     {
         var page = new PageHarness();

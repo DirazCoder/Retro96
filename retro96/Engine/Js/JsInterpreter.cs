@@ -84,6 +84,15 @@ public class JsInterpreter
     // dialog was open — this is the "random" script-timeout bug.
     private bool _isExecuting;
 
+    // DOM-0 event-property handlers belong to the DOM element, not to a
+    // particular JavaScript wrapper object. Wrappers can be recreated by
+    // rebinding/DOM collection access; keeping handlers only on the wrapper
+    // makes `element.onclick = fn` silently disappear while inline
+    // `onclick="..."` continues to work. Keep the live function here keyed
+    // by the actual DomElement so dispatch and property reads share one
+    // source of truth.
+    private readonly Dictionary<DomElement, Dictionary<string, JsValue>> _domEventProperties = new();
+
     // Timer registry — ids are handed to script and used by clearTimeout
     private sealed class ScheduledTimer
     {
@@ -135,6 +144,30 @@ public class JsInterpreter
     /// Keeps the interpreter free of any WinForms/DomBindings dependency.
     /// </summary>
     internal Func<DomElement, JsObject>? ElementWrapperHook { get; set; }
+
+    private static string DescribeJsObject(JsObject obj)
+    {
+        if (obj is DomBindings.ElementWrapper elementWrapper)
+        {
+            var el = elementWrapper.Element;
+            string id = el.GetAttr("id") ?? "";
+            return $"<{el.TagName.ToLowerInvariant()}>" +
+                   (id.Length > 0 ? $"#{id}" : "") +
+                   $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(el)}";
+        }
+        return $"Class={obj.Class}@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)}";
+    }
+
+    private static string DescribeJsValue(JsValue value)
+    {
+        if (value.Type == JsType.String)
+            return $"string:'{value.ToJsString()}'";
+        if (value.Type == JsType.Function)
+            return $"function:'{value.GetFunction()?.Name ?? "<anonymous>"}'";
+        if (value.Type == JsType.Object)
+            return $"object:{DescribeJsObject(value.GetObjectOrFunction())}";
+        return $"{value.Type}:{value.ToJsString()}";
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // Entry points
@@ -193,6 +226,7 @@ public class JsInterpreter
         }
         catch (JsInterpreterException ex)
         {
+            Retro96.DebugLog.JsWrite($"SCRIPT_ERROR {ex.GetType().Name}: {ex.Message}");
             string message = $"Uncaught {ex.Message}";
             _setStatus($"Script error: {ex.Message}");
             PublishConsole("error", message);
@@ -217,6 +251,7 @@ public class JsInterpreter
         }
         catch (JsParserException ex)
         {
+            Retro96.DebugLog.JsWrite($"SCRIPT_PARSE_ERROR line={ex.Line} column={ex.Column}: {ex.Message}");
             string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
             _setStatus($"Script error: {ex.Message}");
             PublishConsole("error", message);
@@ -252,6 +287,72 @@ public class JsInterpreter
     // Events (inline handlers + JS-assigned handlers)
     // ─────────────────────────────────────────────────────────────────────
 
+    internal void SetDomEventProperty(DomElement element, string eventName, JsValue value)
+    {
+        string key = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName.ToLowerInvariant()
+            : "on" + eventName.ToLowerInvariant();
+
+        if (!_domEventProperties.TryGetValue(element, out var handlers))
+        {
+            handlers = new Dictionary<string, JsValue>(StringComparer.OrdinalIgnoreCase);
+            _domEventProperties[element] = handlers;
+        }
+        handlers[key] = value;
+        string id = element.GetAttr("id") ?? "";
+        Retro96.DebugLog.JsWrite($"DOM_EVENT_STORE SET element=<{element.TagName.ToLowerInvariant()}>" +
+            (id.Length > 0 ? $"#{id}" : "") +
+            $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{key}' value={DescribeJsValue(value)}");
+    }
+
+    internal void ClearDomEventProperty(DomElement element, string eventName)
+    {
+        string key = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName.ToLowerInvariant()
+            : "on" + eventName.ToLowerInvariant();
+        if (_domEventProperties.TryGetValue(element, out var handlers))
+        {
+            bool removed = handlers.Remove(key);
+            if (handlers.Count == 0)
+                _domEventProperties.Remove(element);
+            string id = element.GetAttr("id") ?? "";
+            Retro96.DebugLog.JsWrite($"DOM_EVENT_STORE CLEAR element=<{element.TagName.ToLowerInvariant()}>" +
+                (id.Length > 0 ? $"#{id}" : "") +
+                $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{key}' removed={removed}");
+        }
+        else
+        {
+            string id = element.GetAttr("id") ?? "";
+            Retro96.DebugLog.JsWrite($"DOM_EVENT_STORE CLEAR element=<{element.TagName.ToLowerInvariant()}>" +
+                (id.Length > 0 ? $"#{id}" : "") +
+                $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{key}' removed=false(no-store)");
+        }
+    }
+
+    internal bool TryGetDomEventProperty(DomElement element, string eventName, out JsValue value)
+    {
+        string key = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName.ToLowerInvariant()
+            : "on" + eventName.ToLowerInvariant();
+        if (_domEventProperties.TryGetValue(element, out var handlers) &&
+            handlers.TryGetValue(key, out var found) &&
+            found != null)
+        {
+            value = found;
+            string id = element.GetAttr("id") ?? "";
+            Retro96.DebugLog.JsWrite($"DOM_EVENT_STORE GET element=<{element.TagName.ToLowerInvariant()}>" +
+                (id.Length > 0 ? $"#{id}" : "") +
+                $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{key}' -> {DescribeJsValue(found)}");
+            return true;
+        }
+        value = JsValue.Undefined;
+        string missId = element.GetAttr("id") ?? "";
+        Retro96.DebugLog.JsWrite($"DOM_EVENT_STORE GET element=<{element.TagName.ToLowerInvariant()}>" +
+            (missId.Length > 0 ? $"#{missId}" : "") +
+            $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{key}' -> MISS");
+        return false;
+    }
+
     /// <summary>
     /// Fire an event handler with the element as 'this' and an 'event'
     /// object in scope.  Handles both forms:
@@ -269,31 +370,61 @@ public class JsInterpreter
         string normalizedEvent = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
             ? eventName.ToLowerInvariant()
             : "on" + eventName.ToLowerInvariant();
+        string elementId = element.GetAttr("id") ?? "";
+        Retro96.DebugLog.JsWrite($"FIRE_EVENT element=<{element.TagName.ToLowerInvariant()}>" +
+            (elementId.Length > 0 ? $"#{elementId}" : "") +
+            $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{normalizedEvent}'");
 
-        // DOM-0 property handlers are the source of truth for
-        // `element.onclick = function () { ... }`.  Do this lookup even when
-        // EventHandlers has no sentinel: older pages and setAttribute/property
-        // mutations can legitimately create the handler without going through
-        // the HTML parser.  This also prevents a stale EventHandlers dictionary
-        // from making an otherwise valid property assignment inert.
+        // DOM-0 property handlers live on the DOM element's scripting state,
+        // not on a transient wrapper. This is the source of truth for
+        // `element.onclick = function () { ... }`.
         var wrapperForProperty = ElementWrapperHook?.Invoke(element);
-        if (wrapperForProperty != null &&
-            wrapperForProperty.Properties.TryGetValue(normalizedEvent, out var propertyHandler) &&
+        JsValue propertyHandler;
+        if (TryGetDomEventProperty(element, normalizedEvent, out propertyHandler) &&
             propertyHandler.Type == JsType.Function)
         {
-            return CallHandler(propertyHandler, JsValue.FromObject(wrapperForProperty), eventObj);
+            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=dom-property event='{normalizedEvent}' handler={DescribeJsValue(propertyHandler)}");
+            var thisValue = wrapperForProperty != null
+                ? JsValue.FromObject(wrapperForProperty)
+                : JsValue.Undefined;
+            return CallHandler(propertyHandler, thisValue, eventObj);
+        }
+
+        // Keep compatibility with wrappers created before the per-element
+        // event-property store existed.
+        if (wrapperForProperty != null &&
+            wrapperForProperty.Properties.TryGetValue(normalizedEvent, out var wrapperHandler) &&
+            wrapperHandler != null &&
+            wrapperHandler.Type == JsType.Function)
+        {
+            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=wrapper-property event='{normalizedEvent}' handler={DescribeJsValue(wrapperHandler)}");
+            return CallHandler(wrapperHandler, JsValue.FromObject(wrapperForProperty), eventObj);
         }
 
         if (!element.EventHandlers.TryGetValue(normalizedEvent, out var handlerSource))
+        {
+            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=none event='{normalizedEvent}' eventHandlerMap=MISS");
             return JsValue.Undefined;
+        }
 
+        Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=attribute event='{normalizedEvent}' source='{handlerSource}'");
         if (handlerSource == "__js_handler__")
+        {
+            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=none event='{normalizedEvent}' sentinel-without-function");
             return JsValue.Undefined; // property handler was checked above
+        }
 
         try
         {
             var program = JsParser.Parse(handlerSource);
-            var scope = _currentScope.NewChild();
+            // Inline DOM event attributes are compiled in the page's global
+            // event scope, not whichever function/timer scope happened to be
+            // current when the event arrived.  This matters in frames: a
+            // frame has its own interpreter, and handlers such as
+            // onmouseover="hoverOn()" must resolve hoverOn() from that frame
+            // document's global script scope rather than a stale transient
+            // callback scope.
+            var scope = _globalScope.NewChild();
             var thisValue = ElementWrapperHook != null
                 ? JsValue.FromObject(ElementWrapperHook(element))
                 : JsValue.Undefined;
@@ -554,13 +685,23 @@ public class JsInterpreter
                 ? ExecuteExpression(d.Init)
                 : JsValue.Undefined;
             _currentScope.Define(d.Id.Name, value);
+            DebugVariableWrite(d.Id.Name, value);
         }
         return JsValue.Undefined;
     }
 
     private JsValue ExecuteIf(IfStatement ifStmt)
     {
-        if (ExecuteExpression(ifStmt.Test).ToBoolean())
+        var testValue = ExecuteExpression(ifStmt.Test);
+        if (Retro96.DebugLog.JsEnabled)
+        {
+            var testText = testValue.ToJsString();
+            if (testText.Contains("input", StringComparison.OrdinalIgnoreCase) ||
+                testText.Contains("undefined", StringComparison.OrdinalIgnoreCase) ||
+                testText.Contains("null", StringComparison.OrdinalIgnoreCase))
+                Retro96.DebugLog.JsWrite($"IF_TEST value={DescribeJsValue(testValue)} truthy={testValue.ToBoolean()}");
+        }
+        if (testValue.ToBoolean())
             return ExecuteStatement(ifStmt.Consequent);
         if (ifStmt.Alternate != null)
             return ExecuteStatement(ifStmt.Alternate);
@@ -876,6 +1017,21 @@ public class JsInterpreter
     // Expressions
     // ─────────────────────────────────────────────────────────────────────
 
+    private static bool IsDebugVariable(string name) =>
+        name is "btn2" or "btn3" or "d" or "element";
+
+    private void DebugVariableRead(string name, JsValue value)
+    {
+        if (Retro96.DebugLog.JsEnabled && IsDebugVariable(name))
+            Retro96.DebugLog.JsWrite($"VAR_GET name='{name}' -> {DescribeJsValue(value)}");
+    }
+
+    private void DebugVariableWrite(string name, JsValue value)
+    {
+        if (Retro96.DebugLog.JsEnabled && IsDebugVariable(name))
+            Retro96.DebugLog.JsWrite($"VAR_SET name='{name}' value={DescribeJsValue(value)}");
+    }
+
     private JsValue ExecuteExpression(Expr expr)
     {
         CheckTimeout();
@@ -895,7 +1051,7 @@ public class JsInterpreter
             FunctionExpr f => ExecuteFunctionExpr(f),
             ArrayExpr arr => ExecuteArray(arr),
             ObjectExpr o => ExecuteObject(o),
-            Identifier id => _currentScope.Get(id.Name),
+            Identifier id => ReadIdentifierWithDebug(id.Name),
             NumberLiteral num => JsValue.From(num.Value),
             StringLiteral str => JsValue.From(str.Value),
             BoolLiteral b => JsValue.From(b.Value),
@@ -937,6 +1093,7 @@ public class JsInterpreter
             }
 
             _currentScope.Set(ident.Name, newValue);
+            DebugVariableWrite(ident.Name, newValue);
             return newValue;
         }
 
@@ -944,6 +1101,8 @@ public class JsInterpreter
         {
             JsValue objVal = ExecuteExpression(member.Object);
             string name = GetMemberPropertyName(member);
+            if (Retro96.DebugLog.JsEnabled)
+                Retro96.DebugLog.JsWrite($"ASSIGN member='{name}' operator='{a.Operator}' target={DescribeJsValue(objVal)}");
 
             JsValue newValue = a.Operator == "="
                 ? rightVal
@@ -1085,6 +1244,12 @@ public class JsInterpreter
             JsValue objVal = ExecuteExpression(member.Object);
             string name = GetMemberPropertyName(member);
             thisValue = objVal;
+            if (Retro96.DebugLog.JsEnabled &&
+                (name.Equals("setAttribute", StringComparison.OrdinalIgnoreCase) ||
+                 name.Equals("getAttribute", StringComparison.OrdinalIgnoreCase) ||
+                 name.StartsWith("on", StringComparison.OrdinalIgnoreCase) ||
+                 Retro96.DebugLog.JsTraceEnabled))
+                Retro96.DebugLog.JsWrite($"CALL member='{name}' target={DescribeJsValue(objVal)} args={call.Arguments.Count}");
             callee = GetProperty(objVal, name);
         }
         else
@@ -1139,6 +1304,13 @@ public class JsInterpreter
     {
         JsValue objVal = ExecuteExpression(member.Object);
         return GetProperty(objVal, GetMemberPropertyName(member));
+    }
+
+    private JsValue ReadIdentifierWithDebug(string name)
+    {
+        var value = _currentScope.Get(name);
+        DebugVariableRead(name, value);
+        return value;
     }
 
     private JsValue ExecuteFunctionExpr(FunctionExpr f)
@@ -1271,6 +1443,12 @@ public class JsInterpreter
     /// </summary>
     public JsValue CallFunction(JsFunction func, JsValue thisValue, JsValue[] args)
     {
+        if (Retro96.DebugLog.JsEnabled &&
+            (Retro96.DebugLog.JsTraceEnabled ||
+             (func.Name ?? "").StartsWith("on", StringComparison.OrdinalIgnoreCase) ||
+             (func.Name ?? "").Contains("Attribute", StringComparison.OrdinalIgnoreCase)))
+            Retro96.DebugLog.JsWrite($"CALL_FUNCTION name='{func.Name ?? "<anonymous>"}' native={(func.Native != null ? "yes" : "no")} this={DescribeJsValue(thisValue)} argc={args.Length}");
+
         if (func.Native != null)
             return func.Native(thisValue, args);
 
@@ -1333,6 +1511,13 @@ public class JsInterpreter
 
     private static JsValue GetProperty(JsValue target, string name)
     {
+        if (Retro96.DebugLog.JsEnabled &&
+            (name.Equals("setAttribute", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("getAttribute", StringComparison.OrdinalIgnoreCase) ||
+             name.StartsWith("on", StringComparison.OrdinalIgnoreCase) ||
+             Retro96.DebugLog.JsTraceEnabled))
+            Retro96.DebugLog.JsWrite($"PROP_GET name='{name}' target={DescribeJsValue(target)}");
+
         switch (target.Type)
         {
             case JsType.String:
@@ -1371,6 +1556,15 @@ public class JsInterpreter
 
     private static void SetProperty(JsValue target, string name, JsValue value)
     {
+        if (Retro96.DebugLog.JsEnabled &&
+            (name.Equals("setAttribute", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("getAttribute", StringComparison.OrdinalIgnoreCase) ||
+             name.StartsWith("on", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("id", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("value", StringComparison.OrdinalIgnoreCase) ||
+             Retro96.DebugLog.JsTraceEnabled))
+            Retro96.DebugLog.JsWrite($"PROP_SET name='{name}' target={DescribeJsValue(target)} value={DescribeJsValue(value)}");
+
         // Writes to primitives are silently dropped, JS-style
         if (target.Type is JsType.Object or JsType.Function)
             target.GetObjectOrFunction().Set(name, value);

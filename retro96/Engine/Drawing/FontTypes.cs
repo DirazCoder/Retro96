@@ -145,6 +145,61 @@ internal static class FontCatalog
         }
         return null;
     }
+
+    internal static SKTypeface? ResolveLightVariant(string familyName, bool italic)
+    {
+        var candidates = IsLikelySerif(familyName)
+            ? new[] { "Noto Serif", "Segoe UI", "Noto Sans", "DejaVu Sans" }
+            : IsLikelyMono(familyName)
+                ? new[] { "Noto Sans Mono", "Cascadia Mono", "Segoe UI", "Noto Sans" }
+                : new[] { "Segoe UI", "Noto Sans", "Noto Sans Display", "DejaVu Sans" };
+
+        var wanted = new SKFontStyle(
+            SKFontStyleWeight.Light,
+            SKFontStyleWidth.Normal,
+            italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.Equals(familyName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var tf = SKTypeface.FromFamilyName(candidate, wanted);
+            if (tf == null) continue;
+            if (tf.FamilyName.Equals(candidate, StringComparison.OrdinalIgnoreCase) &&
+                tf.FontStyle.Weight <= 350)
+                return tf;
+            tf.Dispose();
+        }
+
+        return null;
+    }
+
+    internal static SKTypeface? ResolveRegularVariant(string familyName, bool italic)
+    {
+        var style = new SKFontStyle(
+            SKFontStyleWeight.Normal,
+            SKFontStyleWidth.Normal,
+            italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+        var tf = SKTypeface.FromFamilyName(familyName, style);
+        if (tf != null && tf.FamilyName.Equals(familyName, StringComparison.OrdinalIgnoreCase))
+            return tf;
+        tf?.Dispose();
+        return null;
+    }
+
+    private static bool IsLikelySerif(string familyName)
+    {
+        string n = familyName.ToLowerInvariant();
+        return n.Contains("serif") || n.Contains("times") || n.Contains("georgia") ||
+               n.Contains("cambria") || n.Contains("baskerville") || n.Contains("garamond");
+    }
+
+    private static bool IsLikelyMono(string familyName)
+    {
+        string n = familyName.ToLowerInvariant();
+        return n.Contains("mono") || n.Contains("courier") || n.Contains("console");
+    }
 }
 
 public sealed class FontFamily : IDisposable
@@ -265,15 +320,41 @@ public sealed class Font : IDisposable
             SKFontStyleWidth.Normal,
             italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
         var styled = SKTypeface.FromFamilyName(family.Name, wanted);
-        if (styled != null &&
-            styled.FamilyName.Equals(family.Name, StringComparison.OrdinalIgnoreCase))
+
+        // CSS 300/lighter is not useful if the host family only has Regular
+        // and Bold: Skia will otherwise select the nearest face, which can
+        // leave a <b style="font-weight:lighter"> visually bold. Prefer an
+        // actual light face when the requested weight is 100..350. We keep
+        // the author's family when it has such a face; otherwise use a
+        // light-capable system family as a last-resort visual fallback.
+        if (Weight <= 350 && (styled == null || styled.FontStyle.Weight > 350))
         {
+            styled?.Dispose();
+            styled = FontCatalog.ResolveLightVariant(family.Name, italic);
+        }
+
+        if (styled != null &&
+            styled.FamilyName.Equals(family.Name, StringComparison.OrdinalIgnoreCase) &&
+            (Weight > 350 || styled.FontStyle.Weight <= 350))
+        {
+            Typeface = styled;
+        }
+        else if (styled != null && Weight <= 350 && styled.FontStyle.Weight <= 350)
+        {
+            // The fallback family is intentionally allowed here when no
+            // light face exists in the requested family.
             Typeface = styled;
         }
         else
         {
             styled?.Dispose();
-            Typeface = family.Typeface;
+            // Never leave a low-weight request on an explicitly bold face.
+            // If no light family exists, use the original family's regular
+            // face rather than silently retaining bold.
+            if (Weight <= 350)
+                Typeface = FontCatalog.ResolveRegularVariant(family.Name, italic) ?? family.Typeface;
+            else
+                Typeface = family.Typeface;
         }
 
         SkFont = new SKFont(Typeface, px)

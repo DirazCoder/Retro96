@@ -45,10 +45,13 @@ public class BrowserCanvas : Control
 
     private bool _blinkVisible = true;
     private DomElement? _lastHoveredElement;
+    private FrameView? _lastHoveredFrame;
 
     // Focused text field only: editable <input> or <textarea>.
     // Other form controls never enter this text-editing focus mode.
     private DomElement? _focusedInput;
+    // Owning frame of the focused editable field. Null means the top-level page.
+    private FrameView? _focusedInputFrame;
 
     // Value snapshot at focus time — drives the onchange-on-blur contract.
     private string? _fieldValueAtFocus;
@@ -62,17 +65,28 @@ public class BrowserCanvas : Control
 
     // Pressed button (Win95 bevel animation)
     private DomElement? _pressedControl;
+    private FrameView? _pressedControlFrame;
 
     // Page text selection
     private LayoutBox? _selAnchor, _selFocus;
+    // Character offsets inside the anchor/focus text runs.  Selection state is
+    // expressed in text coordinates rather than whole layout boxes so partial
+    // word/line selections do not paint the surrounding whitespace or padding.
+    private int _selAnchorOffset, _selFocusOffset;
     private FrameView? _selectionFrame;
     private LayoutBox? _pendingSelectionAnchor;
+    private int _pendingSelectionAnchorOffset;
     private FrameView? _pendingSelectionFrame;
     private System.Drawing.Point _selStart;
     private bool _selecting;
     private bool _dragMoved;
     private bool _suppressNextMouseUp;
     private LayoutBox? _lastTextClickBox;
+    // Layout boxes are rebuilt when hover/active CSS is resolved. Do not use
+    // the box reference itself to recognize a double/triple click; keep the
+    // stable DOM element and frame identity instead.
+    private DomElement? _lastTextClickElement;
+    private FrameView? _lastTextClickFrame;
     private System.Drawing.Point _lastTextClickPoint;
     private long _lastTextClickTicks;
     private int _textClickCount;
@@ -82,6 +96,7 @@ public class BrowserCanvas : Control
     // reproduce the familiar double-click word / triple-click all behaviour
     // here for both <input> and <textarea>.
     private DomElement? _lastFieldClickElement;
+    private FrameView? _lastFieldClickFrame;
     private System.Drawing.Point _lastFieldClickPoint;
     private long _lastFieldClickTicks;
     private int _fieldClickCount;
@@ -98,13 +113,26 @@ public class BrowserCanvas : Control
     private string _embeddedMidiLabel = "MIDI";
     private bool _embeddedMidiPlaying;
     private bool _embeddedMidiLoop;
+    private int _embeddedMidiVolume = 100;
     private RectangleF _embeddedMidiRect;
     private string? _embeddedMidiPressedAction;
+    private bool _embeddedMidiVolumeDragging;
 
     private readonly Dictionary<LayoutBox, FrameView> _frames = new();
     private readonly Dictionary<DomElement, int> _selectRangeAnchors = new();
     private LayoutBox? _focusedFrame;
     private bool _showBoxOutlines;
+
+    // Legacy frame/iframe scrollbars are painted inside the frame itself.
+    // WinForms scrollbars are reserved for the top-level page, so frame
+    // scrollbars need their own hit-testing and thumb-drag state.
+    private enum FrameScrollbarAxis { Vertical, Horizontal }
+    private LayoutBox? _frameScrollbarDragBox;
+    private FrameView? _frameScrollbarDragView;
+    private FrameScrollbarAxis _frameScrollbarDragAxis;
+    private float _frameScrollbarDragStartPointer;
+    private float _frameScrollbarDragStartScroll;
+    private bool _frameScrollbarMouseDownHandled;
 
     // Cached content flags (one DOM pass per render instead of three).
     private bool _hasAnimatedImages;
@@ -147,6 +175,7 @@ public class BrowserCanvas : Control
     public event Action? PageChanged;
     public event Action<System.Windows.Forms.ContextMenuStrip, Retro96.Plugins.ContextMenuContext>? PluginContextMenuRequested;
     public event Action<string>? EmbeddedMidiControlRequested;
+    public event Action<string>? ExternalProtocolRequested;
 
     public LayoutBox? RootBox => _rootBox;
     public DomDocument? PageDocument => _document;
@@ -247,6 +276,7 @@ public class BrowserCanvas : Control
 
             _controlDefaults.Clear();
             _focusedInput = null;
+            _focusedInputFrame = null;
             _lastHoveredElement = null;
             _taCacheLines = null;
             _taCacheText = null;
@@ -291,23 +321,28 @@ public class BrowserCanvas : Control
         // Focus is dropped silently on navigation — running the old page's
         // blur/change handlers from inside SetPage re-enters navigation.
         _focusedInput = null;
+        _focusedInputFrame = null;
         _fieldDragging = false;
         _lastFieldClickElement = null;
+        _lastFieldClickFrame = null;
         _fieldClickCount = 0;
         var focusDoc = _document;
         if (focusDoc != null)
             UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, null);
         _fieldValueAtFocus = null;
         _pressedControl = null;
+        _pressedControlFrame = null;
         _controlDefaults.Clear();
         _selectRangeAnchors.Clear();
         _contextElement = null;
 
-        _selAnchor = _selFocus = null;
-        _selectionFrame = null;
-        _pendingSelectionAnchor = null;
-        _pendingSelectionFrame = null;
+        ClearPageSelection();
         _selecting = false;
+        _lastTextClickBox = null;
+        _lastTextClickElement = null;
+        _lastTextClickFrame = null;
+        _lastTextClickTicks = 0;
+        _textClickCount = 0;
 
         _document = doc;
         _rootBox = rootBox;
@@ -532,18 +567,57 @@ public class BrowserCanvas : Control
         if (_selAnchor == null && _selFocus == null) return;
         _selAnchor = FindMatchingBox(newRoot, _selAnchor);
         _selFocus = FindMatchingBox(newRoot, _selFocus);
+        _selAnchorOffset = Math.Clamp(_selAnchorOffset, 0, _selAnchor?.TextRun?.Length ?? 0);
+        _selFocusOffset = Math.Clamp(_selFocusOffset, 0, _selFocus?.TextRun?.Length ?? 0);
         if (_selAnchor == null || _selFocus == null)
-            _selAnchor = _selFocus = null;
+            ClearPageSelection();
+    }
+
+    private void RemapFrameSelection(FrameView frameView, LayoutBox newRoot)
+    {
+        if (ReferenceEquals(_selectionFrame, frameView))
+        {
+            var oldAnchor = _selAnchor;
+            var oldFocus = _selFocus;
+            _selAnchor = FindMatchingBox(newRoot, oldAnchor);
+            _selFocus = FindMatchingBox(newRoot, oldFocus);
+            _selAnchorOffset = Math.Clamp(_selAnchorOffset, 0, _selAnchor?.TextRun?.Length ?? 0);
+            _selFocusOffset = Math.Clamp(_selFocusOffset, 0, _selFocus?.TextRun?.Length ?? 0);
+            if (_selAnchor == null || _selFocus == null)
+                ClearPageSelection();
+        }
+
+        if (ReferenceEquals(_pendingSelectionFrame, frameView) && _pendingSelectionAnchor != null)
+        {
+            _pendingSelectionAnchor = FindMatchingBox(newRoot, _pendingSelectionAnchor);
+            _pendingSelectionAnchorOffset = Math.Clamp(_pendingSelectionAnchorOffset, 0, _pendingSelectionAnchor?.TextRun?.Length ?? 0);
+            if (_pendingSelectionAnchor == null)
+                _pendingSelectionFrame = null;
+        }
     }
 
     private static LayoutBox? FindMatchingBox(LayoutBox root, LayoutBox? old)
     {
         if (old?.Element == null) return null;
+
+        // Layout boxes are disposable: hover/focus changes can rebuild the
+        // entire tree while a page selection is still active.  Recover the
+        // endpoint from stable DOM identity plus text/position rather than
+        // assuming the first matching fragment is the same one.  This is
+        // especially important for wrapped text and repeated identical runs.
         string text = old.TextRun ?? "";
-        foreach (var b in root.Descendants())
-            if (ReferenceEquals(b.Element, old.Element) && b.TextRun == text)
-                return b;
-        return null;
+        var candidates = root.Descendants()
+            .Where(b => ReferenceEquals(b.Element, old.Element) &&
+                        !string.IsNullOrEmpty(b.TextRun))
+            .ToList();
+        if (candidates.Count == 0) return null;
+
+        var exact = candidates.Where(b => b.TextRun == text).ToList();
+        if (exact.Count == 0) exact = candidates;
+
+        return exact
+            .OrderBy(b => Math.Abs(b.X - old.X) + Math.Abs(b.Y - old.Y))
+            .FirstOrDefault();
     }
 
     private void RemapFramesToNewRoot(LayoutBox newRoot)
@@ -654,6 +728,84 @@ public class BrowserCanvas : Control
         return false;
     }
 
+    /// <summary>Find the frame's immediate host, including top-level frames.</summary>
+    public bool TryFindFrameHost(FrameView target, out FrameView? parent, out LayoutBox? box)
+    {
+        foreach (var (topBox, topView) in _frames)
+        {
+            if (ReferenceEquals(topView, target))
+            {
+                parent = null; box = topBox; return true;
+            }
+            if (TryFindFrameHostRecursive(topView, target, out parent, out box))
+                return true;
+        }
+        parent = null; box = null; return false;
+    }
+
+    private static bool TryFindFrameHostRecursive(FrameView current, FrameView target,
+                                                   out FrameView? parent, out LayoutBox? box)
+    {
+        foreach (var (childBox, childView) in current.ChildFrames)
+        {
+            if (ReferenceEquals(childView, target))
+            { parent = current; box = childBox; return true; }
+            if (TryFindFrameHostRecursive(childView, target, out parent, out box))
+                return true;
+        }
+        parent = null; box = null; return false;
+    }
+
+    private bool TryFindFrameViewByDocument(DomDocument document,
+                                            out FrameView? view, out FrameView? parent,
+                                            out LayoutBox? box)
+    {
+        foreach (var (topBox, topView) in _frames)
+        {
+            if (ReferenceEquals(topView.Document, document))
+            { view = topView; parent = null; box = topBox; return true; }
+            if (TryFindFrameViewByDocumentRecursive(topView, document, out view, out parent, out box))
+                return true;
+        }
+        view = null; parent = null; box = null; return false;
+    }
+
+    private static bool TryFindFrameViewByDocumentRecursive(FrameView current, DomDocument document,
+                                                              out FrameView? view, out FrameView? parent,
+                                                              out LayoutBox? box)
+    {
+        foreach (var (childBox, childView) in current.ChildFrames)
+        {
+            if (ReferenceEquals(childView.Document, document))
+            { view = childView; parent = current; box = childBox; return true; }
+            if (TryFindFrameViewByDocumentRecursive(childView, document, out view, out parent, out box))
+                return true;
+        }
+        view = null; parent = null; box = null; return false;
+    }
+
+    public void ClearChildFrames(FrameView view)
+    {
+        foreach (var (_, child) in view.ChildFrames) DisposeFrameView(child);
+        view.ChildFrames.Clear();
+    }
+
+    public void RecomposeFrameTree(FrameView view)
+    {
+        if (!TryFindFrameHost(view, out var parent, out var box) || box == null)
+        { Invalidate(); return; }
+        if (parent == null)
+        { RenderFrameBitmap(box, view); Invalidate(); return; }
+        var root = parent;
+        while (TryFindFrameHost(root, out var rootParent, out _) && rootParent != null)
+            root = rootParent;
+        if (TryFindFrameHost(root, out var topParent, out var topBox) && topParent == null && topBox != null)
+            RenderFrameBitmap(topBox, root);
+        else
+            RenderFrameBitmap(box, view);
+        Invalidate();
+    }
+
     private static bool TryFindParentFrameRecursive(FrameView current, FrameView target,
                                                     out FrameView? parent, out LayoutBox? childBox)
     {
@@ -693,16 +845,23 @@ public class BrowserCanvas : Control
         _renderedBitmap?.Dispose();
         _renderedBitmap = null;
         _focusedInput = null;
+        _focusedInputFrame = null;
         _fieldDragging = false;
         _fieldValueAtFocus = null;
         _pressedControl = null;
-        _selAnchor = _selFocus = null;
-        _selectionFrame = null;
-        _pendingSelectionAnchor = null;
-        _pendingSelectionFrame = null;
+        _pressedControlFrame = null;
+        ClearPageSelection();
         _selecting = false;
+        _lastTextClickBox = null;
+        _lastTextClickElement = null;
+        _lastTextClickFrame = null;
+        _lastTextClickTicks = 0;
+        _textClickCount = 0;
+        _lastHoveredElement = null;
+        _lastHoveredFrame = null;
         _embeddedMidiElement = null;
         _embeddedMidiPressedAction = null;
+        _embeddedMidiVolumeDragging = false;
         _embeddedMidiRect = RectangleF.Empty;
         _scrollOffset = PointF.Empty;
         UpdateScrollBars();
@@ -767,13 +926,20 @@ public class BrowserCanvas : Control
 
         try
         {
-            var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader);
+            // Frames are rendered into their full content surface, not just
+            // the viewport.  A frame document can have a constrained root box
+            // while a descendant (wide table/image/pre/etc.) extends beyond
+            // it.  Use the actual descendant extents so overflow remains
+            // available to horizontal/vertical scrolling.
+            var contentSize = GetFrameContentSize(view.RootBox, frameBox.Width, frameBox.Height);
+            var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
+            { PressedElement = _pressedControlFrame == view ? _pressedControl : null };
             var bmp = renderer.Render(
                 view.RootBox, view.Document,
                 _fontCache, _imageCache,
-                frameBox.Width, frameBox.Height,
+                contentSize.Width, contentSize.Height,
                 view.Scroll.X, view.Scroll.Y,
-                _lastHoveredElement,
+                view.Document.HoveredElement,
                 _blinkVisible,
                 focusedElement: _focusedInput != null &&
                     FindBoxForElement(view.RootBox, _focusedInput) != null
@@ -782,8 +948,8 @@ public class BrowserCanvas : Control
             view.Rendered?.Dispose();
             view.Rendered = bmp;
 
-            bool overflow = view.RootBox.Width > frameBox.Width + 0.5f ||
-                            view.RootBox.Height > frameBox.Height + 0.5f;
+            bool overflow = contentSize.Width > frameBox.Width + 0.5f ||
+                            contentSize.Height > frameBox.Height + 0.5f;
             view.ScrollingEnabled = view.ScrollMode switch
             {
                 FrameScrollMode.Yes => true,
@@ -791,6 +957,12 @@ public class BrowserCanvas : Control
                 _ => overflow
             };
             if (!view.ScrollingEnabled) view.Scroll = PointF.Empty;
+            else
+            {
+                var metrics = GetFrameScrollMetrics(frameBox, view);
+                view.Scroll.X = Math.Clamp(view.Scroll.X, 0f, metrics.MaxScrollX);
+                view.Scroll.Y = Math.Clamp(view.Scroll.Y, 0f, metrics.MaxScrollY);
+            }
         }
         catch (Exception ex)
         {
@@ -809,23 +981,29 @@ public class BrowserCanvas : Control
 
     /// <summary>Composes a nested frame's bitmap into its parent frame's
     /// bitmap at the nested frame's (document-local) rect.</summary>
-    private static void ComposeChildIntoParent(FrameView parent,
-                                               LayoutBox childBox, FrameView childView)
+    private void ComposeChildIntoParent(FrameView parent, LayoutBox childBox, FrameView childView)
     {
         if (parent.Rendered == null || childView.Rendered == null) return;
-
         var r = childBox.BorderRect;
-        float w = Math.Min(r.Width, childView.Rendered.Width);
-        float h = Math.Min(r.Height, childView.Rendered.Height);
-        if (w <= 0 || h <= 0) return;
-
+        if (r.Width <= 0 || r.Height <= 0) return;
+        var metrics = GetFrameScrollMetrics(childBox, childView);
+        float visibleW = Math.Max(1f, r.Width - (metrics.Vertical ? 16f : 0f));
+        float visibleH = Math.Max(1f, r.Height - (metrics.Horizontal ? 16f : 0f));
+        visibleW = Math.Min(visibleW, r.Width);
+        visibleH = Math.Min(visibleH, r.Height);
         using var g = Graphics.FromImage(parent.Rendered);
-        g.InterpolationMode = InterpolationMode.NearestNeighbor;   // pixel-exact, no bilinear bleed
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
         var state = g.Save();
-        g.SetClip(new RectangleF(r.X, r.Y, w, h));
-        g.DrawImage(childView.Rendered,
-            new RectangleF(r.X, r.Y, w, h),
-            new RectangleF(0, 0, w, h), GraphicsUnit.Pixel);
+        g.SetClip(new RectangleF(r.X, r.Y, r.Width, r.Height));
+        float sourceX = Math.Max(0f, childView.Scroll.X);
+        float sourceY = Math.Max(0f, childView.Scroll.Y);
+        float sourceW = Math.Min(visibleW, childView.Rendered.Width - sourceX);
+        float sourceH = Math.Min(visibleH, childView.Rendered.Height - sourceY);
+        if (sourceW > 0 && sourceH > 0)
+            g.DrawImage(childView.Rendered, new RectangleF(r.X, r.Y, sourceW, sourceH),
+                new RectangleF(sourceX, sourceY, sourceW, sourceH), GraphicsUnit.Pixel);
+        PaintFrameScrollbars(g, r, childView, childBox);
+        if (childView.FrameBorder) PaintFrameBorder(g, r);
         g.Restore(state);
     }
 
@@ -851,19 +1029,8 @@ public class BrowserCanvas : Control
         parent.ChildFrames.Add((childBox, childView));
 
         RenderFrameBitmap(childBox, childView);
-        // FIX: compose directly — nested-of-nested parents (not in _frames)
-        // never got composed at all before.
-        ComposeChildIntoParent(parent, childBox, childView);
-
-        // Recompose the whole parent so earlier children stay painted too.
-        if (_frames.Count > 0)
-        {
-            foreach (var (box, view) in _frames)
-                if (ReferenceEquals(view, parent))
-                { RenderFrameBitmap(box, view); break; }
-        }
+        RecomposeFrameTree(parent);
         CheckAndStartTimers();
-        Invalidate();
     }
 
     /// <summary>Re-renders a child frame and recomposes it into its parent
@@ -874,13 +1041,19 @@ public class BrowserCanvas : Control
         ArgumentNullException.ThrowIfNull(childBox);
         ArgumentNullException.ThrowIfNull(childView);
         RenderFrameBitmap(childBox, childView);
-        ComposeChildIntoParent(parent, childBox, childView);
-        Invalidate();
+        RecomposeFrameTree(parent);
     }
 
     // ─────────────────────────────────────────────────────────────────────
     // Painting
     // ─────────────────────────────────────────────────────────────────────
+
+    // The page bitmap is blitted from integer source coordinates. Live
+    // overlays must use the same integer scroll origin or focused controls
+    // can move by a fractional pixel when the page is scrolled with a
+    // precision wheel/touchpad.
+    private float PaintScrollX => Math.Max(0, (int)MathF.Floor(_scrollOffset.X));
+    private float PaintScrollY => Math.Max(0, (int)MathF.Floor(_scrollOffset.Y));
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -913,6 +1086,9 @@ public class BrowserCanvas : Control
         if (Math.Abs(zoom - 1f) > 0.001f)
             g.ScaleTransform(zoom, zoom);
 
+        float paintScrollX = PaintScrollX;
+        float paintScrollY = PaintScrollY;
+
         if (_renderedBitmap != null)
         {
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
@@ -920,9 +1096,9 @@ public class BrowserCanvas : Control
             // IMPORTANT PERF: give Skia only the logical source slice that is
             // visible. The ScaleTransform expands that slice to the physical
             // viewport without rescanning the entire document bitmap.
-            int sourceX = Math.Clamp((int)_scrollOffset.X, 0,
+            int sourceX = Math.Clamp((int)paintScrollX, 0,
                 Math.Max(0, _renderedBitmap.Width - 1));
-            int sourceY = Math.Clamp((int)_scrollOffset.Y, 0,
+            int sourceY = Math.Clamp((int)paintScrollY, 0,
                 Math.Max(0, _renderedBitmap.Height - 1));
             int sourceW = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVw)), _renderedBitmap.Width - sourceX);
             int sourceH = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVh)), _renderedBitmap.Height - sourceY);
@@ -941,8 +1117,8 @@ public class BrowserCanvas : Control
             if (view.Rendered == null) continue;
 
             var destRect = new RectangleF(
-                box.X - _scrollOffset.X,
-                box.Y - _scrollOffset.Y,
+                box.X - paintScrollX,
+                box.Y - paintScrollY,
                 box.Width, box.Height);
 
             // Skip frames that are completely outside the viewport.  This is
@@ -974,6 +1150,11 @@ public class BrowserCanvas : Control
                     GraphicsUnit.Pixel);
             }
 
+            if (visible.Width > 0 && visible.Height > 0)
+            {
+                PaintFrameScrollbars(g, destRect, view, box);
+            }
+
             if (view.FrameBorder && visible.Width > 0 && visible.Height > 0)
             {
                 PaintFrameBorder(g, destRect);
@@ -984,77 +1165,87 @@ public class BrowserCanvas : Control
                 using var focusPen = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 1);
                 g.DrawRectangle(focusPen, destRect.X, destRect.Y,
                     destRect.Width - 1, destRect.Height - 1);
-                if (_focusedInput != null &&
-                    FindBoxForElement(view.RootBox, _focusedInput) != null)
-                    PaintFrameFieldOverlay(g, box, view);
             }
+
+            if (visible.Width > 0 && visible.Height > 0)
+                PaintFocusedFrameFieldOverlayRecursive(g, destRect, view);
         }
 
-        // Page/frame text selection highlight — one CONTIGUOUS rectangle per
-        // visual line.  Frame selections are painted over the composed frame
-        // bitmap in the frame's own document coordinates.
+        // Page/frame text selection highlight.  Paint only the selected glyph
+        // spans of each inline text run.  Never merge adjacent runs, because
+        // that would fill inter-word whitespace, inline gaps, padding, or an
+        // empty container between the runs.
         if (_selAnchor != null && _selFocus != null)
         {
             using var selBrush = new SolidBrush(Color.FromArgb(110, 0, 0, 170));
 
-            var selBoxes = SelectedTextBoxes()
-                .Where(b => b.Width > 0f && b.Height > 0f)
-                .OrderBy(b => (int)(b.Y / 4f))
-                .ThenBy(b => b.X)
-                .ToList();
-
-            float offsetX = -_scrollOffset.X;
-            float offsetY = -_scrollOffset.Y;
-            int selectionState = -1;
-            if (_selectionFrame != null && TryFindFrameBox(_selectionFrame, out var selectionFrameBox))
+            var selectionRoot = _selectionFrame?.RootBox ?? _rootBox;
+            if (selectionRoot != null)
             {
-                offsetX = selectionFrameBox.X - _scrollOffset.X - _selectionFrame.Scroll.X;
-                offsetY = selectionFrameBox.Y - _scrollOffset.Y - _selectionFrame.Scroll.Y;
-                selectionState = g.Save();
-                g.SetClip(new RectangleF(
-                    selectionFrameBox.X - _scrollOffset.X,
-                    selectionFrameBox.Y - _scrollOffset.Y,
-                    selectionFrameBox.Width,
-                    selectionFrameBox.Height),
-                    CombineMode.Intersect);
-            }
-
-            float spanL = float.MinValue, spanR = float.MinValue;
-            float spanTop = 0f, spanBot = 0f;
-
-            void FlushSpan()
-            {
-                if (spanR > spanL)
-                    g.FillRectangle(selBrush,
-                        spanL + offsetX, spanTop + offsetY,
-                        spanR - spanL, Math.Max(1f, spanBot - spanTop));
-                spanL = spanR = float.MinValue;
-            }
-
-            foreach (var b in selBoxes)
-            {
-                float l = b.X, r = b.X + b.Width;
-                float top = b.Y, bot = b.Y + b.Height;
-
-                bool sameLine =
-                    spanR > spanL &&
-                    Math.Abs(top - spanTop) < 4f;
-
-                if (!sameLine)
+                var ordered = selectionRoot.Descendants()
+                    // Collapsed single ASCII spaces do not have a rendered
+                    // glyph of their own.  Keeping them as standalone
+                    // selection boxes causes stray little rectangles at line
+                    // starts/ends. Word-to-word selection is connected later
+                    // by the same-line span merge.
+                    .Where(b => !string.IsNullOrEmpty(b.TextRun))
+                    .ToList();
+                int anchorIndex = ordered.IndexOf(_selAnchor);
+                int focusIndex = ordered.IndexOf(_selFocus);
+                if (anchorIndex >= 0 && focusIndex >= 0)
                 {
-                    FlushSpan();
-                    spanL = l; spanR = r; spanTop = top; spanBot = bot;
-                }
-                else
-                {
-                    spanR = Math.Max(spanR, r);
-                    spanTop = Math.Min(spanTop, top);
-                    spanBot = Math.Max(spanBot, bot);
+                    bool forward = anchorIndex < focusIndex ||
+                        (anchorIndex == focusIndex && _selAnchorOffset <= _selFocusOffset);
+                    int firstIndex = Math.Min(anchorIndex, focusIndex);
+                    int lastIndex = Math.Max(anchorIndex, focusIndex);
+
+                    float offsetX = -paintScrollX;
+                    float offsetY = -paintScrollY;
+                    int selectionState = -1;
+                    if (_selectionFrame != null &&
+                        TryGetFrameDestinationRect(_selectionFrame, out var selectionFrameDestRect))
+                    {
+                        offsetX = selectionFrameDestRect.X - _selectionFrame.Scroll.X;
+                        offsetY = selectionFrameDestRect.Y - _selectionFrame.Scroll.Y;
+                        selectionState = g.Save();
+                        g.SetClip(selectionFrameDestRect, CombineMode.Intersect);
+                    }
+
+                    for (int i = firstIndex; i <= lastIndex; i++)
+                    {
+                        var box = ordered[i];
+                        int len = box.TextRun?.Length ?? 0;
+                        if (len == 0 || box.TextRun == " ") continue;
+
+                        int a = 0, b = len;
+                        if (i == anchorIndex)
+                        {
+                            int off = Math.Clamp(_selAnchorOffset, 0, len);
+                            if (forward) a = off; else b = off;
+                        }
+                        if (i == focusIndex)
+                        {
+                            int off = Math.Clamp(_selFocusOffset, 0, len);
+                            if (forward) b = off; else a = off;
+                        }
+                        if (b < a) (a, b) = (b, a);
+                        if (b <= a) continue;
+
+                        var spans = SelectionVisualSpans(g, box, a, b).ToList();
+                        // Adjacent text runs on the same line should form one continuous
+                        // selection highlight when they touch.  Keep genuinely separate
+                        // layout gaps (padding/margins/empty regions) unpainted.
+                        foreach (var span in MergeSelectionSpans(spans))
+                        {
+                            g.FillRectangle(selBrush,
+                                span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
+                        }
+                    }
+
+                    if (selectionState >= 0)
+                        g.Restore(selectionState);
                 }
             }
-            FlushSpan();
-            if (selectionState >= 0)
-                g.Restore(selectionState);
         }
 
         // Field caret / in-field selection overlay
@@ -1069,8 +1260,6 @@ public class BrowserCanvas : Control
 
     private void PaintFieldOverlay(Graphics g)
     {
-        // The overlay is only for editable fields; selects/buttons never enter
-        // the text-focus state.
         var el = _focusedInput;
         if (el == null || _rootBox == null || !IsEditableField(el)) return;
 
@@ -1088,56 +1277,60 @@ public class BrowserCanvas : Control
         bool password = el.GetAttrOrDefault("type", "text") == "password";
         if (password) text = new string('*', text.Length);
 
-        // Same font + same GenericTypographic format the renderer draws with,
-        // so caret and selection sit on the actual glyph edges.
         var font = ResolveFieldFont(el);
         if (font == null) return;
         using var fmt = NewFieldFormat(noWrap: true);
 
+        float scrollX = PaintScrollX;
+        float scrollY = PaintScrollY;
+        float fieldScroll = EnsureSingleLineCaretVisible(g, text, font, face, _fieldCaret);
+        bool needsTextRepaint = fieldScroll > 0.01f;
+
         float MeasureTo(int n) => n <= 0 ? 0f
             : g.MeasureString(text[..Math.Min(n, text.Length)], font, int.MaxValue, fmt).Width;
-
-        float lineH = font.GetHeight(g);
-        float top = face.Y + Math.Max(1f, (face.Height - lineH) / 2f) - _scrollOffset.Y;
-        float bottom = Math.Min(top + lineH, face.Bottom - 1 - _scrollOffset.Y);
 
         int caret = Math.Clamp(_fieldCaret, 0, text.Length);
         int anchor = Math.Clamp(_fieldSelAnchor, 0, text.Length);
         int selStart = Math.Min(anchor, caret);
         int selEnd = Math.Max(anchor, caret);
-        float fieldScroll = EnsureSingleLineCaretVisible(g, text, font, face, caret);
-        float textX = face.X + 3 - _scrollOffset.X
-                - fieldScroll;
+        float textX = face.X + 3 - scrollX - fieldScroll;
+        float lineH = font.GetHeight(g);
+        float top = face.Y + Math.Max(1f, (face.Height - lineH) / 2f) - scrollY;
+        float bottom = Math.Min(top + lineH, face.Bottom - 1 - scrollY);
 
         var oldClip = g.Save();
-        g.SetClip(new RectangleF(face.X + 2 - _scrollOffset.X, face.Y - _scrollOffset.Y,
+        g.SetClip(new RectangleF(face.X + 2 - scrollX, face.Y - scrollY,
                                  Math.Max(1, face.Width - 4), face.Height),
                   CombineMode.Intersect);
 
-        // Renderer paints the unfocused value from the left. Once the caret
-        // scrolls right, repaint the focused value with the same offset so
-        // dragging can reveal the hidden suffix instead of leaving stale text
-        // underneath the selection overlay.
-        var style = el.Style;
-        Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
-            ? style.BackgroundColor : Color.White;
-        Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
-        using (var background = new SolidBrush(fieldBackground))
-            g.FillRectangle(background, face.X + 2 - _scrollOffset.X,
-                face.Y - _scrollOffset.Y, Math.Max(1, face.Width - 4), face.Height);
-        using var focusedTextFormat = NewFieldFormat(noWrap: true);
-        focusedTextFormat.LineAlignment = StringAlignment.Center;
-        using (var foreground = new SolidBrush(fieldForeground))
-            g.DrawString(text, font, foreground,
-                new RectangleF(textX, face.Y - _scrollOffset.Y,
-                    Math.Max(face.Width, MeasureTo(text.Length) + 8), face.Height), focusedTextFormat);
+        // The unfocused page bitmap already contains the exact control text.
+        // Do not redraw it merely because the control gained focus: that was
+        // the source of the scroll-position-dependent one-pixel jump. Only
+        // repaint the control interior when the field has its own horizontal
+        // scrolling, which is not represented in the page bitmap.
+        if (needsTextRepaint)
+        {
+            var style = el.Style;
+            Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
+                ? style.BackgroundColor : Color.White;
+            Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
+            using (var background = new SolidBrush(fieldBackground))
+                g.FillRectangle(background, face.X + 2 - scrollX, face.Y - scrollY,
+                    Math.Max(1, face.Width - 4), face.Height);
+            using var focusedTextFormat = NewFieldFormat(noWrap: true);
+            focusedTextFormat.LineAlignment = StringAlignment.Center;
+            using (var foreground = new SolidBrush(fieldForeground))
+                g.DrawString(text, font, foreground,
+                    new RectangleF(textX, face.Y - scrollY,
+                        Math.Max(face.Width, MeasureTo(text.Length) + 8), face.Height), focusedTextFormat);
+        }
 
         if (selEnd > selStart)
         {
             using var selBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
             float x1 = textX + MeasureTo(selStart);
             float x2 = textX + MeasureTo(selEnd);
-            g.FillRectangle(selBrush, x1, top, Math.Max(1f, x2 - x1), bottom - top);
+            g.FillRectangle(selBrush, x1, top, Math.Max(1f, x2 - x1), Math.Max(1f, bottom - top));
         }
 
         if ((uint)Environment.TickCount / 500 % 2 == 0)
@@ -1148,10 +1341,8 @@ public class BrowserCanvas : Control
         }
         g.Restore(oldClip);
 
-        // Keep the focus outline attached to the control, independent of the
-        // horizontal offset used for the field's text.
         using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
-        g.DrawRectangle(focusPen, face.X - _scrollOffset.X, face.Y - _scrollOffset.Y,
+        g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
             face.Width - 1, face.Height - 1);
     }
 
@@ -1165,19 +1356,35 @@ public class BrowserCanvas : Control
         g.DrawLine(dark, rect.Right - 2, rect.Top, rect.Right - 2, rect.Bottom - 2);
     }
 
-    private void PaintFrameFieldOverlay(Graphics g, LayoutBox frameBox, FrameView view)
+    private void PaintFocusedFrameFieldOverlayRecursive(Graphics g, RectangleF frameDestRect, FrameView view)
+    {
+        if (_focusedInput == null) return;
+
+        if (ReferenceEquals(_focusedInputFrame, view))
+            PaintFrameFieldOverlay(g, frameDestRect, view);
+
+        foreach (var (childBox, childView) in view.ChildFrames)
+        {
+            var childDestRect = new RectangleF(
+                frameDestRect.X + childBox.X - view.Scroll.X,
+                frameDestRect.Y + childBox.Y - view.Scroll.Y,
+                childBox.Width, childBox.Height);
+
+            PaintFocusedFrameFieldOverlayRecursive(g, childDestRect, childView);
+        }
+    }
+
+    private void PaintFrameFieldOverlay(Graphics g, RectangleF frameDestRect, FrameView view)
     {
         var el = _focusedInput;
         if (el == null) return;
         var box = FindBoxForElement(view.RootBox, el);
         if (box == null || _fontCache == null) return;
 
-        float frameX = frameBox.X - _scrollOffset.X;
-        float frameY = frameBox.Y - _scrollOffset.Y;
         var localFace = box.ContentRect;
         var face = new RectangleF(
-            frameX + localFace.X - view.Scroll.X,
-            frameY + localFace.Y - view.Scroll.Y,
+            frameDestRect.X + localFace.X - view.Scroll.X,
+            frameDestRect.Y + localFace.Y - view.Scroll.Y,
             localFace.Width, localFace.Height);
         var font = ResolveFieldFont(el);
         if (font == null) return;
@@ -1188,45 +1395,42 @@ public class BrowserCanvas : Control
                 StringComparison.OrdinalIgnoreCase))
             text = new string('*', text.Length);
 
-        var style = el.Style;
-        Color backgroundColor = style != null && style.OwnBackground &&
-            style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
-        Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
-        using var background = new SolidBrush(backgroundColor);
-        using var foreground = new SolidBrush(foregroundColor);
-        using var format = NewFieldFormat(noWrap: el.TagName != "textarea");
-
-        var state = g.Save();
-        g.SetClip(face, CombineMode.Intersect);
-        g.FillRectangle(background, face);
-
         int caret = Math.Clamp(_fieldCaret, 0, text.Length);
         int anchor = Math.Clamp(_fieldSelAnchor, 0, text.Length);
         int selStart = Math.Min(anchor, caret);
         int selEnd = Math.Max(anchor, caret);
+        var state = g.Save();
+        g.SetClip(face, CombineMode.Intersect);
 
         if (el.TagName == "textarea")
         {
-            var geo = GetTextareaGeometry(el, box);
+            var geo = GetTextareaGeometry(el, box, _focusedInputFrame);
             if (geo != null)
             {
                 float lineHeight = geo.Font.GetHeight(g);
                 int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
                 int maxScrollLine = Math.Max(0, geo.Lines.Count - visibleLines);
                 int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
-                // Drawing must not mutate the textarea scroll position. The
-                // old paint-time EnsureTextareaScrollLine call could change
-                // the internal scroll merely because focus caused a repaint,
-                // making the text visibly jump when the page was scrolled.
-                // DrawLines applies the textarea scroll offset itself. Keep the
-                // base origin unscrolled here so text, selection, and caret each
-                // apply (line - scrollLine) exactly once.
-                float textX = face.X + 3;
+                bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
+                float textX = face.X + 3 - _fieldScrollX;
                 float textY = face.Y + 2;
                 using var lineFormat = NewFieldFormat(noWrap: true);
-                Engine.Render.TextareaOverlay.DrawLines(g, text, geo.Font, geo.Lines,
-                    foreground, textX, textY, face.Width - 4, lineHeight,
-                    scrollLine);
+
+                if (needsTextRepaint)
+                {
+                    var style = el.Style;
+                    Color backgroundColor = style != null && style.OwnBackground &&
+                        style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
+                    Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
+                    using var background = new SolidBrush(backgroundColor);
+                    using var foreground = new SolidBrush(foregroundColor);
+                    g.FillRectangle(background, face);
+                    Engine.Render.TextareaOverlay.DrawLines(g, text, geo.Font, geo.Lines,
+                        foreground, textX, textY, face.Width - 4, lineHeight, scrollLine);
+                }
+
+                float Measure(int start, int end) => end <= start ? 0f
+                    : g.MeasureString(text[start..end], geo.Font, int.MaxValue, lineFormat).Width;
 
                 if (selEnd > selStart)
                 {
@@ -1236,49 +1440,58 @@ public class BrowserCanvas : Control
                         var (start, end) = geo.Lines[line];
                         int a = Math.Max(selStart, start), b = Math.Min(selEnd, end);
                         if (b <= a) continue;
-                        float x1 = textX + g.MeasureString(text[start..a], geo.Font,
-                            int.MaxValue, lineFormat).Width;
-                        float x2 = textX + g.MeasureString(text[start..b], geo.Font,
-                            int.MaxValue, lineFormat).Width;
+                        float x1 = textX + Measure(start, a);
+                        float x2 = textX + Measure(start, b);
                         g.FillRectangle(highlight, x1,
                             textY + (line - scrollLine) * lineHeight,
-                            Math.Max(1, x2 - x1), lineHeight);
+                            Math.Max(1f, x2 - x1), lineHeight);
                     }
                 }
 
-                PaintTextareaScrollbar(g, face, geo.Lines.Count, lineHeight, scrollLine);
-
-                if ((uint)Environment.TickCount / 500 % 2 == 0)
+                if ((uint)Environment.TickCount / 500 % 2 == 0 && geo.Lines.Count > 0)
                 {
                     int line = CaretLineIndex(geo.Lines, caret);
                     var (start, _) = geo.Lines[line];
-                    float cx = textX + g.MeasureString(text[start..caret], geo.Font,
-                        int.MaxValue, lineFormat).Width;
-                    using var caretPen = new Pen(Color.Black, 1);
+                    float cx = textX + Measure(start, caret);
                     float caretY = textY + (line - scrollLine) * lineHeight;
-                    g.DrawLine(caretPen, cx, caretY,
-                        cx, caretY + lineHeight);
+                    using var caretPen = new Pen(Color.Black, 1);
+                    g.DrawLine(caretPen, cx, caretY, cx, caretY + lineHeight);
                 }
             }
         }
         else
         {
-            float scroll = EnsureSingleLineCaretVisible(g, text, font, face, caret);
-            float textX = face.X + 3 - scroll;
+            using var format = NewFieldFormat(noWrap: true);
             format.LineAlignment = StringAlignment.Center;
-            float textWidth = g.MeasureString(text, font, int.MaxValue, format).Width;
-            g.DrawString(text, font, foreground,
-                new RectangleF(textX, face.Y, Math.Max(face.Width, textWidth + 8), face.Height), format);
+            float scroll = EnsureSingleLineCaretVisible(g, text, font, box.ContentRect, caret);
+            float textX = face.X + 3 - scroll;
+            float MeasureTo(int n) => n <= 0 ? 0f
+                : g.MeasureString(text[..Math.Min(n, text.Length)], font, int.MaxValue, format).Width;
+
+            if (scroll > 0.01f)
+            {
+                var style = el.Style;
+                Color backgroundColor = style != null && style.OwnBackground &&
+                    style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
+                Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
+                using var background = new SolidBrush(backgroundColor);
+                using var foreground = new SolidBrush(foregroundColor);
+                g.FillRectangle(background, face);
+                float textWidth = g.MeasureString(text, font, int.MaxValue, format).Width;
+                g.DrawString(text, font, foreground,
+                    new RectangleF(textX, face.Y, Math.Max(face.Width, textWidth + 8), face.Height), format);
+            }
+
             if (selEnd > selStart)
             {
                 using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-                float x1 = textX + g.MeasureString(text[..selStart], font, int.MaxValue, format).Width;
-                float x2 = textX + g.MeasureString(text[..selEnd], font, int.MaxValue, format).Width;
-                g.FillRectangle(highlight, x1, face.Y, Math.Max(1, x2 - x1), face.Height);
+                float x1 = textX + MeasureTo(selStart);
+                float x2 = textX + MeasureTo(selEnd);
+                g.FillRectangle(highlight, x1, face.Y, Math.Max(1f, x2 - x1), face.Height);
             }
             if ((uint)Environment.TickCount / 500 % 2 == 0)
             {
-                float cx = textX + g.MeasureString(text[..caret], font, int.MaxValue, format).Width;
+                float cx = textX + MeasureTo(caret);
                 using var caretPen = new Pen(Color.Black, 1);
                 g.DrawLine(caretPen, cx, face.Y + 2, cx, face.Bottom - 2);
             }
@@ -1314,155 +1527,204 @@ public class BrowserCanvas : Control
     {
         var el = _focusedInput;
         if (el == null) return;
-        var geo = GetTextareaGeometry(el);
+        var geo = GetTextareaGeometry(el, frameView: _focusedInputFrame);
         if (geo == null) return;
 
         var font = geo.Font;
         var face = geo.Box.ContentRect;
         string text = geo.Text;
         var lines = geo.Lines;
-
-        // DrawLines applies the textarea scroll offset itself. Keep the
-        // page-scrolled origin here; otherwise text is shifted twice while
-        // the caret/selection are shifted only once after scrolling.
-        float textX = face.X + 3 - _scrollOffset.X;
-        float textY = face.Y + 2 - _scrollOffset.Y;
-        float textBottom = face.Bottom - 2 - _scrollOffset.Y;
+        float scrollX = PaintScrollX;
+        float scrollY = PaintScrollY;
+        float textX = face.X + 3 - scrollX - _fieldScrollX;
+        float textY = face.Y + 2 - scrollY;
         float lineHeight = font.GetHeight(g);
         int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
         int maxScrollLine = Math.Max(0, lines.Count - visibleLines);
         int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
+        bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
         using var noWrap = NewFieldFormat(noWrap: true);
 
         float Measure(int start, int end) => end <= start ? 0f
             : g.MeasureString(text[start..end], font, int.MaxValue, noWrap).Width;
-
-        var oldClip = g.Save();
-        g.SetClip(new RectangleF(face.X + 1 - _scrollOffset.X, face.Y + 1 - _scrollOffset.Y,
-                                 Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
-                  CombineMode.Intersect);
 
         int caret = Math.Clamp(_fieldCaret, 0, text.Length);
         int anchor = Math.Clamp(_fieldSelAnchor, 0, text.Length);
         int selStart = Math.Min(anchor, caret);
         int selEnd = Math.Max(anchor, caret);
 
-        var style = el.Style;
-        Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
-            ? style.BackgroundColor : Color.White;
-        Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
-        using (var background = new SolidBrush(fieldBackground))
-            g.FillRectangle(background, face.X + 1 - _scrollOffset.X,
-                face.Y + 1 - _scrollOffset.Y, Math.Max(1, face.Width - 2),
-                Math.Max(1, face.Height - 2));
+        var oldClip = g.Save();
+        g.SetClip(new RectangleF(face.X + 1 - scrollX, face.Y + 1 - scrollY,
+                                 Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
+                  CombineMode.Intersect);
 
-        using (var foreground = new SolidBrush(fieldForeground))
-            Engine.Render.TextareaOverlay.DrawLines(g, text, font, lines,
-                foreground, textX, textY, face.Width - 4, lineHeight, scrollLine);
+        if (needsTextRepaint)
+        {
+            var style = el.Style;
+            Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
+                ? style.BackgroundColor : Color.White;
+            Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
+            using (var background = new SolidBrush(fieldBackground))
+                g.FillRectangle(background, face.X + 1 - scrollX, face.Y + 1 - scrollY,
+                    Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2));
+            using var foreground = new SolidBrush(fieldForeground);
+            Engine.Render.TextareaOverlay.DrawLines(g, text, font, lines, foreground,
+                textX, textY, face.Width - 4, lineHeight, scrollLine);
+        }
 
         if (selEnd > selStart)
         {
             using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-            for (int i = 0; i < lines.Count; i++)
+            for (int line = 0; line < lines.Count; line++)
             {
-                var (ls, le) = lines[i];
-                int a = Math.Max(selStart, ls), b = Math.Min(selEnd, le);
+                var (start, end) = lines[line];
+                int a = Math.Max(selStart, start), b = Math.Min(selEnd, end);
                 if (b <= a) continue;
-                float y = textY + (i - scrollLine) * lineHeight;
-                float x1 = textX + Measure(ls, a);
-                g.FillRectangle(highlight, x1, y, Math.Max(1f, Measure(a, b)), lineHeight);
+                float x1 = textX + Measure(start, a);
+                float x2 = textX + Measure(start, b);
+                g.FillRectangle(highlight, x1,
+                    textY + (line - scrollLine) * lineHeight,
+                    Math.Max(1f, x2 - x1), lineHeight);
             }
         }
 
-        PaintTextareaScrollbar(g, face, lines.Count, lineHeight, scrollLine);
-
-        if ((uint)Environment.TickCount / 500 % 2 == 0)
+        if ((uint)Environment.TickCount / 500 % 2 == 0 && lines.Count > 0)
         {
-            // A caret at a wrap boundary belongs to the START of the next line;
-            // a caret at a hard newline belongs to the end of its own line.
-            int li = CaretLineIndex(lines, caret);
-            var (cs, _) = lines[li];
-            float cx = textX + Measure(cs, caret);
-            float cy = textY + (li - scrollLine) * lineHeight;
+            int line = CaretLineIndex(lines, caret);
+            var (start, _) = lines[line];
+            float cx = textX + Measure(start, caret);
+            float caretY = textY + (line - scrollLine) * lineHeight;
             using var caretPen = new Pen(Color.Black, 1);
-            g.DrawLine(caretPen, cx, cy, cx, Math.Min(cy + lineHeight, textBottom));
+            g.DrawLine(caretPen, cx, caretY, cx, caretY + lineHeight);
         }
-
         g.Restore(oldClip);
 
-        // Match the single-line input overlay: the focus ring is painted
-        // after the clipped field contents so it remains visible on top.
+        if (needsTextRepaint && lines.Count > visibleLines)
+        {
+            var screenFace = new RectangleF(face.X - scrollX, face.Y - scrollY, face.Width, face.Height);
+            PaintTextareaScrollbar(g, screenFace, lines.Count, lineHeight, scrollLine);
+        }
+
         using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
-        g.DrawRectangle(focusPen, face.X - _scrollOffset.X, face.Y - _scrollOffset.Y,
+        g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
             face.Width - 1, face.Height - 1);
+    }
+
+    private bool EmbeddedMidiUiAllowed()
+    {
+        if (_embeddedMidiElement == null || _rootBox == null) return false;
+        if (LegacyMidiLoop.IsTrue(_embeddedMidiElement.GetAttr("hidden"))) return false;
+        var box = FindBoxForElement(_rootBox, _embeddedMidiElement);
+        if (box == null) return false;
+        // A zero-sized plugin or an embed with neither width nor height is
+        // treated as hidden/no-UI by the legacy compatibility rules.
+        return box.BorderRect.Width > 0f && box.BorderRect.Height > 0f;
+    }
+
+    private static int MidiVolumeFromPoint(RectangleF rect, float x)
+    {
+        float left = rect.Left + 6f;
+        float right = rect.Right - 6f;
+        if (right <= left) return 0;
+        return (int)Math.Round(Math.Clamp((x - left) / (right - left), 0f, 1f) * 100f);
     }
 
     private void PaintEmbeddedMidiControls(Graphics g)
     {
-        if (_embeddedMidiElement == null || _rootBox == null) return;
-        var box = FindBoxForElement(_rootBox, _embeddedMidiElement);
+        if (!EmbeddedMidiUiAllowed())
+        {
+            _embeddedMidiRect = RectangleF.Empty;
+            return;
+        }
+
+        var box = FindBoxForElement(_rootBox!, _embeddedMidiElement!);
         if (box == null) return;
 
-        int attrWidth = _embeddedMidiElement.GetAttrInt("width", 0);
-        int attrHeight = _embeddedMidiElement.GetAttrInt("height", 0);
-        float width = Math.Max(box.BorderRect.Width, attrWidth);
-        float height = Math.Max(box.BorderRect.Height, attrHeight);
-        width = Math.Max(220f, width);
-        height = Math.Max(34f, height);
+        float width = box.BorderRect.Width;
+        float height = box.BorderRect.Height;
         var rect = new RectangleF(box.BorderRect.X, box.BorderRect.Y, width, height);
         _embeddedMidiRect = rect;
 
-        using var background = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
-        using var border = new Pen(Color.FromArgb(0x40, 0x40, 0x40));
-        var screenRect = new RectangleF(rect.X - _scrollOffset.X, rect.Y - _scrollOffset.Y, rect.Width, rect.Height);
+        var screenRect = new RectangleF(rect.X - _scrollOffset.X, rect.Y - _scrollOffset.Y,
+            rect.Width, rect.Height);
+        using var background = new SolidBrush(Color.FromArgb(0xC8, 0xC8, 0xC8));
+        using var border = new Pen(Color.FromArgb(0x30, 0x30, 0x30));
         g.FillRectangle(background, screenRect);
-        g.DrawRectangle(border, screenRect.X, screenRect.Y, screenRect.Width - 1, screenRect.Height - 1);
+        g.DrawRectangle(border, screenRect.X, screenRect.Y,
+            Math.Max(0f, screenRect.Width - 1f), Math.Max(0f, screenRect.Height - 1f));
 
-        using var labelFont = new Font(FontFamily.GenericSansSerif, 8f, FontStyle.Regular, GraphicsUnit.Pixel);
-        using var labelBrush = new SolidBrush(Color.Black);
-        string label = string.IsNullOrWhiteSpace(_embeddedMidiLabel) ? "MIDI" : _embeddedMidiLabel;
-        g.DrawString(label.Length > 28 ? label[..28] : label, labelFont, labelBrush,
-            screenRect.X + 8, screenRect.Y + 7);
-
-        float x = screenRect.X + Math.Min(Math.Max(84f, screenRect.Width * 0.38f), screenRect.Width - 142f);
-        float buttonY = screenRect.Y + 5;
-        float buttonH = Math.Max(22f, screenRect.Height - 10f);
-        string[] names = { _embeddedMidiPlaying ? "Pause" : "Play", "Stop", _embeddedMidiLoop ? "Loop ✓" : "Loop" };
-        string[] actions = { _embeddedMidiPlaying ? "pause" : "play", "stop", "loop" };
-        float remaining = Math.Max(120f, screenRect.Right - x - 8);
-        float buttonW = Math.Max(42f, (remaining - 8f) / 3f);
-
-        using var buttonFont = new Font(FontFamily.GenericSansSerif, 8f, FontStyle.Regular, GraphicsUnit.Pixel);
-        for (int i = 0; i < 3; i++)
+        // Small plugin rectangles in the period commonly collapsed to a single
+        // play/pause affordance rather than clipping a multi-control skin.
+        if (screenRect.Height < 50f || screenRect.Width < 80f)
         {
-            float bx = x + i * (buttonW + 4f);
-            var button = new RectangleF(bx, buttonY, buttonW, buttonH);
-            using var b = new SolidBrush(Color.FromArgb(0xF0, 0xF0, 0xF0));
-            using var p = new Pen(Color.FromArgb(0x70, 0x70, 0x70));
-            g.FillRectangle(b, button);
-            g.DrawRectangle(p, button.X, button.Y, button.Width - 1, button.Height - 1);
-            var textSize = g.MeasureString(names[i], buttonFont);
-            using var tb = new SolidBrush(Color.Black);
-            g.DrawString(names[i], buttonFont, tb,
-                button.X + Math.Max(2f, (button.Width - textSize.Width) / 2f),
-                button.Y + Math.Max(1f, (button.Height - textSize.Height) / 2f));
+            float smallButtonW = Math.Min(screenRect.Width - 8f, Math.Max(44f, screenRect.Width - 8f));
+            float smallButtonH = Math.Max(18f, screenRect.Height - 8f);
+            var button = new RectangleF(screenRect.X + (screenRect.Width - smallButtonW) / 2f,
+                screenRect.Y + (screenRect.Height - smallButtonH) / 2f, smallButtonW, smallButtonH);
+            PaintMidiButton(g, button, _embeddedMidiPlaying ? "Pause" : "Play", 8f);
+            return;
+        }
+
+        float buttonY = screenRect.Y + 5f;
+        float buttonH = Math.Max(22f, Math.Min(28f, screenRect.Height - 10f));
+        float buttonW = Math.Min(46f, Math.Max(34f, (screenRect.Width - 18f) * 0.28f));
+        var playButton = new RectangleF(screenRect.X + 5f, buttonY, buttonW, buttonH);
+        var stopButton = new RectangleF(playButton.Right + 4f, buttonY, buttonW, buttonH);
+        PaintMidiButton(g, playButton, _embeddedMidiPlaying ? "Pause" : "Play", 7f);
+        PaintMidiButton(g, stopButton, "Stop", 7f);
+
+        float sliderLeft = stopButton.Right + 7f;
+        float sliderRight = screenRect.Right - 7f;
+        float sliderY = screenRect.Y + screenRect.Height / 2f + 4f;
+        if (sliderRight > sliderLeft + 20f)
+        {
+            using var labelFont = new Font(FontFamily.GenericSansSerif, 8f, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var labelBrush = new SolidBrush(Color.Black);
+            g.DrawString("Vol", labelFont, labelBrush, sliderLeft, screenRect.Y + 5f);
+            sliderY = screenRect.Y + screenRect.Height - 12f;
+            float trackW = sliderRight - sliderLeft;
+            using var track = new Pen(Color.FromArgb(0x55, 0x55, 0x55), 2f);
+            g.DrawLine(track, sliderLeft, sliderY, sliderRight, sliderY);
+            float thumbX = sliderLeft + trackW * (_embeddedMidiVolume / 100f);
+            using var fill = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 3f);
+            g.DrawLine(fill, sliderLeft, sliderY, thumbX, sliderY);
+            using var thumb = new SolidBrush(Color.FromArgb(0xF0, 0xF0, 0xF0));
+            using var thumbPen = new Pen(Color.FromArgb(0x30, 0x30, 0x30));
+            g.FillRectangle(thumb, thumbX - 3f, sliderY - 5f, 6f, 10f);
+            g.DrawRectangle(thumbPen, thumbX - 3f, sliderY - 5f, 6f, 10f);
         }
     }
 
-    public void SetEmbeddedMidiControls(DomElement element, string label, bool loop, bool playing)
+    private static void PaintMidiButton(Graphics g, RectangleF rect, string label, float fontSize)
+    {
+        using var b = new SolidBrush(Color.FromArgb(0xE8, 0xE8, 0xE8));
+        using var p = new Pen(Color.FromArgb(0x65, 0x65, 0x65));
+        g.FillRectangle(b, rect);
+        g.DrawRectangle(p, rect.X, rect.Y, Math.Max(0f, rect.Width - 1f), Math.Max(0f, rect.Height - 1f));
+        using var font = new Font(FontFamily.GenericSansSerif, fontSize, FontStyle.Regular, GraphicsUnit.Pixel);
+        var size = g.MeasureString(label, font);
+        using var tb = new SolidBrush(Color.Black);
+        g.DrawString(label, font, tb,
+            rect.X + Math.Max(1f, (rect.Width - size.Width) / 2f),
+            rect.Y + Math.Max(0f, (rect.Height - size.Height) / 2f));
+    }
+
+    public void SetEmbeddedMidiControls(DomElement element, string label, bool loop, bool playing, int volume = 100)
     {
         _embeddedMidiElement = element;
         _embeddedMidiLabel = label ?? "MIDI";
         _embeddedMidiLoop = loop;
         _embeddedMidiPlaying = playing;
+        _embeddedMidiVolume = Math.Clamp(volume, 0, 100);
         Invalidate();
     }
 
-    public void UpdateEmbeddedMidiControls(bool loop, bool playing)
+    public void UpdateEmbeddedMidiControls(bool loop, bool playing, int volume = -1)
     {
         if (_embeddedMidiElement == null) return;
         _embeddedMidiLoop = loop;
         _embeddedMidiPlaying = playing;
+        if (volume >= 0) _embeddedMidiVolume = Math.Clamp(volume, 0, 100);
         Invalidate();
     }
 
@@ -1470,34 +1732,57 @@ public class BrowserCanvas : Control
     {
         _embeddedMidiElement = null;
         _embeddedMidiPressedAction = null;
+        _embeddedMidiVolumeDragging = false;
         _embeddedMidiRect = RectangleF.Empty;
         Invalidate();
     }
 
     private bool TryBeginEmbeddedMidiControl(float x, float y)
     {
-        if (_embeddedMidiElement == null || !_embeddedMidiRect.Contains(x, y)) return false;
+        if (!EmbeddedMidiUiAllowed() || !_embeddedMidiRect.Contains(x, y)) return false;
         float localX = x - _embeddedMidiRect.X;
-        float labelWidth = Math.Min(Math.Max(84f, _embeddedMidiRect.Width * 0.38f), _embeddedMidiRect.Width - 142f);
-        float buttonStart = labelWidth;
-        float remaining = Math.Max(120f, _embeddedMidiRect.Width - buttonStart - 8f);
-        float buttonW = Math.Max(42f, (remaining - 8f) / 3f);
-        if (y < _embeddedMidiRect.Y + 4f || y > _embeddedMidiRect.Bottom - 4f) return false;
-        for (int i = 0; i < 3; i++)
+        float localY = y - _embeddedMidiRect.Y;
+
+        if (_embeddedMidiRect.Height < 50f || _embeddedMidiRect.Width < 80f)
         {
-            float bx = buttonStart + i * (buttonW + 4f);
-            if (localX < bx || localX > bx + buttonW) continue;
-            _embeddedMidiPressedAction = i switch
-            {
-                0 => _embeddedMidiPlaying ? "pause" : "play",
-                1 => "stop",
-                _ => "loop"
-            };
+            _embeddedMidiPressedAction = _embeddedMidiPlaying ? "pause" : "play";
             return true;
         }
-        return true;
-    }
 
+        float buttonY = 5f;
+        float buttonH = Math.Max(22f, Math.Min(28f, _embeddedMidiRect.Height - 10f));
+        float buttonW = Math.Min(46f, Math.Max(34f, (_embeddedMidiRect.Width - 18f) * 0.28f));
+        if (localY >= buttonY && localY <= buttonY + buttonH)
+        {
+            if (localX >= 5f && localX <= 5f + buttonW)
+            {
+                _embeddedMidiPressedAction = _embeddedMidiPlaying ? "pause" : "play";
+                return true;
+            }
+            float stopLeft = 5f + buttonW + 4f;
+            if (localX >= stopLeft && localX <= stopLeft + buttonW)
+            {
+                _embeddedMidiPressedAction = "stop";
+                return true;
+            }
+        }
+
+        float sliderLeft = 5f + buttonW + 4f + buttonW + 7f;
+        float sliderRight = _embeddedMidiRect.Width - 7f;
+        float sliderY = _embeddedMidiRect.Height - 12f;
+        if (sliderRight > sliderLeft + 20f && Math.Abs(localY - sliderY) <= 9f)
+        {
+            _embeddedMidiVolumeDragging = true;
+            int volume = MidiVolumeFromPoint(
+                new RectangleF(_embeddedMidiRect.X + sliderLeft, 0,
+                    sliderRight - sliderLeft, _embeddedMidiRect.Height), x);
+            _embeddedMidiVolume = volume;
+            _embeddedMidiPressedAction = "volume:" + volume;
+            Invalidate();
+            return true;
+        }
+        return false;
+    }
     // ─────────────────────────────────────────────────────────────────────
     // Scroll
     // ─────────────────────────────────────────────────────────────────────
@@ -1657,6 +1942,65 @@ public class BrowserCanvas : Control
     public void ScrollBy(float dx, float dy) =>
         ScrollTo((int)(_scrollOffset.X + dx), (int)(_scrollOffset.Y + dy));
 
+    private bool HandleHorizontalWheel(int delta, System.Drawing.Point clientPoint)
+    {
+        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
+        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+
+        if (TryHitFrame(x, y, out var frameHit) && frameHit.View.ScrollingEnabled)
+        {
+            var metrics = GetFrameScrollMetrics(frameHit.Box, frameHit.View);
+            if (metrics.MaxScrollX > 0)
+            {
+                CloseMenusOnScroll();
+                _focusedFrame = frameHit.Box;
+                float amount = (delta / 120f) * 40f;
+                if (Math.Abs(amount) < 0.5f) amount = Math.Sign(delta) * 4f;
+                frameHit.View.Scroll.X = Math.Clamp(frameHit.View.Scroll.X - amount, 0f, metrics.MaxScrollX);
+                RecomposeFrameTree(frameHit.View);
+                return true;
+            }
+            return false;
+        }
+
+        if (_renderedBitmap == null) return false;
+
+        var viewport = GetViewportSize();
+        float maxX = Math.Max(0f, _renderedBitmap.Width - viewport.Width / _pluginZoom);
+        if (maxX <= 0f) return false;
+
+        CloseMenusOnScroll();
+        float pageAmount = (delta / 120f) * 40f;
+        if (Math.Abs(pageAmount) < 0.5f)
+            pageAmount = Math.Sign(delta) * 4f;
+        ScrollTo((int)(_scrollOffset.X - pageAmount), (int)_scrollOffset.Y);
+        return true;
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_MOUSEHWHEEL = 0x020E;
+        if (m.Msg == WM_MOUSEHWHEEL)
+        {
+            long lp = m.LParam.ToInt64();
+            int screenX = (short)(lp & 0xFFFF);
+            int screenY = (short)((lp >> 16) & 0xFFFF);
+            var clientPoint = PointToClient(new System.Drawing.Point(screenX, screenY));
+            int delta = (short)((m.WParam.ToInt64() >> 16) & 0xFFFF);
+            if (delta != 0)
+            {
+                float fx = clientPoint.X / _pluginZoom + _scrollOffset.X;
+                float fy = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+                if (ScrollFocusedFieldHorizontally(delta / 120f * 40f, fx, fy))
+                    return;
+            }
+            if (delta != 0 && HandleHorizontalWheel(delta, clientPoint))
+                return;
+        }
+
+        base.WndProc(ref m);
+    }
+
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         base.OnMouseWheel(e);
@@ -1664,38 +2008,46 @@ public class BrowserCanvas : Control
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
-        if (_focusedInput?.TagName == "textarea" &&
-            TryGetFocusedTextareaBox(x, y, out var textareaBox))
+        if (TryGetEditableFieldAtPoint(x, y, out var wheelField, out var wheelFieldBox, out var wheelFieldView, out _) &&
+            ReferenceEquals(wheelField, _focusedInput) && wheelFieldBox != null)
         {
-            var geo = GetTextareaGeometry(_focusedInput, textareaBox);
-            if (geo != null)
+            if ((ModifierKeys & Keys.Shift) == Keys.Shift)
             {
-                float lineHeight = geo.Font.GetHeight(MeasureGraphics);
-                int visibleLines = Math.Max(1,
-                    (int)Math.Floor((textareaBox.ContentRect.Height - 4) / lineHeight));
-                int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
-                int delta = e.Delta > 0 ? -3 : 3;
-
-                // While the pointer is over a focused textarea, the textarea
-                // owns the wheel event. Clamp at its own limits instead of
-                // falling through and scrolling the containing page/frame.
-                _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
-                Invalidate();
-                return;
+                if (ScrollFocusedFieldHorizontally(e.Delta / 120f * 40f, x, y))
+                    return;
+            }
+            if (wheelField!.TagName == "textarea")
+            {
+                var geo = GetTextareaGeometry(wheelField, wheelFieldBox, wheelFieldView);
+                if (geo != null)
+                {
+                    float lineHeight = geo.Font.GetHeight(MeasureGraphics);
+                    int visibleLines = Math.Max(1,
+                        (int)Math.Floor((wheelFieldBox.ContentRect.Height - 4) / lineHeight));
+                    int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
+                    int delta = e.Delta > 0 ? -3 : 3;
+                    _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
+                    Invalidate();
+                    return;
+                }
             }
         }
 
-        var frameBox = FrameBoxAtPoint(x, y);
-        if (frameBox != null && _frames.TryGetValue(frameBox, out var view) &&
-            view.ScrollingEnabled)
+        if (TryHitFrame(x, y, out var frameHit) && frameHit.View.ScrollingEnabled)
         {
-            CloseMenusOnScroll();
-            _focusedFrame = frameBox;
-            float maxY = view.Rendered != null
-                ? Math.Max(0, view.Rendered.Height - frameBox.Height)
-                : 0;
-            view.Scroll.Y = Math.Clamp(view.Scroll.Y - (e.Delta / 120f) * 40f, 0f, maxY);
-            Invalidate();
+            var metrics = GetFrameScrollMetrics(frameHit.Box, frameHit.View);
+            if (metrics.MaxScrollY > 0 ||
+                ((ModifierKeys & Keys.Shift) == Keys.Shift && metrics.MaxScrollX > 0))
+            {
+                CloseMenusOnScroll();
+                _focusedFrame = frameHit.Box;
+                float amount = (e.Delta / 120f) * 40f;
+                if ((ModifierKeys & Keys.Shift) == Keys.Shift && metrics.MaxScrollX > 0)
+                    frameHit.View.Scroll.X = Math.Clamp(frameHit.View.Scroll.X - amount, 0f, metrics.MaxScrollX);
+                else
+                    frameHit.View.Scroll.Y = Math.Clamp(frameHit.View.Scroll.Y - amount, 0f, metrics.MaxScrollY);
+                RecomposeFrameTree(frameHit.View);
+            }
             return;
         }
 
@@ -1786,7 +2138,7 @@ public class BrowserCanvas : Control
                 // Enter is claimed by IsInputKey, so WinForms does not
                 // reliably follow it with KeyPress. Insert the textarea
                 // newline here instead of waiting for a character event.
-                var js = _jsInterpreter;
+                var js = _focusedInputFrame?.Interpreter ?? _jsInterpreter;
                 var evt = js?.CreateKeyEvent("Enter", 13);
                 var down = js?.FireEvent(_focusedInput, "onkeydown", evt);
                 var press = js?.FireEvent(_focusedInput, "onkeypress", evt);
@@ -1802,7 +2154,7 @@ public class BrowserCanvas : Control
             {
                 // Let page scripts see the key even with no <form> around the input
                 // (the common "text box + JS button" pattern). Returning false cancels.
-                var js = _jsInterpreter;
+                var js = _focusedInputFrame?.Interpreter ?? _jsInterpreter;
                 var evt = js?.CreateKeyEvent("Enter", 13);
                 var down = js?.FireEvent(_focusedInput, "onkeydown", evt);
                 var press = js?.FireEvent(_focusedInput, "onkeypress", evt);
@@ -1949,7 +2301,7 @@ public class BrowserCanvas : Control
 
         // FIX: plain typing never fired onkeydown/onkeypress on the field,
         // so key-capture scripts (and "return false" input filters) were dead.
-        var js = _jsInterpreter;
+        var js = _focusedInputFrame?.Interpreter ?? _jsInterpreter;
         if (js != null)
         {
             try
@@ -2112,10 +2464,11 @@ public class BrowserCanvas : Control
         public required List<(int Start, int End)> Lines;
     }
 
-    private TextareaGeometry? GetTextareaGeometry(DomElement el, LayoutBox? box = null)
+    private TextareaGeometry? GetTextareaGeometry(DomElement el, LayoutBox? box = null, FrameView? frameView = null)
     {
-        if (_rootBox == null) return null;
-        box ??= FindBoxForElement(_rootBox, el);
+        LayoutBox? root = frameView?.RootBox ?? _rootBox;
+        if (root == null) return null;
+        box ??= FindBoxForElement(root, el);
         var font = ResolveFieldFont(el);
         if (box == null || font == null) return null;
         string text = GetFieldText(el);
@@ -2185,7 +2538,7 @@ public class BrowserCanvas : Control
     {
         var el = _focusedInput;
         if (el?.TagName != "textarea") return;
-        var geo = GetTextareaGeometry(el);
+        var geo = GetTextareaGeometry(el, frameView: _focusedInputFrame);
         if (geo == null) return;
         EnsureTextareaScrollLine(geo.Lines, geo.Font.GetHeight(MeasureGraphics),
             geo.Box.ContentRect.Height, _fieldCaret);
@@ -2219,7 +2572,7 @@ public class BrowserCanvas : Control
         return Math.Clamp(lo, start, end);
     }
 
-    private int FieldCaretFromPoint(DomElement el, LayoutBox box, float docX, float docY)
+    private int FieldCaretFromPoint(DomElement el, LayoutBox box, float docX, float docY, FrameView? frameView = null)
     {
         string text = GetFieldText(el);
         if (text.Length == 0) return 0;
@@ -2232,14 +2585,15 @@ public class BrowserCanvas : Control
 
         if (el.TagName == "textarea")
         {
-            var geo = GetTextareaGeometry(el, box);
+            var geo = GetTextareaGeometry(el, box, frameView);
             if (geo == null || geo.Lines.Count == 0) return text.Length;
             float lineH = font.GetHeight(MeasureGraphics);
             int li = Math.Clamp(_textareaScrollLine +
                 (int)Math.Floor((docY - (face.Y + 2)) / lineH),
                 0, geo.Lines.Count - 1);
             var (ls, le) = geo.Lines[li];
-            return NearestCaretIndex(geo.Text, font, fmt, ls, le, docX - (face.X + 3));
+            return NearestCaretIndex(geo.Text, font, fmt, ls, le,
+                docX - (face.X + 3) + _fieldScrollX);
         }
 
         bool password = el.GetAttrOrDefault("type", "text") == "password";
@@ -2289,7 +2643,7 @@ public class BrowserCanvas : Control
 
     private int TextareaLineEdge(DomElement el, string text, bool start)
     {
-        var geo = GetTextareaGeometry(el);
+        var geo = GetTextareaGeometry(el, frameView: _focusedInputFrame);
         if (geo == null || geo.Lines.Count == 0)
             return start ? 0 : text.Length;
         int li = CaretLineIndex(geo.Lines, Math.Clamp(_fieldCaret, 0, text.Length));
@@ -2300,7 +2654,7 @@ public class BrowserCanvas : Control
     {
         var el = _focusedInput;
         if (el == null) return;
-        var geo = GetTextareaGeometry(el);
+        var geo = GetTextareaGeometry(el, frameView: _focusedInputFrame);
         if (geo == null || geo.Lines.Count == 0) return;
 
         int caret = Math.Clamp(_fieldCaret, 0, geo.Text.Length);
@@ -2332,6 +2686,146 @@ public class BrowserCanvas : Control
             is "text" or "password";
     }
 
+    private bool TryGetEditableFieldAtPoint(float x, float y,
+                                            out DomElement? field,
+                                            out LayoutBox? fieldBox,
+                                            out FrameView? frameView,
+                                            out FrameHit frameHit)
+    {
+        field = null;
+        fieldBox = null;
+        frameView = null;
+        frameHit = default;
+
+        if (_rootBox != null)
+        {
+            var deepest = HitTestDeepestBox(_rootBox, x, y);
+            var rootElement = deepest?.Element;
+            if (IsEditableField(rootElement))
+            {
+                field = rootElement;
+                fieldBox = FindBoxForElement(_rootBox, rootElement!) ?? deepest;
+                return fieldBox != null;
+            }
+        }
+
+        if (TryHitFrame(x, y, out frameHit))
+        {
+            var deepest = HitTestDeepestBox(frameHit.View.RootBox, frameHit.LocalX, frameHit.LocalY);
+            var frameElement = deepest?.Element;
+            if (IsEditableField(frameElement))
+            {
+                field = frameElement;
+                fieldBox = FindBoxForElement(frameHit.View.RootBox, frameElement!) ?? deepest;
+                frameView = frameHit.View;
+                return fieldBox != null;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryGetFieldBox(DomElement field, FrameView? frameView, out LayoutBox? box)
+    {
+        var root = frameView?.RootBox ?? _rootBox;
+        box = root == null ? null : FindBoxForElement(root, field);
+        return box != null;
+    }
+
+    private float GetSingleLineFieldMaxScroll(DomElement el, LayoutBox box)
+    {
+        var font = ResolveFieldFont(el);
+        if (font == null) return 0f;
+        string text = GetFieldText(el);
+        if (el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase))
+            text = new string('*', text.Length);
+        using var fmt = NewFieldFormat(noWrap: true);
+        float visible = Math.Max(1f, box.ContentRect.Width - 6f);
+        float width = MeasureGraphics.MeasureString(text, font, int.MaxValue, fmt).Width;
+        return Math.Max(0f, width - visible);
+    }
+
+    private float GetTextareaMaxHorizontalScroll(DomElement el, LayoutBox box, FrameView? frameView)
+    {
+        if (!el.GetAttrOrDefault("wrap", "").Trim().Equals("off", StringComparison.OrdinalIgnoreCase))
+            return 0f;
+        var font = ResolveFieldFont(el);
+        if (font == null) return 0f;
+        var geo = GetTextareaGeometry(el, box, frameView);
+        if (geo == null) return 0f;
+        using var fmt = NewFieldFormat(noWrap: true);
+        float maxLine = 0f;
+        foreach (var (start, end) in geo.Lines)
+            maxLine = Math.Max(maxLine, MeasureGraphics.MeasureString(geo.Text[start..end], font, int.MaxValue, fmt).Width);
+        return Math.Max(0f, maxLine - Math.Max(1f, box.ContentRect.Width - 6f));
+    }
+
+    private bool ScrollFocusedFieldHorizontally(float delta, float x, float y)
+    {
+        if (!TryGetEditableFieldAtPoint(x, y, out var field, out var box, out var frameView, out _))
+            return false;
+        if (!ReferenceEquals(field, _focusedInput) || box == null) return false;
+
+        float maxScroll = field!.TagName == "textarea"
+            ? GetTextareaMaxHorizontalScroll(field, box, frameView)
+            : GetSingleLineFieldMaxScroll(field, box);
+        if (maxScroll <= 0f) return true;
+
+        _fieldScrollX = Math.Clamp(_fieldScrollX - delta, 0f, maxScroll);
+        Invalidate();
+        return true;
+    }
+
+    private bool HandleEditableFieldMouseDown(DomElement element, LayoutBox box,
+                                               float localX, float localY,
+                                               FrameView? frameView,
+                                               JsInterpreter? js, MouseEventArgs e)
+    {
+        if (!IsEditableField(element) || element.HasAttr("disabled")) return false;
+
+        long now = Environment.TickCount64;
+        bool continuing = ReferenceEquals(element, _lastFieldClickElement) &&
+                          ReferenceEquals(frameView, _lastFieldClickFrame) &&
+                          now - _lastFieldClickTicks <= SystemInformation.DoubleClickTime &&
+                          Math.Abs(e.X - _lastFieldClickPoint.X) <= SystemInformation.DoubleClickSize.Width &&
+                          Math.Abs(e.Y - _lastFieldClickPoint.Y) <= SystemInformation.DoubleClickSize.Height;
+        _fieldClickCount = continuing ? _fieldClickCount + 1 : 1;
+        _lastFieldClickElement = element;
+        _lastFieldClickFrame = frameView;
+        _lastFieldClickPoint = e.Location;
+        _lastFieldClickTicks = now;
+
+        int caret = FieldCaretFromPoint(element, box, localX, localY, frameView);
+        ClearPageSelection();
+        FocusControl(element, caret, js, frameView);
+        if (frameView == null)
+            _focusedFrame = null;
+
+        if (_fieldClickCount >= 3)
+        {
+            SelectFieldAll(element);
+            _fieldClickCount = 0;
+            _fieldDragging = false;
+            _suppressNextMouseUp = true;
+            Capture = true;
+            Invalidate();
+            return true;
+        }
+        if (_fieldClickCount == 2)
+        {
+            SelectFieldWord(element, ref _fieldCaret, ref _fieldSelAnchor);
+            _fieldDragging = false;
+            _suppressNextMouseUp = true;
+            Capture = true;
+            Invalidate();
+            return true;
+        }
+
+        _fieldDragging = true;
+        Capture = true;
+        return true;
+    }
+
     private static void SelectFieldWord(DomElement el, ref int caret, ref int anchor)
     {
         string text = GetFieldText(el);
@@ -2353,7 +2847,7 @@ public class BrowserCanvas : Control
         Invalidate();
     }
 
-    private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null)
+    private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null, FrameView? frameView = null)
     {
         ArgumentNullException.ThrowIfNull(el);
 
@@ -2369,8 +2863,9 @@ public class BrowserCanvas : Control
         {
             BlurField();
             _focusedInput = el;
+            _focusedInputFrame = frameView;
             _fieldValueAtFocus = GetFieldText(el);
-            var focusDoc = _document;
+            var focusDoc = frameView?.Document ?? _document;
             if (focusDoc != null)
                 UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el, relayout: false);
             js?.FireEvent(el, "onfocus");   // FIX: clicking a field never fired onfocus
@@ -2382,6 +2877,7 @@ public class BrowserCanvas : Control
             _textareaScrollLine = 0;
         }
 
+        _focusedInputFrame = frameView;
         RememberDefault(el);
         _fieldCaret = _fieldSelAnchor = Math.Clamp(caretPos, 0, GetFieldText(el).Length);
         RequestRerender();
@@ -2391,10 +2887,12 @@ public class BrowserCanvas : Control
     {
         var el = _focusedInput;
         if (el == null) return;
+        var ownerFrame = _focusedInputFrame;
         _focusedInput = null;
+        _focusedInputFrame = null;
         _fieldDragging = false;
 
-        var js = _jsInterpreter;
+        var js = ownerFrame?.Interpreter ?? _jsInterpreter;
         // FIX: onchange NEVER fired for text inputs/textareas.  DOM order:
         // change fires before blur.
         if (IsEditableField(el) && GetFieldText(el) != (_fieldValueAtFocus ?? GetFieldText(el)))
@@ -2402,6 +2900,7 @@ public class BrowserCanvas : Control
         js?.FireEvent(el, "onblur");
         _fieldValueAtFocus = null;
         _lastFieldClickElement = null;
+        _lastFieldClickFrame = null;
         _fieldClickCount = 0;
 
         RequestRerender();
@@ -2449,8 +2948,9 @@ public class BrowserCanvas : Control
         // colors, borders and display exactly like normal CSS rules.
         try
         {
-            var framePair = _frames.FirstOrDefault(x => ReferenceEquals(x.Value.Document, doc));
-            var frameKey = framePair.Key;
+            LayoutBox? frameKey = null;
+            FrameView? frameView = null;
+            TryFindFrameViewByDocument(doc, out frameView, out _, out frameKey);
             var vp = doc == _document ? GetViewportSize() :
                 new System.Drawing.Size(
                     Math.Max(1, frameKey == null ? 800 : (int)frameKey.Width),
@@ -2462,16 +2962,13 @@ public class BrowserCanvas : Control
                 var newRoot = LayoutEngineApi.BuildLayoutTree(doc, vp.Width, vp.Height);
                 ApplyRelayout(doc, newRoot);
             }
-            else
+            else if (frameView != null && frameKey != null)
             {
-                foreach (var (box, view) in _frames)
-                {
-                    if (!ReferenceEquals(view.Document, doc)) continue;
-                    view.RootBox = LayoutEngineApi.BuildLayoutTree(doc,
-                        Math.Max(1, (int)box.Width), Math.Max(1, (int)box.Height));
-                    RenderFrameBitmap(box, view);
-                    break;
-                }
+                var rebuiltFrameRoot = LayoutEngineApi.BuildLayoutTree(doc,
+                    Math.Max(1, (int)frameKey.Width), Math.Max(1, (int)frameKey.Height));
+                RemapFrameSelection(frameView, rebuiltFrameRoot);
+                frameView.RootBox = rebuiltFrameRoot;
+                RecomposeFrameTree(frameView);
             }
         }
         catch { RequestRerender(); }
@@ -2489,6 +2986,12 @@ public class BrowserCanvas : Control
         if (e.Button != MouseButtons.Left || _rootBox == null || _document == null)
             return;
 
+        // A new pointer press starts a new selection context.  Clearing here
+        // prevents a previous Ctrl+A/drag/double-click highlight from
+        // surviving when the user clicks a button, link, blank area, frame,
+        // scrollbar, or form control elsewhere.
+        ClearPageSelection();
+
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
@@ -2498,12 +3001,19 @@ public class BrowserCanvas : Control
             return;
         }
 
+        if (e.Button == MouseButtons.Left && TryBeginFrameScrollbarInteraction(x, y))
+        {
+            _frameScrollbarMouseDownHandled = true;
+            Capture = true;
+            return;
+        }
+
         if (e.Button == MouseButtons.Left &&
             _focusedInput?.TagName == "textarea" &&
             TryGetFocusedTextareaScrollbarPoint(x, y, out var scrollbarBox,
                 out float scrollbarX, out float scrollbarY))
         {
-            var geo = GetTextareaGeometry(_focusedInput, scrollbarBox);
+            var geo = GetTextareaGeometry(_focusedInput, scrollbarBox, _focusedInputFrame);
             if (geo != null)
             {
                 float lineHeight = geo.Font.GetHeight(MeasureGraphics);
@@ -2522,48 +3032,66 @@ public class BrowserCanvas : Control
             }
         }
 
-        // Frame documents have their own layout tree.  Resolve editable
-        // controls in that tree before the parent hit-test sees only the
-        // frame box; otherwise clicks in corporate-page forms never focus
-        // the actual input or textarea.
-        var frameAtPoint = FrameBoxAtPoint(x, y);
-        if (frameAtPoint != null && _frames.TryGetValue(frameAtPoint, out var frameView))
+        // Frame documents have their own layout tree. Resolve controls and
+        // events in the deepest frame, not against the page-level <frame> box.
+        if (TryHitFrame(x, y, out var frameHit))
         {
-            float frameX = x - frameAtPoint.X + frameView.Scroll.X;
-            float frameY = y - frameAtPoint.Y + frameView.Scroll.Y;
-            var frameBox = HitTestDeepestBox(frameView.RootBox, frameX, frameY);
-            var frameElement = frameBox?.Element;
+            var frameView = frameHit.View;
+            var frameElement = HitTestDeepestBox(frameView.RootBox, frameHit.LocalX, frameHit.LocalY)?.Element;
+
             if (_focusedInput != null && !ReferenceEquals(frameElement, _focusedInput))
                 BlurField();
-            if (frameElement != null && IsEditableField(frameElement) &&
-                !frameElement.HasAttr("disabled"))
+
+            // Buttons and other form controls inside a frame get the same
+            // Win95 press-in state as controls on the top-level document.
+            // The renderer is given the frame-local pressed element below.
+            if (frameElement != null && IsControlElement(frameElement))
             {
-                FocusControl(frameElement,
-                    FieldCaretFromPoint(frameElement, frameBox!, frameX, frameY),
-                    frameView.Interpreter ?? _jsInterpreter);
-                _focusedFrame = frameAtPoint;
-                _fieldDragging = true;
+                if (frameElement.HasAttr("disabled")) return;
+                if (IsEditableField(frameElement))
+                {
+                    var frameFieldBox = FindBoxForElement(frameView.RootBox, frameElement);
+                    if (frameFieldBox != null &&
+                        HandleEditableFieldMouseDown(frameElement, frameFieldBox,
+                            frameHit.LocalX, frameHit.LocalY, frameView,
+                            frameView.Interpreter ?? _jsInterpreter, e))
+                    {
+                        _focusedFrame = frameHit.Box;
+                        return;
+                    }
+                }
+
+                _pressedControl = frameElement;
+                _pressedControlFrame = frameView;
+                _focusedFrame = frameHit.Box;
+                UpdateCssInteractionState(frameView.Document, frameView.Document.HoveredElement,
+                    frameElement, frameView.Document.FocusedElement, relayout: false);
                 Capture = true;
+                RerenderNow();
                 return;
             }
 
-            // Text selection inside a frame must use the frame document
-            // tree.  The page-level root only sees the <frame> box itself,
-            // so treating this as a normal page click makes every frame
-            // paragraph effectively unselectable.
-            var frameTextAnchor = HitTestTextBox(frameView.RootBox, frameX, frameY);
-            if (frameTextAnchor != null)
+            // Text selection inside a frame uses the frame's own document
+            // and interpreter context.
+            var frameTextHit = HitTestTextPosition(frameView.RootBox, frameHit.LocalX, frameHit.LocalY);
+            if (frameTextHit != null)
             {
-                _focusedFrame = frameAtPoint;
+                var frameTextAnchor = frameTextHit.Value.Box;
+                int frameTextOffset = frameTextHit.Value.Offset;
+                _focusedFrame = frameHit.Box;
                 _selStart = e.Location;
                 long frameNow = Environment.TickCount64;
                 bool continuingFrameTextClick =
-                    frameTextAnchor == _lastTextClickBox &&
+                    _lastTextClickFrame == frameView &&
+                    frameTextAnchor.Element != null &&
+                    ReferenceEquals(frameTextAnchor.Element, _lastTextClickElement) &&
                     frameNow - _lastTextClickTicks <= SystemInformation.DoubleClickTime &&
                     Math.Abs(e.X - _lastTextClickPoint.X) <= SystemInformation.DoubleClickSize.Width &&
                     Math.Abs(e.Y - _lastTextClickPoint.Y) <= SystemInformation.DoubleClickSize.Height;
                 _textClickCount = continuingFrameTextClick ? _textClickCount + 1 : 1;
                 _lastTextClickBox = frameTextAnchor;
+                _lastTextClickElement = frameTextAnchor.Element;
+                _lastTextClickFrame = frameView;
                 _lastTextClickPoint = e.Location;
                 _lastTextClickTicks = frameNow;
 
@@ -2580,7 +3108,7 @@ public class BrowserCanvas : Control
                 if (_textClickCount == 2)
                 {
                     _selectionFrame = frameView;
-                    _selAnchor = _selFocus = frameTextAnchor;
+                    SelectWordAt(frameTextAnchor, frameTextOffset);
                     _selecting = false;
                     _suppressNextMouseUp = true;
                     Invalidate();
@@ -2589,7 +3117,9 @@ public class BrowserCanvas : Control
 
                 _selectionFrame = null;
                 _selAnchor = _selFocus = null;
+                _selAnchorOffset = _selFocusOffset = 0;
                 _pendingSelectionAnchor = frameTextAnchor;
+                _pendingSelectionAnchorOffset = frameTextOffset;
                 _pendingSelectionFrame = frameView;
                 _selecting = true;
                 Capture = true;
@@ -2598,6 +3128,7 @@ public class BrowserCanvas : Control
             }
         }
 
+        _focusedFrame = null;
         var deepest = HitTestDeepestBox(_rootBox, x, y);
         var el = deepest?.Element;
         UpdateCssInteractionState(_document, _lastHoveredElement, el, _focusedInput,
@@ -2615,36 +3146,8 @@ public class BrowserCanvas : Control
             string type = el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
             if (IsEditableField(el))
             {
-                long fieldNow = Environment.TickCount64;
-                bool continuingFieldClick =
-                    ReferenceEquals(el, _lastFieldClickElement) &&
-                    fieldNow - _lastFieldClickTicks <= SystemInformation.DoubleClickTime &&
-                    Math.Abs(e.X - _lastFieldClickPoint.X) <= SystemInformation.DoubleClickSize.Width &&
-                    Math.Abs(e.Y - _lastFieldClickPoint.Y) <= SystemInformation.DoubleClickSize.Height;
-
-                _fieldClickCount = continuingFieldClick ? _fieldClickCount + 1 : 1;
-                _lastFieldClickElement = el;
-                _lastFieldClickPoint = e.Location;
-                _lastFieldClickTicks = fieldNow;
-
-                int caret = FieldCaretFromPoint(el, deepest!, x, y);
-                FocusControl(el, caret);
-
-                if (_fieldClickCount >= 3)
-                {
-                    // Triple-click: select the entire value, matching the
-                    // page-text selection convention used by Retro96 and the
-                    // common desktop browser interaction users expect.
-                    SelectFieldAll(el);
-                }
-                else if (_fieldClickCount == 2)
-                {
-                    // Double-click: select the current whitespace-delimited word.
-                    SelectFieldWord(el, ref _fieldCaret, ref _fieldSelAnchor);
-                }
-
-                _fieldDragging = true;
-                Capture = true;   // FIX: drag-selection lost the mouse past the field edge
+                if (HandleEditableFieldMouseDown(el, deepest!, x, y, null, _jsInterpreter, e))
+                    return;
                 return;
             }
             if (el.TagName == "button" ||
@@ -2652,6 +3155,7 @@ public class BrowserCanvas : Control
             {
                 // Win95 press-in bevel while held
                 _pressedControl = el;
+                _pressedControlFrame = null;
                 RerenderNow();
                 return;
             }
@@ -2661,15 +3165,21 @@ public class BrowserCanvas : Control
         // Page text selection drag.  FIX: a fresh press on blank space used
         // to leave the previous selection highlighted forever.
         _selStart = e.Location;
-        var anchor = HitTestTextBox(_rootBox, x, y);
+        var textHit = HitTestTextPosition(_rootBox, x, y);
+        var anchor = textHit?.Box;
+        int anchorOffset = textHit?.Offset ?? 0;
         long now = Environment.TickCount64;
         bool continuingTextClick = anchor != null &&
-            ReferenceEquals(anchor, _lastTextClickBox) &&
+            _lastTextClickFrame == null &&
+            anchor.Element != null &&
+            ReferenceEquals(anchor.Element, _lastTextClickElement) &&
             now - _lastTextClickTicks <= SystemInformation.DoubleClickTime &&
             Math.Abs(e.X - _lastTextClickPoint.X) <= SystemInformation.DoubleClickSize.Width &&
             Math.Abs(e.Y - _lastTextClickPoint.Y) <= SystemInformation.DoubleClickSize.Height;
         _textClickCount = continuingTextClick ? _textClickCount + 1 : 1;
         _lastTextClickBox = anchor;
+        _lastTextClickElement = anchor?.Element;
+        _lastTextClickFrame = null;
         _lastTextClickPoint = e.Location;
         _lastTextClickTicks = now;
 
@@ -2684,15 +3194,14 @@ public class BrowserCanvas : Control
         }
         if (anchor != null && _textClickCount == 2)
         {
-            _selAnchor = _selFocus = anchor;
+            SelectWordAt(anchor, anchorOffset);
             _selecting = false;
             _suppressNextMouseUp = true;
             Invalidate();
             return;
         }
-        _selAnchor = _selFocus = null;
-        _selectionFrame = null;
         _pendingSelectionAnchor = anchor;
+        _pendingSelectionAnchorOffset = anchorOffset;
         _pendingSelectionFrame = null;
         _selecting = anchor != null;
         if (_selecting) Capture = true;
@@ -2703,26 +3212,80 @@ public class BrowserCanvas : Control
     {
         base.OnMouseMove(e);
 
+        if (_embeddedMidiVolumeDragging && _embeddedMidiElement != null && _embeddedMidiRect != RectangleF.Empty)
+        {
+            float x = e.X / _pluginZoom + _scrollOffset.X;
+            var box = FindBoxForElement(_rootBox!, _embeddedMidiElement);
+            if (box != null)
+            {
+                float buttonW = Math.Min(46f, Math.Max(34f, (_embeddedMidiRect.Width - 18f) * 0.28f));
+                float sliderLeft = 5f + buttonW + 4f + buttonW + 7f;
+                float sliderRight = _embeddedMidiRect.Width - 7f;
+                if (sliderRight > sliderLeft + 20f)
+                {
+                    int volume = (int)Math.Round(Math.Clamp(
+                        (x - (_embeddedMidiRect.X + sliderLeft)) / (sliderRight - sliderLeft), 0f, 1f) * 100f);
+                    if (volume != _embeddedMidiVolume)
+                    {
+                        _embeddedMidiVolume = volume;
+                        _embeddedMidiPressedAction = "volume:" + volume;
+                        EmbeddedMidiControlRequested?.Invoke(_embeddedMidiPressedAction);
+                        Invalidate();
+                    }
+                }
+            }
+            return;
+        }
+
+        if (_frameScrollbarDragView != null && _frameScrollbarDragBox != null && Capture)
+        {
+            float pointer = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
+                ? e.Y / _pluginZoom + _scrollOffset.Y
+                : e.X / _pluginZoom + _scrollOffset.X;
+            var metrics = GetFrameScrollMetrics(_frameScrollbarDragBox, _frameScrollbarDragView);
+            float trackLength = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
+                ? metrics.VerticalTrackLength
+                : metrics.HorizontalTrackLength;
+            float thumbLength = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
+                ? metrics.VerticalThumbLength
+                : metrics.HorizontalThumbLength;
+            float travel = Math.Max(1f, trackLength - thumbLength);
+            float delta = pointer - _frameScrollbarDragStartPointer;
+            float maxScroll = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
+                ? metrics.MaxScrollY : metrics.MaxScrollX;
+            float ratio = maxScroll <= 0 ? 0 : Math.Clamp(delta / travel, -1f, 1f);
+            if (_frameScrollbarDragAxis == FrameScrollbarAxis.Vertical)
+                _frameScrollbarDragView.Scroll.Y = Math.Clamp(
+                    _frameScrollbarDragStartScroll + ratio * maxScroll, 0f, maxScroll);
+            else
+                _frameScrollbarDragView.Scroll.X = Math.Clamp(
+                    _frameScrollbarDragStartScroll + ratio * maxScroll, 0f, maxScroll);
+            RecomposeFrameTree(_frameScrollbarDragView);
+            return;
+        }
+
         if (_fieldDragging && _focusedInput != null && _rootBox != null)
         {
             float x = e.X / _pluginZoom + _scrollOffset.X;
             float y = e.Y / _pluginZoom + _scrollOffset.Y;
-            var box = FindBoxForElement(_rootBox, _focusedInput);
-            if (box == null && _focusedFrame != null &&
-                _frames.TryGetValue(_focusedFrame, out var frameView))
+            if (_focusedInputFrame != null &&
+                TryHitFrame(x, y, out var fieldHit) &&
+                ReferenceEquals(fieldHit.View, _focusedInputFrame))
             {
-                float frameX = x - _focusedFrame.X + frameView.Scroll.X;
-                float frameY = y - _focusedFrame.Y + frameView.Scroll.Y;
-                box = FindBoxForElement(frameView.RootBox, _focusedInput);
+                var box = FindBoxForElement(fieldHit.View.RootBox, _focusedInput);
                 if (box != null)
-                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, frameX, frameY);
+                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, fieldHit.LocalX, fieldHit.LocalY, fieldHit.View);
                 Invalidate();
                 return;
             }
-            if (box != null)
+
+            if (_focusedInputFrame == null)
             {
-                _fieldCaret = FieldCaretFromPoint(_focusedInput, box, x, y);
+                var box = FindBoxForElement(_rootBox, _focusedInput);
+                if (box != null)
+                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, x, y);
                 Invalidate();
+                return;
             }
             return;
         }
@@ -2732,22 +3295,32 @@ public class BrowserCanvas : Control
             float x = e.X / _pluginZoom + _scrollOffset.X;
             float y = e.Y / _pluginZoom + _scrollOffset.Y;
             LayoutBox? f = null;
+            var oldFocus = _selFocus;
+            int oldFocusOffset = _selFocusOffset;
             var selectionView = _selectionFrame ?? _pendingSelectionFrame;
             if (selectionView != null)
             {
-                var selectionFrameBox = FrameBoxAtPoint(x, y);
-                if (selectionFrameBox != null &&
-                    _frames.TryGetValue(selectionFrameBox, out var selectionViewAtPoint) &&
-                    ReferenceEquals(selectionViewAtPoint, selectionView))
+                // Use the recursive frame hit result here. Looking the frame
+                // box up only in _frames fails for nested frames because their
+                // boxes live in the parent's ChildFrames collection. That made
+                // drag-selection work in a top-level frame but stop updating as
+                // soon as the pointer was inside a nested frame.
+                if (TryHitFrame(x, y, out var selectionHit) &&
+                    ReferenceEquals(selectionHit.View, selectionView))
                 {
-                    f = HitTestTextBox(selectionViewAtPoint.RootBox,
-                        x - selectionFrameBox.X + selectionViewAtPoint.Scroll.X,
-                        y - selectionFrameBox.Y + selectionViewAtPoint.Scroll.Y);
+                    var localHit = HitTestTextPosition(selectionHit.View.RootBox,
+                        selectionHit.LocalX, selectionHit.LocalY);
+                    f = localHit?.Box;
+                    if (localHit != null)
+                        _selFocusOffset = localHit.Value.Offset;
                 }
             }
             else if (_rootBox != null)
             {
-                f = HitTestTextBox(_rootBox, x, y);
+                var pageHit = HitTestTextPosition(_rootBox, x, y);
+                f = pageHit?.Box;
+                if (pageHit != null)
+                    _selFocusOffset = pageHit.Value.Offset;
             }
 
             bool moved = Math.Abs(e.X - _selStart.X) + Math.Abs(e.Y - _selStart.Y) > 4;
@@ -2756,10 +3329,13 @@ public class BrowserCanvas : Control
                 _dragMoved = true;
                 _selectionFrame = _pendingSelectionFrame;
                 _selAnchor = _pendingSelectionAnchor;
+                _selAnchorOffset = _pendingSelectionAnchorOffset;
                 _selFocus = f ?? _pendingSelectionAnchor;
+                if (f == null) _selFocusOffset = _pendingSelectionAnchorOffset;
                 Invalidate();
             }
-            else if (_dragMoved && f != null && f != _selFocus)
+            else if (_dragMoved && f != null &&
+                     (f != oldFocus || _selFocusOffset != oldFocusOffset))
             {
                 _selFocus = f;
                 Invalidate();
@@ -2774,18 +3350,29 @@ public class BrowserCanvas : Control
 
         DomElement? element;
         DomDocument doc = _document;
+        FrameView? hoverFrame = null;
+        FrameHit frameHit = default;
 
-        var frameBox = FrameBoxAtPoint(mx, my);
-        if (frameBox != null && _frames.TryGetValue(frameBox, out var view))
+        if (TryHitFrame(mx, my, out frameHit))
         {
-            element = HitTestElement(view.RootBox,
-                mx - frameBox.X + view.Scroll.X,
-                my - frameBox.Y + view.Scroll.Y);
-            doc = view.Document;
+            hoverFrame = frameHit.View;
+            element = HitTestElement(hoverFrame.RootBox, frameHit.LocalX, frameHit.LocalY);
+            doc = hoverFrame.Document;
         }
         else
         {
             element = HitTestElement(_rootBox, mx, my);
+        }
+
+        if (TryGetEditableFieldAtPoint(mx, my, out var cursorField, out _, out var cursorFrame, out var cursorHit))
+        {
+            element = cursorField;
+            hoverFrame = cursorFrame;
+            if (cursorFrame != null)
+            {
+                frameHit = cursorHit;
+                doc = cursorFrame.Document;
+            }
         }
 
         var hoverAnchor = element != null && element.TagName == "a"
@@ -2806,30 +3393,37 @@ public class BrowserCanvas : Control
         }
         else
         {
-            // I-beam over selectable text AND over editable fields
-            bool overText;
-            if (frameBox != null && _frames.TryGetValue(frameBox, out var hoverView))
-            {
-                overText = HitTestTextBox(hoverView.RootBox,
-                    mx - frameBox.X + hoverView.Scroll.X,
-                    my - frameBox.Y + hoverView.Scroll.Y) != null;
-            }
-            else
-            {
-                overText = (_rootBox != null && HitTestTextBox(_rootBox, mx, my) != null) ||
-                           IsEditableField(element);
-            }
+            bool overText = IsEditableField(element) ||
+                (hoverFrame != null
+                    ? HitTestTextBox(hoverFrame.RootBox, frameHit.LocalX, frameHit.LocalY) != null
+                    : (_rootBox != null && HitTestTextBox(_rootBox, mx, my) != null));
             Cursor = overText ? Cursors.IBeam : Cursors.Default;
             SetStatus("");
         }
 
-        if (element != _lastHoveredElement)
+        if (!ReferenceEquals(element, _lastHoveredElement) || !ReferenceEquals(hoverFrame, _lastHoveredFrame))
         {
             if (_lastHoveredElement != null)
-                _jsInterpreter?.FireEvent(_lastHoveredElement, "onmouseout");
+            {
+                var oldFrame = _lastHoveredFrame;
+                var oldJs = oldFrame?.Interpreter ?? _jsInterpreter;
+                oldJs?.FireEvent(_lastHoveredElement, "onmouseout");
+                if (oldFrame != null)
+                    UpdateCssInteractionState(oldFrame.Document, null, oldFrame.Document.ActiveElement,
+                        oldFrame.Document.FocusedElement);
+                else
+                    UpdateCssInteractionState(_document, null, _document.ActiveElement, _document.FocusedElement);
+            }
             if (element != null)
-                _jsInterpreter?.FireEvent(element, "onmouseover");
+            {
+                var hoverJs = hoverFrame?.Interpreter ?? _jsInterpreter;
+                hoverJs?.FireEvent(element, "onmouseover");
+                var status = hoverJs?.WindowObject?.Get("status");
+                if (status is { Type: JsType.String } && status.GetString().Length > 0)
+                    SetStatus(status.GetString());
+            }
             _lastHoveredElement = element;
+            _lastHoveredFrame = hoverFrame;
         }
     }
 
@@ -2837,10 +3431,28 @@ public class BrowserCanvas : Control
     {
         base.OnMouseUp(e);
 
+        if (_frameScrollbarDragView != null)
+        {
+            _frameScrollbarDragBox = null;
+            _frameScrollbarDragView = null;
+            _frameScrollbarMouseDownHandled = false;
+            Capture = false;
+            Invalidate();
+            return;
+        }
+
+        if (_frameScrollbarMouseDownHandled)
+        {
+            _frameScrollbarMouseDownHandled = false;
+            Capture = false;
+            return;
+        }
+
         if (_embeddedMidiPressedAction != null)
         {
             string action = _embeddedMidiPressedAction;
             _embeddedMidiPressedAction = null;
+            _embeddedMidiVolumeDragging = false;
             Capture = false;
             if (e.Button == MouseButtons.Left && action != "none")
                 EmbeddedMidiControlRequested?.Invoke(action);
@@ -2850,16 +3462,26 @@ public class BrowserCanvas : Control
         // FIX: releasing the mouse OFF a pressed button used to activate it
         // anyway — browsers cancel the click in that case.
         var pressedEl = _pressedControl;
+        var pressedFrame = _pressedControlFrame;
         bool wasPressed = pressedEl != null;
 
         bool wasSelecting = _selecting;
         _selecting = false;
         Capture = false;
 
-        // Release any pressed button bevel
+        // Release any pressed button bevel and clear :active in the same
+        // document that received the mouse-down.
         if (pressedEl != null)
         {
+            if (pressedFrame != null)
+                UpdateCssInteractionState(pressedFrame.Document,
+                    pressedFrame.Document.HoveredElement, null,
+                    pressedFrame.Document.FocusedElement, relayout: false);
+            else if (_document != null)
+                UpdateCssInteractionState(_document, _document.HoveredElement, null,
+                    _document.FocusedElement, relayout: false);
             _pressedControl = null;
+            _pressedControlFrame = null;
             RerenderNow();
         }
 
@@ -2869,9 +3491,10 @@ public class BrowserCanvas : Control
             // The field click was fully handled at mouse-down. Do not clear
             // the active state through a second full relayout here; doing so
             // moved textarea geometry after a page scroll.
-            if (_document != null && _document.ActiveElement != null)
-                UpdateCssInteractionState(_document, _document.HoveredElement,
-                    null, _document.FocusedElement, relayout: false);
+            var focusDoc = _focusedInputFrame?.Document ?? _document;
+            if (focusDoc != null && focusDoc.ActiveElement != null)
+                UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement,
+                    null, focusDoc.FocusedElement, relayout: false);
             return;
         }
 
@@ -2902,10 +3525,7 @@ public class BrowserCanvas : Control
         // release of a double-click (that was the highlight flicker).
         if (wasSelecting && !_dragMoved)
         {
-            _selAnchor = _selFocus = null;
-            _selectionFrame = null;
-            _pendingSelectionAnchor = null;
-            _pendingSelectionFrame = null;
+            ClearPageSelection();
             Invalidate();
         }
 
@@ -2913,7 +3533,18 @@ public class BrowserCanvas : Control
         {
             float ux = e.X / _pluginZoom + _scrollOffset.X;
             float uy = e.Y / _pluginZoom + _scrollOffset.Y;
-            var upEl = _rootBox != null ? HitTestDeepestBox(_rootBox, ux, uy)?.Element : null;
+            DomElement? upEl = null;
+            if (pressedFrame != null)
+            {
+                if (TryHitFrame(ux, uy, out var releaseHit) &&
+                    ReferenceEquals(releaseHit.View, pressedFrame))
+                    upEl = HitTestDeepestBox(pressedFrame.RootBox,
+                        releaseHit.LocalX, releaseHit.LocalY)?.Element;
+            }
+            else if (_rootBox != null)
+            {
+                upEl = HitTestDeepestBox(_rootBox, ux, uy)?.Element;
+            }
             if (upEl == null || !IsElementWithin(upEl, pressedEl!))
                 return;   // released off the control — cancel activation
         }
@@ -2938,39 +3569,52 @@ public class BrowserCanvas : Control
 
         // Double-click inside an editable field: the primary mouse-down path
         // already performs the selection. Keep this WinForms event as a
-        // compatibility fallback, but never let it overwrite a triple-click
-        // that has just selected the entire field.
+        // compatibility fallback for both the page and nested frames.
         if (_focusedInput != null && _fieldClickCount == 2)
         {
-            var box = FindBoxForElement(_rootBox, _focusedInput);
-            if (box != null && box.BorderRect.Contains(x, y))
+            if (_focusedInputFrame != null &&
+                TryHitFrame(x, y, out var fieldHit) &&
+                ReferenceEquals(fieldHit.View, _focusedInputFrame))
             {
-                int caret = FieldCaretFromPoint(_focusedInput, box, x, y);
-                SelectFieldWord(_focusedInput, ref caret, ref _fieldSelAnchor);
-                _fieldCaret = caret;
-                Invalidate();
-                return;
+                var box = FindBoxForElement(fieldHit.View.RootBox, _focusedInput);
+                if (box != null)
+                {
+                    int caret = FieldCaretFromPoint(_focusedInput, box, fieldHit.LocalX, fieldHit.LocalY, fieldHit.View);
+                    SelectFieldWord(_focusedInput, ref caret, ref _fieldSelAnchor);
+                    _fieldCaret = caret;
+                    Invalidate();
+                    return;
+                }
+            }
+            else
+            {
+                var box = FindBoxForElement(_rootBox!, _focusedInput);
+                if (box != null && box.BorderRect.Contains(x, y))
+                {
+                    int caret = FieldCaretFromPoint(_focusedInput, box, x, y);
+                    SelectFieldWord(_focusedInput, ref caret, ref _fieldSelAnchor);
+                    _fieldCaret = caret;
+                    Invalidate();
+                    return;
+                }
             }
         }
 
-        // Double-click on frame text uses the frame's own layout tree.
-        var frameBox = FrameBoxAtPoint(x, y);
-        if (frameBox != null && _frames.TryGetValue(frameBox, out var frameView))
+        // Double-click on frame text uses the frame's own layout tree,
+        // including nested iframe/frame views.
+        if (TryHitFrame(x, y, out var frameHit))
         {
-            var frameWord = HitTestTextBox(frameView.RootBox,
-                x - frameBox.X + frameView.Scroll.X,
-                y - frameBox.Y + frameView.Scroll.Y);
-            if (frameWord != null)
+            var frameView = frameHit.View;
+            var frameWordHit = HitTestTextPosition(frameView.RootBox, frameHit.LocalX, frameHit.LocalY);
+            if (frameWordHit != null)
             {
-                _focusedFrame = frameBox;
+                var frameWord = frameWordHit.Value.Box;
+                _focusedFrame = frameHit.Box;
                 _selectionFrame = frameView;
                 if (e.Clicks >= 3)
                     SelectTextBlock(frameWord);
                 else
-                {
-                    _selAnchor = frameWord;
-                    _selFocus = frameWord;
-                }
+                    SelectWordAt(frameWord, frameWordHit.Value.Offset);
                 Invalidate();
                 return;
             }
@@ -2978,17 +3622,15 @@ public class BrowserCanvas : Control
 
         // Double-click on page text: each fragment IS one word (spaces are
         // glued to the previous word) — select that box.
-        var word = HitTestTextBox(_rootBox, x, y);
-        if (word != null)
+        var wordHit = HitTestTextPosition(_rootBox, x, y);
+        if (wordHit != null)
         {
+            var word = wordHit.Value.Box;
             _selectionFrame = null;
             if (e.Clicks >= 3)
                 SelectTextBlock(word);
             else
-            {
-                _selAnchor = word;
-                _selFocus = word;
-            }
+                SelectWordAt(word, wordHit.Value.Offset);
             Invalidate();
         }
     }
@@ -3016,11 +3658,216 @@ public class BrowserCanvas : Control
         {
             _selAnchor = textBoxes[0];
             _selFocus = textBoxes[^1];
+            _selAnchorOffset = 0;
+            _selFocusOffset = textBoxes[^1].TextRun?.Length ?? 0;
         }
         else
         {
             _selAnchor = _selFocus = word;
+            _selAnchorOffset = 0;
+            _selFocusOffset = word.TextRun?.Length ?? 0;
         }
+    }
+
+    private void SelectWordAt(LayoutBox box, int offset)
+    {
+        string text = box.TextRun ?? string.Empty;
+        if (text.Length == 0) return;
+        int p = Math.Clamp(offset, 0, text.Length - 1);
+        if (char.IsWhiteSpace(text[p]))
+        {
+            int left = p - 1;
+            while (left >= 0 && char.IsWhiteSpace(text[left])) left--;
+            int right = p + 1;
+            while (right < text.Length && char.IsWhiteSpace(text[right])) right++;
+            if (left >= 0) p = left;
+            else if (right < text.Length) p = right;
+            else
+            {
+                _selAnchor = _selFocus = box;
+                _selAnchorOffset = _selFocusOffset = 0;
+                return;
+            }
+        }
+
+        int start = p;
+        int end = p + 1;
+        while (start > 0 && !char.IsWhiteSpace(text[start - 1])) start--;
+        while (end < text.Length && !char.IsWhiteSpace(text[end])) end++;
+
+        _selAnchor = _selFocus = box;
+        _selAnchorOffset = start;
+        _selFocusOffset = end;
+    }
+
+    private readonly record struct TextSelectionHit(LayoutBox Box, int Offset);
+
+    private TextSelectionHit? HitTestTextPosition(LayoutBox root, float x, float y)
+    {
+        var box = HitTestTextBox(root, x, y);
+        if (box == null || string.IsNullOrEmpty(box.TextRun)) return null;
+        return new TextSelectionHit(box, GetTextOffsetAtPoint(box, x));
+    }
+
+    private static string TransformSelectionText(string text, TextTransform transform)
+    {
+        return transform switch
+        {
+            TextTransform.Uppercase => text.ToUpperInvariant(),
+            TextTransform.Lowercase => text.ToLowerInvariant(),
+            TextTransform.Capitalize => CapitalizeSelectionWords(text),
+            _ => text
+        };
+    }
+
+    private static string CapitalizeSelectionWords(string text)
+    {
+        var chars = text.ToCharArray();
+        bool start = true;
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (char.IsLetterOrDigit(chars[i]))
+            {
+                if (start) chars[i] = char.ToUpperInvariant(chars[i]);
+                start = false;
+            }
+            else start = true;
+        }
+        return new string(chars);
+    }
+
+    private int GetTextOffsetAtPoint(LayoutBox box, float x)
+    {
+        string text = box.TextRun ?? string.Empty;
+        if (text.Length == 0) return 0;
+
+        var style = box.StyleOverride ?? box.Element?.Style;
+        if (_fontCache == null || style == null)
+            return Math.Clamp((int)Math.Round(x - box.ContentRect.X), 0, text.Length);
+
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        var font = _fontCache.Resolve(style.FontFamily, style.FontSize,
+            (int)style.FontWeight, italic, oblique);
+        string visualText = TransformSelectionText(text, style.TextTransform);
+        float target = Math.Max(0f, x - box.ContentRect.X);
+        float previous = 0f;
+        for (int i = 1; i <= text.Length; i++)
+        {
+            float w = SelectionAdvance(_measureGfx ?? MeasureGraphics, font, visualText[..i], style);
+            if (target <= w)
+                return (target - previous) <= (w - target) ? i - 1 : i;
+            previous = w;
+        }
+        return text.Length;
+    }
+
+    private float SelectionAdvance(Graphics g, Font font, string text, ComputedStyle style)
+    {
+        if (string.IsNullOrEmpty(text)) return 0f;
+        float width = g.MeasureString(text, font, int.MaxValue, NewSelectionFormat()).Width;
+        if (Math.Abs(style.LetterSpacing) > 0.001f || Math.Abs(style.WordSpacing) > 0.001f)
+        {
+            width = 0f;
+            for (int i = 0; i < text.Length; i++)
+            {
+                width += g.MeasureString(text[i].ToString(), font, int.MaxValue, NewSelectionFormat()).Width;
+                if (i + 1 < text.Length) width += style.LetterSpacing;
+                if (char.IsWhiteSpace(text[i])) width += style.WordSpacing;
+            }
+        }
+        return Math.Max(0f, width);
+    }
+
+    private StringFormat NewSelectionFormat()
+    {
+        var sf = new StringFormat();
+        sf.FormatFlags |= StringFormatFlags.NoClip | StringFormatFlags.NoWrap;
+        return sf;
+    }
+
+    private IEnumerable<RectangleF> SelectionVisualSpans(Graphics g, LayoutBox box, int start, int end)
+    {
+        string text = box.TextRun ?? string.Empty;
+        if (text.Length == 0) yield break;
+        start = Math.Clamp(start, 0, text.Length);
+        end = Math.Clamp(end, 0, text.Length);
+        if (end <= start) yield break;
+
+        var style = box.StyleOverride ?? box.Element?.Style;
+        if (_fontCache == null || style == null)
+            yield break;
+
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        var font = _fontCache.Resolve(style.FontFamily, style.FontSize,
+            (int)style.FontWeight, italic, oblique);
+        float lineHeight = Math.Max(1f, Math.Min(box.Height > 0 ? box.Height : font.GetHeight(g), font.GetHeight(g)));
+        float baseX = box.ContentRect.X;
+        float y = box.ContentRect.Y;
+        string visualText = TransformSelectionText(text, style.TextTransform);
+
+        // A selected range inside one text run is one continuous visual
+        // selection, including the selected whitespace between words.  Splitting
+        // each word into its own rectangle leaves visible holes in the highlight
+        // and does not match normal browser selection rendering.
+        float x1 = baseX + SelectionAdvance(g, font, visualText[..start], style);
+        float x2 = baseX + SelectionAdvance(g, font, visualText[..end], style);
+        if (x2 > x1)
+            yield return new RectangleF(x1, y, x2 - x1, lineHeight);
+    }
+
+    private static IEnumerable<RectangleF> MergeSelectionSpans(List<RectangleF> spans)
+    {
+        if (spans.Count == 0) yield break;
+
+        spans.Sort((a, b) =>
+        {
+            int y = a.Y.CompareTo(b.Y);
+            return y != 0 ? y : a.X.CompareTo(b.X);
+        });
+
+        RectangleF current = spans[0];
+        for (int i = 1; i < spans.Count; i++)
+        {
+            var next = spans[i];
+            bool sameLine = Math.Abs(next.Y - current.Y) <= 1.5f &&
+                Math.Abs(next.Height - current.Height) <= 1.5f;
+            // Layout and font measurement can leave a few fractional pixels
+            // between adjacent inline text runs (especially around collapsed
+            // spaces and run boundaries).  Treat only these tiny same-line
+            // gaps as part of one continuous selection; larger gaps still
+            // preserve real padding/margin/empty-layout separation.
+            // A collapsed inter-word space is laid out as a separate inline
+            // run, so the visible glyph spans can be several pixels apart even
+            // though the selection should look continuous. Keep the bridge
+            // small enough not to swallow ordinary block/padding gaps.
+            const float selectionJoinTolerance = 8f;
+            bool touching = next.X <= current.Right + selectionJoinTolerance;
+            if (sameLine && touching)
+            {
+                float right = Math.Max(current.Right, next.Right);
+                current = new RectangleF(current.X, Math.Min(current.Y, next.Y),
+                    right - current.X, Math.Max(current.Bottom, next.Bottom) - Math.Min(current.Y, next.Y));
+            }
+            else
+            {
+                yield return current;
+                current = next;
+            }
+        }
+
+        yield return current;
+    }
+
+    private void ClearPageSelection()
+    {
+        _selAnchor = _selFocus = null;
+        _selAnchorOffset = _selFocusOffset = 0;
+        _selectionFrame = null;
+        _pendingSelectionAnchor = null;
+        _pendingSelectionAnchorOffset = 0;
+        _pendingSelectionFrame = null;
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -3035,8 +3882,15 @@ public class BrowserCanvas : Control
         }
         if (_lastHoveredElement != null)
         {
-            _jsInterpreter?.FireEvent(_lastHoveredElement, "onmouseout");
+            var hoverJs = _lastHoveredFrame?.Interpreter ?? _jsInterpreter;
+            hoverJs?.FireEvent(_lastHoveredElement, "onmouseout");
+            if (_lastHoveredFrame != null)
+                UpdateCssInteractionState(_lastHoveredFrame.Document, null,
+                    _lastHoveredFrame.Document.ActiveElement, _lastHoveredFrame.Document.FocusedElement);
+            else if (_document != null)
+                UpdateCssInteractionState(_document, null, _document.ActiveElement, _document.FocusedElement);
             _lastHoveredElement = null;
+            _lastHoveredFrame = null;
         }
     }
 
@@ -3066,35 +3920,78 @@ public class BrowserCanvas : Control
         catch { }
     }
 
-    private IEnumerable<LayoutBox> SelectedTextBoxes()
+    private List<LayoutBox> OrderedSelectionBoxes()
     {
         var selectionRoot = _selectionFrame?.RootBox ?? _rootBox;
         if (selectionRoot == null || _selAnchor == null || _selFocus == null)
-            yield break;
-
-        var textBoxes = selectionRoot.Descendants()
+            return new List<LayoutBox>();
+        return selectionRoot.Descendants()
             .Where(b => !string.IsNullOrEmpty(b.TextRun))
             .ToList();
+    }
+
+    private IEnumerable<LayoutBox> SelectedTextBoxes()
+    {
+        var textBoxes = OrderedSelectionBoxes();
+        if (textBoxes.Count == 0 || _selAnchor == null || _selFocus == null)
+            yield break;
         int start = textBoxes.IndexOf(_selAnchor);
         int end = textBoxes.IndexOf(_selFocus);
         if (start < 0 || end < 0) yield break;
         if (start > end) (start, end) = (end, start);
-
         for (int i = start; i <= end; i++)
             yield return textBoxes[i];
     }
 
     private string GetSelectedText()
     {
-        if (_selAnchor == null || _selFocus == null) return "";
-        return string.Concat(SelectedTextBoxes().Select(b => b.TextRun));
+        var textBoxes = OrderedSelectionBoxes();
+        if (textBoxes.Count == 0 || _selAnchor == null || _selFocus == null) return "";
+        int ai = textBoxes.IndexOf(_selAnchor);
+        int fi = textBoxes.IndexOf(_selFocus);
+        if (ai < 0 || fi < 0) return "";
+
+        bool forward = ai < fi || (ai == fi && _selAnchorOffset <= _selFocusOffset);
+        int startIndex = forward ? ai : fi;
+        int endIndex = forward ? fi : ai;
+        int startOffset = forward ? _selAnchorOffset : _selFocusOffset;
+        int endOffset = forward ? _selFocusOffset : _selAnchorOffset;
+
+        var sb = new System.Text.StringBuilder();
+        for (int i = startIndex; i <= endIndex; i++)
+        {
+            string text = textBoxes[i].TextRun ?? "";
+            if (text.Length == 0) continue;
+            if (i == startIndex && i == endIndex)
+            {
+                int a = Math.Clamp(startOffset, 0, text.Length);
+                int b = Math.Clamp(endOffset, a, text.Length);
+                if (b > a) sb.Append(text[a..b]);
+            }
+            else if (i == startIndex)
+            {
+                int a = Math.Clamp(startOffset, 0, text.Length);
+                sb.Append(text[a..]);
+            }
+            else if (i == endIndex)
+            {
+                int b = Math.Clamp(endOffset, 0, text.Length);
+                sb.Append(text[..b]);
+            }
+            else
+            {
+                sb.Append(text);
+            }
+        }
+        return sb.ToString();
     }
 
     private void SelectAllText()
     {
         FrameView? selectionView = null;
         LayoutBox? selectionRoot = _rootBox;
-        if (_focusedFrame != null && _frames.TryGetValue(_focusedFrame, out var focusedView))
+        if (_focusedFrame != null && TryGetFrameViewForBox(_focusedFrame, out var focusedView) &&
+            focusedView != null)
         {
             selectionView = focusedView;
             selectionRoot = focusedView.RootBox;
@@ -3102,14 +3999,17 @@ public class BrowserCanvas : Control
         if (selectionRoot == null) return;
 
         _selectionFrame = selectionView;
-
         var textBoxes = selectionRoot.Descendants()
-            .Where(b => !string.IsNullOrEmpty(b.TextRun))
+            // Do not anchor Ctrl+A on collapsed indentation/edge spaces that
+            // the layout pass skips visually.
+            .Where(b => !string.IsNullOrEmpty(b.TextRun) && b.TextRun.Any(ch => ch != ' '))
             .ToList();
         if (textBoxes.Count == 0) return;
 
         _selAnchor = textBoxes[0];
         _selFocus = textBoxes[^1];
+        _selAnchorOffset = 0;
+        _selFocusOffset = textBoxes[^1].TextRun?.Length ?? 0;
         Invalidate();
     }
 
@@ -3175,13 +4075,10 @@ public class BrowserCanvas : Control
 
         float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
         float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
-        var frameBox = FrameBoxAtPoint(x, y);
-        if (frameBox != null && _frames.TryGetValue(frameBox, out var view))
+        if (TryHitFrame(x, y, out var hit))
         {
-            _focusedFrame = frameBox;
-            HandleClickInView(view, frameBox,
-                x - frameBox.X + view.Scroll.X,
-                y - frameBox.Y + view.Scroll.Y);
+            _focusedFrame = hit.Box;
+            HandleClickInView(hit.View, hit.Box, hit.LocalX, hit.LocalY);
             return;
         }
 
@@ -3203,47 +4100,432 @@ public class BrowserCanvas : Control
     private static LayoutBox? HitTestTextBox(LayoutBox box, float x, float y) =>
         Engine.Layout.HitTester.TextBoxAt(box, x, y);
 
-    private LayoutBox? FrameBoxAtPoint(float x, float y)
+    private static (float Width, float Height) GetFrameContentSize(LayoutBox rootBox,
+                                                                      float viewportWidth,
+                                                                      float viewportHeight)
     {
-        foreach (var (box, _) in _frames)
-            if (box.BorderRect.Contains(x, y))
-                return box;
-        return null;
+        float width = Math.Max(1f, Math.Max(viewportWidth, rootBox.Width));
+        float height = Math.Max(1f, Math.Max(viewportHeight, rootBox.Height));
+
+        // The root box may stay constrained to the viewport even when one of
+        // its descendants overflows it.  Scan the laid-out descendants for
+        // the true document extents instead of assuming rootBox.Width/Height
+        // are the complete scrollable surface.
+        foreach (var box in rootBox.Descendants())
+        {
+            if (ReferenceEquals(box, rootBox)) continue;
+            width = Math.Max(width, box.X + Math.Max(0f, box.Width));
+            height = Math.Max(height, box.Y + Math.Max(0f, box.Height));
+        }
+
+        return (width, height);
     }
 
-    private bool TryFindFrameBox(FrameView view, out LayoutBox box)
+    private readonly record struct FrameScrollMetrics(
+        bool Vertical,
+        bool Horizontal,
+        float ViewportWidth,
+        float ViewportHeight,
+        float MaxScrollX,
+        float MaxScrollY,
+        float VerticalTrackLength,
+        float VerticalThumbLength,
+        float HorizontalTrackLength,
+        float HorizontalThumbLength);
+
+    private static FrameScrollMetrics GetFrameScrollMetrics(LayoutBox frameBox, FrameView view)
     {
-        foreach (var pair in _frames)
+        float frameW = Math.Max(1f, frameBox.Width);
+        float frameH = Math.Max(1f, frameBox.Height);
+        var layoutContent = GetFrameContentSize(view.RootBox, frameW, frameH);
+        float contentW = Math.Max(frameW, Math.Max(layoutContent.Width, view.Rendered?.Width ?? 0f));
+        float contentH = Math.Max(frameH, Math.Max(layoutContent.Height, view.Rendered?.Height ?? 0f));
+        const float bar = 16f;
+
+        bool vertical = false, horizontal = false;
+        if (view.ScrollMode == FrameScrollMode.No || !view.ScrollingEnabled)
+            return new FrameScrollMetrics(false, false, frameW, frameH, 0, 0, 0, 0, 0, 0);
+
+        // scrolling=yes means that a scrollbar is offered even when the
+        // current document fits. Keep the classic browser behaviour by
+        // forcing the vertical bar; add the horizontal bar when content
+        // really needs it (or the reduced viewport created by the vertical
+        // bar makes it necessary).
+        if (view.ScrollMode == FrameScrollMode.Yes)
+            vertical = true;
+        else
+            vertical = contentH > frameH + 0.5f;
+
+        horizontal = contentW > frameW + 0.5f;
+
+        // A visible scrollbar shrinks the usable content viewport, which can
+        // in turn require the other axis. Iterate to a stable pair.
+        for (int i = 0; i < 3; i++)
         {
-            if (ReferenceEquals(pair.Value, view))
+            float vpW = Math.Max(1f, frameW - (vertical ? bar : 0f));
+            float vpH = Math.Max(1f, frameH - (horizontal ? bar : 0f));
+            bool newHorizontal = view.ScrollMode == FrameScrollMode.Yes
+                ? contentW > vpW + 0.5f
+                : horizontal || contentW > vpW + 0.5f;
+            bool newVertical = view.ScrollMode == FrameScrollMode.Yes
+                ? true
+                : vertical || contentH > vpH + 0.5f;
+            if (newHorizontal == horizontal && newVertical == vertical) break;
+            horizontal = newHorizontal;
+            vertical = newVertical;
+        }
+
+        float viewportW = Math.Max(1f, frameW - (vertical ? bar : 0f));
+        float viewportH = Math.Max(1f, frameH - (horizontal ? bar : 0f));
+        float maxX = Math.Max(0f, contentW - viewportW);
+        float maxY = Math.Max(0f, contentH - viewportH);
+
+        const float arrow = 16f;
+        float vTrack = vertical ? Math.Max(1f, viewportH - arrow * 2f) : 0f;
+        float hTrack = horizontal ? Math.Max(1f, viewportW - arrow * 2f) : 0f;
+        float vThumb = vertical
+            ? Math.Clamp(vTrack * viewportH / Math.Max(viewportH, contentH), 10f, vTrack)
+            : 0f;
+        float hThumb = horizontal
+            ? Math.Clamp(hTrack * viewportW / Math.Max(viewportW, contentW), 10f, hTrack)
+            : 0f;
+
+        return new FrameScrollMetrics(vertical, horizontal, viewportW, viewportH,
+            maxX, maxY, vTrack, vThumb, hTrack, hThumb);
+    }
+
+    private static RectangleF GetFrameVerticalScrollbarRect(RectangleF rect, FrameScrollMetrics metrics)
+    {
+        const float bar = 16f;
+        return new RectangleF(rect.Right - bar, rect.Top, bar,
+            rect.Height - (metrics.Horizontal ? bar : 0f));
+    }
+
+    private static RectangleF GetFrameHorizontalScrollbarRect(RectangleF rect, FrameScrollMetrics metrics)
+    {
+        const float bar = 16f;
+        return new RectangleF(rect.Left, rect.Bottom - bar,
+            rect.Width - (metrics.Vertical ? bar : 0f), bar);
+    }
+
+    private static RectangleF GetFrameVerticalThumb(RectangleF track, FrameScrollMetrics metrics, float scroll)
+    {
+        const float arrow = 16f;
+        float travel = Math.Max(1f, metrics.VerticalTrackLength - metrics.VerticalThumbLength);
+        float offset = metrics.MaxScrollY <= 0 ? 0f :
+            travel * Math.Clamp(scroll / metrics.MaxScrollY, 0f, 1f);
+        return new RectangleF(track.X + 2f, track.Top + arrow + offset,
+            Math.Max(4f, track.Width - 4f), metrics.VerticalThumbLength);
+    }
+
+    private static RectangleF GetFrameHorizontalThumb(RectangleF track, FrameScrollMetrics metrics, float scroll)
+    {
+        const float arrow = 16f;
+        float travel = Math.Max(1f, metrics.HorizontalTrackLength - metrics.HorizontalThumbLength);
+        float offset = metrics.MaxScrollX <= 0 ? 0f :
+            travel * Math.Clamp(scroll / metrics.MaxScrollX, 0f, 1f);
+        return new RectangleF(track.Left + arrow + offset, track.Y + 2f,
+            metrics.HorizontalThumbLength, Math.Max(4f, track.Height - 4f));
+    }
+
+    private static void PaintFrameScrollButton(Graphics g, RectangleF rect, bool pressed, bool upOrLeft)
+    {
+        using var face = new SolidBrush(Color.FromArgb(212, 208, 200));
+        using var edgeLight = new Pen(Color.FromArgb(255, 255, 255));
+        using var edgeDark = new Pen(Color.FromArgb(128, 128, 128));
+        g.FillRectangle(face, rect);
+        g.DrawRectangle(pressed ? edgeDark : edgeLight, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
+        if (!pressed)
+            g.DrawLine(edgeDark, rect.Left, rect.Bottom - 1, rect.Right - 1, rect.Bottom - 1);
+
+        float cx = rect.X + rect.Width / 2f;
+        float cy = rect.Y + rect.Height / 2f;
+        PointF[] tri = upOrLeft
+            ? (rect.Height >= rect.Width
+                ? new[] { new PointF(cx, cy - 4), new PointF(cx - 4, cy + 3), new PointF(cx + 4, cy + 3) }
+                : new[] { new PointF(cx - 4, cy), new PointF(cx + 3, cy - 4), new PointF(cx + 3, cy + 4) })
+            : (rect.Height >= rect.Width
+                ? new[] { new PointF(cx - 4, cy - 3), new PointF(cx + 4, cy - 3), new PointF(cx, cy + 4) }
+                : new[] { new PointF(cx - 3, cy - 4), new PointF(cx + 4, cy), new PointF(cx - 3, cy + 4) });
+        using var arrow = new SolidBrush(Color.FromArgb(0, 0, 0));
+        g.FillPolygon(arrow, tri);
+    }
+
+    private static void PaintFrameScrollbar(Graphics g, RectangleF track, bool vertical,
+                                            float scroll, float maxScroll, float trackLength,
+                                            float thumbLength)
+    {
+        using var bg = new SolidBrush(Color.FromArgb(212, 208, 200));
+        using var border = new Pen(Color.FromArgb(128, 128, 128));
+        g.FillRectangle(bg, track);
+        g.DrawRectangle(border, track.X, track.Y, track.Width - 1, track.Height - 1);
+
+        const float arrow = 16f;
+        if (vertical)
+        {
+            var top = new RectangleF(track.Left, track.Top, track.Width, arrow);
+            var bottom = new RectangleF(track.Left, track.Bottom - arrow, track.Width, arrow);
+            PaintFrameScrollButton(g, top, false, true);
+            PaintFrameScrollButton(g, bottom, false, false);
+            float travel = Math.Max(1f, trackLength - thumbLength);
+            float offset = maxScroll <= 0 ? 0f : travel * Math.Clamp(scroll / maxScroll, 0f, 1f);
+            var thumb = new RectangleF(track.Left + 2f, track.Top + arrow + offset,
+                Math.Max(4f, track.Width - 4f), thumbLength);
+            using var thumbFill = new SolidBrush(Color.FromArgb(128, 128, 128));
+            using var thumbEdge = new Pen(Color.FromArgb(64, 64, 64));
+            g.FillRectangle(thumbFill, thumb);
+            g.DrawRectangle(thumbEdge, thumb.X, thumb.Y, thumb.Width - 1, thumb.Height - 1);
+        }
+        else
+        {
+            var left = new RectangleF(track.Left, track.Top, arrow, track.Height);
+            var right = new RectangleF(track.Right - arrow, track.Top, arrow, track.Height);
+            PaintFrameScrollButton(g, left, false, true);
+            PaintFrameScrollButton(g, right, false, false);
+            float travel = Math.Max(1f, trackLength - thumbLength);
+            float offset = maxScroll <= 0 ? 0f : travel * Math.Clamp(scroll / maxScroll, 0f, 1f);
+            var thumb = new RectangleF(track.Left + arrow + offset, track.Top + 2f,
+                thumbLength, Math.Max(4f, track.Height - 4f));
+            using var thumbFill = new SolidBrush(Color.FromArgb(128, 128, 128));
+            using var thumbEdge = new Pen(Color.FromArgb(64, 64, 64));
+            g.FillRectangle(thumbFill, thumb);
+            g.DrawRectangle(thumbEdge, thumb.X, thumb.Y, thumb.Width - 1, thumb.Height - 1);
+        }
+    }
+
+    private void PaintFrameScrollbars(Graphics g, RectangleF destRect, FrameView view, LayoutBox frameBox)
+    {
+        var metrics = GetFrameScrollMetrics(frameBox, view);
+        if (!metrics.Vertical && !metrics.Horizontal) return;
+
+        int state = g.Save();
+        g.SetClip(destRect, CombineMode.Intersect);
+        if (metrics.Vertical)
+        {
+            var rect = GetFrameVerticalScrollbarRect(destRect, metrics);
+            PaintFrameScrollbar(g, rect, true, view.Scroll.Y, metrics.MaxScrollY,
+                metrics.VerticalTrackLength, metrics.VerticalThumbLength);
+        }
+        if (metrics.Horizontal)
+        {
+            var rect = GetFrameHorizontalScrollbarRect(destRect, metrics);
+            PaintFrameScrollbar(g, rect, false, view.Scroll.X, metrics.MaxScrollX,
+                metrics.HorizontalTrackLength, metrics.HorizontalThumbLength);
+        }
+        if (metrics.Vertical && metrics.Horizontal)
+        {
+            using var fill = new SolidBrush(Color.FromArgb(212, 208, 200));
+            g.FillRectangle(fill, destRect.Right - 16f, destRect.Bottom - 16f, 16f, 16f);
+            using var edge = new Pen(Color.FromArgb(128, 128, 128));
+            g.DrawRectangle(edge, destRect.Right - 16f, destRect.Bottom - 16f, 15f, 15f);
+        }
+        g.Restore(state);
+    }
+
+    private bool TryBeginFrameScrollbarInteraction(float x, float y)
+    {
+        if (!TryHitFrame(x, y, out var hit) || !hit.View.ScrollingEnabled)
+            return false;
+
+        var metrics = GetFrameScrollMetrics(hit.Box, hit.View);
+        var frameRect = new RectangleF(0, 0, hit.Box.Width, hit.Box.Height);
+        float localX = hit.ViewX;
+        float localY = hit.ViewY;
+        if (metrics.Vertical)
+        {
+            var track = GetFrameVerticalScrollbarRect(frameRect, metrics);
+            if (track.Contains(localX, localY))
             {
-                box = pair.Key;
+                const float arrow = 16f;
+                var thumb = GetFrameVerticalThumb(track, metrics, hit.View.Scroll.Y);
+                if (thumb.Contains(localX, localY))
+                {
+                    _frameScrollbarDragBox = hit.Box;
+                    _frameScrollbarDragView = hit.View;
+                    _frameScrollbarDragAxis = FrameScrollbarAxis.Vertical;
+                    _frameScrollbarDragStartPointer = y;
+                    _frameScrollbarDragStartScroll = hit.View.Scroll.Y;
+                    _focusedFrame = hit.Box;
+                    return true;
+                }
+                if (localY < thumb.Top && localY > track.Top + arrow)
+                    hit.View.Scroll.Y = Math.Max(0f, hit.View.Scroll.Y - metrics.ViewportHeight);
+                else if (localY > thumb.Bottom && localY < track.Bottom - arrow)
+                    hit.View.Scroll.Y = Math.Min(metrics.MaxScrollY, hit.View.Scroll.Y + metrics.ViewportHeight);
+                else if (localY <= track.Top + arrow)
+                    hit.View.Scroll.Y = Math.Max(0f, hit.View.Scroll.Y - 40f);
+                else if (localY >= track.Bottom - arrow)
+                    hit.View.Scroll.Y = Math.Min(metrics.MaxScrollY, hit.View.Scroll.Y + 40f);
+                _focusedFrame = hit.Box;
+                RecomposeFrameTree(hit.View);
                 return true;
             }
         }
-        box = null!;
+
+        if (metrics.Horizontal)
+        {
+            var track = GetFrameHorizontalScrollbarRect(frameRect, metrics);
+            if (track.Contains(localX, localY))
+            {
+                const float arrow = 16f;
+                var thumb = GetFrameHorizontalThumb(track, metrics, hit.View.Scroll.X);
+                if (thumb.Contains(localX, localY))
+                {
+                    _frameScrollbarDragBox = hit.Box;
+                    _frameScrollbarDragView = hit.View;
+                    _frameScrollbarDragAxis = FrameScrollbarAxis.Horizontal;
+                    _frameScrollbarDragStartPointer = x;
+                    _frameScrollbarDragStartScroll = hit.View.Scroll.X;
+                    _focusedFrame = hit.Box;
+                    return true;
+                }
+                if (localX < thumb.Left && localX > track.Left + arrow)
+                    hit.View.Scroll.X = Math.Max(0f, hit.View.Scroll.X - metrics.ViewportWidth);
+                else if (localX > thumb.Right && localX < track.Right - arrow)
+                    hit.View.Scroll.X = Math.Min(metrics.MaxScrollX, hit.View.Scroll.X + metrics.ViewportWidth);
+                else if (localX <= track.Left + arrow)
+                    hit.View.Scroll.X = Math.Max(0f, hit.View.Scroll.X - 40f);
+                else if (localX >= track.Right - arrow)
+                    hit.View.Scroll.X = Math.Min(metrics.MaxScrollX, hit.View.Scroll.X + 40f);
+                _focusedFrame = hit.Box;
+                RecomposeFrameTree(hit.View);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private readonly record struct FrameHit(LayoutBox Box, FrameView View, float LocalX, float LocalY, float ViewX, float ViewY);
+
+    private bool TryHitFrame(float x, float y, out FrameHit hit)
+    {
+        foreach (var (box, view) in _frames)
+        {
+            if (!box.BorderRect.Contains(x, y)) continue;
+            float viewX = x - box.X, viewY = y - box.Y;
+            float localX = viewX + view.Scroll.X, localY = viewY + view.Scroll.Y;
+            if (TryHitNestedFrame(view, localX, localY, out hit)) return true;
+            hit = new FrameHit(box, view, localX, localY, viewX, viewY); return true;
+        }
+        hit = default; return false;
+    }
+
+    private static bool TryHitNestedFrame(FrameView parent, float parentX, float parentY, out FrameHit hit)
+    {
+        foreach (var (childBox, childView) in parent.ChildFrames)
+        {
+            if (!childBox.BorderRect.Contains(parentX, parentY)) continue;
+            float viewX = parentX - childBox.X, viewY = parentY - childBox.Y;
+            float localX = viewX + childView.Scroll.X, localY = viewY + childView.Scroll.Y;
+            if (TryHitNestedFrame(childView, localX, localY, out hit)) return true;
+            hit = new FrameHit(childBox, childView, localX, localY, viewX, viewY); return true;
+        }
+        hit = default; return false;
+    }
+
+    private LayoutBox? FrameBoxAtPoint(float x, float y) => TryHitFrame(x, y, out var hit) ? hit.Box : null;
+
+    private bool TryFindFrameBox(FrameView view, out LayoutBox box)
+    {
+        if (TryFindFrameHost(view, out _, out var found) && found != null)
+        { box = found; return true; }
+        box = null!; return false;
+    }
+
+    // Returns the frame view owning a frame layout box, including nested
+    // ChildFrames. _frames only contains top-level frame boxes, so direct
+    // dictionary lookups are insufficient for selection/focus inside an
+    // embedded frame hierarchy.
+    private static bool TryGetFrameViewForBox(FrameView current, LayoutBox target,
+                                               out FrameView? view)
+    {
+        foreach (var (childBox, childView) in current.ChildFrames)
+        {
+            if (ReferenceEquals(childBox, target))
+            {
+                view = childView;
+                return true;
+            }
+            if (TryGetFrameViewForBox(childView, target, out view))
+                return true;
+        }
+        view = null;
+        return false;
+    }
+
+    private bool TryGetFrameViewForBox(LayoutBox target, out FrameView? view)
+    {
+        foreach (var (topBox, topView) in _frames)
+        {
+            if (ReferenceEquals(topBox, target))
+            {
+                view = topView;
+                return true;
+            }
+            if (TryGetFrameViewForBox(topView, target, out view))
+                return true;
+        }
+        view = null;
+        return false;
+    }
+
+    // Computes a frame's actual destination rectangle in top-level canvas
+    // coordinates. Child frame boxes are expressed in their parent's document
+    // coordinates, so simply using childBox.X/Y produces the wrong offset for
+    // nested selections.
+    private bool TryGetFrameDestinationRect(FrameView target, out RectangleF rect)
+    {
+        foreach (var (topBox, topView) in _frames)
+        {
+            var topRect = new RectangleF(
+                topBox.X - _scrollOffset.X,
+                topBox.Y - _scrollOffset.Y,
+                topBox.Width, topBox.Height);
+            if (ReferenceEquals(topView, target))
+            {
+                rect = topRect;
+                return true;
+            }
+            if (TryGetNestedFrameDestinationRect(topView, target, topRect, out rect))
+                return true;
+        }
+        rect = RectangleF.Empty;
+        return false;
+    }
+
+    private static bool TryGetNestedFrameDestinationRect(FrameView parent, FrameView target,
+                                                          RectangleF parentRect,
+                                                          out RectangleF rect)
+    {
+        foreach (var (childBox, childView) in parent.ChildFrames)
+        {
+            var childRect = new RectangleF(
+                parentRect.X + childBox.X - parent.Scroll.X,
+                parentRect.Y + childBox.Y - parent.Scroll.Y,
+                childBox.Width, childBox.Height);
+            if (ReferenceEquals(childView, target))
+            {
+                rect = childRect;
+                return true;
+            }
+            if (TryGetNestedFrameDestinationRect(childView, target, childRect, out rect))
+                return true;
+        }
+        rect = RectangleF.Empty;
         return false;
     }
 
     private bool TryGetFocusedTextareaBox(float x, float y, out LayoutBox box)
     {
         box = null!;
-        if (_focusedInput == null) return false;
-
-        var rootBox = FindBoxForElement(_rootBox!, _focusedInput);
-        if (rootBox != null && rootBox.BorderRect.Contains(x, y))
-        {
-            box = rootBox;
-            return true;
-        }
-
-        var frame = FrameBoxAtPoint(x, y);
-        if (frame == null || !_frames.TryGetValue(frame, out var view)) return false;
-        var localX = x - frame.X + view.Scroll.X;
-        var localY = y - frame.Y + view.Scroll.Y;
-        var frameField = FindBoxForElement(view.RootBox, _focusedInput);
-        if (frameField == null || !frameField.BorderRect.Contains(localX, localY)) return false;
-        box = frameField;
+        if (_focusedInput?.TagName != "textarea") return false;
+        if (!TryGetEditableFieldAtPoint(x, y, out var field, out var fieldBox, out var frameView, out var frameHit) ||
+            !ReferenceEquals(field, _focusedInput) || fieldBox == null)
+            return false;
+        float localX = frameView == null ? x : frameHit.LocalX;
+        float localY = frameView == null ? y : frameHit.LocalY;
+        if (!fieldBox.BorderRect.Contains(localX, localY)) return false;
+        box = fieldBox;
         return true;
     }
 
@@ -3254,24 +4536,15 @@ public class BrowserCanvas : Control
     {
         box = null!;
         localX = localY = 0;
-        if (_focusedInput == null) return false;
+        if (_focusedInput?.TagName != "textarea") return false;
+        if (!TryGetEditableFieldAtPoint(x, y, out var field, out var fieldBox, out var frameView, out var frameHit) ||
+            !ReferenceEquals(field, _focusedInput) || fieldBox == null)
+            return false;
 
-        var rootField = FindBoxForElement(_rootBox!, _focusedInput);
-        if (rootField != null && rootField.BorderRect.Contains(x, y))
-        {
-            box = rootField;
-            localX = x;
-            localY = y;
-        }
-        else
-        {
-            var frame = FrameBoxAtPoint(x, y);
-            if (frame == null || !_frames.TryGetValue(frame, out var view)) return false;
-            localX = x - frame.X + view.Scroll.X;
-            localY = y - frame.Y + view.Scroll.Y;
-            box = FindBoxForElement(view.RootBox, _focusedInput)!;
-            if (box == null || !box.BorderRect.Contains(localX, localY)) return false;
-        }
+        localX = frameView == null ? x : frameHit.LocalX;
+        localY = frameView == null ? y : frameHit.LocalY;
+        box = fieldBox;
+        if (!box.BorderRect.Contains(localX, localY)) return false;
 
         var face = box.ContentRect;
         return localX >= face.Right - 14 && localY >= face.Top && localY <= face.Bottom;
@@ -3446,10 +4719,24 @@ public class BrowserCanvas : Control
             if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
                 return;
 
-            if (href.TrimStart().StartsWith("javascript:", StringComparison.OrdinalIgnoreCase))
+            string trimmedHref = href.TrimStart();
+            if (trimmedHref.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase))
             {
-                try { js?.ExecuteString(href.TrimStart()[11..]); }
+                try { js?.ExecuteString(trimmedHref[11..]); }
                 catch { }
+                return;
+            }
+
+            // External mail links are absolute by definition and must be
+            // handled before requiring a document BaseUrl.  Frame documents
+            // can legitimately have a missing/placeholder BaseUrl while still
+            // containing <a href="mailto:..."> links; those links should open
+            // the host mail handler rather than falling through to generic
+            // protocol navigation and an error page.
+            if (trimmedHref.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryNormalizeExternalMailto(trimmedHref, out string mailtoAbs))
+                    ExternalProtocolRequested?.Invoke(mailtoAbs);
                 return;
             }
 
@@ -3458,6 +4745,12 @@ public class BrowserCanvas : Control
                 string abs = document.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
                     ? Engine.Network.FileUrls.Resolve(document.BaseUrl, href)
                     : document.BaseUrl.Resolve(href).ToAbsolute();
+
+                if (abs.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+                {
+                    ExternalProtocolRequested?.Invoke(abs);
+                    return;
+                }
 
                 string? target = anchor.GetAttr("target");
                 if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(document.BaseTarget))
@@ -3712,6 +5005,102 @@ public class BrowserCanvas : Control
         return null;
     }
 
+    private static FrameView? FindNamedFrameRecursive(FrameView current, string target)
+    {
+        if (string.Equals(current.Name, target, StringComparison.OrdinalIgnoreCase))
+            return current;
+        foreach (var (_, child) in current.ChildFrames)
+        {
+            var found = FindNamedFrameRecursive(child, target);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static FrameView? FindParentOfFrameRecursive(FrameView current, FrameView target)
+    {
+        foreach (var (_, child) in current.ChildFrames)
+        {
+            if (ReferenceEquals(child, target)) return current;
+            var found = FindParentOfFrameRecursive(child, target);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private FrameView? FindNamedFrameForNavigation(FrameView? sourceFrame, string target)
+    {
+        target = target.Trim();
+        if (target.Length == 0) return null;
+
+        // A named target inside a nested frameset resolves to the nearest
+        // frameset context first.  Without this, a nested frame named "main"
+        // could accidentally resolve to the OUTER frames.html main frame,
+        // breaking links on pages such as 1996-corporate.html.
+        if (sourceFrame != null)
+        {
+            foreach (var (_, child) in sourceFrame.ChildFrames)
+            {
+                var found = FindNamedFrameRecursive(child, target);
+                if (found != null) return found;
+            }
+
+            FrameView? parent = null;
+            foreach (var (_, top) in _frames)
+            {
+                if (ReferenceEquals(top, sourceFrame)) break;
+                parent = FindParentOfFrameRecursive(top, sourceFrame);
+                if (parent != null) break;
+            }
+            if (parent != null)
+            {
+                foreach (var (_, sibling) in parent.ChildFrames)
+                {
+                    if (ReferenceEquals(sibling, sourceFrame)) continue;
+                    var found = FindNamedFrameRecursive(sibling, target);
+                    if (found != null) return found;
+                }
+                var inParent = FindNamedFrameRecursive(parent, target);
+                if (inParent != null && !ReferenceEquals(inParent, sourceFrame)) return inParent;
+            }
+        }
+
+        foreach (var (_, view) in _frames)
+        {
+            var found = FindNamedFrameRecursive(view, target);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    public FrameView? FindFrameByName(string target)
+    {
+        if (string.IsNullOrWhiteSpace(target)) return null;
+        foreach (var (_, view) in _frames)
+        {
+            var found = FindNamedFrameRecursive(view, target.Trim());
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static bool TryNormalizeExternalMailto(string href, out string absolute)
+    {
+        absolute = "";
+        string s = href.Trim();
+        if (!s.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Keep the URI opaque; only reject control characters that cannot be
+        // part of a valid mailto URI. The host owns the actual launch.
+        foreach (char c in s)
+            if (c < ' ' || c == '\x7F')
+                return false;
+
+        absolute = "mailto:" + s[7..];
+        return true;
+    }
+
     private void NavigateWithTarget(string absUrl, string? target, FrameView? sourceFrame)
     {
         target = target?.Trim();
@@ -3727,9 +5116,24 @@ public class BrowserCanvas : Control
             return;
         }
 
-        if (target == "_top" || target == "_parent")
+        if (target == "_top")
         {
             NavigateRequested?.Invoke(absUrl);
+            return;
+        }
+
+        if (target == "_parent")
+        {
+            if (sourceFrame != null &&
+                TryFindFrameHost(sourceFrame, out var parentView, out _) &&
+                parentView != null)
+            {
+                FrameNavigationRequested?.Invoke((this, parentView, absUrl));
+            }
+            else
+            {
+                NavigateRequested?.Invoke(absUrl);
+            }
             return;
         }
 
@@ -3739,13 +5143,11 @@ public class BrowserCanvas : Control
             return;
         }
 
-        foreach (var (_, view) in _frames)
+        FrameView? named = FindNamedFrameForNavigation(sourceFrame, target);
+        if (named != null)
         {
-            if (string.Equals(view.Name, target, StringComparison.OrdinalIgnoreCase))
-            {
-                FrameNavigationRequested?.Invoke((this, view, absUrl));
-                return;
-            }
+            FrameNavigationRequested?.Invoke((this, named, absUrl));
+            return;
         }
 
         OpenNewWindow(absUrl);
@@ -4207,6 +5609,13 @@ public class BrowserCanvas : Control
         // early exit (this runs on every animation tick).
         bool hasBlink = false;
         _hasMarquee = false;
+
+        // <blink> is not limited to the top-level document.  Frame and iframe
+        // documents have their own DOMs and are rendered from the same shell
+        // timer, so the timer must be started when a nested document contains
+        // a blink element too.  Previously frames.html could contain a blink
+        // page while the outer frameset had no <blink>, causing the shared
+        // timer to stop and the frame content to remain permanently visible.
         if (_document != null)
         {
             foreach (var e in _document.ElementDescendants())
@@ -4214,6 +5623,15 @@ public class BrowserCanvas : Control
                 var tag = e.TagName;
                 if (tag == "blink") hasBlink = true;
                 else if (tag == "marquee") _hasMarquee = true;
+                if (hasBlink && _hasMarquee) break;
+            }
+        }
+
+        if (!hasBlink)
+        {
+            foreach (var (_, frame) in _frames)
+            {
+                ScanAnimationTags(frame, ref hasBlink, ref _hasMarquee);
                 if (hasBlink && _hasMarquee) break;
             }
         }
@@ -4240,6 +5658,25 @@ public class BrowserCanvas : Control
             (_jsInterpreter != null || _frames.Values.Any(v => v.Interpreter != null));
         if (needsJsTick) { if (!_jsTimer.Enabled) _jsTimer.Start(); }
         else if (_jsTimer.Enabled) _jsTimer.Stop();
+    }
+
+    private static void ScanAnimationTags(FrameView view, ref bool hasBlink, ref bool hasMarquee)
+    {
+        foreach (var e in view.Document.ElementDescendants())
+        {
+            var tag = e.TagName;
+            if (tag == "blink") hasBlink = true;
+            else if (tag == "marquee") hasMarquee = true;
+            if (hasBlink && hasMarquee) break;
+        }
+
+        if (hasBlink && hasMarquee) return;
+
+        foreach (var (_, child) in view.ChildFrames)
+        {
+            ScanAnimationTags(child, ref hasBlink, ref hasMarquee);
+            if (hasBlink && hasMarquee) return;
+        }
     }
 
     private void OnAnimationTick(object? sender, EventArgs e)
@@ -4291,6 +5728,13 @@ public class BrowserCanvas : Control
         view.ChildFrames.Clear();
     }
 
+    private static void CollectFrameViews(FrameView view, List<FrameView> result)
+    {
+        result.Add(view);
+        foreach (var (_, child) in view.ChildFrames)
+            CollectFrameViews(child, result);
+    }
+
     private void OnJsTimerTick(object? sender, EventArgs e)
     {
         if (!BrowserRuntime.JavaScriptTimersEnabled)
@@ -4307,7 +5751,9 @@ public class BrowserCanvas : Control
         // _frames while this callback is running. Snapshot the views first so
         // that navigation from a timer cannot invalidate the dictionary
         // enumerator and crash the WinForms UI timer.
-        var frameViews = _frames.Values.ToArray();
+        var frameViews = new List<FrameView>();
+        foreach (var view in _frames.Values)
+            CollectFrameViews(view, frameViews);
         foreach (var view in frameViews)
             view.Interpreter?.TickTimers();
 
@@ -4381,7 +5827,7 @@ public class BrowserCanvas : Control
         var box = _rootBox == null ? null : FindBoxForElement(_rootBox, element);
         if (box != null)
         {
-            _selAnchor = _selFocus = null;
+            ClearPageSelection();
             ScrollTo((int)_scrollOffset.X, Math.Max(0, (int)box.Y - 20));
         }
         Invalidate();
@@ -4389,7 +5835,7 @@ public class BrowserCanvas : Control
 
     public void FindClear()
     {
-        _findText = string.Empty; _findMatches.Clear(); _findIndex = -1; _selAnchor = _selFocus = null; Invalidate();
+        _findText = string.Empty; _findMatches.Clear(); _findIndex = -1; ClearPageSelection(); Invalidate();
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -4490,6 +5936,45 @@ public class BrowserCanvas : Control
             _ = _imageCache.GetAsync(abs, _resourceLoader, default);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Builds a clean print surface from the current document without using
+    /// the user's current scroll/hover/selection state.  The screen bitmap
+    /// is a viewport composition, so printing it directly could print a
+    /// partially scrolled or highlighted page.  Re-rendering from the live
+    /// layout tree at scroll (0,0) gives PrintDocument a stable page surface.
+    /// </summary>
+    public Bitmap? CreatePrintBitmap()
+    {
+        if (_rootBox == null || _document == null ||
+            _fontCache == null || _imageCache == null || _resourceLoader == null)
+            return null;
+
+        try
+        {
+            int width = Math.Max(1, (int)Math.Ceiling(_rootBox.Width));
+            int height = Math.Max(1, (int)Math.Ceiling(_rootBox.Height));
+            var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
+            {
+                PressedElement = null
+            };
+
+            return renderer.Render(
+                _rootBox, _document,
+                _fontCache, _imageCache,
+                width, height,
+                0f, 0f,
+                hoveredElement: null,
+                blinkVisible: true,
+                showBoxOutlines: false,
+                focusedElement: null);
+        }
+        catch (Exception ex)
+        {
+            Retro96.DebugLog.WriteException("CreatePrintBitmap", ex);
+            return null;
+        }
     }
 
     public Bitmap? RenderedBitmap => _renderedBitmap;

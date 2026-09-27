@@ -20,6 +20,32 @@ public class CssParserTests
 
 
     [Fact]
+    public void VisitedPseudoClassUsesSessionHistoryAndStillAllowsHoverToWin()
+    {
+        const string css = "a:link { color: #0000EE; } a:visited { color: #551A8B; } a:hover { color: #FF0000; }";
+        var doc = ParseAndResolve("<a id='go' href='#anchor-alpha'>alpha</a>", css);
+        var link = doc.AllTags("a")[0];
+        var visited = CssSelector.ParseSelector("a:visited")[0];
+        var unvisited = CssSelector.ParseSelector("a:link")[0];
+
+        Check.That(!visited.Matches(link), "fresh href is not visited");
+        Check.That(unvisited.Matches(link), "fresh href matches :link");
+
+        doc.VisitedUrls.Add("http://x.test/#anchor-alpha");
+        StyleResolver.Resolve(doc, 800);
+        Check.That(visited.Matches(link), "session history makes the fragment :visited");
+        Check.That(!unvisited.Matches(link), "visited href no longer matches :link");
+        Check.That(link.Style != null && link.Style.Color == Retro96.Drawing.Color.FromArgb(0x55, 0x1A, 0x8B),
+            "a:visited supplies the purple author color", link.Style?.Color.ToString() ?? "(no style)");
+
+        doc.HoveredElement = link;
+        StyleResolver.Resolve(doc, 800);
+        Check.That(link.Style != null && link.Style.Color == Retro96.Drawing.Color.FromArgb(0xFF, 0x00, 0x00),
+            "a:hover still outranks a:visited while hovering", link.Style?.Color.ToString() ?? "(no style)");
+        Check.Done();
+    }
+
+    [Fact]
     public void DynamicPseudoClassesUseDocumentInteractionState()
     {
         var doc = ParseAndResolve("<a id='go' href='/x'><span>go</span></a>");

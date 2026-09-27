@@ -112,6 +112,55 @@ public class HtmlParserTests
         Check.Done();
     }
 
+    [Fact]
+    public void StrayTextBetweenTableRowsIsFosterParentedOutsideTable()
+    {
+        var doc = Parse("<html><body><table border='1'><tr><td>cell one</td></tr>" +
+                        "stray text node directly between tr tags" +
+                        "<tr><td>cell two</td></tr></table></body></html>");
+
+        var body = doc.FirstTag("body")!;
+        var table = doc.FirstTag("table")!;
+        const string stray = "stray text node directly between tr tags";
+
+        var fostered = body.Children.OfType<DomText>()
+            .FirstOrDefault(t => t.Data.Contains(stray, StringComparison.Ordinal));
+        Check.That(fostered != null,
+            "non-whitespace text between rows is retained as a body-level text node");
+        Check.That(fostered != null && body.Children.IndexOf(fostered) < body.Children.IndexOf(table),
+            "fostered stray text is placed before the table");
+        Check.That(!table.Descendants().OfType<DomText>()
+            .Any(t => t.Data.Contains(stray, StringComparison.Ordinal)),
+            "stray text is not inserted into the table row/cell grid");
+
+        doc = Parse("<html><body><table><tr><td>one</td></tr>\n   \n<tr><td>two</td></tr></table></body></html>");
+        var table2 = doc.FirstTag("table")!;
+        Check.That(!table2.Descendants().OfType<DomText>()
+            .Any(t => t.Data.Trim().Length == 0),
+            "whitespace-only text between rows remains ignored (TN-07)");
+        Check.Done();
+    }
+
+    [Fact]
+    public void MisnestedFontEndTagReconstructsBoldOutsideFont()
+    {
+        var doc = Parse("<html><body><p><font color=red><b>red bold</font> bold after font?</b> plain.</p></body></html>");
+        var font = doc.FirstTag("font");
+        var p = doc.FirstTag("p");
+        var bolds = doc.AllTags("b").ToList();
+
+        Check.That(font != null && p != null, "font and p survive the malformed inline markup");
+        Check.That(bolds.Count == 2, "misnested </font> reconstructs an open <b> chain", bolds.Count.ToString());
+
+        var firstBold = bolds.FirstOrDefault(b => ReferenceEquals(b.Parent, font));
+        var continuedBold = bolds.FirstOrDefault(b => ReferenceEquals(b.Parent, p));
+        Check.That(firstBold != null && (firstBold!.InnerText ?? "").Contains("red bold"),
+            "content before </font> stays inside the original bold+font chain");
+        Check.That(continuedBold != null && (continuedBold!.InnerText ?? "").Contains("bold after font?"),
+            "content after </font> remains bold outside the font element");
+        Check.Done();
+    }
+
     // ── attribute quoting ────────────────────────────────────────────
 
     [Fact]

@@ -60,6 +60,21 @@ public static class HtmlParser
             "body", "html", "frameset", "frame"
         };
 
+    // HTML tag-soup formatting elements whose end tags can legally arrive
+    // while another formatting element is still open.  For these, old
+    // browsers reconstructed the still-open formatting chain instead of
+    // popping every intervening element.  This matters for pages such as:
+    //   <font color=red><b>red bold</font> bold after font?</b>
+    // where the first phrase must remain red+bold but the later phrase must
+    // remain bold after FONT has closed.
+    private static readonly HashSet<string> ReconstructibleFormattingTags =
+        new(StringComparer.Ordinal)
+        {
+            "b", "big", "code", "em", "font", "i", "kbd",
+            "s", "small", "strike", "strong", "sub", "sup",
+            "tt", "u", "var"
+        };
+
     public static DomDocument Parse(string html, ParsedUrl baseUrl, CookieStore cookies,
                                     InlineScriptExecutor? onScript = null,
                                     ExternalScriptLoader? loadExternalScript = null)
@@ -1018,6 +1033,18 @@ public static class HtmlParser
             if (depthFromTop < 0)
                 return ""; // stray end tag: ignore
 
+            // Misnested inline formatting: close the requested formatting
+            // element, but reconstruct the still-open formatting chain outside
+            // it rather than dropping those styles from following text.
+            // This is the critical recovery for BH-04's
+            // <font><b>...</font> ...</b> case.
+            if (depthFromTop > 0 &&
+                ReconstructibleFormattingTags.Contains(tag.Name) &&
+                TryReconstructFormattingChain(snapshot, depthFromTop))
+            {
+                return "";
+            }
+
             // Never pop html/body through a random end tag.
             if (snapshot[depthFromTop].TagName is "html" or "body" or "frameset")
             {
@@ -1051,6 +1078,59 @@ public static class HtmlParser
                 PopOne();
 
             return written;
+        }
+
+        private bool TryReconstructFormattingChain(DomElement[] snapshot, int targetDepthFromTop)
+        {
+            var target = snapshot[targetDepthFromTop];
+            var parent = target.Parent as DomElement;
+            if (parent == null) return false;
+
+            // Only reconstruct a pure inline-formatting chain.  Crossing a
+            // block/table/form boundary falls back to the normal recovery path
+            // rather than inventing a more intrusive tree rewrite.
+            for (int i = 0; i < targetDepthFromTop; i++)
+            {
+                if (!ReconstructibleFormattingTags.Contains(snapshot[i].TagName))
+                    return false;
+            }
+
+            // Clone the still-open chain from the element immediately inside
+            // the target out to the current element.  The ORIGINAL chain stays
+            // under the closing target, preserving the styling of content that
+            // occurred before </target>.  The clone becomes the live open chain
+            // for content that follows the misplaced end tag.
+            var clones = new List<DomElement>(targetDepthFromTop);
+            DomElement cloneParent = parent;
+            for (int i = targetDepthFromTop - 1; i >= 0; i--)
+            {
+                var clone = CloneFormattingElement(snapshot[i]);
+                cloneParent.AppendChild(clone);
+                clones.Add(clone);
+                cloneParent = clone;
+            }
+
+            // Close the original target and all formatting elements above it.
+            for (int i = 0; i <= targetDepthFromTop; i++)
+                PopOne();
+
+            // Re-open the cloned chain in bottom-to-top order.  The last push is
+            // therefore the same logical formatting element that was current
+            // immediately before </target>.
+            foreach (var clone in clones)
+                Push(clone);
+
+            return true;
+        }
+
+        private static DomElement CloneFormattingElement(DomElement source)
+        {
+            var clone = new DomElement(source.TagName);
+            foreach (var attr in source.Attrs)
+                clone.Attrs[attr.Key] = attr.Value;
+            foreach (var handler in source.EventHandlers)
+                clone.EventHandlers[handler.Key] = handler.Value;
+            return clone;
         }
 
         private string ExecuteScript(DomElement scriptElement)
@@ -1110,6 +1190,14 @@ public static class HtmlParser
         private void HandleText(string data)
         {
             if (string.IsNullOrEmpty(data))
+                return;
+
+            // HTML 3.2-era table recovery ("foster parenting"): text that
+            // appears directly between table rows does not become table-grid
+            // content.  Real browsers move non-whitespace text outside the
+            // table, before the table itself.  Whitespace-only runs are simply
+            // ignored, which preserves the TN-07 behaviour.
+            if (TryFosterParentStrayTableText(data))
                 return;
 
             // Whitespace-only text before any structure exists is dropped.
@@ -1199,6 +1287,86 @@ public static class HtmlParser
                 return;
 
             parent.AppendChild(new DomText(collapsed));
+        }
+
+        /// <summary>
+        /// Relocates non-whitespace text that occurs in the table insertion
+        /// context but outside any row/cell.  Netscape-era HTML recovery
+        /// foster-parented this text before the nearest table rather than
+        /// manufacturing a phantom row/cell.  This is intentionally narrow:
+        /// text inside TD/TH remains normal cell content, and whitespace-only
+        /// runs between rows remain invisible.
+        /// </summary>
+        private bool TryFosterParentStrayTableText(string data)
+        {
+            if (_open.Count == 0 || _current == null)
+                return false;
+
+            if (IsAllHtmlWhitespace(data))
+            {
+                // Only suppress whitespace in the actual row-group/table gap;
+                // ordinary whitespace elsewhere must continue through the
+                // normal collapsing path below.
+                foreach (var e in _open)
+                {
+                    if (e.TagName is "td" or "th" or "tr") return false;
+                    if (e.TagName == "caption" || e.TagName == "colgroup") return false;
+                    if (e.TagName is "table" or "tbody" or "thead" or "tfoot")
+                        return true;
+                }
+                return false;
+            }
+
+            DomElement? table = null;
+            foreach (var e in _open)
+            {
+                // A cell/row above the nearest table means this text belongs
+                // to that cell/row, not to the table's foster-parent area.
+                if (e.TagName is "td" or "th" or "tr")
+                    return false;
+
+                if (e.TagName == "caption" || e.TagName == "colgroup")
+                    return false;
+
+                if (e.TagName == "table")
+                {
+                    table = e;
+                    break;
+                }
+            }
+
+            if (table == null || table.Parent == null)
+                return false;
+
+            // Collapse ASCII HTML whitespace exactly as ordinary text does,
+            // but insert the resulting run before the table so it participates
+            // in normal block flow outside the table grid.
+            var sb = new StringBuilder(data.Length);
+            bool lastWasWhitespace = false;
+            foreach (char c in data)
+            {
+                if (IsHtmlWhitespace(c))
+                {
+                    if (!lastWasWhitespace)
+                    {
+                        sb.Append(' ');
+                        lastWasWhitespace = true;
+                    }
+                }
+                else
+                {
+                    sb.Append(c);
+                    lastWasWhitespace = false;
+                }
+            }
+
+            string fostered = sb.ToString();
+            if (fostered.Length == 0)
+                return true;
+
+            var textNode = new DomText(fostered);
+            table.Parent.InsertBefore(textNode, table);
+            return true;
         }
 
         private bool IsInsideFrameset()

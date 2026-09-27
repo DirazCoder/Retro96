@@ -32,6 +32,7 @@
     <Compile Include="../../retro96/Engine/Html/HtmlTokenizer.cs" />
     <Compile Include="../../retro96/Engine/Html/HtmlParser.cs" />
     <Compile Include="../../retro96/Engine/Html/HtmlEntities.cs" />
+    <Compile Include="../../retro96/LegacyMidi.cs" />
     <Compile Include="../../retro96/Engine/Dom/DomNode.cs" />
     <Compile Include="../../retro96/Engine/Css/ComputedStyle.cs" />
     <Compile Include="../../retro96/Engine/Css/CssParser.cs" />
@@ -62,6 +63,8 @@
     <Compile Include="CssParserTests.cs" />
     <Compile Include="JsEngineTests.cs" />
     <Compile Include="PluginApiTests.cs" />
+    <Compile Include="LegacyMidiTests.cs" />
+    <Compile Include="LegacyHtmlMidiTests.cs" />
     <Compile Include="FormDomTests.cs" />
     <Compile Include="FrameLinkDomTests.cs" />
     <Compile Include="../../retro96/Engine/Layout/InlineLayout.cs" />

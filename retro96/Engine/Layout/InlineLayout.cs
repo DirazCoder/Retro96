@@ -188,6 +188,25 @@ public class FloatContext
             yield return OuterBottom(f);
     }
 
+    /// <summary>
+    /// Returns the first bottom edge below <paramref name="fromY">fromY</paramref>
+    /// of a float that is currently covering that Y band. A float wider than
+    /// its containing block can make the available inline width exactly zero;
+    /// in that case the next line box must begin after the float instead of
+    /// being painted to its right/inside its overflow area.
+    /// </summary>
+    public float GetNextBlockingFloatBottom(float fromY)
+    {
+        float next = float.MaxValue;
+        foreach (var f in _floats)
+        {
+            float bottom = OuterBottom(f);
+            if (f.Y <= fromY + 0.01f && bottom > fromY + 0.01f)
+                next = Math.Min(next, bottom);
+        }
+        return next;
+    }
+
     public float GetClearY(float fromY, ClearValue clear)
     {
         float y = fromY;
@@ -465,7 +484,8 @@ public static class InlineLayout
                     if (isSpace && lastWasSpace)
                         continue;
                     MeasureBox(frag, out float w, out float h, out float asc);
-                    bool atomic = frag.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame
+                    bool atomic = frag.Element?.TagName == "spacer"
+                                  || frag.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame
                                   || frag.ReplacedImage != null;
                     items.Add(new MeasuredItem(frag, w, h, asc, GetVAlignMode(frag), atomic,
                         atomic ? frag.MarginLeft : 0f,
@@ -475,11 +495,35 @@ public static class InlineLayout
         }
 
         float currentY = startY;
+        float availW = containerWidth;
         bool firstLine = true;
         bool nowrap = containerStyle.WhiteSpace is WhiteSpaceValue.Nowrap
                                                 or WhiteSpaceValue.Pre;
-        float availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
-        if (firstLine) availW = Math.Max(0f, availW - ResolveTextIndent(containerStyle, containerWidth));
+
+        // If a float is wider than the current containing block, its left/right
+        // exclusion edges can leave zero inline width. Do not flush text at
+        // that Y: a line box with no usable width would otherwise be placed at
+        // the float's right edge and paint directly over/alongside the image.
+        // Instead advance to the next bottom edge of the blocking float, which
+        // matches normal float overflow behaviour without changing ordinary
+        // wrapping around floats that still leave usable width.
+        void RecomputeAvailableWidth()
+        {
+            float rawAvail = GetAvailableWidth(containerX, currentY, containerWidth, floats);
+            if (rawAvail <= 0.01f && floats != null && floats.HasFloats)
+            {
+                float next = floats.GetNextBlockingFloatBottom(currentY);
+                if (next < float.MaxValue && next > currentY + 0.01f)
+                    currentY = next;
+                rawAvail = GetAvailableWidth(containerX, currentY, containerWidth, floats);
+            }
+
+            availW = rawAvail;
+            if (firstLine)
+                availW = Math.Max(0f, availW - ResolveTextIndent(containerStyle, containerWidth));
+        }
+
+        RecomputeAvailableWidth();
         LayoutTrace.Log($"  initial availW at y={currentY:F1} => {availW:F1} " +
             $"(containerWidth={containerWidth:F1})");
 
@@ -527,8 +571,7 @@ public static class InlineLayout
                 // <input><br><input>, leaving an extra vertical gap.
                 if (!hadLineContent)
                     currentY += brH;
-                availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
-                if (firstLine) availW = Math.Max(0f, availW - ResolveTextIndent(containerStyle, containerWidth));
+                RecomputeAvailableWidth();
                 continue;
             }
 
@@ -597,7 +640,7 @@ public static class InlineLayout
                 firstLine = false;
                 lineItems.Clear();
                 lineW = 0f;
-                availW = GetAvailableWidth(containerX, currentY, containerWidth, floats);
+                RecomputeAvailableWidth();
                 LayoutTrace.Log($"  new availW at y={currentY:F1} => {availW:F1}");
                 if (it.Box.TextRun == " ")
                 {
@@ -880,7 +923,11 @@ public static class InlineLayout
         out float width, out float height, out float ascent)
     {
         // Atomic inline boxes (images, form controls, inline-blocks, frames)
-        if (box.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame
+        // and Netscape <spacer type=horizontal>.  SPACER is an empty element,
+        // so a plain Inline box would otherwise fall through to the empty/text
+        // path and measure as 0px even though GenerateBoxes recorded its width.
+        if (box.Element?.TagName == "spacer" ||
+            box.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame
             || box.ReplacedImage != null)
         {
             var el = box.Element;

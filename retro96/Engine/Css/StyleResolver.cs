@@ -495,6 +495,7 @@ public static class StyleResolver
             case "link":
             case "base":
             case "basefont":
+            case "bgsound":
                 style.Display = DisplayValue.None;
                 break;
 
@@ -702,10 +703,51 @@ public static class StyleResolver
             case "ul":
             case "ol":
             case "li":
-                // <ul type=> / <ol type=> / <li type=> and <ol start> /
-                // <li value> are consumed by the Renderer when drawing
-                // markers; nothing to resolve here.
+                // HTML 3.2 list TYPE is a presentational declaration.  Keep
+                // it in the computed style so the marker painter sees the
+                // authored shape instead of the UA default (disc/decimal).
+                ApplyLegacyListTypeAttr(elem, style);
                 break;
+
+            case "dd":
+                // HTML 3.2 definition descriptions have a UA hanging indent.
+                // Enforce it at the final presentational-attribute stage so a
+                // later fallback style cannot accidentally collapse it to 0.
+                style.MarginLeft = Math.Max(style.MarginLeft, 40f);
+                break;
+        }
+    }
+
+    private static void ApplyLegacyListTypeAttr(DomElement elem, ComputedStyle style)
+    {
+        string? raw = elem.GetAttr("type");
+        if (string.IsNullOrWhiteSpace(raw)) return;
+
+        string type = raw.Trim();
+        ListStyleType mapped = type switch
+        {
+            // Unordered list shapes.
+            "disc" => ListStyleType.Disc,
+            "circle" => ListStyleType.Circle,
+            "square" => ListStyleType.Square,
+
+            // Ordered-list HTML TYPE values.
+            "1" => ListStyleType.Decimal,
+            "a" => ListStyleType.LowerAlpha,
+            "A" => ListStyleType.UpperAlpha,
+            "i" => ListStyleType.LowerRoman,
+            "I" => ListStyleType.UpperRoman,
+            _ => style.ListStyleType
+        };
+
+        // Only recognised HTML TYPE values are authored list-style choices.
+        // Unknown values are tolerated and leave the current computed value
+        // alone, as old browsers did.
+        if (mapped != style.ListStyleType || type is "disc" or "circle" or "square" or
+            "1" or "a" or "A" or "i" or "I")
+        {
+            style.ListStyleType = mapped;
+            style.OwnListStyleType = true;
         }
     }
 

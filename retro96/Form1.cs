@@ -2,6 +2,7 @@ namespace Retro96;
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -31,6 +32,14 @@ public static class DebugLog
     public static readonly bool Enabled =
         Environment.GetEnvironmentVariable("RETRO96_DEBUG") == "1";
 
+    // Focused JavaScript/DOM diagnostics. RETRO96_DEBUG also enables JS logs.
+    public static readonly bool JsEnabled =
+        Enabled || Environment.GetEnvironmentVariable("RETRO96_JS_DEBUG") == "1";
+
+    // Extra-verbose JavaScript property/function tracing.
+    public static readonly bool JsTraceEnabled =
+        Environment.GetEnvironmentVariable("RETRO96_JS_TRACE") == "1";
+
     private static readonly string Path =
         System.IO.Path.Combine(AppContext.BaseDirectory, "retro96-debug.log");
     private static readonly object Lock = new();
@@ -54,6 +63,23 @@ public static class DebugLog
 
     public static void WriteException(string context, Exception ex) =>
         Write($"{context} THREW: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+
+    public static void JsWrite(string message)
+    {
+        if (!JsEnabled) return;
+        try
+        {
+            lock (Lock)
+            {
+                File.AppendAllText(Path,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] [JSDBG] {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // Diagnostics must never affect page execution.
+        }
+    }
 }
 
 public partial class Form1 : Form
@@ -236,6 +262,7 @@ public partial class Form1 : Form
         _canvas.StatusChanged += OnCanvasStatusChanged;
         _canvas.NewWindowRequested += OpenNewBrowserWindow;
         _canvas.FrameNavigationRequested += OnFrameNavigationRequested;
+        _canvas.ExternalProtocolRequested += OpenExternalProtocol;
         _canvas.FormSubmitRequested += OnFormSubmitted;
 
         // Context-menu navigation hooks
@@ -245,13 +272,22 @@ public partial class Form1 : Form
 
         _statusStrip.Items.Add(_statusLabel);
         _statusStrip.Dock = DockStyle.Bottom;
+        // Keep enough vertical room for the native status-strip renderer's
+        // border/padding plus the full status-font ascent/descent.  A fixed
+        // 24px strip could clip the lower part of short live-status messages
+        // such as "Done" on some font/DPI combinations.
         _statusStrip.AutoSize = false;
-        _statusStrip.Height = 24;
+        var statusFont = SystemFonts.StatusFont ?? SystemFonts.DefaultFont;
+        _statusStrip.Height = Math.Max(28, statusFont.Height + 10);
         _statusStrip.Padding = Padding.Empty;
         _statusStrip.Visible = true;
         _statusStrip.SizingGrip = false;
         _statusStrip.RenderMode = ToolStripRenderMode.System;
         _statusLabel.AutoSize = false;
+        _statusLabel.Font = statusFont;
+        _statusLabel.Margin = Padding.Empty;
+        _statusLabel.Padding = new Padding(4, 0, 4, 0);
+        _statusLabel.DisplayStyle = ToolStripItemDisplayStyle.Text;
         _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
         _statusLabel.Text = "Ready";
         _statusLabel.Spring = true;
@@ -1590,6 +1626,15 @@ public partial class Form1 : Form
                                    DocumentBindingsState frameState)
     {
         content.Document.VisitedUrls.UnionWith(_visitedUrls);
+        // Replacing a frame document invalidates every nested iframe/frameset
+        // view that belonged to the old document. Dispose them before the new
+        // bitmap is rendered, otherwise stale child surfaces remain painted.
+        _canvas.ClearChildFrames(view);
+        // Drop the old bitmap before installing the replacement document.
+        // Otherwise a navigated frame can keep displaying the previous page
+        // (and its nested iframe composition) until a later repaint happens.
+        view.Rendered?.Dispose();
+        view.Rendered = null;
         view.Document = content.Document;
         view.RootBox = content.RootBox;
         view.Url = content.AbsoluteUrl;
@@ -1638,7 +1683,7 @@ public partial class Form1 : Form
 
     /// <summary>The layout box currently displaying a frame view.</summary>
     private LayoutBox? FindBoxForView(BrowserCanvas.FrameView view) =>
-        _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
+        _canvas.TryFindFrameHost(view, out _, out var box) ? box : null;
 
     /// <summary>
     /// Fetches a frame's images, then rebuilds the frame layout with real
@@ -1742,28 +1787,21 @@ public partial class Form1 : Form
         long gen = _navGeneration;
         try
         {
-            // A fresh scripting context per navigation, exactly like the
-            // initial load (link-navigated frames used to arrive with NO
-            // scripting — the frame went dead after the first click).
-            var (interpreter, state) = CreateFrameContext(view);
+            if (!_canvas.TryFindFrameHost(view, out var parentView, out var frameBox) || frameBox == null)
+                return;
 
-            // The frame's own current URL is the resolution base (JS may
-            // assign a relative location.href).
+            var (interpreter, state) = CreateFrameContext(view);
+            int frameW = Math.Max(1, (int)frameBox.Width);
+            int frameH = Math.Max(1, (int)frameBox.Height);
+            string baseUrl = string.IsNullOrWhiteSpace(view.Url) ? url : view.Url;
+
             FrameContent? content = null;
             if (postData == null)
             {
-                // Same loader the initial page load uses — full scheme
-                // support (http/file), era error pages rendered INSIDE the
-                // frame.  (The old code navigated the WHOLE top-level
-                // window on any non-200, blowing away the frameset page
-                // over one dead link.)
-                var sizeBox = _canvas.Frames
-                    .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
-                int w = (int)(sizeBox?.Width ?? 300f);
-                int h = (int)(sizeBox?.Height ?? 150f);
+                using var frameCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
                 content = await FrameLoader.LoadAsync(
-                    view.Url, url, w, h,
-                    _httpClient, _cookieStore, CancellationToken.None,
+                    baseUrl, url, frameW, frameH,
+                    _httpClient, _cookieStore, frameCts.Token,
                     BrowserRuntime.JavaScriptEnabled
                         ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
                         : null,
@@ -1779,52 +1817,88 @@ public partial class Form1 : Form
                 if (result is HttpSuccess s && s.StatusCode == 200)
                 {
                     string html = DecodeBody(s);
-                    var frameBoxForScriptedPost = _canvas.Frames
-                        .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
-                    int scriptedPostWidth = (int)(frameBoxForScriptedPost?.Width ?? 300f);
                     var doc = HtmlParser.Parse(html, parsed, _cookieStore,
                         BrowserRuntime.JavaScriptEnabled
                             ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
                             : null,
                         BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
-                    StyleResolver.Resolve(doc, Math.Max(1, scriptedPostWidth));
-
-                    var frameBox = _canvas.Frames
-                        .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
-                    if (frameBox == null) return;
-
-                    var root = LayoutEngineApi.BuildLayoutTree(doc,
-                        (int)frameBox.Width, (int)frameBox.Height);
-                    content = new FrameContent(doc, root, url);
+                    if (BrowserRuntime.StylesheetsEnabled)
+                        await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
+                    doc.VisitedUrls.UnionWith(_visitedUrls);
+                    StyleResolver.Resolve(doc, Math.Max(1, frameW));
+                    var root = LayoutEngineApi.BuildLayoutTree(doc, frameW, frameH);
+                    content = new FrameContent(doc, root, s.EffectiveUrl.Length > 0 ? s.EffectiveUrl : url);
                 }
             }
 
-            if (gen != _navGeneration) return;
-            if (content != null)
+            if (gen != _navGeneration || content == null)
             {
-                var liveFrameBox = _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
-                if (liveFrameBox == null) return;
-                var frameElem = liveFrameBox.Element!;
-                content = ApplyFramePresentation(frameElem, content,
-                    (int)liveFrameBox.Width, (int)liveFrameBox.Height);
-                view.Scroll = default;
-                ApplyFrameContent(view, content, interpreter, state);
-
-                var frameBox = _canvas.Frames
-                    .FirstOrDefault(f => ReferenceEquals(f.View, view)).Box;
-                if (frameBox == null) return;
-                _canvas.SetFrame(frameBox, view);
-
-                _ = LoadFrameImagesThenReflowAsync(view, content, gen,
-                    parentView: null, frameElem: frameBox.Element!,
-                    originalBox: frameBox);
+                if (gen == _navGeneration)
+                    DebugLog.Write($"Frame navigation produced no content: {url}");
                 return;
             }
-        }
-        catch { }
 
-        if (gen == _navGeneration)
-            NavigateTo(url);
+            var frameElem = frameBox.Element;
+            if (frameElem != null)
+                content = ApplyFramePresentation(frameElem, content, frameW, frameH);
+
+            view.Scroll = Retro96.Drawing.PointF.Empty;
+            ApplyFrameContent(view, content, interpreter, state);
+
+            // Re-render the actual host. Nested frames cannot be found in the
+            // top-level _frames dictionary; route through the parent view so
+            // target="main" and links inside nested frames keep their content.
+            if (parentView == null)
+                _canvas.SetFrame(frameBox, view);
+            else
+                _canvas.RefreshChildFrame(parentView, frameBox, view);
+
+            if (frameElem != null)
+            {
+                _ = LoadFrameImagesThenReflowAsync(view, content, gen,
+                    parentView, frameElem, frameBox);
+            }
+
+            // A navigated frame may itself contain a frameset or iframe. The
+            // initial top-level load already recursed through this path;
+            // navigations must do the same or pages such as 1996-corporate
+            // and frames-main#geometry appear blank inside the target frame.
+            await LoadFrameLevelAsync(content.Document, content.RootBox, view, gen);
+
+            // Targeted frame navigation may include a fragment, e.g.
+            // frames-main.html#geometry or #help.  The frame document itself
+            // must finish loading (including nested iframes) before the
+            // fragment can be scrolled into view.
+            try
+            {
+                string fragment = ParsedUrl.Parse(view.Url).Fragment;
+                if (!string.IsNullOrEmpty(fragment))
+                    _canvas.ScrollFrameToAnchor(view, fragment);
+            }
+            catch { }
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException("LoadFrameAsync", ex);
+            if (gen == _navGeneration)
+                BeginInvoke(() => _statusLabel.Text = $"Frame navigation failed: {ex.Message}");
+        }
+    }
+
+    private void OpenExternalProtocol(string url)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = url,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = $"Unable to open external link: {ex.Message}";
+        }
     }
 
     private void OnFrameNavigationRequested(
@@ -1945,8 +2019,12 @@ public partial class Form1 : Form
             if (BrowserRuntime.StylesheetsEnabled)
                 await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
 
-            StyleResolver.Resolve(document);
+            // The visited session store must be copied onto the document
+            // BEFORE CSS matching. Resolving first meant a:visited saw an
+            // empty history on local/file pages, even after a link had been
+            // followed and the page reloaded.
             document.VisitedUrls.UnionWith(_visitedUrls);
+            StyleResolver.Resolve(document);
 
             Size sz = GetCanvasSize();
             var root = LayoutEngineApi.BuildLayoutTree(document, sz.Width, sz.Height);
@@ -2020,13 +2098,16 @@ public partial class Form1 : Form
     {
         if (_currentPageUrl != null && url.StartsWith('#'))
         {
-            _history.PushAnchor(_currentPageUrl + url);
+            string absoluteAnchorUrl = _currentPageUrl + url;
+            MarkVisitedUrl(absoluteAnchorUrl);
+            _history.PushAnchor(absoluteAnchorUrl);
             _canvas.ScrollToAnchor(url[1..]);
-            _txtUrl.Text = _currentPageUrl + url;
+            _txtUrl.Text = absoluteAnchorUrl;
             return;
         }
         if (_currentPageUrl != null && url.StartsWith(_currentPageUrl + "#"))
         {
+            MarkVisitedUrl(url);
             _history.PushAnchor(url);
             _canvas.ScrollToAnchor(url[(_currentPageUrl.Length + 1)..]);
             _txtUrl.Text = url;
@@ -2034,6 +2115,28 @@ public partial class Form1 : Form
         }
 
         NavigateTo(url);
+    }
+
+    /// <summary>
+    /// Same-document fragment navigation does not go through NavigateAsync,
+    /// so it used to bypass the session history used by :visited entirely.
+    /// Record the resolved href here and immediately expose it to the live
+    /// document, then re-resolve CSS so a:visited can take effect without
+    /// reloading or disturbing the anchor scroll.
+    /// </summary>
+    private void MarkVisitedUrl(string absoluteUrl)
+    {
+        if (string.IsNullOrWhiteSpace(absoluteUrl))
+            return;
+
+        _visitedUrls.Add(absoluteUrl);
+
+        var document = _canvas.PageDocument;
+        if (document == null)
+            return;
+
+        document.VisitedUrls.Add(absoluteUrl);
+        _canvas.ReflowDocument();
     }
 
     private void OnCanvasStatusChanged(string status) =>
@@ -2074,10 +2177,9 @@ public partial class Form1 : Form
         }
         else
         {
-            var named = _canvas.Frames.FirstOrDefault(f =>
-                string.Equals(f.View.Name, submit.Target, StringComparison.OrdinalIgnoreCase));
-            if (named.View != null)
-                _ = LoadFrameAsync(named.View, submit.Url, submit.Body);
+            var named = _canvas.FindFrameByName(submit.Target);
+            if (named != null)
+                _ = LoadFrameAsync(named, submit.Url, submit.Body);
             else
                 _ = NavigateAsync(submit.Url, submit.Body);
         }
@@ -2113,10 +2215,9 @@ public partial class Form1 : Form
             }
             else if (!string.IsNullOrEmpty(target) && !target.Equals("_top", StringComparison.OrdinalIgnoreCase))
             {
-                var named = _canvas.Frames.FirstOrDefault(f =>
-                    string.Equals(f.View.Name, target, StringComparison.OrdinalIgnoreCase));
-                if (named.View != null)
-                    await ApplyMultipartResponseToFrameAsync(named.View, ok, url, cts.Token);
+                var named = _canvas.FindFrameByName(target);
+                if (named != null)
+                    await ApplyMultipartResponseToFrameAsync(named, ok, url, cts.Token);
                 else if (target.Equals("_blank", StringComparison.OrdinalIgnoreCase))
                     OpenNewBrowserWindow(submit.Url);
                 else
@@ -2137,8 +2238,7 @@ public partial class Form1 : Form
         BrowserCanvas.FrameView view, HttpSuccess response, ParsedUrl responseUrl,
         CancellationToken ct)
     {
-        var frameInfo = _canvas.Frames.FirstOrDefault(f => ReferenceEquals(f.View, view));
-        var frameBox = frameInfo.Box;
+        _canvas.TryFindFrameHost(view, out var parentView, out var frameBox);
         int frameW = (int)(frameBox?.Width ?? view.RootBox.Width);
         int frameH = (int)(frameBox?.Height ?? view.RootBox.Height);
         var (interpreter, state) = CreateFrameContext(view);
@@ -2162,9 +2262,11 @@ public partial class Form1 : Form
         view.Scroll = Retro96.Drawing.PointF.Empty;
 
         if (frameBox != null)
-            _canvas.SetFrame(frameBox, view);
-        else if (_canvas.TryFindParentFrame(view, out var parent, out var childBox) && parent != null && childBox != null)
-            _canvas.RefreshChildFrame(parent, childBox, view);
+        {
+            if (parentView == null) _canvas.SetFrame(frameBox, view);
+            else _canvas.RefreshChildFrame(parentView, frameBox, view);
+            await LoadFrameLevelAsync(content.Document, content.RootBox, view, _navGeneration);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2319,75 +2421,98 @@ public partial class Form1 : Form
 
     private void PrintPage()
     {
-        var bitmap = _canvas.RenderedBitmap;
-        if (bitmap == null)
+        _statusLabel.Text = "Preparing print…";
+
+        // Never print the live scrolled/selected screen composition.  Ask
+        // the engine for a clean, top-of-document surface first.  Falling
+        // back to the existing bitmap keeps printing useful if a transient
+        // render failure occurs.
+        var printEngineBitmap = _canvas.CreatePrintBitmap();
+        var engineBitmap = printEngineBitmap ?? _canvas.RenderedBitmap;
+        if (engineBitmap == null)
         {
             _statusLabel.Text = "Nothing to print";
             return;
         }
 
-        _statusLabel.Text = "Printing…";
+        using var gdiBitmap = SkiaWinForms.ToGdi(engineBitmap);
+        if (printEngineBitmap != null)
+            printEngineBitmap.Dispose();
 
-        using var printDoc = new System.Drawing.Printing.PrintDocument();
-        using var dialog = new PrintDialog { Document = printDoc };
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-        {
-            _statusLabel.Text = "Ready";
-            return;
-        }
-
-        // The engine renders on SkiaSharp; printing runs on GDI — convert
-        // the page to a GDI twin ONCE (ShellPaint) and print from that.
-        using var gdiBitmap = SkiaWinForms.ToGdi(bitmap);
         if (gdiBitmap == null)
         {
             _statusLabel.Text = "Nothing to print";
             return;
         }
 
-        float srcDpiX = SafeBitmapDpi(gdiBitmap, horizontal: true);
-        float srcDpiY = SafeBitmapDpi(gdiBitmap, horizontal: false);
+        using var printDoc = new System.Drawing.Printing.PrintDocument
+        {
+            DocumentName = string.IsNullOrWhiteSpace(Text) ? "Retro96" : Text
+        };
+        using var dialog = new PrintDialog { Document = printDoc, UseEXDialog = true };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            _statusLabel.Text = "Ready";
+            return;
+        }
 
-        float printableWidth = PageWidth(printDoc);
         int pageIndex = 0;
 
         printDoc.PrintPage += (s, e) =>
         {
             try
             {
-                float srcWidthPx = printableWidth * srcDpiX / 100f;
-                float scale = srcWidthPx > 0 ? srcWidthPx / gdiBitmap.Width : 1f;
-
-                float pageHeightPx = e.MarginBounds.Height * srcDpiY / 100f / scale;
-
-                float srcY = pageIndex * pageHeightPx;
-                if (srcY >= gdiBitmap.Height)
+                var graphics = e.Graphics;
+                if (graphics == null || gdiBitmap.Width <= 0 || gdiBitmap.Height <= 0)
                 {
                     e.HasMorePages = false;
                     return;
                 }
 
-                float srcH = Math.Min(pageHeightPx, gdiBitmap.Height - srcY);
-                var srcRect = new RectangleF(0f, srcY, gdiBitmap.Width, srcH);
+                // MarginBounds is already expressed in the printer's page
+                // unit (1/100 inch).  Fit the entire rendered page to the
+                // printable width and derive the source-pixel height from
+                // the same scale, so there is no DPI double-conversion or
+                // vertical drift between pages.
+                float destWidth = Math.Max(1f, e.MarginBounds.Width);
+                float scale = destWidth / gdiBitmap.Width;
+                float srcPageHeight = Math.Max(1f, e.MarginBounds.Height / scale);
+                float srcY = pageIndex * srcPageHeight;
 
+                if (srcY >= gdiBitmap.Height - 0.01f)
+                {
+                    e.HasMorePages = false;
+                    return;
+                }
+
+                float srcHeight = Math.Min(srcPageHeight, gdiBitmap.Height - srcY);
+                var srcRect = new RectangleF(0f, srcY, gdiBitmap.Width, srcHeight);
                 var destRect = new RectangleF(
-                    e.MarginBounds.Left, e.MarginBounds.Top,
-                    srcRect.Width * scale * 100f / srcDpiX,
-                    srcRect.Height * scale * 100f / srcDpiY);
+                    e.MarginBounds.Left,
+                    e.MarginBounds.Top,
+                    destWidth,
+                    srcHeight * scale);
 
-                var graphics = e.Graphics;
-                if (graphics == null) return;
+                var graphicsState = graphics.Save();
+                try
+                {
+                    graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
+                    graphics.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                    graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                    graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
 
-                graphics.InterpolationMode =
-                    System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                graphics.PixelOffsetMode =
-                    System.Drawing.Drawing2D.PixelOffsetMode.Half;
-                graphics.DrawImage(gdiBitmap, destRect, srcRect, GraphicsUnit.Pixel);
+                    graphics.DrawImage(gdiBitmap, destRect, srcRect, GraphicsUnit.Pixel);
+                }
+                finally
+                {
+                    graphics.Restore(graphicsState);
+                }
 
                 pageIndex++;
-                e.HasMorePages = srcY + srcH < gdiBitmap.Height - 1f;
+                e.HasMorePages = srcY + srcHeight < gdiBitmap.Height - 0.01f;
                 if (!e.HasMorePages)
-                    _statusLabel.Text = "Printed.";
+                    _statusLabel.Text = $"Printed ({pageIndex} page{(pageIndex == 1 ? "" : "s")}).";
             }
             catch (Exception ex)
             {
@@ -2396,7 +2521,11 @@ public partial class Form1 : Form
             }
         };
 
-        try { printDoc.Print(); }
+        try
+        {
+            _statusLabel.Text = "Printing…";
+            printDoc.Print();
+        }
         catch (Exception ex)
         {
             _statusLabel.Text = $"Print error: {ex.Message}";
