@@ -372,8 +372,11 @@ public static class InlineLayout
                             : 0f;
                         float buttonWidth = Math.Max(92f,
                             MeasureTextWidth("Choose File", style) + 24f);
-                        float labelWidth = Math.Max(96f,
-                            MeasureTextWidth("No file chosen", style) + 8f);
+                        // Keep a little more room for the browser-visible file
+                        // name. The native Choose File button is fixed, so the
+                        // extra width belongs to the filename display area.
+                        float labelWidth = Math.Max(132f,
+                            MeasureTextWidth("No file chosen", style) + 14f);
                         width = Math.Max(
                             legacyWidth,
                             buttonWidth + labelWidth + 12f);

@@ -108,6 +108,10 @@ public class Renderer
     // visible for each control.
     public Func<DomElement, (int ScrollLine, float ScrollX, bool ShowScrollbar)>? TextareaStateResolver { get; set; }
 
+    // Multiple-select listboxes keep their option scroll position in the shell,
+    // just like textarea scrolling. This resolver keeps the renderer stateless.
+    public Func<DomElement, int>? SelectScrollResolver { get; set; }
+
     private readonly ResourceLoader _resourceLoader;
     private string? _baseUrl;
     private float _scrollX, _scrollY;
@@ -1727,17 +1731,49 @@ public class Renderer
             button.Right + 6, face.Y + 1,
             Math.Max(0f, face.Right - button.Right - 9), face.Height - 2);
 
+        string displayLabel = FitFileNameToWidth(g, label, font, Math.Max(0f, labelRect.Width));
         using var labelFmt = new StringFormat(StringFormat.GenericTypographic)
         {
             Alignment = StringAlignment.Near,
             LineAlignment = StringAlignment.Center,
             FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-            Trimming = StringTrimming.EllipsisCharacter
+            Trimming = StringTrimming.None
         };
         var clip = g.Save();
         g.SetClip(labelRect, CombineMode.Intersect);
-        g.DrawString(label, font, brush, labelRect, labelFmt);
+        g.DrawString(displayLabel, font, brush, labelRect, labelFmt);
         g.Restore(clip);
+    }
+
+    private static string FitFileNameToWidth(Graphics g, string fileName, Font font, float width)
+    {
+        if (width <= 0f || string.IsNullOrEmpty(fileName)) return fileName;
+        if (g.MeasureString(fileName, font).Width <= width) return fileName;
+
+        const string ellipsis = "…";
+        string extension = System.IO.Path.GetExtension(fileName);
+        string stem = extension.Length > 0 ? fileName[..^extension.Length] : fileName;
+
+        // Preserve the complete final extension. Remove characters from the
+        // middle of the stem until the prefix + suffix + extension fits.
+        int left = (stem.Length + 1) / 2;
+        int right = stem.Length / 2;
+        while (left + right > 0)
+        {
+            string candidate = stem[..left] + ellipsis +
+                               (right > 0 ? stem[^right..] : string.Empty) + extension;
+            if (g.MeasureString(candidate, font).Width <= width)
+                return candidate;
+
+            if (left >= right && left > 0) left--;
+            else if (right > 0) right--;
+            else break;
+        }
+
+        string extensionOnly = ellipsis + extension;
+        if (g.MeasureString(extensionOnly, font).Width <= width)
+            return extensionOnly;
+        return extension.Length > 0 ? extension : ellipsis;
     }
 
     private static void PaintTextControl(Graphics g, LayoutBox box, FontCache fonts,
@@ -1860,7 +1896,7 @@ public class Renderer
         }
     }
 
-    private static void PaintSelect(Graphics g, LayoutBox box, FontCache fonts)
+    private void PaintSelect(Graphics g, LayoutBox box, FontCache fonts)
     {
         var elem = box.Element!;
         var rect = box.BorderRect;
@@ -1873,6 +1909,7 @@ public class Renderer
 
         int sizeAttr = Math.Max(1, elem.GetAttrInt("size", 1));
         bool isListbox = sizeAttr > 1 || elem.HasAttr("multiple");   // MULTIPLE → listbox, era rule
+        int visibleRows = elem.HasAttr("multiple") && sizeAttr == 1 ? 4 : sizeAttr;
         var options = elem.Descendants()
             .OfType<DomElement>()
             .Where(o => o.TagName == "option")
@@ -1886,25 +1923,44 @@ public class Renderer
 
         if (isListbox && options.Count > 0)
         {
-            // Listbox: show min(size, options) rows
             float rowH = font.GetHeight(g) + 2;
-            int rows = Math.Min(sizeAttr > 1 ? sizeAttr : 4, options.Count);
-            for (int i = 0; i < rows; i++)
+            visibleRows = Math.Max(1, visibleRows);
+            int maxScroll = Math.Max(0, options.Count - visibleRows);
+            int scrollOffset = Math.Clamp(SelectScrollResolver?.Invoke(elem) ?? 0, 0, maxScroll);
+            bool needsScrollbar = options.Count > visibleRows && face.Width >= 16;
+            const float scrollbarWidth = 14f;
+            float optionWidth = Math.Max(1f, face.Width - (needsScrollbar ? scrollbarWidth : 0f));
+            var optionFace = new RectangleF(face.X, face.Y, optionWidth, face.Height);
+
+            int rows = Math.Min(visibleRows, options.Count - scrollOffset);
+            var state = g.Save();
+            try
             {
-                var opt = options[i];
-                float rowY = face.Y + i * rowH;
-                if (rowY + rowH > face.Bottom) break;
+                g.SetClip(optionFace, CombineMode.Intersect);
+                for (int row = 0; row < rows; row++)
+                {
+                    var opt = options[scrollOffset + row];
+                    float rowY = face.Y + row * rowH;
+                    if (rowY + rowH > face.Bottom) break;
 
-                bool selected = opt.HasAttr("selected");
-                if (selected)
-                    g.FillRectangle(SystemBrushes.Highlight,
-                        face.X + 1, rowY, face.Width - 2, rowH);
+                    bool selected = opt.HasAttr("selected");
+                    if (selected)
+                        g.FillRectangle(SystemBrushes.Highlight,
+                            optionFace.X + 1, rowY, Math.Max(1f, optionFace.Width - 2), rowH);
 
-                using var brush = new SolidBrush(disabled
-                    ? Color.Gray : selected ? Color.White : Color.Black);
-                g.DrawString(GlyphSubstitution.MapGlyphs((opt.InnerText ?? "").Trim()), font, brush,
-                    face.X + 3, rowY + 1);
+                    using var brush = new SolidBrush(disabled
+                        ? Color.Gray : selected ? Color.White : Color.Black);
+                    g.DrawString(GlyphSubstitution.MapGlyphs((opt.InnerText ?? "").Trim()), font, brush,
+                        optionFace.X + 3, rowY + 1);
+                }
             }
+            finally
+            {
+                g.Restore(state);
+            }
+
+            if (needsScrollbar)
+                PaintSelectScrollbar(g, face, options.Count, visibleRows, scrollOffset);
             return;
         }
 
@@ -1938,6 +1994,30 @@ public class Renderer
             new PointF(arrowX + 8, arrowY - 4),
             new PointF(arrowX + 4, arrowY + 3)
         });
+    }
+
+    private static void PaintSelectScrollbar(Graphics g, RectangleF face,
+                                              int optionCount, int visibleRows,
+                                              int scrollOffset)
+    {
+        if (optionCount <= visibleRows || face.Width < 16 || face.Height < 8) return;
+
+        const float barWidth = 14f;
+        float trackX = face.Right - barWidth + 1f;
+        float trackY = face.Top + 1f;
+        float trackHeight = Math.Max(1f, face.Height - 2f);
+        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
+        float maxThumbHeight = Math.Max(1f, trackHeight - 2f);
+        float thumbHeight = Math.Min(maxThumbHeight, Math.Max(10f,
+            trackHeight * visibleRows / Math.Max(1f, optionCount)));
+        float travel = Math.Max(0f, trackHeight - 2f - thumbHeight);
+        int maxScroll = Math.Max(0, optionCount - visibleRows);
+        float thumbY = trackY + 1f +
+            travel * Math.Clamp(scrollOffset / (float)Math.Max(1, maxScroll), 0f, 1f);
+        g.FillRectangle(thumb, trackX + 1f, thumbY,
+            Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
     private void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts,

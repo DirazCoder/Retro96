@@ -105,11 +105,19 @@ internal sealed class DownloadsDialog : Form
         _grid.RowHeadersVisible = false;
         _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         _grid.AutoGenerateColumns = false;
+        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
         _grid.MultiSelect = false;
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "File", DataPropertyName = nameof(DownloadItem.FileName), Width = 210 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "URL", DataPropertyName = nameof(DownloadItem.Url), Width = 380 });
         _grid.Columns.Add(new DownloadProgressColumn { HeaderText = "Progress", Width = 180, SortMode = DataGridViewColumnSortMode.NotSortable });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Status", DataPropertyName = nameof(DownloadItem.Status), Width = 110 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Status",
+            DataPropertyName = nameof(DownloadItem.Status),
+            Width = 110,
+            MinimumWidth = 88,
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
+        });
         _grid.CellDoubleClick += (_, _) => OpenSelected();
 
         _contextMenu.Items.Add("Open").Click += (_, _) => OpenSelected();
@@ -230,15 +238,48 @@ internal sealed class DownloadsDialog : Form
 
     private void UpdateGridColumns()
     {
-        if (_grid.Columns.Count < 4) return;
-        int available = Math.Max(520, _grid.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 8);
-        int progress = Math.Min(190, Math.Max(140, available / 5));
-        int status = 108;
-        int file = Math.Min(260, Math.Max(170, available / 4));
+        if (_grid.Columns.Count < 4 || WindowState == FormWindowState.Minimized || !_grid.IsHandleCreated)
+            return;
+
+        int available = _grid.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4;
+        if (available <= 0) return;
+
+        // The old Math.Max(520, ...) floor forced a wider four-column layout
+        // into a temporarily tiny client area during minimize/narrow resize,
+        // leaving Progress and Status overlapping until a later repaint. Keep
+        // the fixed columns inside the actual client width and let Status fill
+        // the right-hand remainder.
+        int file = Math.Clamp(available / 4, 140, 230);
+        int progress = Math.Clamp(available / 6, 104, 180);
+        int status = Math.Clamp(available / 7, 88, 132);
+        int url = available - file - progress - status;
+
+        if (url < 80)
+        {
+            int deficit = 80 - url;
+            int reducibleFile = Math.Max(0, file - 120);
+            int take = Math.Min(deficit, reducibleFile);
+            file -= take;
+            deficit -= take;
+
+            int reducibleProgress = Math.Max(0, progress - 92);
+            take = Math.Min(deficit, reducibleProgress);
+            progress -= take;
+            deficit -= take;
+
+            int reducibleStatus = Math.Max(0, status - 80);
+            take = Math.Min(deficit, reducibleStatus);
+            status -= take;
+            deficit -= take;
+            url = Math.Max(20, available - file - progress - status);
+        }
+
         _grid.Columns[0].Width = file;
+        _grid.Columns[1].Width = url;
         _grid.Columns[2].Width = progress;
-        _grid.Columns[3].Width = status;
-        _grid.Columns[1].Width = Math.Max(220, available - file - progress - status);
+        _grid.Columns[3].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        _grid.Columns[3].MinimumWidth = Math.Min(status, Math.Max(1, available - file - progress));
+        _grid.Columns[3].FillWeight = 1f;
     }
 
     private DownloadItem? SelectedItem() => _grid.SelectedRows.Count == 0 ? null : _grid.SelectedRows[0].Tag as DownloadItem;

@@ -71,8 +71,8 @@ internal sealed class PreferencesDialog : Form
             Margin = new Padding(0),
             Padding = new Padding(0)
         };
-        var cancel = new Button { Text = "Cancel", Width = 96, Height = 34, DialogResult = DialogResult.Cancel, Margin = new Padding(8, 0, 0, 0) };
-        var ok = new Button { Text = "Apply", Width = 96, Height = 34, DialogResult = DialogResult.OK, Margin = new Padding(8, 0, 0, 0) };
+        var cancel = new Button { Text = "Cancel", Width = 96, Height = 34, Margin = new Padding(8, 0, 0, 0) };
+        var ok = new Button { Text = "Apply", Width = 96, Height = 34, Margin = new Padding(8, 0, 0, 0) };
         buttonRow.Controls.Add(ok);
         buttonRow.Controls.Add(cancel);
         buttons.Controls.Add(defaults);
@@ -87,7 +87,20 @@ internal sealed class PreferencesDialog : Form
 
         ok.Click += (_, _) =>
         {
+            // Do not give the button a DialogResult: WinForms may close the
+            // modal form as part of the button activation before a later Click
+            // subscriber gets a chance to copy the edited controls. Explicitly
+            // copy first, then close with OK so the caller receives the values
+            // that are actually visible in the dialog.
             CopyInto(_settings);
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+
+        cancel.Click += (_, _) =>
+        {
+            DialogResult = DialogResult.Cancel;
+            Close();
         };
 
         Controls.Add(tabs);

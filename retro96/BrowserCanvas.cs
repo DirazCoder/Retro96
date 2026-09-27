@@ -71,6 +71,14 @@ public class BrowserCanvas : Control
     private FrameView? _textareaScrollbarDragFrame;
     private float _textareaScrollbarGrabOffset;
 
+    // Multiple-select listboxes have a real in-control vertical scrollbar.
+    // Keep the DOM control's scroll position separate from the page scroll.
+    private readonly Dictionary<DomElement, int> _selectScrollOffsets = new();
+    private bool _selectScrollbarDragging;
+    private DomElement? _selectScrollbarDragSelect;
+    private FrameView? _selectScrollbarDragFrame;
+    private float _selectScrollbarGrabOffset;
+
     // Pressed button (Win95 bevel animation)
     private DomElement? _pressedControl;
     private FrameView? _pressedControlFrame;
@@ -287,6 +295,10 @@ public class BrowserCanvas : Control
             _textareaScrollXs.Clear();
             _textareaScrollbarDragging = false;
             _textareaScrollbarDragFrame = null;
+            _selectScrollOffsets.Clear();
+            _selectScrollbarDragging = false;
+            _selectScrollbarDragSelect = null;
+            _selectScrollbarDragFrame = null;
             _focusedInput = null;
             _focusedInputFrame = null;
             _lastHoveredElement = null;
@@ -349,6 +361,10 @@ public class BrowserCanvas : Control
         _textareaScrollXs.Clear();
         _textareaScrollbarDragging = false;
         _textareaScrollbarDragFrame = null;
+        _selectScrollOffsets.Clear();
+        _selectScrollbarDragging = false;
+        _selectScrollbarDragSelect = null;
+        _selectScrollbarDragFrame = null;
         _selectRangeAnchors.Clear();
         _contextElement = null;
 
@@ -902,7 +918,8 @@ public class BrowserCanvas : Control
             var renderer = new Renderer(fontCache, imageCache, resourceLoader)
             {
                 PressedElement = _pressedControl,
-                TextareaStateResolver = GetTextareaRenderState
+                TextareaStateResolver = GetTextareaRenderState,
+                SelectScrollResolver = GetSelectScrollOffset
             };
 
             var newBitmap = renderer.Render(
@@ -952,7 +969,8 @@ public class BrowserCanvas : Control
             var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
             {
                 PressedElement = _pressedControlFrame == view ? _pressedControl : null,
-                TextareaStateResolver = GetTextareaRenderState
+                TextareaStateResolver = GetTextareaRenderState,
+                SelectScrollResolver = GetSelectScrollOffset
             };
             var bmp = renderer.Render(
                 view.RootBox, view.Document,
@@ -2131,6 +2149,22 @@ public class BrowserCanvas : Control
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
+        if (TryGetSelectAtPoint(x, y, out var wheelSelect, out _, out _, out _, out _))
+        {
+            int visibleRows = GetSelectVisibleRows(wheelSelect);
+            int optionCount = wheelSelect.Descendants().OfType<DomElement>()
+                .Count(o => o.TagName == "option");
+            int maxScroll = Math.Max(0, optionCount - visibleRows);
+            if (maxScroll > 0)
+            {
+                int delta = e.Delta > 0 ? -3 : 3;
+                _selectScrollOffsets[wheelSelect] = Math.Clamp(
+                    GetSelectScrollOffset(wheelSelect) + delta, 0, maxScroll);
+                RerenderNow();
+                return;
+            }
+        }
+
         if (TryGetEditableFieldAtPoint(x, y, out var wheelField, out var wheelFieldBox, out var wheelFieldView, out _) &&
             ReferenceEquals(wheelField, _focusedInput) && wheelFieldBox != null)
         {
@@ -3056,6 +3090,86 @@ public class BrowserCanvas : Control
         return (line, scrollX, false);
     }
 
+    private static int GetSelectVisibleRows(DomElement select)
+    {
+        int size = Math.Max(1, select.GetAttrInt("size", 1));
+        return select.HasAttr("multiple") && size == 1 ? 4 : size;
+    }
+
+    private int GetSelectScrollOffset(DomElement el)
+    {
+        if (el.TagName != "select") return 0;
+        int optionCount = el.Descendants().OfType<DomElement>()
+            .Count(o => o.TagName == "option");
+        int maxScroll = Math.Max(0, optionCount - GetSelectVisibleRows(el));
+        int current = _selectScrollOffsets.TryGetValue(el, out var value) ? value : 0;
+        int clamped = Math.Clamp(current, 0, maxScroll);
+        if (clamped != current) _selectScrollOffsets[el] = clamped;
+        return clamped;
+    }
+
+    private bool TryGetSelectAtPoint(float x, float y,
+                                     out DomElement select, out LayoutBox box,
+                                     out FrameView? frameView, out float localX, out float localY)
+    {
+        select = null!;
+        box = null!;
+        frameView = null;
+        localX = x;
+        localY = y;
+
+        LayoutBox? root;
+        if (TryHitFrame(x, y, out var frameHit))
+        {
+            frameView = frameHit.View;
+            root = frameView.RootBox;
+            localX = frameHit.LocalX;
+            localY = frameHit.LocalY;
+        }
+        else
+        {
+            root = _rootBox;
+        }
+
+        if (root == null) return false;
+
+        var hitElement = HitTestDeepestBox(root, localX, localY)?.Element;
+        for (var candidate = hitElement; candidate != null; candidate = candidate.Parent as DomElement)
+        {
+            if (candidate.TagName != "select") continue;
+            if (candidate.HasAttr("disabled") ||
+                (!candidate.HasAttr("multiple") && candidate.GetAttrInt("size", 1) <= 1))
+                return false;
+
+            var options = candidate.Descendants().OfType<DomElement>()
+                .Where(o => o.TagName == "option").ToList();
+            int visibleRows = GetSelectVisibleRows(candidate);
+            if (options.Count <= visibleRows) return false;
+
+            var candidateBox = FindBoxForElement(root, candidate);
+            if (candidateBox == null || !candidateBox.ContentRect.Contains(localX, localY)) return false;
+
+            select = candidate;
+            box = candidateBox;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryGetSelectScrollbarPoint(float x, float y,
+                                             out DomElement select, out LayoutBox box,
+                                             out FrameView? frameView, out float localX, out float localY)
+    {
+        if (!TryGetSelectAtPoint(x, y, out select, out box, out frameView, out localX, out localY))
+            return false;
+
+        const float barWidth = 14f;
+        var face = box.ContentRect;
+        return new RectangleF(face.Right - barWidth, face.Top, barWidth, face.Height)
+            .Contains(localX, localY);
+    }
+
     private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null, FrameView? frameView = null)
     {
         ArgumentNullException.ThrowIfNull(el);
@@ -3270,6 +3384,49 @@ public class BrowserCanvas : Control
             }
         }
 
+        if (e.Button == MouseButtons.Left &&
+            TryGetSelectScrollbarPoint(x, y, out var selectScrollbar,
+                out var selectScrollbarBox, out var selectScrollbarFrame,
+                out _, out float selectScrollbarY))
+        {
+            int visibleRows = GetSelectVisibleRows(selectScrollbar);
+            int optionCount = selectScrollbar.Descendants().OfType<DomElement>()
+                .Count(o => o.TagName == "option");
+            int maxScroll = Math.Max(0, optionCount - visibleRows);
+            float trackY = selectScrollbarBox.ContentRect.Top + 1f;
+            float trackHeight = Math.Max(1f, selectScrollbarBox.ContentRect.Height - 2f);
+            float thumbHeight = Math.Max(10f, trackHeight * visibleRows /
+                Math.Max(1, optionCount));
+            float travel = Math.Max(1f, trackHeight - thumbHeight);
+            int currentScroll = GetSelectScrollOffset(selectScrollbar);
+            float thumbTop = trackY + travel * currentScroll / Math.Max(1, maxScroll);
+
+            if (selectScrollbarY < thumbTop || selectScrollbarY > thumbTop + thumbHeight)
+            {
+                float desiredTop = Math.Clamp(selectScrollbarY - thumbHeight / 2f,
+                    trackY, trackY + travel);
+                currentScroll = Math.Clamp(
+                    (int)Math.Round((desiredTop - trackY) / travel * maxScroll),
+                    0, maxScroll);
+                thumbTop = trackY + travel * currentScroll / Math.Max(1, maxScroll);
+                _selectScrollbarGrabOffset = thumbHeight / 2f;
+                _selectScrollOffsets[selectScrollbar] = currentScroll;
+                RerenderNow();
+            }
+            else
+            {
+                _selectScrollbarGrabOffset = Math.Clamp(
+                    selectScrollbarY - thumbTop, 0f, thumbHeight);
+            }
+
+            _selectScrollbarDragging = true;
+            _selectScrollbarDragSelect = selectScrollbar;
+            _selectScrollbarDragFrame = selectScrollbarFrame;
+            Capture = true;
+            Invalidate();
+            return;
+        }
+
         // Frame documents have their own layout tree. Resolve controls and
         // events in the deepest frame, not against the page-level <frame> box.
         if (TryHitFrame(x, y, out var frameHit))
@@ -3452,6 +3609,48 @@ public class BrowserCanvas : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+
+        if (_selectScrollbarDragging && _selectScrollbarDragSelect != null && Capture)
+        {
+            var root = _selectScrollbarDragFrame?.RootBox ?? _rootBox;
+            if (root != null)
+            {
+                float px = e.X / _pluginZoom + _scrollOffset.X;
+                float py = e.Y / _pluginZoom + _scrollOffset.Y;
+                float localY = py;
+                if (_selectScrollbarDragFrame != null)
+                {
+                    if (!TryHitFrame(px, py, out var hit) ||
+                        !ReferenceEquals(hit.View, _selectScrollbarDragFrame))
+                        return;
+                    localY = hit.LocalY;
+                }
+
+                var box = FindBoxForElement(root, _selectScrollbarDragSelect);
+                if (box != null)
+                {
+                    int visibleRows = GetSelectVisibleRows(_selectScrollbarDragSelect);
+                    int optionCount = _selectScrollbarDragSelect.Descendants().OfType<DomElement>()
+                        .Count(o => o.TagName == "option");
+                    int maxScroll = Math.Max(0, optionCount - visibleRows);
+                    float trackY = box.ContentRect.Top + 1f;
+                    float trackHeight = Math.Max(1f, box.ContentRect.Height - 2f);
+                    float thumbHeight = Math.Max(10f, trackHeight * visibleRows /
+                        Math.Max(1, optionCount));
+                    float travel = Math.Max(1f, trackHeight - thumbHeight);
+                    float thumbTop = Math.Clamp(localY - _selectScrollbarGrabOffset,
+                        trackY, trackY + travel);
+                    int scroll = Math.Clamp(
+                        (int)Math.Round((thumbTop - trackY) / travel * maxScroll),
+                        0, maxScroll);
+                    if (_selectScrollOffsets.TryGetValue(_selectScrollbarDragSelect, out var old) && old == scroll)
+                        return;
+                    _selectScrollOffsets[_selectScrollbarDragSelect] = scroll;
+                    RerenderNow();
+                }
+            }
+            return;
+        }
 
         if (_textareaScrollbarDragging && _focusedInput?.TagName == "textarea" && Capture)
         {
@@ -3646,6 +3845,11 @@ public class BrowserCanvas : Control
             element = HitTestElement(_rootBox, mx, my);
         }
 
+        bool overTextareaScrollbar = _focusedInput?.TagName == "textarea" &&
+            TryGetFocusedTextareaScrollbarPoint(mx, my, out _, out _, out _);
+        bool overSelectScrollbar = TryGetSelectScrollbarPoint(mx, my,
+            out _, out _, out _, out _, out _);
+
         if (TryGetEditableFieldAtPoint(mx, my, out var cursorField, out _, out var cursorFrame, out var cursorHit))
         {
             element = cursorField;
@@ -3664,7 +3868,12 @@ public class BrowserCanvas : Control
         bool fieldInteraction = IsEditableField(element) || IsEditableField(doc.FocusedElement);
         UpdateCssInteractionState(doc, element, doc.ActiveElement, doc.FocusedElement,
             relayout: !fieldInteraction);
-        if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
+        if (overTextareaScrollbar || overSelectScrollbar)
+        {
+            Cursor = Cursors.Default;
+            SetStatus("");
+        }
+        else if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
         {
             Cursor = Cursors.Hand;
             try
@@ -3736,6 +3945,15 @@ public class BrowserCanvas : Control
             _textareaScrollbarDragFrame = null;
             Capture = false;
             PersistFocusedTextareaScrollState();
+            return;
+        }
+
+        if (_selectScrollbarDragging)
+        {
+            _selectScrollbarDragging = false;
+            _selectScrollbarDragSelect = null;
+            _selectScrollbarDragFrame = null;
+            Capture = false;
             return;
         }
 
@@ -4831,8 +5049,9 @@ public class BrowserCanvas : Control
         // Do not use deepest-box hit testing here: the scrollbar sits on the
         // same visual face as the textarea's text child, so generic hit-testing
         // can report the text node and send the click into text selection.
-        box = FindBoxForElement(root, _focusedInput);
-        if (box == null || !box.BorderRect.Contains(localX, localY)) return false;
+        var foundBox = FindBoxForElement(root, _focusedInput);
+        if (foundBox == null || !foundBox.BorderRect.Contains(localX, localY)) return false;
+        box = foundBox;
 
         var geo = GetTextareaGeometry(_focusedInput, box, frameView);
         if (geo == null || !geo.NeedsVerticalScrollbar) return false;
@@ -5111,9 +5330,10 @@ public class BrowserCanvas : Control
         var font = ResolveFieldFont(select);
         if (font == null) return;
         float rowHeight = font.GetHeight(MeasureGraphics) + 2f;
-        int index = (int)Math.Floor((y - box.ContentRect.Y) / rowHeight);
-        int visibleRows = Math.Max(1, select.GetAttrInt("size", 4));
-        if (index < 0 || index >= Math.Min(visibleRows, options.Count)) return;
+        int visibleRows = GetSelectVisibleRows(select);
+        int scrollOffset = GetSelectScrollOffset(select);
+        int index = scrollOffset + (int)Math.Floor((y - box.ContentRect.Y) / rowHeight);
+        if (index < scrollOffset || index >= Math.Min(scrollOffset + visibleRows, options.Count)) return;
 
         var captured = options[index];
         bool toggle = (ModifierKeys & Keys.Control) == Keys.Control;
