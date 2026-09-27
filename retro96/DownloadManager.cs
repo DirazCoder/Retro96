@@ -120,7 +120,8 @@ internal sealed class DownloadsDialog : Form
         });
         _grid.CellDoubleClick += (_, _) => OpenSelected();
 
-        _contextMenu.Items.Add("Open").Click += (_, _) => OpenSelected();
+        // The main command bar already exposes Open. Keeping a second Open entry
+        // here made the Downloads WinForm present the same action twice to users.
         _contextMenu.Items.Add("Open Folder").Click += (_, _) => OpenFolderSelected();
         _contextMenu.Items.Add("Copy URL").Click += (_, _) => CopySelectedUrl();
         _contextMenu.Items.Add(new ToolStripSeparator());
@@ -142,12 +143,10 @@ internal sealed class DownloadsDialog : Form
 
         var close = new Button { Text = "Close", Width = 94, Height = 30 };
         var remove = new Button { Text = "Remove", Width = 94, Height = 30 };
-        var folder = new Button { Text = "Open Folder", Width = 104, Height = 30 };
         var open = new Button { Text = "Open", Width = 94, Height = 30 };
         var cancel = new Button { Text = "Cancel", Width = 94, Height = 30 };
         cancel.Click += (_, _) => CancelSelected();
         open.Click += (_, _) => OpenSelected();
-        folder.Click += (_, _) => OpenFolderSelected();
         remove.Click += (_, _) => RemoveSelected();
 
         var buttons = new FlowLayoutPanel
@@ -158,9 +157,11 @@ internal sealed class DownloadsDialog : Form
             Padding = new Padding(10, 8, 10, 10),
             Margin = Padding.Empty
         };
+        // Keep a single Open command in the bottom bar. Open Folder remains
+        // available from the row context menu without creating a second
+        // Open-style button beside it.
         buttons.Controls.Add(close);
         buttons.Controls.Add(remove);
-        buttons.Controls.Add(folder);
         buttons.Controls.Add(open);
         buttons.Controls.Add(cancel);
 
@@ -288,13 +289,11 @@ internal sealed class DownloadsDialog : Form
     {
         var item = SelectedItem();
         bool has = item != null;
-        bool complete = item?.Status == DownloadStatus.Complete && !string.IsNullOrWhiteSpace(item.FilePath);
         bool hasPath = item != null && !string.IsNullOrWhiteSpace(item.FilePath);
-        _contextMenu.Items[0].Enabled = complete;
-        _contextMenu.Items[1].Enabled = hasPath;
-        _contextMenu.Items[2].Enabled = has;
-        _contextMenu.Items[4].Enabled = item?.Status == DownloadStatus.Downloading;
-        _contextMenu.Items[5].Enabled = has && item?.Status != DownloadStatus.Downloading;
+        _contextMenu.Items[0].Enabled = hasPath; // Open Folder
+        _contextMenu.Items[1].Enabled = has;     // Copy URL
+        _contextMenu.Items[3].Enabled = item?.Status == DownloadStatus.Downloading; // Cancel
+        _contextMenu.Items[4].Enabled = has && item?.Status != DownloadStatus.Downloading; // Remove
     }
 
     private void OpenSelected()
