@@ -62,6 +62,14 @@ public class BrowserCanvas : Control
     private bool _fieldDragging;
     private float _fieldScrollX;
     private int _textareaScrollLine;
+    // Textarea scrolling belongs to the DOM control, not to focus. Keep it
+    // here so blur/unfocus can repaint the field at the same viewport without
+    // showing the editing scrollbar.
+    private readonly Dictionary<DomElement, int> _textareaScrollLines = new();
+    private readonly Dictionary<DomElement, float> _textareaScrollXs = new();
+    private bool _textareaScrollbarDragging;
+    private FrameView? _textareaScrollbarDragFrame;
+    private float _textareaScrollbarGrabOffset;
 
     // Pressed button (Win95 bevel animation)
     private DomElement? _pressedControl;
@@ -275,6 +283,10 @@ public class BrowserCanvas : Control
             _contextMenus.Clear();
 
             _controlDefaults.Clear();
+            _textareaScrollLines.Clear();
+            _textareaScrollXs.Clear();
+            _textareaScrollbarDragging = false;
+            _textareaScrollbarDragFrame = null;
             _focusedInput = null;
             _focusedInputFrame = null;
             _lastHoveredElement = null;
@@ -333,6 +345,10 @@ public class BrowserCanvas : Control
         _pressedControl = null;
         _pressedControlFrame = null;
         _controlDefaults.Clear();
+        _textareaScrollLines.Clear();
+        _textareaScrollXs.Clear();
+        _textareaScrollbarDragging = false;
+        _textareaScrollbarDragFrame = null;
         _selectRangeAnchors.Clear();
         _contextElement = null;
 
@@ -885,7 +901,8 @@ public class BrowserCanvas : Control
 
             var renderer = new Renderer(fontCache, imageCache, resourceLoader)
             {
-                PressedElement = _pressedControl
+                PressedElement = _pressedControl,
+                TextareaStateResolver = GetTextareaRenderState
             };
 
             var newBitmap = renderer.Render(
@@ -933,7 +950,10 @@ public class BrowserCanvas : Control
             // available to horizontal/vertical scrolling.
             var contentSize = GetFrameContentSize(view.RootBox, frameBox.Width, frameBox.Height);
             var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
-            { PressedElement = _pressedControlFrame == view ? _pressedControl : null };
+            {
+                PressedElement = _pressedControlFrame == view ? _pressedControl : null,
+                TextareaStateResolver = GetTextareaRenderState
+            };
             var bmp = renderer.Render(
                 view.RootBox, view.Document,
                 _fontCache, _imageCache,
@@ -1171,10 +1191,10 @@ public class BrowserCanvas : Control
                 PaintFocusedFrameFieldOverlayRecursive(g, destRect, view);
         }
 
-        // Page/frame text selection highlight.  Paint only the selected glyph
-        // spans of each inline text run.  Never merge adjacent runs, because
-        // that would fill inter-word whitespace, inline gaps, padding, or an
-        // empty container between the runs.
+        // Page/frame text selection highlight. Collect selected glyph spans
+        // first, then merge only compatible same-line spans so word + whitespace
+        // + word selections render as one continuous browser-style band without
+        // swallowing genuinely separate layout gaps.
         if (_selAnchor != null && _selFocus != null)
         {
             using var selBrush = new SolidBrush(Color.FromArgb(110, 0, 0, 170));
@@ -1183,11 +1203,9 @@ public class BrowserCanvas : Control
             if (selectionRoot != null)
             {
                 var ordered = selectionRoot.Descendants()
-                    // Collapsed single ASCII spaces do not have a rendered
-                    // glyph of their own.  Keeping them as standalone
-                    // selection boxes causes stray little rectangles at line
-                    // starts/ends. Word-to-word selection is connected later
-                    // by the same-line span merge.
+                    // Keep collapsed single ASCII space runs in the ordered
+                    // selection stream so their measured advance can bridge
+                    // adjacent word runs during the final same-line merge.
                     .Where(b => !string.IsNullOrEmpty(b.TextRun))
                     .ToList();
                 int anchorIndex = ordered.IndexOf(_selAnchor);
@@ -1211,11 +1229,17 @@ public class BrowserCanvas : Control
                         g.SetClip(selectionFrameDestRect, CombineMode.Intersect);
                     }
 
+                    // Collect ALL selected visual spans first. Merging one box at a
+                    // time can never connect separate inline runs, which is how a
+                    // sentence became a row of disconnected highlight rectangles.
+                    // Space-only runs are kept so their real layout advance bridges
+                    // neighbouring words.
+                    var selectedSpans = new List<RectangleF>();
                     for (int i = firstIndex; i <= lastIndex; i++)
                     {
                         var box = ordered[i];
                         int len = box.TextRun?.Length ?? 0;
-                        if (len == 0 || box.TextRun == " ") continue;
+                        if (len == 0) continue;
 
                         int a = 0, b = len;
                         if (i == anchorIndex)
@@ -1231,15 +1255,16 @@ public class BrowserCanvas : Control
                         if (b < a) (a, b) = (b, a);
                         if (b <= a) continue;
 
-                        var spans = SelectionVisualSpans(g, box, a, b).ToList();
-                        // Adjacent text runs on the same line should form one continuous
-                        // selection highlight when they touch.  Keep genuinely separate
-                        // layout gaps (padding/margins/empty regions) unpainted.
-                        foreach (var span in MergeSelectionSpans(spans))
-                        {
-                            g.FillRectangle(selBrush,
-                                span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
-                        }
+                        selectedSpans.AddRange(SelectionVisualSpans(g, box, a, b));
+                    }
+
+                    // Only merge after the complete selection has been collected so
+                    // adjacent word/space/inline-element runs on the same visual line
+                    // become one continuous band. Large layout gaps remain distinct.
+                    foreach (var span in MergeSelectionSpans(selectedSpans))
+                    {
+                        g.FillRectangle(selBrush,
+                            span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
                     }
 
                     if (selectionState >= 0)
@@ -1463,7 +1488,7 @@ public class BrowserCanvas : Control
             if (geo != null)
             {
                 float lineHeight = geo.Font.GetHeight(g);
-                int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+                int visibleLines = geo.VisibleLines;
                 int maxScrollLine = Math.Max(0, geo.Lines.Count - visibleLines);
                 int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
                 bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
@@ -1481,7 +1506,7 @@ public class BrowserCanvas : Control
                     using var foreground = new SolidBrush(foregroundColor);
                     g.FillRectangle(background, face);
                     Engine.Render.TextareaOverlay.DrawLines(g, text, geo.Font, geo.Lines,
-                        foreground, textX, textY, face.Width - 4, lineHeight, scrollLine);
+                        foreground, textX, textY, geo.TextWidth, lineHeight, scrollLine);
                 }
 
                 float Measure(int start, int end) => end <= start ? 0f
@@ -1512,6 +1537,10 @@ public class BrowserCanvas : Control
                     using var caretPen = new Pen(Color.Black, 1);
                     g.DrawLine(caretPen, cx, caretY, cx, caretY + lineHeight);
                 }
+
+                if (needsTextRepaint && geo.NeedsVerticalScrollbar)
+                    PaintTextareaScrollbar(g, new RectangleF(face.X, face.Y, face.Width, face.Height),
+                        geo.Lines.Count, lineHeight, scrollLine);
             }
         }
         else
@@ -1598,20 +1627,23 @@ public class BrowserCanvas : Control
                                                int scrollLine = 0)
     {
         int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
-        if (lineCount <= visibleLines || face.Width < 12 || face.Height < 8) return;
+        if (lineCount <= visibleLines || face.Width < 16 || face.Height < 8) return;
 
-        float trackX = face.Right - 12;
-        float trackY = face.Top + 1;
-        float trackHeight = Math.Max(1, face.Height - 2);
+        const float barWidth = 14f;
+        float trackX = face.Right - barWidth + 1f;
+        float trackY = face.Top + 1f;
+        float trackHeight = Math.Max(1f, face.Height - 2f);
         using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
         using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
-        g.FillRectangle(track, trackX, trackY, 11, trackHeight);
-        float thumbHeight = Math.Max(10, trackHeight * visibleLines / lineCount);
-        float maxThumbY = Math.Max(1, trackHeight - thumbHeight);
-        float thumbY = trackY + 1 + maxThumbY * scrollLine /
-            Math.Max(1, lineCount - visibleLines);
-        g.FillRectangle(thumb, trackX + 1, thumbY, 9,
-            Math.Min(trackHeight - 2, thumbHeight - 2));
+        g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
+        float thumbHeight = Math.Clamp(
+            trackHeight * visibleLines / Math.Max(1f, lineCount), 10f, trackHeight - 2f);
+        float travel = Math.Max(0f, trackHeight - 2f - thumbHeight);
+        int maxLine = Math.Max(0, lineCount - visibleLines);
+        float thumbY = trackY + 1f +
+            travel * Math.Clamp(scrollLine / (float)Math.Max(1, maxLine), 0f, 1f);
+        g.FillRectangle(thumb, trackX + 1f, thumbY,
+            Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
     private void PaintTextareaFieldOverlay(Graphics g)
@@ -1630,7 +1662,7 @@ public class BrowserCanvas : Control
         float textX = face.X + 3 - scrollX - _fieldScrollX;
         float textY = face.Y + 2 - scrollY;
         float lineHeight = font.GetHeight(g);
-        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
+        int visibleLines = geo.VisibleLines;
         int maxScrollLine = Math.Max(0, lines.Count - visibleLines);
         int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
         bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
@@ -1660,7 +1692,7 @@ public class BrowserCanvas : Control
                     Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2));
             using var foreground = new SolidBrush(fieldForeground);
             Engine.Render.TextareaOverlay.DrawLines(g, text, font, lines, foreground,
-                textX, textY, face.Width - 4, lineHeight, scrollLine);
+                textX, textY, geo.TextWidth, lineHeight, scrollLine);
         }
 
         if (selEnd > selStart)
@@ -1690,7 +1722,7 @@ public class BrowserCanvas : Control
         }
         g.Restore(oldClip);
 
-        if (needsTextRepaint && lines.Count > visibleLines)
+        if (needsTextRepaint && geo.NeedsVerticalScrollbar)
         {
             var screenFace = new RectangleF(face.X - scrollX, face.Y - scrollY, face.Width, face.Height);
             PaintTextareaScrollbar(g, screenFace, lines.Count, lineHeight, scrollLine);
@@ -2113,11 +2145,11 @@ public class BrowserCanvas : Control
                 if (geo != null)
                 {
                     float lineHeight = geo.Font.GetHeight(MeasureGraphics);
-                    int visibleLines = Math.Max(1,
-                        (int)Math.Floor((wheelFieldBox.ContentRect.Height - 4) / lineHeight));
+                    int visibleLines = geo.VisibleLines;
                     int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
                     int delta = e.Delta > 0 ? -3 : 3;
                     _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
+                    PersistFocusedTextareaScrollState();
                     Invalidate();
                     return;
                 }
@@ -2316,6 +2348,13 @@ public class BrowserCanvas : Control
         _fieldCaret = Math.Clamp(_fieldCaret, 0, len);
         _fieldSelAnchor = Math.Clamp(_fieldSelAnchor, 0, len);
 
+        // Ctrl+A and other caret/selection commands do not change layout.
+        // Re-rendering the whole document for those commands was enough to
+        // re-run table/form layout while a password selection overlay was
+        // active, producing page-wide position/size jumps. Only value edits
+        // need a new document bitmap.
+        bool valueChanges = e.KeyCode is Keys.Delete or Keys.V or Keys.X;
+
         switch (e.KeyCode)
         {
             case Keys.Left:
@@ -2381,7 +2420,13 @@ public class BrowserCanvas : Control
         }
 
         EnsureFocusedTextareaCaretVisible();
-        RequestRerender();
+        if (valueChanges)
+            RequestRerender();
+        else
+            Invalidate();
+        // Stop WinForms from delivering a second KeyPress for the command key.
+        // In particular Ctrl+A must never fall through into the character path.
+        e.SuppressKeyPress = true;
         e.Handled = true;
     }
 
@@ -2389,6 +2434,17 @@ public class BrowserCanvas : Control
     {
         var elem = _focusedInput;
         if (elem == null || !IsEditableField(elem)) return;
+
+        // KeyDown owns Ctrl+A/C/V/X and Enter. WinForms can still emit the
+        // corresponding C0 control character through KeyPress; sending that
+        // into the text-edit path scheduled a whole document rerender during
+        // password select-all, allowing unrelated table/layout state to jump.
+        // Backspace is the one control character that is real editing input.
+        if ((e.KeyChar < ' ' && e.KeyChar != '\b') || e.KeyChar == '\x7f')
+        {
+            e.Handled = true;
+            return;
+        }
 
         // FIX: plain typing never fired onkeydown/onkeypress on the field,
         // so key-capture scripts (and "return false" input filters) were dead.
@@ -2553,6 +2609,10 @@ public class BrowserCanvas : Control
         public required Font Font;
         public required string Text;
         public required List<(int Start, int End)> Lines;
+        public required float TextWidth;
+        public required float TextViewportWidth;
+        public required bool NeedsVerticalScrollbar;
+        public required int VisibleLines;
     }
 
     private TextareaGeometry? GetTextareaGeometry(DomElement el, LayoutBox? box = null, FrameView? frameView = null)
@@ -2563,8 +2623,17 @@ public class BrowserCanvas : Control
         var font = ResolveFieldFont(el);
         if (box == null || font == null) return null;
         string text = GetFieldText(el);
-        var lines = GetTextareaLines(el, box, text, font);
-        return new TextareaGeometry { Box = box, Font = font, Text = text, Lines = lines };
+        bool wrapOff = el.GetAttrOrDefault("wrap", "").Trim()
+            .Equals("off", StringComparison.OrdinalIgnoreCase);
+        var layout = TextareaOverlay.CalculateLayout(MeasureGraphics, text, font,
+            box.ContentRect.Width, box.ContentRect.Height, wrapOff);
+        return new TextareaGeometry
+        {
+            Box = box, Font = font, Text = text, Lines = layout.Lines,
+            TextWidth = layout.TextWidth, TextViewportWidth = layout.TextViewportWidth,
+            NeedsVerticalScrollbar = layout.NeedsVerticalScrollbar,
+            VisibleLines = layout.VisibleLines
+        };
     }
 
     private List<(int Start, int End)> GetTextareaLines(DomElement el, LayoutBox box,
@@ -2582,7 +2651,9 @@ public class BrowserCanvas : Control
             _taCacheWidth == width && _taCacheWrapOff == wrapOff)
             return _taCacheLines;
 
-        var lines = BreakTextareaLines(MeasureGraphics, text, font, width, wrapOff);
+        var layout = TextareaOverlay.CalculateLayout(MeasureGraphics, text, font,
+            box.ContentRect.Width, box.ContentRect.Height, wrapOff);
+        var lines = layout.Lines;
         _taCacheText = text;
         _taCacheFont = font;
         _taCacheWidth = width;
@@ -2622,6 +2693,7 @@ public class BrowserCanvas : Control
         else if (caretLine >= _textareaScrollLine + visibleLines)
             _textareaScrollLine = caretLine - visibleLines + 1;
         _textareaScrollLine = Math.Clamp(_textareaScrollLine, 0, maxLine);
+        PersistFocusedTextareaScrollState();
         return _textareaScrollLine;
     }
 
@@ -2862,11 +2934,15 @@ public class BrowserCanvas : Control
         if (font == null) return 0f;
         var geo = GetTextareaGeometry(el, box, frameView);
         if (geo == null) return 0f;
+        // CalculateLayout.TextWidth is the measured line width, while
+        // TextViewportWidth is the actual drawable width after the vertical
+        // scrollbar gutter. Subtract the latter; subtracting TextWidth from
+        // itself made horizontal scrolling permanently report zero.
         using var fmt = NewFieldFormat(noWrap: true);
         float maxLine = 0f;
         foreach (var (start, end) in geo.Lines)
             maxLine = Math.Max(maxLine, MeasureGraphics.MeasureString(geo.Text[start..end], font, int.MaxValue, fmt).Width);
-        return Math.Max(0f, maxLine - Math.Max(1f, box.ContentRect.Width - 6f));
+        return Math.Max(0f, maxLine - Math.Max(1f, geo.TextViewportWidth));
     }
 
     private bool ScrollFocusedFieldHorizontally(float delta, float x, float y)
@@ -2881,6 +2957,7 @@ public class BrowserCanvas : Control
         if (maxScroll <= 0f) return true;
 
         _fieldScrollX = Math.Clamp(_fieldScrollX - delta, 0f, maxScroll);
+        PersistFocusedTextareaScrollState();
         Invalidate();
         return true;
     }
@@ -2956,6 +3033,29 @@ public class BrowserCanvas : Control
         Invalidate();
     }
 
+    private void PersistFocusedTextareaScrollState()
+    {
+        if (_focusedInput?.TagName != "textarea") return;
+        _textareaScrollLines[_focusedInput] = Math.Max(0, _textareaScrollLine);
+        _textareaScrollXs[_focusedInput] = Math.Max(0f, _fieldScrollX);
+    }
+
+    private void RestoreTextareaScrollState(DomElement el)
+    {
+        _textareaScrollLine = _textareaScrollLines.TryGetValue(el, out int line) ? Math.Max(0, line) : 0;
+        _fieldScrollX = _textareaScrollXs.TryGetValue(el, out float scrollX) ? Math.Max(0f, scrollX) : 0f;
+    }
+
+    private (int ScrollLine, float ScrollX, bool ShowScrollbar) GetTextareaRenderState(DomElement el)
+    {
+        if (ReferenceEquals(el, _focusedInput) && el.TagName == "textarea")
+            return (Math.Max(0, _textareaScrollLine), Math.Max(0f, _fieldScrollX), true);
+
+        int line = _textareaScrollLines.TryGetValue(el, out var storedLine) ? Math.Max(0, storedLine) : 0;
+        float scrollX = _textareaScrollXs.TryGetValue(el, out var storedX) ? Math.Max(0f, storedX) : 0f;
+        return (line, scrollX, false);
+    }
+
     private void FocusControl(DomElement el, int caretPos, JsInterpreter? js = null, FrameView? frameView = null)
     {
         ArgumentNullException.ThrowIfNull(el);
@@ -2979,11 +3079,16 @@ public class BrowserCanvas : Control
                 UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el, relayout: false);
             js?.FireEvent(el, "onfocus");   // FIX: clicking a field never fired onfocus
 
-            // A newly focused control starts at the top/left. Re-clicking an
-            // already focused control must NOT reset its internal scroll, or
-            // the textarea text visibly jumps when the page itself is scrolled.
-            _fieldScrollX = 0f;
-            _textareaScrollLine = 0;
+            // A textarea's scroll position is control-local state. Re-focusing
+            // it must resume where the user last scrolled instead of jumping to
+            // line zero after every blur/refocus cycle.
+            if (el.TagName == "textarea")
+                RestoreTextareaScrollState(el);
+            else
+            {
+                _fieldScrollX = 0f;
+                _textareaScrollLine = 0;
+            }
         }
 
         _focusedInputFrame = frameView;
@@ -2997,6 +3102,7 @@ public class BrowserCanvas : Control
         var el = _focusedInput;
         if (el == null) return;
         var ownerFrame = _focusedInputFrame;
+        PersistFocusedTextareaScrollState();
         _focusedInput = null;
         _focusedInputFrame = null;
         _fieldDragging = false;
@@ -3048,7 +3154,11 @@ public class BrowserCanvas : Control
         // still take the full dynamic-CSS relayout path.
         if (!relayout)
         {
-            RequestRerender();
+            // Field focus/hover/selection is painted by the live overlay.
+            // Do not rebuild the document bitmap for it: that reruns layout
+            // while a password or textarea selection is being manipulated and
+            // is the direct trigger for page-wide table/position jumps.
+            Invalidate();
             return;
         }
 
@@ -3123,19 +3233,38 @@ public class BrowserCanvas : Control
                 out float scrollbarX, out float scrollbarY))
         {
             var geo = GetTextareaGeometry(_focusedInput, scrollbarBox, _focusedInputFrame);
-            if (geo != null)
+            if (geo != null && geo.NeedsVerticalScrollbar)
             {
-                float lineHeight = geo.Font.GetHeight(MeasureGraphics);
-                int visibleLines = Math.Max(1,
-                    (int)Math.Floor((scrollbarBox.ContentRect.Height - 4) / lineHeight));
-                int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
-                float trackHeight = Math.Max(1, scrollbarBox.ContentRect.Height - 2);
-                float thumbHeight = Math.Max(10,
-                    trackHeight * visibleLines / Math.Max(1, geo.Lines.Count));
-                float travel = Math.Max(1, trackHeight - thumbHeight);
-                _textareaScrollLine = Math.Clamp((int)Math.Round(
-                    (scrollbarY - scrollbarBox.ContentRect.Top - thumbHeight / 2) /
-                    travel * maxLine), 0, maxLine);
+                float trackY = scrollbarBox.ContentRect.Top + 1f;
+                float trackHeight = Math.Max(1f, scrollbarBox.ContentRect.Height - 2f);
+                float thumbHeight = Math.Max(10f, trackHeight * geo.VisibleLines /
+                    Math.Max(1, geo.Lines.Count));
+                float travel = Math.Max(1f, trackHeight - thumbHeight);
+                int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
+                float thumbTop = trackY + travel * _textareaScrollLine /
+                    Math.Max(1, maxLine);
+
+                if (scrollbarY < thumbTop || scrollbarY > thumbTop + thumbHeight)
+                {
+                    float desiredTop = Math.Clamp(scrollbarY - thumbHeight / 2f,
+                        trackY, trackY + travel);
+                    _textareaScrollLine = Math.Clamp(
+                        (int)Math.Round((desiredTop - trackY) / travel * maxLine),
+                        0, maxLine);
+                    thumbTop = trackY + travel * _textareaScrollLine /
+                        Math.Max(1, maxLine);
+                    _textareaScrollbarGrabOffset = thumbHeight / 2f;
+                }
+                else
+                {
+                    _textareaScrollbarGrabOffset = Math.Clamp(
+                        scrollbarY - thumbTop, 0f, thumbHeight);
+                }
+
+                PersistFocusedTextareaScrollState();
+                _textareaScrollbarDragging = true;
+                _textareaScrollbarDragFrame = _focusedInputFrame;
+                Capture = true;
                 Invalidate();
                 return;
             }
@@ -3323,6 +3452,47 @@ public class BrowserCanvas : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+
+        if (_textareaScrollbarDragging && _focusedInput?.TagName == "textarea" && Capture)
+        {
+            var root = _textareaScrollbarDragFrame?.RootBox ?? _rootBox;
+            if (root != null)
+            {
+                float px = e.X / _pluginZoom + _scrollOffset.X;
+                float py = e.Y / _pluginZoom + _scrollOffset.Y;
+                float localY = py;
+                if (_textareaScrollbarDragFrame != null)
+                {
+                    if (!TryHitFrame(px, py, out var hit) ||
+                        !ReferenceEquals(hit.View, _textareaScrollbarDragFrame))
+                        return;
+                    localY = hit.LocalY;
+                }
+
+                var box = FindBoxForElement(root, _focusedInput);
+                if (box != null)
+                {
+                    var geo = GetTextareaGeometry(_focusedInput, box, _textareaScrollbarDragFrame);
+                    if (geo != null && geo.NeedsVerticalScrollbar)
+                    {
+                        float trackY = box.ContentRect.Top + 1f;
+                        float trackHeight = Math.Max(1f, box.ContentRect.Height - 2f);
+                        float thumbHeight = Math.Max(10f, trackHeight * geo.VisibleLines /
+                            Math.Max(1, geo.Lines.Count));
+                        float travel = Math.Max(1f, trackHeight - thumbHeight);
+                        float thumbTop = Math.Clamp(localY - _textareaScrollbarGrabOffset,
+                            trackY, trackY + travel);
+                        int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
+                        _textareaScrollLine = Math.Clamp(
+                            (int)Math.Round((thumbTop - trackY) / travel * maxLine),
+                            0, maxLine);
+                        PersistFocusedTextareaScrollState();
+                        Invalidate();
+                    }
+                }
+            }
+            return;
+        }
 
         if (_embeddedMidiVolumeDragging && _embeddedMidiElement != null && _embeddedMidiRect != RectangleF.Empty)
         {
@@ -3560,6 +3730,15 @@ public class BrowserCanvas : Control
             return;
         }
 
+        if (_textareaScrollbarDragging)
+        {
+            _textareaScrollbarDragging = false;
+            _textareaScrollbarDragFrame = null;
+            Capture = false;
+            PersistFocusedTextareaScrollState();
+            return;
+        }
+
         if (_embeddedMidiPressedAction != null)
         {
             string action = _embeddedMidiPressedAction;
@@ -3610,8 +3789,32 @@ public class BrowserCanvas : Control
             return;
         }
 
+        // Selection releases are paint-only. Rebuilding layout here can replace
+        // the boxes selected by the preceding MouseDown, so a triple-click
+        // highlight flashes and disappears. Drag selection also keeps its exact
+        // geometry until the next real interaction.
+        if (_suppressNextMouseUp)
+        {
+            _suppressNextMouseUp = false;
+            _dragMoved = false;
+            return;
+        }
+
+        if (_dragMoved)
+        {
+            _dragMoved = false;
+            return;
+        }
+
+        if (wasSelecting)
+        {
+            ClearPageSelection();
+            Invalidate();
+        }
+
         if (_document != null && _document.ActiveElement != null)
-            UpdateCssInteractionState(_document, _document.HoveredElement, null, _document.FocusedElement);
+            UpdateCssInteractionState(_document, _document.HoveredElement, null, _document.FocusedElement,
+                relayout: false);
 
         if (e.Button == MouseButtons.Right)
         {
@@ -3620,26 +3823,6 @@ public class BrowserCanvas : Control
         }
         if (e.Button != MouseButtons.Left)
             return;
-
-        if (_suppressNextMouseUp)
-        {
-            _suppressNextMouseUp = false;
-            return;
-        }
-
-        if (_dragMoved)
-        {
-            _dragMoved = false;
-            return;   // selection drag, not a click
-        }
-
-        // Plain single click clears the selection — but NOT the second
-        // release of a double-click (that was the highlight flicker).
-        if (wasSelecting && !_dragMoved)
-        {
-            ClearPageSelection();
-            Invalidate();
-        }
 
         if (wasPressed)
         {
@@ -3764,7 +3947,9 @@ public class BrowserCanvas : Control
 
         container ??= word.Parent;
         var textBoxes = container?.Descendants()
-            .Where(b => !string.IsNullOrEmpty(b.TextRun))
+            .Where(b => !string.IsNullOrEmpty(b.TextRun) &&
+                        b.Width > 0.01f && b.Height > 0.01f &&
+                        b.ContentRect.Width > 0.01f && b.ContentRect.Height > 0.01f)
             .ToList();
         if (textBoxes is { Count: > 0 })
         {
@@ -3901,7 +4086,12 @@ public class BrowserCanvas : Control
     private IEnumerable<RectangleF> SelectionVisualSpans(Graphics g, LayoutBox box, int start, int end)
     {
         string text = box.TextRun ?? string.Empty;
-        if (text.Length == 0) yield break;
+        if (text.Length == 0 || box.Width <= 0.01f || box.Height <= 0.01f) yield break;
+        var content = box.ContentRect;
+        if (!float.IsFinite(content.X) || !float.IsFinite(content.Y) ||
+            !float.IsFinite(content.Width) || !float.IsFinite(content.Height) ||
+            content.Width <= 0.01f || content.Height <= 0.01f)
+            yield break;
         start = Math.Clamp(start, 0, text.Length);
         end = Math.Clamp(end, 0, text.Length);
         if (end <= start) yield break;
@@ -3930,47 +4120,7 @@ public class BrowserCanvas : Control
     }
 
     private static IEnumerable<RectangleF> MergeSelectionSpans(List<RectangleF> spans)
-    {
-        if (spans.Count == 0) yield break;
-
-        spans.Sort((a, b) =>
-        {
-            int y = a.Y.CompareTo(b.Y);
-            return y != 0 ? y : a.X.CompareTo(b.X);
-        });
-
-        RectangleF current = spans[0];
-        for (int i = 1; i < spans.Count; i++)
-        {
-            var next = spans[i];
-            bool sameLine = Math.Abs(next.Y - current.Y) <= 1.5f &&
-                Math.Abs(next.Height - current.Height) <= 1.5f;
-            // Layout and font measurement can leave a few fractional pixels
-            // between adjacent inline text runs (especially around collapsed
-            // spaces and run boundaries).  Treat only these tiny same-line
-            // gaps as part of one continuous selection; larger gaps still
-            // preserve real padding/margin/empty-layout separation.
-            // A collapsed inter-word space is laid out as a separate inline
-            // run, so the visible glyph spans can be several pixels apart even
-            // though the selection should look continuous. Keep the bridge
-            // small enough not to swallow ordinary block/padding gaps.
-            const float selectionJoinTolerance = 8f;
-            bool touching = next.X <= current.Right + selectionJoinTolerance;
-            if (sameLine && touching)
-            {
-                float right = Math.Max(current.Right, next.Right);
-                current = new RectangleF(current.X, Math.Min(current.Y, next.Y),
-                    right - current.X, Math.Max(current.Bottom, next.Bottom) - Math.Min(current.Y, next.Y));
-            }
-            else
-            {
-                yield return current;
-                current = next;
-            }
-        }
-
-        yield return current;
-    }
+        => SelectionOverlay.MergeSpans(spans);
 
     private void ClearPageSelection()
     {
@@ -4038,7 +4188,11 @@ public class BrowserCanvas : Control
         if (selectionRoot == null || _selAnchor == null || _selFocus == null)
             return new List<LayoutBox>();
         return selectionRoot.Descendants()
-            .Where(b => !string.IsNullOrEmpty(b.TextRun))
+            .Where(b => !string.IsNullOrEmpty(b.TextRun) &&
+                        b.Width > 0.01f && b.Height > 0.01f &&
+                        float.IsFinite(b.ContentRect.X) && float.IsFinite(b.ContentRect.Y) &&
+                        float.IsFinite(b.ContentRect.Width) && float.IsFinite(b.ContentRect.Height) &&
+                        b.ContentRect.Width > 0.01f && b.ContentRect.Height > 0.01f)
             .ToList();
     }
 
@@ -4100,6 +4254,11 @@ public class BrowserCanvas : Control
 
     private void SelectAllText()
     {
+        // Ctrl+A replaces any prior page selection. Clear first so a document
+        // with no selectable visual text cannot leave an orphaned selection
+        // frame/paint rectangle behind.
+        ClearPageSelection();
+
         FrameView? selectionView = null;
         LayoutBox? selectionRoot = _rootBox;
         if (_focusedFrame != null && TryGetFrameViewForBox(_focusedFrame, out var focusedView) &&
@@ -4114,7 +4273,9 @@ public class BrowserCanvas : Control
         var textBoxes = selectionRoot.Descendants()
             // Do not anchor Ctrl+A on collapsed indentation/edge spaces that
             // the layout pass skips visually.
-            .Where(b => !string.IsNullOrEmpty(b.TextRun) && b.TextRun.Any(ch => ch != ' '))
+            .Where(b => !string.IsNullOrEmpty(b.TextRun) &&
+                        b.Width > 0.01f && b.Height > 0.01f &&
+                        b.TextRun.Any(ch => !char.IsWhiteSpace(ch)))
             .ToList();
         if (textBoxes.Count == 0) return;
 
@@ -4649,17 +4810,36 @@ public class BrowserCanvas : Control
         box = null!;
         localX = localY = 0;
         if (_focusedInput?.TagName != "textarea") return false;
-        if (!TryGetEditableFieldAtPoint(x, y, out var field, out var fieldBox, out var frameView, out var frameHit) ||
-            !ReferenceEquals(field, _focusedInput) || fieldBox == null)
-            return false;
 
-        localX = frameView == null ? x : frameHit.LocalX;
-        localY = frameView == null ? y : frameHit.LocalY;
-        box = fieldBox;
-        if (!box.BorderRect.Contains(localX, localY)) return false;
+        var frameView = _focusedInputFrame;
+        var root = frameView?.RootBox ?? _rootBox;
+        if (root == null) return false;
+
+        if (frameView == null)
+        {
+            localX = x;
+            localY = y;
+        }
+        else
+        {
+            if (!TryHitFrame(x, y, out var hit) || !ReferenceEquals(hit.View, frameView))
+                return false;
+            localX = hit.LocalX;
+            localY = hit.LocalY;
+        }
+
+        // Do not use deepest-box hit testing here: the scrollbar sits on the
+        // same visual face as the textarea's text child, so generic hit-testing
+        // can report the text node and send the click into text selection.
+        box = FindBoxForElement(root, _focusedInput);
+        if (box == null || !box.BorderRect.Contains(localX, localY)) return false;
+
+        var geo = GetTextareaGeometry(_focusedInput, box, frameView);
+        if (geo == null || !geo.NeedsVerticalScrollbar) return false;
 
         var face = box.ContentRect;
-        return localX >= face.Right - 14 && localY >= face.Top && localY <= face.Bottom;
+        return new RectangleF(face.Right - 14f, face.Top, 14f, face.Height)
+            .Contains(localX, localY);
     }
 
     private static LayoutBox? FindBoxForElement(LayoutBox root, DomElement element) =>

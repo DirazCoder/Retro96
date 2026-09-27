@@ -102,6 +102,12 @@ public class Renderer
     /// pressed-in bevel.</summary>
     public DomElement? PressedElement { get; set; }
 
+    // Textareas keep their scroll position as control-local state in the shell.
+    // The renderer is deliberately agnostic about focus ownership, so the
+    // shell supplies the current scroll offsets and whether the scrollbar is
+    // visible for each control.
+    public Func<DomElement, (int ScrollLine, float ScrollX, bool ShowScrollbar)>? TextareaStateResolver { get; set; }
+
     private readonly ResourceLoader _resourceLoader;
     private string? _baseUrl;
     private float _scrollX, _scrollY;
@@ -1791,28 +1797,34 @@ public class Renderer
         // full graphics state and explicitly select the correct hint for this
         // one draw.
         var textState = g.Save();
-        g.SetClip(textRect, CombineMode.Intersect);
-        g.TextRenderingHint = isPassword
-            ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
-            : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
-        if (isPassword && box.Element != null)
+        try
         {
-            using var maskFormat = new StringFormat(StringFormat.GenericTypographic)
+            g.SetClip(textRect, CombineMode.Intersect);
+            g.TextRenderingHint = isPassword
+                ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
+                : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
+            if (isPassword && box.Element != null)
             {
-                FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-                Trimming = StringTrimming.None,
-                LineAlignment = StringAlignment.Center,
-                Alignment = StringAlignment.Near
-            };
-            int length = text.Length;
-            PasswordMaskLayout.DrawRange(g, length, font, brush, textRect.X, textRect.Y,
-                textRect.Height, 0, length, maskFormat);
+                using var maskFormat = new StringFormat(StringFormat.GenericTypographic)
+                {
+                    FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
+                    Trimming = StringTrimming.None,
+                    LineAlignment = StringAlignment.Center,
+                    Alignment = StringAlignment.Near
+                };
+                int length = text.Length;
+                PasswordMaskLayout.DrawRange(g, length, font, brush, textRect.X, textRect.Y,
+                    textRect.Height, 0, length, maskFormat);
+            }
+            else
+            {
+                g.DrawString(text, font, brush, textRect, sf);
+            }
         }
-        else
+        finally
         {
-            g.DrawString(text, font, brush, textRect, sf);
+            g.Restore(textState);
         }
-        g.Restore(textState);
     }
 
     private static void PaintCheckboxOrRadio(Graphics g, LayoutBox box, bool isRadio)
@@ -1928,8 +1940,8 @@ public class Renderer
         });
     }
 
-    private static void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts,
-                                      bool isFocused)
+    private void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts,
+                               bool isFocused)
     {
         var elem = box.Element!;
         var rect = box.BorderRect;
@@ -1954,46 +1966,67 @@ public class Renderer
             g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
         }
 
-        bool bold = style.FontWeight >= FontWeightValue.Bold;
-        bool italic = style.FontStyle is FontStyleValue.Italic or FontStyleValue.Oblique;
         var font = ResolveFont(fonts, style);
-
         string text = elem.InnerText ?? "";
-
         using var brush = new SolidBrush(fgColor);
-        bool wrapOff = elem.GetAttrOrDefault("wrap", "").Trim().ToLowerInvariant() == "off";
+        bool wrapOff = elem.GetAttrOrDefault("wrap", "").Trim()
+            .Equals("off", StringComparison.OrdinalIgnoreCase);
 
-        var lines = TextareaOverlay.BreakLines(g, text, font,
-            Math.Max(1f, face.Width - 6), wrapOff);
-        float lineHeight = font.GetHeight(g);
-        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
-        var textClip = g.Save();
-        g.SetClip(new RectangleF(face.X + 1, face.Y + 1,
-            Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
-            CombineMode.Intersect);
-        TextareaOverlay.DrawLines(g, text, font, lines, brush,
-            face.X + 3, face.Y + 2, face.Width - 6, lineHeight);
-        g.Restore(textClip);
+        var layout = TextareaOverlay.CalculateLayout(g, text, font,
+            face.Width, face.Height, wrapOff);
+        var textareaState = TextareaStateResolver?.Invoke(elem) ?? default;
+        int requestedScroll = textareaState.ScrollLine;
+        int scrollLine = Math.Clamp(requestedScroll, 0,
+            Math.Max(0, layout.Lines.Count - layout.VisibleLines));
+        float requestedScrollX = textareaState.ScrollX;
+        float maxScrollX = Math.Max(0f, layout.TextWidth - layout.TextViewportWidth);
+        float scrollX = wrapOff ? Math.Clamp(requestedScrollX, 0f, maxScrollX) : 0f;
 
-        if (lines.Count > visibleLines)
-            PaintTextareaScrollbar(g, face, lines.Count, visibleLines);
+        int textState = g.Save();
+        try
+        {
+            g.SetClip(new RectangleF(face.X + 1, face.Y + 1,
+                Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
+                CombineMode.Intersect);
+            TextareaOverlay.DrawLines(g, text, font, layout.Lines, brush,
+                face.X + 3 - scrollX, face.Y + 2,
+                layout.TextWidth, layout.LineHeight, scrollLine);
+        }
+        finally
+        {
+            g.Restore(textState);
+        }
+
+        // The scrollbar is focus-owned UI.  Its absence while unfocused is
+        // intentional, but the text layout still reserves the same gutter so
+        // wrapping does not jump when focus moves away.
+        if (isFocused && layout.NeedsVerticalScrollbar)
+            PaintTextareaScrollbar(g, face, layout.Lines.Count,
+                layout.VisibleLines, scrollLine);
     }
 
     private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
-                                               int lineCount, int visibleLines)
+                                               int lineCount, int visibleLines,
+                                               int scrollLine)
     {
-        if (lineCount <= visibleLines || face.Width < 12 || face.Height < 8) return;
+        if (lineCount <= visibleLines || face.Width < 16 || face.Height < 8) return;
 
-        float trackX = face.Right - 12;
-        float trackY = face.Top + 1;
-        float trackHeight = Math.Max(1, face.Height - 2);
+        const float barWidth = 14f;
+        float trackX = face.Right - barWidth + 1f;
+        float trackY = face.Top + 1f;
+        float trackHeight = Math.Max(1f, face.Height - 2f);
         using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
         using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
-        g.FillRectangle(track, trackX, trackY, 11, trackHeight);
+        g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
 
-        float thumbHeight = Math.Max(10, trackHeight * visibleLines / lineCount);
-        g.FillRectangle(thumb, trackX + 1, trackY + 1, 9,
-            Math.Min(trackHeight - 2, thumbHeight - 2));
+        float thumbHeight = Math.Clamp(
+            trackHeight * visibleLines / Math.Max(1f, lineCount), 10f, trackHeight - 2f);
+        float travel = Math.Max(0f, trackHeight - 2f - thumbHeight);
+        int maxLine = Math.Max(0, lineCount - visibleLines);
+        float thumbY = trackY + 1f +
+            travel * Math.Clamp(scrollLine / (float)Math.Max(1, maxLine), 0f, 1f);
+        g.FillRectangle(thumb, trackX + 1f, thumbY,
+            Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
     private void PaintButton(Graphics g, LayoutBox box, FontCache fonts, string text)

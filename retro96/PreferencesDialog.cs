@@ -468,7 +468,8 @@ internal sealed class PreferencesDialog : Form
         target.MarqueeText = _marquee.Checked;
 
         if (!string.IsNullOrWhiteSpace(_home.Text)) target.HomePageUrl = _home.Text.Trim();
-        if (!string.IsNullOrWhiteSpace(_search.Text)) target.SearchQueryUrl = _search.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(_search.Text))
+            target.SearchQueryUrl = UserSettings.NormalizeSearchTemplate(_search.Text);
     }
 
     private void UpdateUserAgentHint()

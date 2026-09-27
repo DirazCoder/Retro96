@@ -64,8 +64,14 @@ public sealed class UserSettings
     public bool HostCheckImages { get; set; } = true;
     public bool DiscardPageStateOnClose { get; set; } = true;
 
-    private static string FilePath =>
-        Path.Combine(AppContext.BaseDirectory, "retro96.ini");
+    private static string ConfigDirectory =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Retro96");
+
+    private static string FilePath => Path.Combine(ConfigDirectory, "retro96.ini");
+
+    // Keep the executable-directory file as a legacy/portable mirror, but never
+    // let a stale copy silently override the user's last applied preferences.
+    private static string LegacyFilePath => Path.Combine(AppContext.BaseDirectory, "retro96.ini");
 
     public string EffectiveUserAgent =>
         string.IsNullOrWhiteSpace(UserAgentOverride)
@@ -105,10 +111,32 @@ public sealed class UserSettings
     public static UserSettings Load()
     {
         var s = new UserSettings();
+        string? loadPath = null;
+
         try
         {
-            if (!File.Exists(FilePath)) return s;
-            foreach (var raw in File.ReadAllLines(FilePath))
+            // Keep one deterministic source when both locations exist. The
+            // most recently modified copy wins, then Save() mirrors the chosen
+            // preferences to both locations. This fixes the original
+            // "edit -> Apply -> restart -> old value came back" split-brain
+            // behaviour while still allowing a human to edit either retro96.ini
+            // copy deliberately.
+            bool hasUser = File.Exists(FilePath);
+            bool hasLegacy = File.Exists(LegacyFilePath);
+            if (hasUser && hasLegacy)
+            {
+                loadPath = File.GetLastWriteTimeUtc(FilePath) >=
+                           File.GetLastWriteTimeUtc(LegacyFilePath)
+                    ? FilePath : LegacyFilePath;
+            }
+            else if (hasUser)
+                loadPath = FilePath;
+            else if (hasLegacy)
+                loadPath = LegacyFilePath;
+
+            if (loadPath == null) return s;
+
+            foreach (var raw in File.ReadAllLines(loadPath))
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith(';') || line.StartsWith('['))
@@ -200,53 +228,99 @@ public sealed class UserSettings
                 }
             }
         }
-        catch { /* unreadable settings → defaults */ }
+        catch { /* unreadable settings -> defaults */ }
 
         Normalize(s);
         return s;
     }
 
-    public void Save()
+    public bool Save()
     {
         Normalize(this);
+        var sb = new StringBuilder();
+        sb.AppendLine("[Preferences]");
+        sb.AppendLine("; Retro96 preferences - human editable");
+        sb.AppendLine("Search.Url=" + SearchQueryUrl);
+        sb.AppendLine("Home.Url=" + HomePageUrl);
+        sb.AppendLine("Engine.Mode=" + EngineMode);
+        sb.AppendLine("UserAgent.Override=" + UserAgentOverride);
+        sb.AppendLine("Background.Mode=" + BackgroundMode);
+        sb.AppendLine("Background.Color=" + ForcedBackgroundColor);
+        sb.AppendLine("Images.Enabled=" + BoolText(LoadImages));
+        sb.AppendLine("JavaScript.Enabled=" + BoolText(EnableJavaScript));
+        sb.AppendLine("ScriptedWindows.Enabled=" + BoolText(AllowScriptedWindows));
+        sb.AppendLine("Stylesheets.Enabled=" + BoolText(LoadStylesheets));
+        sb.AppendLine("Frames.Enabled=" + BoolText(LoadFrames));
+        sb.AppendLine("Forms.Enabled=" + BoolText(AllowFormSubmissions));
+        sb.AppendLine("JavaScript.Timers=" + BoolText(EnableJavaScriptTimers));
+        sb.AppendLine("JavaScript.Dialogs=" + BoolText(EnableJavaScriptDialogs));
+        sb.AppendLine("Network.Redirects=" + BoolText(FollowHttpRedirects));
+        sb.AppendLine("Network.MetaRefresh=" + BoolText(FollowMetaRefresh));
+        sb.AppendLine("Network.Cookies=" + BoolText(EnableCookies));
+        sb.AppendLine("Network.Referrer=" + BoolText(SendReferrer));
+        sb.AppendLine("Render.Animation=" + BoolText(AnimateImages));
+        sb.AppendLine("Render.Blink=" + BoolText(BlinkText));
+        sb.AppendLine("Render.Marquee=" + BoolText(MarqueeText));
+        sb.AppendLine("Security.Mode=" + TrustMode);
+        sb.AppendLine("Security.HostImageCheck=" + BoolText(HostCheckImages));
+        sb.AppendLine("Security.DiscardState=" + BoolText(DiscardPageStateOnClose));
+        string contents = sb.ToString();
+
+        bool userSaved = false;
         try
         {
-            var sb = new StringBuilder();
-            sb.AppendLine("[Preferences]");
-            sb.AppendLine("; Retro96 preferences — human editable");
-            sb.AppendLine("Search.Url=" + SearchQueryUrl);
-            sb.AppendLine("Home.Url=" + HomePageUrl);
-            sb.AppendLine("Engine.Mode=" + EngineMode);
-            sb.AppendLine("UserAgent.Override=" + UserAgentOverride);
-            sb.AppendLine("Background.Mode=" + BackgroundMode);
-            sb.AppendLine("Background.Color=" + ForcedBackgroundColor);
-            sb.AppendLine("Images.Enabled=" + BoolText(LoadImages));
-            sb.AppendLine("JavaScript.Enabled=" + BoolText(EnableJavaScript));
-            sb.AppendLine("ScriptedWindows.Enabled=" + BoolText(AllowScriptedWindows));
-            sb.AppendLine("Stylesheets.Enabled=" + BoolText(LoadStylesheets));
-            sb.AppendLine("Frames.Enabled=" + BoolText(LoadFrames));
-            sb.AppendLine("Forms.Enabled=" + BoolText(AllowFormSubmissions));
-            sb.AppendLine("JavaScript.Timers=" + BoolText(EnableJavaScriptTimers));
-            sb.AppendLine("JavaScript.Dialogs=" + BoolText(EnableJavaScriptDialogs));
-            sb.AppendLine("Network.Redirects=" + BoolText(FollowHttpRedirects));
-            sb.AppendLine("Network.MetaRefresh=" + BoolText(FollowMetaRefresh));
-            sb.AppendLine("Network.Cookies=" + BoolText(EnableCookies));
-            sb.AppendLine("Network.Referrer=" + BoolText(SendReferrer));
-            sb.AppendLine("Render.Animation=" + BoolText(AnimateImages));
-            sb.AppendLine("Render.Blink=" + BoolText(BlinkText));
-            sb.AppendLine("Render.Marquee=" + BoolText(MarqueeText));
-            sb.AppendLine("Security.Mode=" + TrustMode);
-            sb.AppendLine("Security.HostImageCheck=" + BoolText(HostCheckImages));
-            sb.AppendLine("Security.DiscardState=" + BoolText(DiscardPageStateOnClose));
-            File.WriteAllText(FilePath, sb.ToString(), new UTF8Encoding(false));
+            Directory.CreateDirectory(ConfigDirectory);
+            WriteAtomic(FilePath, contents);
+            userSaved = true;
         }
-        catch { /* read-only dir etc. — keep running with in-memory value */ }
+        catch { }
+
+        // Also refresh the legacy portable location when it is already writable
+        // (or when the per-user location could not be created). This preserves
+        // existing portable installs without making that location authoritative.
+        try
+        {
+            if (userSaved || File.Exists(LegacyFilePath))
+                WriteAtomic(LegacyFilePath, contents);
+        }
+        catch { }
+
+        return userSaved || CanReadBack(FilePath) || CanReadBack(LegacyFilePath);
+    }
+
+    private static void WriteAtomic(string path, string contents)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        string temp = path + ".tmp";
+        File.WriteAllText(temp, contents, new UTF8Encoding(false));
+        try
+        {
+            File.Move(temp, path, true);
+        }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+        }
+    }
+
+    private static bool CanReadBack(string path)
+    {
+        try { return File.Exists(path) && new FileInfo(path).Length > 0; }
+        catch { return false; }
+    }
+
+    public static string NormalizeSearchTemplate(string? value)
+    {
+        string template = (value ?? string.Empty).Trim();
+        if (template.Contains("{searchTerms}", StringComparison.OrdinalIgnoreCase))
+            template = template.Replace("{searchTerms}", "%s", StringComparison.OrdinalIgnoreCase);
+        return template.Contains("%s", StringComparison.Ordinal) ? template : DefaultSearchUrl;
     }
 
     private static void Normalize(UserSettings s)
     {
-        if (string.IsNullOrWhiteSpace(s.SearchQueryUrl) || !s.SearchQueryUrl.Contains("%s", StringComparison.Ordinal))
-            s.SearchQueryUrl = DefaultSearchUrl;
+        s.SearchQueryUrl = NormalizeSearchTemplate(s.SearchQueryUrl);
         if (string.IsNullOrWhiteSpace(s.HomePageUrl))
             s.HomePageUrl = "retro96:home";
         if (s.UserAgentOverride.Length > 2048)

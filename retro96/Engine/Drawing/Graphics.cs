@@ -34,6 +34,22 @@ public sealed class Graphics : IDisposable
     public float DpiX => 96f;
     public float DpiY => 96f;
 
+    // Skia Save/Restore preserves the canvas matrix/clip, but these rendering
+    // properties live on the Retro96 wrapper (and some also mutate the cached
+    // SkFont). A password control temporarily switches to aliased text; without
+    // snapshotting the wrapper state, that mode leaks into every later draw in
+    // the same paint pass.
+    private readonly List<SavedGraphicsState> _savedStates = [];
+
+    private readonly record struct SavedGraphicsState(
+        int CanvasState,
+        TextRenderingHint TextRenderingHint,
+        SmoothingMode SmoothingMode,
+        PixelOffsetMode PixelOffsetMode,
+        InterpolationMode InterpolationMode,
+        CompositingMode CompositingMode,
+        CompositingQuality CompositingQuality);
+
     private Graphics(Bitmap bitmap)
     {
         _bitmap = bitmap;
@@ -53,9 +69,43 @@ public sealed class Graphics : IDisposable
 
     // ── State / transform / clip ───────────────────────────────────────
 
-    public int Save() => _canvas.Save();
+    public int Save()
+    {
+        int state = _canvas.Save();
+        _savedStates.Add(new SavedGraphicsState(
+            state,
+            TextRenderingHint,
+            SmoothingMode,
+            PixelOffsetMode,
+            InterpolationMode,
+            CompositingMode,
+            CompositingQuality));
+        return state;
+    }
 
-    public void Restore(int state) => _canvas.RestoreToCount(state);
+    public void Restore(int state)
+    {
+        _canvas.RestoreToCount(state);
+
+        // Match GDI+/Skia's non-top restore semantics: restoring to an older
+        // save invalidates nested saves as well. If the caller restored a
+        // canvas state created internally by DrawString(), there is no wrapper
+        // snapshot and therefore nothing on this stack to restore.
+        for (int i = _savedStates.Count - 1; i >= 0; i--)
+        {
+            if (_savedStates[i].CanvasState != state) continue;
+
+            var saved = _savedStates[i];
+            TextRenderingHint = saved.TextRenderingHint;
+            SmoothingMode = saved.SmoothingMode;
+            PixelOffsetMode = saved.PixelOffsetMode;
+            InterpolationMode = saved.InterpolationMode;
+            CompositingMode = saved.CompositingMode;
+            CompositingQuality = saved.CompositingQuality;
+            _savedStates.RemoveRange(i, _savedStates.Count - i);
+            return;
+        }
+    }
 
     public void TranslateTransform(float dx, float dy) => _canvas.Translate(dx, dy);
 
@@ -216,11 +266,35 @@ public sealed class Graphics : IDisposable
         return text.Replace(LegacyBulletMarker, '·');
     }
 
-    private static float MeasureAdvance(Font font, string text) =>
-        font.MeasureText(NormalizeSpecialGlyphsForMeasurement(text));
-
-    private void ApplyEdging(Font font)
+    private static float MeasureAdvance(Font font, string text)
     {
+        text = NormalizeSpecialGlyphsForMeasurement(text);
+        float width = font.MeasureText(text);
+
+        // InlineLayout intentionally fragments text at collapsed spaces. Some
+        // Skia/font combinations can report an isolated ASCII space as zero
+        // width even though the same glyph has a real advance in contextual
+        // measurement. Preserve that advance using the SAME font metrics; a
+        // made-up em percentage would desynchronise wrapping and selection.
+        if (text.Length == 1 && text[0] == ' ' && width <= 0.001f)
+        {
+            float withSpace = font.MeasureText("0 ");
+            float withoutSpace = font.MeasureText("0");
+            float contextual = withSpace - withoutSpace;
+            if (contextual > 0.001f)
+                return contextual;
+        }
+
+        return Math.Max(0f, width);
+    }
+
+    private SKFontEdging ApplyEdging(Font font)
+    {
+        // Font objects are cached/shared by the renderer.  SKFont.Edging is
+        // mutable, so changing it for one password draw must not permanently
+        // alter the cached font used by later page text. Return the previous
+        // value so each draw can restore it in a finally block.
+        var previous = font.SkFont.Edging;
         font.SkFont.Edging = TextRenderingHint switch
         {
             TextRenderingHint.SingleBitPerPixel
@@ -228,20 +302,28 @@ public sealed class Graphics : IDisposable
                 or TextRenderingHint.SystemDefault => SKFontEdging.Alias,
             _ => SKFontEdging.Antialias,
         };
+        return previous;
     }
 
     /// <summary>Plain draw: line-box top at (x, y). Format optional.</summary>
     public void DrawString(string? text, Font font, Brush brush, float x, float y, StringFormat? format)
     {
         if (string.IsNullOrEmpty(text) || font == null || brush is not SolidBrush sb) return;
-        ApplyEdging(font);
-        float baseline = y + font.AscentPx;
-        if (text.IndexOf(LegacyBulletMarker) >= 0)
+        var previousEdging = ApplyEdging(font);
+        try
         {
-            DrawTextWithSpecialGlyphs(text, font, sb, x, baseline);
-            return;
+            float baseline = y + font.AscentPx;
+            if (text.IndexOf(LegacyBulletMarker) >= 0)
+            {
+                DrawTextWithSpecialGlyphs(text, font, sb, x, baseline);
+                return;
+            }
+            _canvas.DrawText(text, x, baseline, font.SkFont, sb.Prepare(antialias: true));
         }
-        _canvas.DrawText(text, x, baseline, font.SkFont, sb.Prepare(antialias: true));
+        finally
+        {
+            font.SkFont.Edging = previousEdging;
+        }
     }
 
     public void DrawString(string? text, Font font, Brush brush, float x, float y)
@@ -295,69 +377,76 @@ public sealed class Graphics : IDisposable
 
         var sf = format ?? new StringFormat();
         bool noWrap = (sf.FormatFlags & StringFormatFlags.NoWrap) != 0;
+        var previousEdging = ApplyEdging(font);
 
-        ApplyEdging(font);
-        var paint = sb.Prepare(antialias: true);
-        float lineHeight = font.GetHeight();
-
-        // Break into visual lines (single line when NoWrap).
-        List<string> lines = noWrap
-            ? new List<string> { text }
-            : WrapToWidth(text, font, layoutRect.Width);
-
-        // Trimming: ellipsize every line that still overflows.
-        if (sf.Trimming is StringTrimming.EllipsisCharacter or StringTrimming.EllipsisWord)
-        {
-            for (int i = 0; i < lines.Count; i++)
-            {
-                while (lines[i].Length > 1 && MeasureAdvance(font, Ellipsize(lines[i])) > layoutRect.Width)
-                    lines[i] = lines[i][..^2];
-            }
-        }
-        else if (sf.Trimming is StringTrimming.Character or StringTrimming.Word)
-        {
-            for (int i = 0; i < lines.Count; i++)
-            {
-                while (lines[i].Length > 1 && MeasureAdvance(font, lines[i]) > layoutRect.Width)
-                    lines[i] = lines[i][..^1];
-            }
-        }
-
-        // Vertical placement of the whole block.
-        float blockHeight = lines.Count * lineHeight;
-        float top = sf.LineAlignment switch
-        {
-            StringAlignment.Center => layoutRect.Y + (layoutRect.Height - blockHeight) / 2f,
-            StringAlignment.Far => layoutRect.Bottom - blockHeight,
-            _ => layoutRect.Y,
-        };
-
-        int save = _canvas.Save();
         try
         {
-            if ((sf.FormatFlags & StringFormatFlags.NoClip) == 0)
-                _canvas.ClipRect(SKRect.Create(layoutRect.X, layoutRect.Y,
-                    layoutRect.Width, layoutRect.Height), SKClipOperation.Intersect);
+            var paint = sb.Prepare(antialias: true);
+            float lineHeight = font.GetHeight();
 
-            for (int i = 0; i < lines.Count; i++)
+            // Break into visual lines (single line when NoWrap).
+            List<string> lines = noWrap
+                ? new List<string> { text }
+                : WrapToWidth(text, font, layoutRect.Width);
+
+            // Trimming: ellipsize every line that still overflows.
+            if (sf.Trimming is StringTrimming.EllipsisCharacter or StringTrimming.EllipsisWord)
             {
-                float w = MeasureAdvance(font, lines[i]);
-                float x = sf.Alignment switch
+                for (int i = 0; i < lines.Count; i++)
                 {
-                    StringAlignment.Center => layoutRect.X + (layoutRect.Width - w) / 2f,
-                    StringAlignment.Far => layoutRect.Right - w,
-                    _ => layoutRect.X,
-                };
-                float baseline = top + i * lineHeight + font.AscentPx;
-                if (lines[i].IndexOf(LegacyBulletMarker) >= 0)
-                    DrawTextWithSpecialGlyphs(lines[i], font, sb, x, baseline);
-                else
-                    _canvas.DrawText(lines[i], x, baseline, font.SkFont, paint);
+                    while (lines[i].Length > 1 && MeasureAdvance(font, Ellipsize(lines[i])) > layoutRect.Width)
+                        lines[i] = lines[i][..^2];
+                }
+            }
+            else if (sf.Trimming is StringTrimming.Character or StringTrimming.Word)
+            {
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    while (lines[i].Length > 1 && MeasureAdvance(font, lines[i]) > layoutRect.Width)
+                        lines[i] = lines[i][..^1];
+                }
+            }
+
+            // Vertical placement of the whole block.
+            float blockHeight = lines.Count * lineHeight;
+            float top = sf.LineAlignment switch
+            {
+                StringAlignment.Center => layoutRect.Y + (layoutRect.Height - blockHeight) / 2f,
+                StringAlignment.Far => layoutRect.Bottom - blockHeight,
+                _ => layoutRect.Y,
+            };
+
+            int save = _canvas.Save();
+            try
+            {
+                if ((sf.FormatFlags & StringFormatFlags.NoClip) == 0)
+                    _canvas.ClipRect(SKRect.Create(layoutRect.X, layoutRect.Y,
+                        layoutRect.Width, layoutRect.Height), SKClipOperation.Intersect);
+
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    float w = MeasureAdvance(font, lines[i]);
+                    float x = sf.Alignment switch
+                    {
+                        StringAlignment.Center => layoutRect.X + (layoutRect.Width - w) / 2f,
+                        StringAlignment.Far => layoutRect.Right - w,
+                        _ => layoutRect.X,
+                    };
+                    float baseline = top + i * lineHeight + font.AscentPx;
+                    if (lines[i].IndexOf(LegacyBulletMarker) >= 0)
+                        DrawTextWithSpecialGlyphs(lines[i], font, sb, x, baseline);
+                    else
+                        _canvas.DrawText(lines[i], x, baseline, font.SkFont, paint);
+                }
+            }
+            finally
+            {
+                _canvas.RestoreToCount(save);
             }
         }
         finally
         {
-            _canvas.RestoreToCount(save);
+            font.SkFont.Edging = previousEdging;
         }
     }
 

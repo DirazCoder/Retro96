@@ -123,7 +123,7 @@ public partial class Form1 : Form
     private string? _currentPageUrl;
     private string? _referrerUrl;          // document.referrer for the next page
 
-    // User preferences (search engine etc.) — retro96.ini next to the exe
+    // User preferences (search engine etc.); persisted per-user with a portable retro96.ini mirror
     private readonly UserSettings _settings = UserSettings.Load();
 
     // Guards against meta-refresh chains that loop forever
@@ -418,10 +418,7 @@ public partial class Form1 : Form
             return;
         }
 
-        string template = _settings.SearchQueryUrl;
-        if (string.IsNullOrWhiteSpace(template) || !template.Contains("%s"))
-            template = UserSettings.DefaultSearchUrl;
-
+        string template = UserSettings.NormalizeSearchTemplate(_settings.SearchQueryUrl);
         NavigateTo(template.Replace("%s", ParsedUrl.PercentEncode(t)));
     }
 
@@ -448,7 +445,7 @@ public partial class Form1 : Form
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         var updated = dialog.Settings;
-        _settings.SearchQueryUrl = updated.SearchQueryUrl;
+        _settings.SearchQueryUrl = UserSettings.NormalizeSearchTemplate(updated.SearchQueryUrl);
         _settings.HomePageUrl = updated.HomePageUrl;
         _settings.EngineMode = updated.EngineMode;
         _settings.UserAgentOverride = updated.UserAgentOverride;
