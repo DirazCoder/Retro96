@@ -7,6 +7,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -140,6 +141,12 @@ public partial class Form1 : Form
     private readonly FontCache _fontCache = new();
     private ResourceLoader? _resourceLoader;
     private readonly HttpClient _httpClient = new();
+    private static readonly System.Net.Http.HttpClient _pluginHttpClient = new(new System.Net.Http.HttpClientHandler
+    {
+        AllowAutoRedirect = true,
+        UseCookies = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+    });
     private bool _hostOpenedLocalDocument;
 
     // Per-page JS
@@ -151,10 +158,137 @@ public partial class Form1 : Form
     // so their APIs can safely target the live browser window.
     private PluginManager? _pluginManager;
     private ToolStripMenuItem? _pluginCommandsMenu;
+    internal BrowserCanvas PluginCanvas => _canvas;
 
     internal string? PluginCurrentUrl => _currentPageUrl;
     internal string PluginCurrentTitle => Text.EndsWith(" — Retro96", StringComparison.Ordinal)
         ? Text[..^10] : Text;
+
+    internal string PluginUserAgent => BrowserRuntime.UserAgent;
+
+    internal sealed record PluginEmbeddedSource(
+        Stream Body, int StatusCode, IReadOnlyDictionary<string, string> Headers,
+        string? ContentType, string? Charset, string EffectiveUrl, bool CanSeek, long? Length) : IDisposable
+    {
+        public void Dispose() { Body.Dispose(); }
+    }
+
+    internal async Task<PluginEmbeddedSource> OpenPluginEmbeddedSourceAsync(string url, CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) throw new InvalidDataException("Embedded source URL is invalid.");
+        if (uri.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+        {
+            var parsed = ParsedUrl.Parse(uri.AbsoluteUri);
+            string? path = LocalPathFromFileUrl(parsed);
+            if (path == null || !File.Exists(path)) throw new FileNotFoundException("Embedded source was not found.", path);
+            var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
+            return new PluginEmbeddedSource(fs, 200, new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase),
+                MimeFromExtension(path), null, CanonicalFileUrl(path), true, fs.Length);
+        }
+        if (uri.Scheme.Equals("data", StringComparison.OrdinalIgnoreCase))
+        {
+            int comma = url.IndexOf(',');
+            if (comma < 0) throw new InvalidDataException("Malformed data URL.");
+            string meta = url[..comma];
+            string dataPart = url[(comma + 1)..];
+            byte[] bytes = meta.Contains(";base64", StringComparison.OrdinalIgnoreCase)
+                ? Convert.FromBase64String(Uri.UnescapeDataString(dataPart))
+                : Encoding.UTF8.GetBytes(Uri.UnescapeDataString(dataPart));
+            return new PluginEmbeddedSource(new MemoryStream(bytes, writable: false), 200, new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase),
+                meta.Split(';').FirstOrDefault(x => x.StartsWith("data:", StringComparison.OrdinalIgnoreCase))?[5..] ?? "text/plain", null, uri.AbsoluteUri, true, bytes.Length);
+        }
+        if (!uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) && !uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+            throw new SecurityException("Embedded sources may only use http, https, file, or data URLs.");
+
+        using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("User-Agent", PluginUserAgent);
+        if (BrowserRuntime.ReferrerEnabled && !string.IsNullOrWhiteSpace(_currentPageUrl))
+            request.Headers.TryAddWithoutValidation("Referer", _currentPageUrl);
+        try
+        {
+            string cookie = _cookieStore.Get(ParsedUrl.Parse(uri.AbsoluteUri));
+            if (!string.IsNullOrEmpty(cookie)) request.Headers.TryAddWithoutValidation("Cookie", cookie);
+        }
+        catch { }
+        var response = await _pluginHttpClient.SendAsync(request, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            int status = (int)response.StatusCode;
+            response.Dispose();
+            throw new InvalidOperationException($"Embedded source request failed with HTTP {status}.");
+        }
+        var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        string? contentType = response.Content.Headers.ContentType?.MediaType;
+        string? charset = response.Content.Headers.ContentType?.CharSet;
+        string effective = response.RequestMessage?.RequestUri?.AbsoluteUri ?? uri.AbsoluteUri;
+        long? length = response.Content.Headers.ContentLength;
+        // Keep the HttpResponseMessage alive by wrapping its content stream.
+        return new PluginEmbeddedSource(new ResponseOwnedStream(response, stream), (int)response.StatusCode,
+            response.Headers.Concat(response.Content.Headers).ToDictionary(h => h.Key, h => string.Join(", ", h.Value), StringComparer.OrdinalIgnoreCase),
+            contentType, charset, effective, false, length);
+    }
+
+    internal async Task<PluginSandboxSession.PluginNetworkStream> OpenPluginNetworkStreamAsync(
+        PluginSandboxProtocol.NetworkRequestPayload request, PluginManager.PluginRecord record, CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(request.Url, UriKind.Absolute, out var uri)) throw new InvalidDataException("Plugin network URL is invalid.");
+        if (uri.Scheme is not ("http" or "https" or "file" or "data"))
+            throw new SecurityException("Plugin network requests may only use http, https, file, or data URLs.");
+
+        if (uri.Scheme is "file" or "data")
+        {
+            var local = await OpenPluginEmbeddedSourceAsync(uri.AbsoluteUri, cancellationToken).ConfigureAwait(false);
+            return new PluginSandboxSession.PluginNetworkStream(local.Body, local.StatusCode, local.Headers, local.ContentType, local.Charset, local.EffectiveUrl, local.CanSeek, local.Length);
+        }
+
+        var method = new System.Net.Http.HttpMethod(request.Method?.Trim().ToUpperInvariant() ?? "GET");
+        using var message = new System.Net.Http.HttpRequestMessage(method, uri);
+        message.Headers.TryAddWithoutValidation("User-Agent", PluginUserAgent);
+        if (BrowserRuntime.ReferrerEnabled && !string.IsNullOrWhiteSpace(_currentPageUrl))
+            message.Headers.TryAddWithoutValidation("Referer", _currentPageUrl);
+        foreach (var pair in request.Headers ?? new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase))
+            message.Headers.TryAddWithoutValidation(pair.Key, pair.Value);
+        try
+        {
+            string cookie = _cookieStore.Get(ParsedUrl.Parse(uri.AbsoluteUri));
+            if (!string.IsNullOrEmpty(cookie) && !(request.Headers?.Keys.Any(k => k.Equals("Cookie", StringComparison.OrdinalIgnoreCase)) ?? false))
+                message.Headers.TryAddWithoutValidation("Cookie", cookie);
+        }
+        catch { }
+        if (!string.IsNullOrEmpty(request.BodyBase64))
+        {
+            var bytes = Convert.FromBase64String(request.BodyBase64);
+            message.Content = new ByteArrayContent(bytes);
+            if (!string.IsNullOrWhiteSpace(request.ContentType)) message.Content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(request.ContentType);
+        }
+        var response = await _pluginHttpClient.SendAsync(message, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var detached = await ResponseOwnedStream.DetachAsync(response, cancellationToken).ConfigureAwait(false);
+        return new PluginSandboxSession.PluginNetworkStream(detached.Stream, (int)response.StatusCode, detached.Headers, detached.ContentType, detached.Charset, detached.EffectiveUrl, false, detached.Length);
+    }
+
+    private static string MimeFromExtension(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+    {
+        ".dcr" or ".dir" or ".dxr" => "application/x-director",
+        ".mov" => "video/quicktime",
+        _ => "application/octet-stream"
+    };
+
+    private sealed class ResponseOwnedStream : Stream
+    {
+        private readonly System.Net.Http.HttpResponseMessage _response;
+        private readonly Stream _inner;
+        public ResponseOwnedStream(System.Net.Http.HttpResponseMessage response, Stream inner) { _response=response; _inner=inner; }
+        public static async Task<(Stream Stream, IReadOnlyDictionary<string,string> Headers, string? ContentType, string? Charset, string EffectiveUrl, long? Length, IDisposable Owner)> DetachAsync(System.Net.Http.HttpResponseMessage response, CancellationToken ct)
+        {
+            var inner = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            var stream = new ResponseOwnedStream(response, inner);
+            return (stream, response.Headers.Concat(response.Content.Headers).ToDictionary(h => h.Key, h => string.Join(", ", h.Value), StringComparer.OrdinalIgnoreCase), response.Content.Headers.ContentType?.MediaType, response.Content.Headers.ContentType?.CharSet, response.RequestMessage?.RequestUri?.AbsoluteUri ?? "", response.Content.Headers.ContentLength, stream);
+        }
+        protected override void Dispose(bool disposing) { if (disposing) { try { _inner.Dispose(); } catch { } try { _response.Dispose(); } catch { } } base.Dispose(disposing); }
+        public override bool CanRead => _inner.CanRead; public override bool CanSeek => _inner.CanSeek; public override bool CanWrite => _inner.CanWrite; public override long Length => _inner.Length; public override long Position { get=>_inner.Position; set=>_inner.Position=value; }
+        public override void Flush()=>_inner.Flush(); public override int Read(byte[] buffer,int offset,int count)=>_inner.Read(buffer,offset,count); public override long Seek(long offset,SeekOrigin origin)=>_inner.Seek(offset,origin); public override void SetLength(long value)=>_inner.SetLength(value); public override void Write(byte[] buffer,int offset,int count)=>_inner.Write(buffer,offset,count);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct=default)=>_inner.ReadAsync(buffer,ct);
+    }
 
     public Form1()
     {
@@ -927,7 +1061,7 @@ public partial class Form1 : Form
                     new HistoryEntry(url.ToAbsolute(), postData));
                 var win = interpreter.WindowObject;
                 if (win != null && win.Get("onload") is { Type: JsType.Function } onload)
-                    interpreter.CallHandler(onload, JsValue.FromObject(win));
+                    interpreter.CallHandler(onload, Retro96.Engine.Js.JsValue.FromObject(win));
                 var body = document.ElementDescendants()
                     .FirstOrDefault(e => e.TagName == "body");
                 if (body != null && BrowserRuntime.JavaScriptEnabled)
@@ -1100,7 +1234,9 @@ public partial class Form1 : Form
             Interpreter = _jsInterpreter,
             Canvas = _canvas,
             LastModified = "",
-            Referrer = ""
+            Referrer = "",
+            EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
+            EmbeddedScriptCall = _canvas.EmbeddedScriptCall
         };
         _jsInterpreter.ElementWrapperHook =
             e => DomBindings.WrapElement(e, _jsState);
@@ -1584,7 +1720,9 @@ public partial class Form1 : Form
             Interpreter = interpreter,
             Canvas = _canvas,
             LastModified = "",
-            Referrer = ""
+            Referrer = "",
+            EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
+            EmbeddedScriptCall = _canvas.EmbeddedScriptCall
         };
         interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, state);
         interpreter.RegisterRuntimeBuiltins();
@@ -1659,7 +1797,7 @@ public partial class Form1 : Form
         {
             var fwin = frameState.WindowObject;
             if (fwin != null && fwin.Get("onload") is { Type: JsType.Function } fol)
-                frameInterpreter.CallHandler(fol, JsValue.FromObject(fwin));
+                frameInterpreter.CallHandler(fol, Retro96.Engine.Js.JsValue.FromObject(fwin));
             if (BrowserRuntime.JavaScriptEnabled)
             {
                 foreach (var elem in content.Document.ElementDescendants()
@@ -2052,7 +2190,7 @@ public partial class Form1 : Form
                     var win = interpreter.WindowObject;
                     if (BrowserRuntime.JavaScriptEnabled &&
                         win != null && win.Get("onload") is { Type: JsType.Function } onload)
-                        interpreter.CallHandler(onload, JsValue.FromObject(win));
+                        interpreter.CallHandler(onload, Retro96.Engine.Js.JsValue.FromObject(win));
 
                     var body = document.ElementDescendants()
                         .FirstOrDefault(e => e.TagName == "body");
@@ -2346,6 +2484,45 @@ public partial class Form1 : Form
     internal void SetPluginStatus(string pluginId, string text)
     {
         _statusLabel.Text = $"{text}";
+    }
+
+    internal void SetEmbeddedPluginStatus(string pluginId, string text) => _statusLabel.Text = text ?? string.Empty;
+
+    internal async Task<Retro96.Plugins.JsValue> PluginCallPageFunctionAsync(
+        DomElement embed, string name, IReadOnlyList<Retro96.Plugins.JsValue> args, CancellationToken cancellationToken = default)
+    {
+        if (!BrowserRuntime.JavaScriptEnabled) throw new SecurityException("Page JavaScript is disabled.");
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A page function name is required.", nameof(name));
+        if (_jsInterpreter == null || _globalScope == null) throw new InvalidOperationException("The page scripting context is unavailable.");
+        if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
+
+        string[] parts = name.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0 || parts.Length > 8 || parts.Any(p => !p.All(c => char.IsLetterOrDigit(c) || c is '_' or '$')))
+            throw new SecurityException("Page function names must be simple JavaScript member paths.");
+        return await InvokeOnUiThreadAsync(() =>
+        {
+            Retro96.Engine.Js.JsValue target = _globalScope.Get(parts[0]);
+            Retro96.Engine.Js.JsValue thisValue = Retro96.Engine.Js.JsValue.FromObject(_globalScope.Get("window").Type == JsType.Object
+                ? _globalScope.Get("window").GetObject()
+                : new JsObject());
+            for (int i = 1; i < parts.Length; i++)
+            {
+                if (target.Type is not (JsType.Object or JsType.Function)) throw new MissingMemberException(parts[i]);
+                thisValue = target;
+                target = target.GetObjectOrFunction().Get(parts[i]);
+            }
+            if (target.Type != JsType.Function) throw new MissingMethodException(name);
+            var engineArgs = args.Select(Retro96.Plugins.PluginJsValueCodec.ToEngine).ToArray();
+            var result = _jsInterpreter.CallFunction(target.GetFunction(), thisValue, engineArgs);
+            return Retro96.Plugins.PluginJsValueCodec.FromEngine(result);
+        }).ConfigureAwait(true);
+    }
+
+    private async Task<T> InvokeOnUiThreadAsync<T>(Func<T> action)
+    {
+        if (IsDisposed) throw new ObjectDisposedException(nameof(Form1));
+        if (!InvokeRequired) return action();
+        return (T)Invoke(action)!;
     }
 
     internal void OpenPluginWindow(string url) => OpenNewBrowserWindow(url);

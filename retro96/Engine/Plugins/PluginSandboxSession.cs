@@ -1,12 +1,13 @@
+using System.Text;
 using System.IO.Pipes;
 using System.Security;
 using System.Security.AccessControl;
 using System.Security.Principal;
-using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
 using System.Windows.Forms;
 using Retro96;
+using Retro96.Engine.Dom;
 
 namespace Retro96.Plugins;
 
@@ -28,9 +29,11 @@ internal sealed class PluginSandboxSession : IDisposable
     private readonly Dictionary<string, Form1.PluginPanelHost> _panels = new(StringComparer.Ordinal);
     private readonly TaskCompletionSource<bool> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<PluginSandboxProtocol.Envelope>> _pending = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<PluginSandboxProtocol.BinaryEnvelope>> _pendingBinary = new();
+    private readonly Dictionary<string, HostEmbeddedRegistration> _embeddedRegistrations = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HostEmbeddedInstance> _embeddedInstances = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HostStreamState> _streams = new(StringComparer.Ordinal);
     private NamedPipeServerStream? _pipe;
-    private StreamReader? _reader;
-    private StreamWriter? _writer;
     private WindowsSecurity.WorkerProcess? _worker;
     private string? _profileName;
     private int _disposed;
@@ -75,12 +78,6 @@ internal sealed class PluginSandboxSession : IDisposable
                 workerArguments: $"--plugin-worker \"{pipeName}\" \"PluginPayload\\{_record.Manifest.Id}\"");
 
             await _pipe.WaitForConnectionAsync(_lifetime.Token).ConfigureAwait(false);
-            _reader = new StreamReader(_pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
-            _writer = new StreamWriter(_pipe, new UTF8Encoding(false), 64 * 1024, leaveOpen: true)
-            {
-                AutoFlush = false,
-                NewLine = "\n"
-            };
 
             _ = Task.Run(RunLoopAsync);
             await _ready.Task.WaitAsync(TimeSpan.FromSeconds(20), _lifetime.Token).ConfigureAwait(false);
@@ -92,6 +89,115 @@ internal sealed class PluginSandboxSession : IDisposable
         }
     }
 
+    internal bool TryGetEmbedRegistrationToken(string mimeType, out string token)
+    {
+        lock (_embeddedRegistrations)
+        {
+            var match = _embeddedRegistrations.FirstOrDefault(p => p.Value.MimeTypes.Any(t => t.Equals(mimeType, StringComparison.OrdinalIgnoreCase)));
+            token = match.Key ?? string.Empty;
+            return match.Key != null;
+        }
+    }
+
+    internal async Task<EmbeddedHostInstance> CreateEmbeddedInstanceAsync(
+        string registrationToken, string mimeType, string sourceUrl, string? currentUrl, string userAgent,
+        IReadOnlyDictionary<string, string> parameters, int width, int height,
+        Stream stream, bool canSeek, long? length, CancellationToken cancellationToken)
+    {
+        Demand(PluginPermission.EmbedRenderer);
+        HostEmbeddedRegistration registration;
+        lock (_embeddedRegistrations)
+        {
+            if (!_embeddedRegistrations.TryGetValue(registrationToken, out registration!))
+                throw new InvalidOperationException("Embedded content registration is unavailable.");
+            if (!registration.MimeTypes.Any(t => t.Equals(mimeType, StringComparison.OrdinalIgnoreCase)))
+                throw new SecurityException("Embedded MIME type is not registered by the plugin.");
+        }
+
+        string instanceToken = Guid.NewGuid().ToString("N");
+        string streamToken = Guid.NewGuid().ToString("N");
+        var streamState = new HostStreamState(this, streamToken, stream, canSeek, length, PluginPermission.EmbedRenderer);
+        lock (_streams) _streams[streamToken] = streamState;
+        lock (_embeddedInstances) _embeddedInstances[instanceToken] = new HostEmbeddedInstance(instanceToken, streamToken, sourceUrl);
+        try
+        {
+            var payload = new PluginSandboxProtocol.EmbedCreatePayload(
+                registrationToken, instanceToken, mimeType, sourceUrl, currentUrl, userAgent,
+                new Dictionary<string, string>(parameters, StringComparer.Ordinal), width, height,
+                canSeek, length, streamToken);
+            var reply = await SendRequestAsync<PluginSandboxProtocol.EmbedCreateReply>(
+                "embed.create", payload, cancellationToken).ConfigureAwait(false);
+            lock (_embeddedInstances)
+            {
+                if (_embeddedInstances.TryGetValue(instanceToken, out var state))
+                    state.ScriptName = reply.ScriptName;
+            }
+            return new EmbeddedHostInstance(this, instanceToken, streamToken, reply.ScriptName, reply.ScriptMethods);
+        }
+        catch
+        {
+            lock (_embeddedInstances) _embeddedInstances.Remove(instanceToken);
+            RemoveStream(streamToken);
+            throw;
+        }
+    }
+
+    internal void AttachEmbeddedElement(EmbeddedHostInstance instance, DomElement element)
+    {
+        instance.Element = element;
+        lock (_embeddedInstances)
+        {
+            if (_embeddedInstances.TryGetValue(instance.InstanceToken, out var state))
+                state.Element = element;
+        }
+    }
+
+    internal async Task<EmbeddedFrameBuffer> RenderEmbeddedAsync(EmbeddedHostInstance instance, EmbeddedRenderRequest request, CancellationToken cancellationToken)
+    {
+        Demand(PluginPermission.EmbedRenderer);
+        if (request.IsPrint) Demand(PluginPermission.EmbedPrint);
+        ValidateRenderRequest(request);
+        var reply = await SendBinaryRequestAsync("embed.render",
+            new PluginSandboxProtocol.EmbedRenderPayload(instance.InstanceToken, request.Width, request.Height, request.Stride, request.DpiX, request.DpiY, request.IsPrint),
+            cancellationToken).ConfigureAwait(false);
+        var payload = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedFramePayload>(reply)
+            ?? throw new InvalidDataException("Embedded plugin frame metadata is missing.");
+        if (payload.InstanceToken != instance.InstanceToken || payload.Width != request.Width || payload.Height != request.Height || payload.Stride != request.Stride)
+            throw new InvalidDataException("Embedded plugin frame metadata does not match the render request.");
+        return new EmbeddedFrameBuffer(payload.Width, payload.Height, payload.Stride, reply.Data).Validate();
+    }
+
+    internal Task SendEmbeddedInputAsync(EmbeddedHostInstance instance, EmbeddedInputEvent inputEvent, CancellationToken cancellationToken = default)
+    {
+        Demand(PluginPermission.EmbedRenderer);
+        return SendBinaryAsync("embed.input", Guid.NewGuid().ToString("N"),
+            new PluginSandboxProtocol.EmbedInputPayload(instance.InstanceToken, inputEvent), Array.Empty<byte>(), cancellationToken);
+    }
+
+    internal Task<JsValue> CallEmbeddedScriptAsync(EmbeddedHostInstance instance, string name, IReadOnlyList<JsValue> args, CancellationToken cancellationToken = default)
+    {
+        Demand(PluginPermission.EmbedScript);
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A script method name is required.", nameof(name));
+        var wire = args.Select(PluginJsValueCodec.ToWire).ToArray();
+        return CallEmbeddedScriptCoreAsync(instance, name, wire, cancellationToken);
+    }
+
+    private async Task<JsValue> CallEmbeddedScriptCoreAsync(EmbeddedHostInstance instance, string name, PluginSandboxProtocol.JsValueWire[] args, CancellationToken cancellationToken)
+    {
+        var reply = await SendRequestAsync<PluginSandboxProtocol.EmbedScriptCallReply>(
+            "embed.script.call", new PluginSandboxProtocol.EmbedScriptCallPayload(instance.InstanceToken, name, args), cancellationToken).ConfigureAwait(false);
+        return PluginJsValueCodec.FromWire(reply.Value);
+    }
+
+    private void ValidateRenderRequest(EmbeddedRenderRequest request)
+    {
+        if (request.Width <= 0 || request.Height <= 0 || request.Stride < checked(request.Width * 4))
+            throw new ArgumentOutOfRangeException(nameof(request));
+        if (checked(request.Stride * request.Height) > PluginSandboxProtocol.MaxBinaryFrameBytes)
+            throw new InvalidOperationException("Embedded render surface is too large.");
+        if (request.DpiX <= 0 || request.DpiY <= 0) throw new ArgumentOutOfRangeException(nameof(request));
+    }
+
     public void RaiseNavigated(string url) => SendEvent("event.navigated", new PluginSandboxProtocol.EventNavigatedPayload(url));
     public void RaisePageLoaded(string url, string title) => SendEvent("event.pageLoaded", new PluginSandboxProtocol.EventPageLoadedPayload(url, title));
     public void RaiseHostShuttingDown() => SendEvent("event.hostShuttingDown", new { });
@@ -101,7 +207,7 @@ internal sealed class PluginSandboxSession : IDisposable
 
     private void SendEvent(string op, object payload)
     {
-        if (_writer == null || Volatile.Read(ref _disposed) != 0) return;
+        if (_pipe == null || Volatile.Read(ref _disposed) != 0) return;
         _ = WriteSafeAsync(op, Guid.NewGuid().ToString("N"), payload);
     }
 
@@ -109,7 +215,7 @@ internal sealed class PluginSandboxSession : IDisposable
     {
         try
         {
-            await PluginSandboxProtocol.WriteAsync(_writer!, op, id, payload, _writeLock, _lifetime.Token).ConfigureAwait(false);
+            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, _lifetime.Token).ConfigureAwait(false);
         }
         catch { }
     }
@@ -120,15 +226,27 @@ internal sealed class PluginSandboxSession : IDisposable
         {
             while (!_lifetime.IsCancellationRequested)
             {
-                var envelope = await PluginSandboxProtocol.ReadAsync(_reader!, _lifetime.Token).ConfigureAwait(false);
-                if (envelope == null) break;
-                if (envelope.Op is "response" or "error")
+                var message = await PluginSandboxProtocol.ReadAsync(_pipe!, _lifetime.Token).ConfigureAwait(false);
+                if (message == null) break;
+                switch (message)
                 {
-                    if (_pending.TryGetValue(envelope.Id, out var completion))
-                        completion.TrySetResult(envelope);
-                    continue;
+                    case PluginSandboxProtocol.JsonMessage json:
+                        var envelope = json.Envelope;
+                        if (envelope.Op is "response" or "error")
+                        {
+                            if (_pending.TryGetValue(envelope.Id, out var completion))
+                                completion.TrySetResult(envelope);
+                            continue;
+                        }
+                        await HandleAsync(envelope).ConfigureAwait(false);
+                        break;
+                    case PluginSandboxProtocol.BinaryMessage binary:
+                        if (binary.Envelope.Op == "embed.frame" && _pendingBinary.TryGetValue(binary.Envelope.Id, out var binaryCompletion))
+                            binaryCompletion.TrySetResult(binary.Envelope);
+                        else
+                            await HandleBinaryAsync(binary.Envelope).ConfigureAwait(false);
+                        break;
                 }
-                await HandleAsync(envelope).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }
@@ -343,6 +461,103 @@ internal sealed class PluginSandboxSession : IDisposable
                     if (log != null) DebugLog.Write($"PLUGIN[{_record.Manifest.Id}] {log.Level}: {log.Message}{(string.IsNullOrEmpty(log.Exception) ? "" : " | " + log.Exception)}");
                     await ReplyOkAsync(envelope); break;
 
+                case "embed.register":
+                    Demand(PluginPermission.EmbedRenderer);
+                    var er = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    var types = er.MimeTypes.Select(t => (t ?? string.Empty).Trim().ToLowerInvariant()).Where(t => t.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                    if (types.Length == 0) throw new InvalidDataException("At least one embedded MIME type is required.");
+                    if (types.Any(t => !_record.Manifest.EmbedTypes.Any(m => m.Equals(t, StringComparison.OrdinalIgnoreCase))))
+                        throw new SecurityException("Plugin attempted to register an undeclared embedded MIME type.");
+                    string embedRegToken = Guid.NewGuid().ToString("N");
+                    lock (_embeddedRegistrations) _embeddedRegistrations[embedRegToken] = new HostEmbeddedRegistration(embedRegToken, types);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.EmbedRegisterReply(embedRegToken)).ConfigureAwait(false);
+                    break;
+                case "embed.unregister":
+                    Demand(PluginPermission.EmbedRenderer);
+                    var eu = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedUnregisterPayload>(envelope) ?? throw new InvalidDataException();
+                    lock (_embeddedRegistrations) _embeddedRegistrations.Remove(eu.Token);
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "embed.create":
+                    throw new InvalidOperationException("embed.create is worker-owned.");
+                case "embed.dispose":
+                    Demand(PluginPermission.EmbedRenderer);
+                    var ed = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedDisposePayload>(envelope) ?? throw new InvalidDataException();
+                    HostEmbeddedInstance? disposedInstance;
+                    lock (_embeddedInstances) _embeddedInstances.Remove(ed.InstanceToken, out disposedInstance);
+                    RemoveStream(ed.StreamToken);
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "embed.stream.credit":
+                    var credit = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStreamCreditPayload>(envelope) ?? throw new InvalidDataException();
+                    var creditStream = GetStream(credit.StreamToken);
+                    Demand(creditStream.RequiredPermission);
+                    await creditStream.AddCreditAsync(credit.MaxBytes, envelope.Id, _lifetime.Token).ConfigureAwait(false);
+                    break;
+                case "embed.stream.seek":
+                    var seek = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStreamSeekPayload>(envelope) ?? throw new InvalidDataException();
+                    var seekStream = GetStream(seek.StreamToken);
+                    Demand(seekStream.RequiredPermission);
+                    var seekResult = await seekStream.SeekAsync(seek.Offset, seek.Origin, _lifetime.Token).ConfigureAwait(false);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.EmbedStreamSeekReply(seek.StreamToken, seekResult.Position, seekResult.Length)).ConfigureAwait(false);
+                    break;
+                case "embed.stream.close":
+                    var close = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStreamClosePayload>(envelope) ?? throw new InvalidDataException();
+                    var closeStream = GetStream(close.StreamToken);
+                    Demand(closeStream.RequiredPermission);
+                    RemoveStream(close.StreamToken);
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "network.stream.open":
+                    Demand(PluginPermission.Network);
+                    var ns = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkStreamOpenPayload>(envelope) ?? throw new InvalidDataException();
+                    EnsurePluginHeaders(ns.Request.Headers);
+                    var net = await _browser.OpenPluginNetworkStreamAsync(ns.Request, _record, _lifetime.Token).ConfigureAwait(true);
+                    string networkStreamToken = Guid.NewGuid().ToString("N");
+                    var networkState = new HostStreamState(this, networkStreamToken, net.Body, net.CanSeek, net.Length, PluginPermission.Network);
+                    lock (_streams) _streams[networkStreamToken] = networkState;
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkStreamOpenReply(
+                        true, net.StatusCode, new Dictionary<string,string>(net.Headers, StringComparer.OrdinalIgnoreCase), net.ContentType, net.Charset,
+                        net.EffectiveUrl, networkStreamToken, net.CanSeek, net.Length)).ConfigureAwait(false);
+                    break;
+                case "embed.network.stream.open":
+                    Demand(PluginPermission.EmbedNetwork);
+                    var ens = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkStreamOpenPayload>(envelope) ?? throw new InvalidDataException();
+                    EnsurePluginHeaders(ens.Request.Headers);
+                    var embedNet = await _browser.OpenPluginNetworkStreamAsync(ens.Request, _record, _lifetime.Token).ConfigureAwait(true);
+                    string embedNetworkStreamToken = Guid.NewGuid().ToString("N");
+                    var embedNetworkState = new HostStreamState(this, embedNetworkStreamToken, embedNet.Body, embedNet.CanSeek, embedNet.Length, PluginPermission.EmbedNetwork);
+                    lock (_streams) _streams[embedNetworkStreamToken] = embedNetworkState;
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkStreamOpenReply(
+                        true, embedNet.StatusCode, new Dictionary<string,string>(embedNet.Headers, StringComparer.OrdinalIgnoreCase), embedNet.ContentType, embedNet.Charset,
+                        embedNet.EffectiveUrl, embedNetworkStreamToken, embedNet.CanSeek, embedNet.Length)).ConfigureAwait(false);
+                    break;
+                case "embed.script.pageCall":
+                    Demand(PluginPermission.EmbedScript);
+                    var pageCall = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedScriptPageCallPayload>(envelope) ?? throw new InvalidDataException();
+                    HostEmbeddedInstance? pageInstance;
+                    lock (_embeddedInstances) _embeddedInstances.TryGetValue(pageCall.InstanceToken, out pageInstance);
+                    if (pageInstance?.Element == null) throw new InvalidOperationException("Embedded page-call instance is unavailable.");
+                    var pageArgs = pageCall.Args.Select(PluginJsValueCodec.FromWire).ToArray();
+                    var pageValue = await _browser.PluginCallPageFunctionAsync(pageInstance.Element, pageCall.Name, pageArgs, _lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.EmbedScriptCallReply(PluginJsValueCodec.ToWire(pageValue))).ConfigureAwait(false);
+                    break;
+                case "embed.status":
+                    Demand(PluginPermission.EmbedStatus);
+                    var status = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStatusPayload>(envelope) ?? throw new InvalidDataException();
+                    EnsureEmbeddedInstance(status.InstanceToken);
+                    RunOnUi(() => _browser.SetEmbeddedPluginStatus(_record.Manifest.Id, status.Text));
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "embed.navigate":
+                    Demand(PluginPermission.EmbedNavigate);
+                    var navigate = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedNavigatePayload>(envelope) ?? throw new InvalidDataException();
+                    EnsureEmbeddedInstance(navigate.InstanceToken);
+                    ValidateEmbedNavigationUrl(navigate.Url);
+                    RunOnUi(() => _browser.NavigateTo(navigate.Url));
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+
                 case "worker.fatal":
                     var fatal = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ErrorPayload>(envelope);
                     _record.Error = fatal?.Error ?? "Plugin worker terminated unexpectedly.";
@@ -358,6 +573,197 @@ internal sealed class PluginSandboxSession : IDisposable
             await ReplyAsync(envelope.Id, "error", new PluginSandboxProtocol.ErrorPayload(ex.Message)).ConfigureAwait(false);
             _record.Error = ex.Message;
         }
+    }
+
+    private async Task HandleBinaryAsync(PluginSandboxProtocol.BinaryEnvelope envelope)
+    {
+        if (envelope.Op == "embed.frame" && _pendingBinary.TryGetValue(envelope.Id, out var frameCompletion))
+        {
+            frameCompletion.TrySetResult(envelope);
+            return;
+        }
+        throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{envelope.Op}'.");
+    }
+
+    internal sealed class EmbeddedHostInstance : IEmbeddedContentInstance
+    {
+        private PluginSandboxSession? _session;
+        internal EmbeddedHostInstance(PluginSandboxSession session, string instanceToken, string streamToken, string scriptName, IReadOnlyList<string> scriptMethods)
+        { _session = session; InstanceToken=instanceToken; StreamToken=streamToken; ScriptName=scriptName; ScriptMethods=scriptMethods; }
+        internal string InstanceToken { get; }
+        internal string StreamToken { get; }
+        public string ScriptName { get; }
+        public IReadOnlyList<string> ScriptMethods { get; }
+        internal DomElement? Element { get; set; }
+        public Task<EmbeddedFrameBuffer> RenderAsync(EmbeddedRenderRequest request, CancellationToken cancellationToken = default) =>
+            (_session ?? throw new ObjectDisposedException(nameof(EmbeddedHostInstance))).RenderEmbeddedAsync(this, request, cancellationToken);
+        public Task HandleInputAsync(EmbeddedInputEvent inputEvent, CancellationToken cancellationToken = default) =>
+            (_session ?? throw new ObjectDisposedException(nameof(EmbeddedHostInstance))).SendEmbeddedInputAsync(this, inputEvent, cancellationToken);
+        internal Task<JsValue> CallScriptAsync(string name, IReadOnlyList<JsValue> args, CancellationToken ct = default) =>
+            (_session ?? throw new ObjectDisposedException(nameof(EmbeddedHostInstance))).CallEmbeddedScriptAsync(this, name, args, ct);
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _session, null);
+            if (s == null) return;
+            try { s.SendRequestAsync<object>("embed.dispose", new PluginSandboxProtocol.EmbedDisposePayload(InstanceToken, StreamToken), CancellationToken.None).GetAwaiter().GetResult(); } catch { }
+            lock (s._embeddedInstances) s._embeddedInstances.Remove(InstanceToken);
+            s.RemoveStream(StreamToken);
+        }
+    }
+
+    private sealed record HostEmbeddedRegistration(string Token, string[] MimeTypes);
+
+    private sealed class HostEmbeddedInstance
+    {
+        public HostEmbeddedInstance(string token, string streamToken, string sourceUrl) { Token=token; StreamToken=streamToken; SourceUrl=sourceUrl; }
+        public string Token { get; }
+        public string StreamToken { get; }
+        public string SourceUrl { get; }
+        public string ScriptName { get; set; } = "";
+        public DomElement? Element { get; set; }
+    }
+
+    internal sealed record PluginNetworkStream(Stream Body, int StatusCode, IReadOnlyDictionary<string,string> Headers, string? ContentType, string? Charset, string EffectiveUrl, bool CanSeek, long? Length) : IDisposable
+    {
+        public void Dispose() { Body.Dispose(); }
+    }
+
+    private sealed class HostStreamState : IDisposable
+    {
+        private readonly PluginSandboxSession _session;
+        private readonly string _token;
+        private readonly Stream _stream;
+        private readonly bool _canSeek;
+        private readonly long? _length;
+        private readonly PluginPermission _requiredPermission;
+        private readonly CancellationTokenSource _lifetime = new();
+        private readonly SemaphoreSlim _ioLock = new(1, 1);
+        private long _credit;
+        private long _position;
+        private long _generation;
+        private bool _eof;
+        private bool _pumping;
+        private int _disposed;
+
+        public HostStreamState(PluginSandboxSession session, string token, Stream stream, bool canSeek, long? length, PluginPermission permission)
+        { _session=session; _token=token; _stream=stream; _canSeek=canSeek; _length=length; _requiredPermission=permission; _position=stream.CanSeek ? stream.Position : 0; }
+        internal PluginPermission RequiredPermission => _requiredPermission;
+
+        public async Task AddCreditAsync(int maxBytes, string requestId, CancellationToken cancellationToken)
+        {
+            if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(HostStreamState));
+            if (maxBytes <= 0 || maxBytes > PluginSandboxProtocol.MaxStreamChunkBytes) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            lock (this)
+            {
+                if (_eof) { _ = _session.ReplyAsync(requestId, "response", new { success = true }); return; }
+                _credit = Math.Min(_credit + maxBytes, 8L * PluginSandboxProtocol.MaxStreamChunkBytes);
+                if (_pumping) { _ = _session.ReplyAsync(requestId, "response", new { success = true }); return; }
+                _pumping = true;
+            }
+            await _session.ReplyAsync(requestId, "response", new { success = true }).ConfigureAwait(false);
+            _ = PumpAsync();
+        }
+
+        private async Task PumpAsync()
+        {
+            try
+            {
+                while (Volatile.Read(ref _disposed) == 0)
+                {
+                    int readSize; long offset; long generation;
+                    lock (this)
+                    {
+                        if (_eof || _credit <= 0) { _pumping=false; return; }
+                        readSize=(int)Math.Min(_credit, PluginSandboxProtocol.MaxStreamChunkBytes);
+                        offset=_position;
+                        generation=_generation;
+                    }
+                    byte[] buffer = new byte[readSize];
+                    int count;
+                    try
+                    {
+                        await _ioLock.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+                        try { count=await _stream.ReadAsync(buffer.AsMemory(0, readSize), _lifetime.Token).ConfigureAwait(false); }
+                        finally { _ioLock.Release(); }
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (this) { _eof=true; _pumping=false; }
+                        await _session.SendBinaryAsync("embed.stream.chunk", Guid.NewGuid().ToString("N"),
+                            new PluginSandboxProtocol.EmbedStreamChunkPayload(_token, offset, true, ex.Message), Array.Empty<byte>(), CancellationToken.None).ConfigureAwait(false);
+                        return;
+                    }
+                    bool end = count == 0;
+                    lock (this)
+                    {
+                        if (generation != _generation)
+                            continue;
+                        _credit = Math.Max(0, _credit - count);
+                        _position = checked(_position + count);
+                        if (end) _eof = true;
+                    }
+                    await _session.SendBinaryAsync("embed.stream.chunk", Guid.NewGuid().ToString("N"),
+                        new PluginSandboxProtocol.EmbedStreamChunkPayload(_token, offset, end),
+                        count == buffer.Length ? buffer : buffer.AsMemory(0, count), _lifetime.Token).ConfigureAwait(false);
+                    if (end) { lock (this) _pumping=false; return; }
+                }
+            }
+            catch { lock (this) _pumping=false; }
+        }
+
+        public async Task<EmbeddedSeekResult> SeekAsync(long offset, SeekOrigin origin, CancellationToken cancellationToken)
+        {
+            if (!_canSeek || !_stream.CanSeek) throw new NotSupportedException("This embedded stream is not seekable.");
+            await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                long pos=_stream.Seek(offset, origin);
+                lock (this) { _position=pos; _credit=0; _eof=false; _generation=checked(_generation + 1); }
+                return new EmbeddedSeekResult(pos, _length);
+            }
+            finally { _ioLock.Release(); }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed,1)!=0) return;
+            _lifetime.Cancel();
+            try { _stream.Dispose(); } catch { }
+            _ioLock.Dispose();
+            _lifetime.Dispose();
+        }
+    }
+
+    private HostStreamState GetStream(string token)
+    {
+        lock (_streams)
+        {
+            if (_streams.TryGetValue(token, out var state)) return state;
+        }
+        throw new InvalidOperationException("Plugin stream handle is invalid or closed.");
+    }
+
+    private void RemoveStream(string token)
+    {
+        HostStreamState? state = null;
+        lock (_streams) _streams.Remove(token, out state);
+        try { state?.Dispose(); } catch { }
+    }
+
+    private HostEmbeddedInstance EnsureEmbeddedInstance(string token)
+    {
+        lock (_embeddedInstances)
+        {
+            if (_embeddedInstances.TryGetValue(token, out var state)) return state;
+        }
+        throw new InvalidOperationException("Embedded content instance is unavailable.");
+    }
+
+    private static void ValidateEmbedNavigationUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("http" or "https" or "file" or "about"))
+            throw new SecurityException("Embedded navigation may only use http, https, file, or about URLs.");
     }
 
     private bool QueryPluginContextCallback(string token, ContextMenuContext context)
@@ -398,16 +804,33 @@ internal sealed class PluginSandboxSession : IDisposable
         _pending[id] = completion;
         try
         {
-            await PluginSandboxProtocol.WriteAsync(_writer!, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
+            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
             var envelope = await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             if (envelope.Op == "error")
                 throw new InvalidOperationException(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ErrorPayload>(envelope)?.Error ?? "Plugin worker request failed.");
             return PluginSandboxProtocol.GetPayload<T>(envelope) ?? throw new InvalidOperationException("Plugin worker returned an invalid response.");
         }
-        finally
+        finally { _pending.TryRemove(id, out _); }
+    }
+
+    private async Task<PluginSandboxProtocol.BinaryEnvelope> SendBinaryRequestAsync(string op, object? payload, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(PluginSandboxSession));
+        string id = Guid.NewGuid().ToString("N");
+        var completion = new TaskCompletionSource<PluginSandboxProtocol.BinaryEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingBinary[id] = completion;
+        try
         {
-            _pending.TryRemove(id, out _);
+            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
+        finally { _pendingBinary.TryRemove(id, out _); }
+    }
+
+    private async Task SendBinaryAsync(string op, string id, object payload, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        if (_pipe == null || Volatile.Read(ref _disposed) != 0) return;
+        await PluginSandboxProtocol.WriteBinaryAsync(_pipe, op, id, payload, data, _writeLock, cancellationToken).ConfigureAwait(false);
     }
 
     private void EnsurePluginHeaders(IReadOnlyDictionary<string, string>? headers)
@@ -431,7 +854,7 @@ internal sealed class PluginSandboxSession : IDisposable
     private Task ReplyOkAsync(PluginSandboxProtocol.Envelope envelope) => ReplyOkAsync(envelope.Id);
 
     private Task ReplyAsync(string id, string op, object payload) =>
-        PluginSandboxProtocol.WriteAsync(_writer!, op, id, payload, _writeLock, _lifetime.Token);
+        PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, _lifetime.Token);
 
     private T RunOnUi<T>(Func<T> func)
     {
@@ -527,8 +950,13 @@ internal sealed class PluginSandboxSession : IDisposable
         lock (_toolbarItems) { foreach (var item in _toolbarItems.Values) { try { item.Dispose(); } catch { } } _toolbarItems.Clear(); }
         lock (_contextItems) { foreach (var item in _contextItems.Values) { try { item.Dispose(); } catch { } } _contextItems.Clear(); }
         lock (_panels) { foreach (var item in _panels.Values) { try { item.Dispose(); } catch { } } _panels.Clear(); }
-        try { _reader?.Dispose(); } catch { }
-        try { _writer?.Dispose(); } catch { }
+        HostStreamState[] streams;
+        lock (_streams) { streams = _streams.Values.ToArray(); _streams.Clear(); }
+        foreach (var stream in streams) { try { stream.Dispose(); } catch { } }
+        lock (_embeddedInstances) _embeddedInstances.Clear();
+        lock (_embeddedRegistrations) _embeddedRegistrations.Clear();
+        foreach (var completion in _pendingBinary.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginSandboxSession)));
+        _pendingBinary.Clear();
         try { _pipe?.Dispose(); } catch { }
         try { _worker?.Dispose(); } catch { }
         try { _writeLock.Dispose(); } catch { }

@@ -13,6 +13,7 @@ using Retro96.Engine.Js;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
 using Retro96.Engine.Render;
+using Retro96.Plugins;
 using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 
 /// <summary>
@@ -133,6 +134,15 @@ public class BrowserCanvas : Control
     private RectangleF _embeddedMidiRect;
     private string? _embeddedMidiPressedAction;
     private bool _embeddedMidiVolumeDragging;
+    private DomElement? _focusedEmbeddedElement;
+    private DomElement? _pressedEmbeddedElement;
+
+    // Internal callbacks are fields rather than Control properties so WinForms
+    // designer serialization never tries to persist delegates from the host.
+    internal Func<DomElement, LayoutBox, bool, Bitmap?>? EmbeddedFrameResolver;
+    internal Action<DomElement, EmbeddedInputEvent>? EmbeddedInputDispatcher;
+    internal Func<DomElement, (string ScriptName, IReadOnlyList<string> Methods)?>? EmbeddedScriptInfoResolver;
+    internal Func<DomElement, string, IReadOnlyList<Retro96.Plugins.JsValue>, Task<Retro96.Plugins.JsValue>>? EmbeddedScriptCall;
 
     private readonly Dictionary<LayoutBox, FrameView> _frames = new();
     private readonly Dictionary<DomElement, int> _selectRangeAnchors = new();
@@ -262,7 +272,11 @@ public class BrowserCanvas : Control
         _caretTimer.Start();
 
         KeyDown += OnDevToolsKeyDown;
+        KeyDown += OnEmbeddedKeyDown;
+        KeyUp += OnEmbeddedKeyUp;
         KeyPress += OnCanvasKeyPress;
+        Enter += (_, _) => SendEmbeddedFocus(true);
+        Leave += (_, _) => SendEmbeddedFocus(false);
     }
 
     protected override void Dispose(bool disposing)
@@ -346,6 +360,8 @@ public class BrowserCanvas : Control
         // blur/change handlers from inside SetPage re-enters navigation.
         _focusedInput = null;
         _focusedInputFrame = null;
+        _focusedEmbeddedElement = null;
+        _pressedEmbeddedElement = null;
         _fieldDragging = false;
         _lastFieldClickElement = null;
         _lastFieldClickFrame = null;
@@ -919,7 +935,8 @@ public class BrowserCanvas : Control
             {
                 PressedElement = _pressedControl,
                 TextareaStateResolver = GetTextareaRenderState,
-                SelectScrollResolver = GetSelectScrollOffset
+                SelectScrollResolver = GetSelectScrollOffset,
+                EmbeddedFrameResolver = EmbeddedFrameResolver
             };
 
             var newBitmap = renderer.Render(
@@ -970,7 +987,8 @@ public class BrowserCanvas : Control
             {
                 PressedElement = _pressedControlFrame == view ? _pressedControl : null,
                 TextareaStateResolver = GetTextareaRenderState,
-                SelectScrollResolver = GetSelectScrollOffset
+                SelectScrollResolver = GetSelectScrollOffset,
+                EmbeddedFrameResolver = EmbeddedFrameResolver
             };
             var bmp = renderer.Render(
                 view.RootBox, view.Document,
@@ -2145,6 +2163,14 @@ public class BrowserCanvas : Control
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         base.OnMouseWheel(e);
+        float px = e.X / _pluginZoom + _scrollOffset.X;
+        float py = e.Y / _pluginZoom + _scrollOffset.Y;
+        if (_focusedEmbeddedElement != null && TryGetEmbeddedBox(_focusedEmbeddedElement, out var feb) &&
+            feb.HitTest(px, py))
+        {
+            SendEmbeddedInput(_focusedEmbeddedElement, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseWheel, e, feb, px, py) with { WheelDelta = e.Delta });
+            return;
+        }
 
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
@@ -2464,8 +2490,32 @@ public class BrowserCanvas : Control
         e.Handled = true;
     }
 
+    private void OnEmbeddedKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode is Keys.F11 or Keys.F12) return;
+        if (_focusedEmbeddedElement == null || _focusedInput != null) return;
+        SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
+            EmbeddedInputEventKind.KeyDown, KeyCode: (int)e.KeyCode, Shift: e.Shift,
+            Control: e.Control, Alt: e.Alt, Meta: e.KeyData.HasFlag(Keys.LWin) || e.KeyData.HasFlag(Keys.RWin)));
+    }
+
+    private void OnEmbeddedKeyUp(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode is Keys.F11 or Keys.F12) return;
+        if (_focusedEmbeddedElement == null || _focusedInput != null) return;
+        SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
+            EmbeddedInputEventKind.KeyUp, KeyCode: (int)e.KeyCode, Shift: e.Shift,
+            Control: e.Control, Alt: e.Alt, Meta: e.KeyData.HasFlag(Keys.LWin) || e.KeyData.HasFlag(Keys.RWin)));
+    }
+
     private void OnCanvasKeyPress(object? sender, KeyPressEventArgs e)
     {
+        if (_focusedEmbeddedElement != null && _focusedInput == null)
+        {
+            SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
+                EmbeddedInputEventKind.TextInput, Text: e.KeyChar.ToString()));
+            return;
+        }
         var elem = _focusedInput;
         if (elem == null || !IsEditableField(elem)) return;
 
@@ -3328,6 +3378,12 @@ public class BrowserCanvas : Control
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
+        if (e.Button == MouseButtons.Left && TryBeginEmbeddedInput(x, y, e))
+        {
+            Capture = true;
+            return;
+        }
+
         if (e.Button == MouseButtons.Left && TryBeginEmbeddedMidiControl(x, y))
         {
             Capture = true;
@@ -3606,9 +3662,68 @@ public class BrowserCanvas : Control
         Invalidate();
     }
 
+    private bool TryBeginEmbeddedInput(float x, float y, MouseEventArgs e)
+    {
+        if (_rootBox == null || _document == null || EmbeddedInputDispatcher == null) return false;
+        var box = HitTestDeepestBox(_rootBox, x, y);
+        var element = box?.Element;
+        if (element?.TagName != "embed") return false;
+        var old = _focusedEmbeddedElement;
+        if (!ReferenceEquals(old, element))
+        {
+            if (old != null) SendEmbeddedInput(old, new EmbeddedInputEvent(EmbeddedInputEventKind.FocusLost));
+            _focusedEmbeddedElement = element;
+            SendEmbeddedInput(element, new EmbeddedInputEvent(EmbeddedInputEventKind.FocusGained));
+        }
+        _pressedEmbeddedElement = element;
+        SendEmbeddedInput(element, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseDown, e, box!, x, y));
+        return true;
+    }
+
+    private void SendEmbeddedFocus(bool gained)
+    {
+        if (_focusedEmbeddedElement == null) return;
+        SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
+            gained ? EmbeddedInputEventKind.FocusGained : EmbeddedInputEventKind.FocusLost));
+    }
+
+    private void SendEmbeddedInput(DomElement element, EmbeddedInputEvent ev)
+    {
+        try { EmbeddedInputDispatcher?.Invoke(element, ev); } catch (Exception ex) { Retro96.DebugLog.WriteException("EmbeddedInput", ex); }
+    }
+
+    private bool TryGetEmbeddedBox(DomElement element, out LayoutBox box)
+    {
+        box = null!;
+        if (_rootBox == null) return false;
+        box = FindBoxForElement(_rootBox, element)!;
+        return box != null;
+    }
+
+    private EmbeddedInputEvent MakeEmbeddedMouseEvent(EmbeddedInputEventKind kind, MouseEventArgs e, LayoutBox box, float x, float y)
+    {
+        return new EmbeddedInputEvent(kind,
+            X: Math.Max(0, (int)Math.Round(x - box.X)),
+            Y: Math.Max(0, (int)Math.Round(y - box.Y)),
+            Button: (int)e.Button,
+            WheelDelta: kind == EmbeddedInputEventKind.MouseWheel ? e.Delta : 0,
+            Shift: (ModifierKeys & Keys.Shift) != 0,
+            Control: (ModifierKeys & Keys.Control) != 0,
+            Alt: (ModifierKeys & Keys.Alt) != 0);
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+
+        if (_pressedEmbeddedElement != null && Capture)
+        {
+            float px = e.X / _pluginZoom + _scrollOffset.X;
+            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            if (TryGetEmbeddedBox(_pressedEmbeddedElement, out var eb))
+                SendEmbeddedInput(_pressedEmbeddedElement, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseMove, e, eb, px, py));
+            return;
+        }
 
         if (_selectScrollbarDragging && _selectScrollbarDragSelect != null && Capture)
         {
@@ -3953,6 +4068,18 @@ public class BrowserCanvas : Control
             _selectScrollbarDragging = false;
             _selectScrollbarDragSelect = null;
             _selectScrollbarDragFrame = null;
+            Capture = false;
+            return;
+        }
+
+        if (_pressedEmbeddedElement != null)
+        {
+            var embed = _pressedEmbeddedElement;
+            _pressedEmbeddedElement = null;
+            float px = e.X / _pluginZoom + _scrollOffset.X;
+            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            if (TryGetEmbeddedBox(embed, out var eb))
+                SendEmbeddedInput(embed, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseUp, e, eb, px, py));
             Capture = false;
             return;
         }
@@ -6469,7 +6596,9 @@ public class BrowserCanvas : Control
             int height = Math.Max(1, (int)Math.Ceiling(_rootBox.Height));
             var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
             {
-                PressedElement = null
+                PressedElement = null,
+                EmbeddedFrameResolver = EmbeddedFrameResolver,
+                IsPrintRendering = true
             };
 
             return renderer.Render(

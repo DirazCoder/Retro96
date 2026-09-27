@@ -5,6 +5,11 @@ using System.Security;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Forms;
+using Retro96.Drawing;
+using Retro96.Engine.Dom;
+using Retro96.Engine.Layout;
+using Retro96.Engine.Render;
+using Retro96.Engine.Js;
 
 namespace Retro96.Plugins;
 
@@ -21,6 +26,8 @@ public sealed class PluginManager : IDisposable
     private readonly Dictionary<string, PluginRecord> _plugins = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
     private bool _disposed;
+    private readonly Dictionary<DomElement, EmbeddedRuntime> _embedded = new();
+    private readonly object _embedLock = new();
 
     public PluginManager(Form1 browser)
     {
@@ -28,6 +35,11 @@ public sealed class PluginManager : IDisposable
         _rootDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Retro96", "Plugins");
         _stateFile = Path.Combine(_rootDirectory, "plugin-state.json");
         Directory.CreateDirectory(_rootDirectory);
+        _browser.PluginCanvas.EmbeddedFrameResolver = ResolveEmbeddedFrame;
+        _browser.PluginCanvas.EmbeddedInputDispatcher = DispatchEmbeddedInput;
+        _browser.PluginCanvas.EmbeddedScriptInfoResolver = GetEmbeddedScriptInfo;
+        _browser.PluginCanvas.EmbeddedScriptCall = CallEmbeddedScriptAsync;
+        _browser.PluginCanvas.PageChanged += OnPageChanged;
         LoadState();
         if (_browser.IsHandleCreated)
             LoadEnabledPlugins();
@@ -148,6 +160,272 @@ public sealed class PluginManager : IDisposable
         dialog.ShowDialog(owner);
     }
 
+    private void OnPageChanged()
+    {
+        EmbeddedRuntime[] old;
+        lock (_embedLock) { old = _embedded.Values.ToArray(); _embedded.Clear(); }
+        foreach (var item in old) item.Dispose();
+    }
+
+    private Bitmap? ResolveEmbeddedFrame(DomElement element, LayoutBox box, bool isPrint)
+    {
+        if (_disposed || element.TagName != "embed" || box.Width <= 0 || box.Height <= 0) return null;
+        int width = Math.Max(1, (int)Math.Ceiling(box.Width));
+        int height = Math.Max(1, (int)Math.Ceiling(box.Height));
+        EmbeddedRuntime runtime;
+        lock (_embedLock)
+        {
+            if (!_embedded.TryGetValue(element, out runtime!))
+            {
+                runtime = new EmbeddedRuntime(element);
+                _embedded[element] = runtime;
+            }
+            EnsureEmbeddedStart(runtime, element, width, height);
+        }
+
+        if (isPrint)
+        {
+            if (runtime.Instance == null) return runtime.LastPrintFrame;
+            if (runtime.LastPrintWidth == width && runtime.LastPrintHeight == height && runtime.LastPrintFrame != null)
+                return runtime.LastPrintFrame;
+            try
+            {
+                var request = new EmbeddedRenderRequest(width, height, checked(width * 4), 300, 300, true);
+                var bitmap = ConvertFrame(runtime.Instance.RenderAsync(request, CancellationToken.None).GetAwaiter().GetResult());
+                runtime.LastPrintFrame?.Dispose();
+                runtime.LastPrintFrame = bitmap;
+                runtime.LastPrintWidth = width;
+                runtime.LastPrintHeight = height;
+            }
+            catch (Exception ex)
+            {
+                runtime.Error = ex.Message;
+            }
+            return runtime.LastPrintFrame;
+        }
+
+        if (runtime.Instance != null && (runtime.LastWidth != width || runtime.LastHeight != height))
+            RequestEmbeddedRender(runtime, width, height, false);
+        return runtime.LastFrame;
+    }
+
+    private void EnsureEmbeddedStart(EmbeddedRuntime runtime, DomElement element, int width, int height)
+    {
+        if (runtime.Instance != null || runtime.StartTask != null) return;
+        runtime.StartTask = StartEmbeddedAsync(runtime, element, width, height);
+    }
+
+    private static Bitmap ConvertFrame(EmbeddedFrameBuffer frame)
+    {
+        using var bitmap = new Bitmap(frame.Width, frame.Height);
+        var data = bitmap.LockBits(new Rectangle(0, 0, frame.Width, frame.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            if (data.Stride == frame.Stride)
+                System.Runtime.InteropServices.Marshal.Copy(frame.Pixels, 0, data.Scan0, frame.Pixels.Length);
+            else
+            {
+                for (int y = 0; y < frame.Height; y++)
+                    System.Runtime.InteropServices.Marshal.Copy(frame.Pixels, y * frame.Stride, data.Scan0 + y * data.Stride, Math.Min(frame.Stride, data.Stride));
+            }
+        }
+        finally { bitmap.UnlockBits(data); }
+        return bitmap.Clone();
+    }
+
+    private void RequestEmbeddedRender(EmbeddedRuntime runtime, int width, int height, bool isPrint)
+    {
+        if (Interlocked.Exchange(ref runtime.Rendering, 1) != 0 || runtime.Instance == null) return;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                int stride = checked(width * 4);
+                int dpi = isPrint ? 300 : 96;
+                var frame = await runtime.Instance.RenderAsync(new EmbeddedRenderRequest(width, height, stride, dpi, dpi, isPrint), runtime.Lifetime.Token).ConfigureAwait(false);
+                var bitmap = ConvertFrame(frame);
+                if (runtime.IsDisposed) { bitmap.Dispose(); return; }
+                if (isPrint) runtime.LastPrintFrame?.Dispose(); else runtime.LastFrame?.Dispose();
+                if (isPrint) runtime.LastPrintFrame = bitmap; else { runtime.LastFrame = bitmap; runtime.LastWidth = width; runtime.LastHeight = height; }
+                if (_browser.IsHandleCreated && !_browser.IsDisposed)
+                    _browser.BeginInvoke((Action)(() => _browser.Invalidate()));
+            }
+            catch (Exception ex) { runtime.Error = ex.Message; }
+            finally { Volatile.Write(ref runtime.Rendering, 0); }
+        });
+    }
+
+    private async Task StartEmbeddedAsync(EmbeddedRuntime runtime, DomElement element, int width, int height)
+    {
+        try
+        {
+            string mime = (element.GetAttr("type") ?? InferMimeFromSource(element.GetAttr("src"))).Trim().ToLowerInvariant();
+            if (mime.Length == 0) return;
+            PluginRecord? record = null;
+            string registrationToken = "";
+            lock (_plugins)
+            {
+                foreach (var candidate in _plugins.Values)
+                {
+                    if (!candidate.Enabled || candidate.Sandbox == null || !candidate.HasPermission(PluginPermission.EmbedRenderer)) continue;
+                    if (!candidate.Manifest.EmbedTypes.Any(t => t.Equals(mime, StringComparison.OrdinalIgnoreCase))) continue;
+                    if (candidate.Sandbox.TryGetEmbedRegistrationToken(mime, out registrationToken)) { record = candidate; break; }
+                }
+            }
+            if (record?.Sandbox == null || registrationToken.Length == 0) return;
+            string source = element.GetAttr("src") ?? "";
+            string absolute = ResolveEmbedUrl(source);
+            var sourceStream = await _browser.OpenPluginEmbeddedSourceAsync(absolute, runtime.Lifetime.Token).ConfigureAwait(false);
+            bool owned = false;
+            try
+            {
+                var parameters = element.Attrs.ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase);
+                var instance = await record.Sandbox.CreateEmbeddedInstanceAsync(registrationToken, mime, absolute, _browser.PluginCurrentUrl, _browser.PluginUserAgent, parameters, width, height, sourceStream.Body, sourceStream.CanSeek, sourceStream.Length, runtime.Lifetime.Token).ConfigureAwait(false);
+                owned = true;
+                if (runtime.IsDisposed)
+                {
+                    instance.Dispose();
+                    return;
+                }
+                runtime.Instance = instance;
+                instance.Element = element;
+                record.Sandbox.AttachEmbeddedElement(instance, element);
+                runtime.ScriptName = instance.ScriptName;
+                runtime.ScriptMethods = instance.ScriptMethods;
+                RequestEmbeddedRender(runtime, width, height, false);
+            }
+            finally
+            {
+                if (!owned) sourceStream.Dispose();
+            }
+        }
+        catch (Exception ex) { runtime.Error = ex.Message; }
+        finally
+        {
+            lock (_embedLock)
+            {
+                if (runtime.Instance == null) runtime.StartTask = null;
+            }
+        }
+    }
+
+    private string ResolveEmbedUrl(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source)) return _browser.PluginCurrentUrl ?? "about:blank";
+        string baseUrl = _browser.PluginCurrentUrl ?? "about:blank";
+        return ImageCache.ResolveUrl(source, baseUrl);
+    }
+
+    private static string InferMimeFromSource(string? source)
+    {
+        string path = (source ?? "").Split('?', '#')[0];
+        return Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".dcr" or ".dir" or ".dxr" => "application/x-director",
+            ".mov" => "video/quicktime",
+            ".mid" or ".midi" => "audio/midi",
+            _ => "application/octet-stream"
+        };
+    }
+
+    private (string ScriptName, IReadOnlyList<string> Methods)? GetEmbeddedScriptInfo(DomElement element)
+    {
+        lock (_embedLock)
+        {
+            if (_embedded.TryGetValue(element, out var runtime) && !string.IsNullOrWhiteSpace(runtime.ScriptName))
+                return (runtime.ScriptName, runtime.ScriptMethods);
+
+            string mime = (element.GetAttr("type") ?? InferMimeFromSource(element.GetAttr("src"))).Trim().ToLowerInvariant();
+            foreach (var candidate in _plugins.Values)
+            {
+                if (!candidate.Enabled || candidate.Sandbox == null || !candidate.HasPermission(PluginPermission.EmbedRenderer) || !candidate.HasPermission(PluginPermission.EmbedScript)) continue;
+                if (string.IsNullOrWhiteSpace(candidate.Manifest.ScriptName)) continue;
+                if (!candidate.Manifest.EmbedTypes.Any(t => t.Equals(mime, StringComparison.OrdinalIgnoreCase))) continue;
+                return (candidate.Manifest.ScriptName, Array.Empty<string>());
+            }
+            return null;
+        }
+    }
+
+    private async Task<JsValue> CallEmbeddedScriptAsync(DomElement element, string name, IReadOnlyList<JsValue> args)
+    {
+        EmbeddedRuntime runtime;
+        lock (_embedLock)
+        {
+            if (!_embedded.TryGetValue(element, out runtime!))
+            {
+                runtime = new EmbeddedRuntime(element);
+                _embedded[element] = runtime;
+            }
+            EnsureEmbeddedStart(runtime, element, Math.Max(1, _browser.PluginViewportSize.Width), Math.Max(1, _browser.PluginViewportSize.Height));
+        }
+        if (runtime.StartTask != null && runtime.Instance == null)
+            await runtime.StartTask.ConfigureAwait(false);
+        if (runtime.Instance == null) throw new InvalidOperationException("Embedded plugin instance is unavailable.");
+        if (runtime.ScriptMethods.Count != 0 && !runtime.ScriptMethods.Contains(name, StringComparer.Ordinal))
+            throw new MissingMethodException(name);
+        return await runtime.Instance.CallScriptAsync(name, args).ConfigureAwait(false);
+    }
+
+    private void DispatchEmbeddedInput(DomElement element, EmbeddedInputEvent ev)
+    {
+        EmbeddedRuntime? runtime;
+        lock (_embedLock)
+        {
+            if (!_embedded.TryGetValue(element, out runtime))
+            {
+                runtime = new EmbeddedRuntime(element);
+                _embedded[element] = runtime;
+            }
+            EnsureEmbeddedStart(runtime, element, Math.Max(1, _browser.PluginViewportSize.Width), Math.Max(1, _browser.PluginViewportSize.Height));
+        }
+        _ = DispatchAfterStartAsync(runtime, ev);
+    }
+
+    private static async Task DispatchAfterStartAsync(EmbeddedRuntime runtime, EmbeddedInputEvent ev)
+    {
+        try
+        {
+            if (runtime.StartTask != null && runtime.Instance == null) await runtime.StartTask.ConfigureAwait(false);
+            if (runtime.Instance != null) await runtime.Instance.HandleInputAsync(ev).ConfigureAwait(false);
+        }
+        catch { }
+    }
+
+    private sealed class EmbeddedRuntime : IDisposable
+    {
+        public EmbeddedRuntime(DomElement element) { Element = element; }
+        public DomElement Element { get; }
+        public PluginSandboxSession.EmbeddedHostInstance? Instance { get; set; }
+        public string ScriptName { get; set; } = "";
+        public IReadOnlyList<string> ScriptMethods { get; set; } = Array.Empty<string>();
+        public Bitmap? LastFrame { get; set; }
+        public Bitmap? LastPrintFrame { get; set; }
+        public int LastWidth { get; set; }
+        public int LastHeight { get; set; }
+        public int LastPrintWidth { get; set; }
+        public int LastPrintHeight { get; set; }
+        public Task? StartTask { get; set; }
+        public int Rendering;
+        public string? Error { get; set; }
+        public CancellationTokenSource Lifetime { get; } = new();
+        public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            Lifetime.Cancel();
+            try { Instance?.Dispose(); } catch { }
+            Instance = null;
+            LastFrame?.Dispose();
+            LastFrame = null;
+            LastPrintFrame?.Dispose();
+            LastPrintFrame = null;
+            Lifetime.Dispose();
+        }
+    }
+
     internal IDisposable RegisterFileMenuItem(PluginRecord record, string text, Action callback)
     {
         if (!record.HasPermission(PluginPermission.UserInterface))
@@ -243,6 +521,8 @@ public sealed class PluginManager : IDisposable
             }
             record.Status = "Loaded (sandboxed)";
             record.Error = null;
+            if (_browser.IsHandleCreated && !_browser.IsDisposed)
+                _browser.BeginInvoke((Action)(() => _browser.Invalidate()));
         }
         catch (Exception ex)
         {
@@ -307,6 +587,23 @@ public sealed class PluginManager : IDisposable
         if (!manifest.Id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_'))
             throw new InvalidDataException("Plugin id may contain only letters, digits, '.', '-' and '_'.");
         ValidatePermissions(manifest.Permissions);
+        manifest.EmbedTypes ??= new List<string>();
+        bool renderer = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedRenderer);
+        bool script = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedScript);
+        if (renderer && manifest.EmbedTypes.Count == 0)
+            throw new InvalidDataException("Plugins requesting 'embed.renderer' must declare at least one embed_types MIME type.");
+        foreach (string mime in manifest.EmbedTypes)
+        {
+            string normalized = (mime ?? "").Trim();
+            if (normalized.Length is < 3 or > 256 || !normalized.Contains('/'))
+                throw new InvalidDataException($"Invalid embedded MIME type '{mime}'.");
+        }
+        if (script && !renderer)
+            throw new InvalidDataException("'embed.script' requires 'embed.renderer'.");
+        if (!string.IsNullOrWhiteSpace(manifest.ScriptName) && (manifest.ScriptName.Length > 128 || !(char.IsLetter(manifest.ScriptName[0]) || manifest.ScriptName[0] is '_' or '$') || !manifest.ScriptName.Skip(1).All(c => char.IsLetterOrDigit(c) || c is '_' or '$')))
+            throw new InvalidDataException("script_name must be a simple JavaScript identifier.");
+        if (script && string.IsNullOrWhiteSpace(manifest.ScriptName))
+            throw new InvalidDataException("Plugins requesting 'embed.script' must declare script_name.");
     }
 
     private static void ExtractPackageSafely(string packagePath, string destination)
@@ -397,6 +694,12 @@ public sealed class PluginManager : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _browser.PluginCanvas.PageChanged -= OnPageChanged;
+        _browser.PluginCanvas.EmbeddedFrameResolver = null;
+        _browser.PluginCanvas.EmbeddedInputDispatcher = null;
+        _browser.PluginCanvas.EmbeddedScriptInfoResolver = null;
+        _browser.PluginCanvas.EmbeddedScriptCall = null;
+        OnPageChanged();
         foreach (var record in _plugins.Values.ToArray()) DisableRecord(record);
         _plugins.Clear();
     }

@@ -113,6 +113,10 @@ public class Renderer
     public Func<DomElement, int>? SelectScrollResolver { get; set; }
 
     private readonly ResourceLoader _resourceLoader;
+
+    /// <summary>Host-provided secure embedded-content compositor. The renderer never exposes its bitmap or native window to the plugin.</summary>
+    public Func<DomElement, LayoutBox, bool, Bitmap?>? EmbeddedFrameResolver { get; set; }
+    public bool IsPrintRendering { get; set; }
     private string? _baseUrl;
     private float _scrollX, _scrollY;
 
@@ -1037,6 +1041,11 @@ public class Renderer
                     case "hr":
                         return;   // painted as border
                     case "embed":
+                        if (EmbeddedFrameResolver?.Invoke(box.Element, box, IsPrintRendering) is { } embeddedFrame)
+                        {
+                            g.DrawImage(embeddedFrame, box.X, box.Y, box.Width, box.Height);
+                            return;
+                        }
                         // Legacy MIDI <embed> controls are painted by
                         // BrowserCanvas. Do not leave the generic plugin
                         // placeholder underneath them (or underneath a

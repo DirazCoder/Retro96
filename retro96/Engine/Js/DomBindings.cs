@@ -4,6 +4,7 @@ using System.Linq;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Html;
 using Retro96.Engine.Network;
+using Retro96.Plugins;
 
 namespace Retro96.Engine.Js;
 
@@ -49,6 +50,10 @@ public sealed class DocumentBindingsState
     /// rebind this object to the same live DOM instead of replacing the JS
     /// document object before every script.</summary>
     public JsObject? DocumentObject;
+
+    /// <summary>Host-managed legacy &lt;embed&gt; script bridge. The JS engine only sees typed values and async promise facades.</summary>
+    public Func<DomElement, (string ScriptName, IReadOnlyList<string> Methods)?>? EmbeddedScriptInfoResolver;
+    public Func<DomElement, string, IReadOnlyList<Retro96.Plugins.JsValue>, Task<Retro96.Plugins.JsValue>>? EmbeddedScriptCall;
 }
 
 /// <summary>
@@ -371,6 +376,7 @@ public static class DomBindings
         d.Set("images", JsValue.FromObject(BuildElementCollection(scope, doc.Images, state)));
         d.Set("links", JsValue.FromObject(BuildElementCollection(scope, doc.Links, state)));
         d.Set("anchors", JsValue.FromObject(BuildElementCollection(scope, doc.Anchors, state)));
+        d.Set("embeds", JsValue.FromObject(BuildElementCollection(scope, doc.ElementDescendants().Where(e => e.TagName == "embed"), state)));
 
         d.Set("write", Fn(scope, "write", (self, args) =>
         {
@@ -875,6 +881,76 @@ public static class DomBindings
 
     /// <summary>Minimal text-node wrapper for firstChild/lastChild/
     /// childNodes/siblings: {nodeType, nodeName, nodeValue, data, length}.</summary>
+    private sealed class EmbeddedScriptObject : JsObject
+    {
+        private readonly DomElement _element;
+        private readonly DocumentBindingsState _state;
+        private readonly IReadOnlySet<string> _methods;
+
+        public EmbeddedScriptObject(DomElement element, DocumentBindingsState state, IReadOnlyList<string> methods)
+        { _element = element; _state = state; _methods = methods.ToHashSet(StringComparer.Ordinal); Class = "EmbeddedPlugin"; }
+
+        public override JsValue Get(string name)
+        {
+            if ((_methods.Count != 0 && !_methods.Contains(name)) || _state.EmbeddedScriptCall == null)
+                return base.Get(name);
+            return JsValue.FromFunction(new JsFunction((self, args) =>
+            {
+                try
+                {
+                    var pluginArgs = args.Select(PluginJsValueCodec.FromEngine).ToArray();
+                    var task = _state.EmbeddedScriptCall(_element, name, pluginArgs);
+                    return JsValue.FromObject(new JsPromiseObject(_state.Interpreter!, _state.Canvas!, task));
+                }
+                catch (Exception ex)
+                {
+                    return JsValue.FromObject(JsPromiseObject.FromFault(_state.Interpreter!, _state.Canvas!, ex));
+                }
+            }, _state.Interpreter?.GlobalScope ?? new JsScope(), name));
+        }
+    }
+
+    /// <summary>Small DOM-0 promise facade. It deliberately exposes only then/catch; all work is still brokered asynchronously.</summary>
+    private sealed class JsPromiseObject : JsObject
+    {
+        private readonly JsInterpreter _interpreter;
+        private readonly BrowserCanvas _canvas;
+        private readonly Task<Retro96.Plugins.JsValue> _task;
+
+        public JsPromiseObject(JsInterpreter interpreter, BrowserCanvas canvas, Task<Retro96.Plugins.JsValue> task)
+        { _interpreter=interpreter; _canvas=canvas; _task=task; Class="Promise"; }
+
+        public static JsPromiseObject FromFault(JsInterpreter interpreter, BrowserCanvas canvas, Exception ex) =>
+            new(interpreter, canvas, Task.FromException<Retro96.Plugins.JsValue>(ex));
+
+        public override JsValue Get(string name)
+        {
+            if (name is not ("then" or "catch")) return base.Get(name);
+            return JsValue.FromFunction(new JsFunction((self, args) =>
+            {
+                JsFunction? callback = args.Length > 0 && args[0].Type == JsType.Function ? args[0].GetFunction() : null;
+                if (callback != null)
+                {
+                    _ = _task.ContinueWith(_ =>
+                    {
+                        try
+                        {
+                            var engineValue = PluginJsValueCodec.ToEngine(_task.GetAwaiter().GetResult());
+                            if (_canvas.IsHandleCreated && !_canvas.IsDisposed)
+                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(callback, JsValue.Undefined, new[] { engineValue })));
+                        }
+                        catch (Exception ex)
+                        {
+                            if (name == "catch" && _canvas.IsHandleCreated && !_canvas.IsDisposed)
+                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(callback, JsValue.Undefined, new[] { JsValue.From(ex.Message) })));
+                        }
+                    }, TaskScheduler.Default);
+                }
+                return self;
+            }, _interpreter.GlobalScope, name));
+        }
+    }
+
     private sealed class TextNodeObject : JsObject
     {
         public TextNodeObject(string data, int nodeType = 3)
@@ -1088,6 +1164,12 @@ public static class DomBindings
 
         public override JsValue Get(string name)
         {
+            if (_element.TagName == "embed" && _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
+                scriptInfo.ScriptName.Length > 0 && string.Equals(name, scriptInfo.ScriptName, StringComparison.Ordinal))
+            {
+                return JsValue.FromObject(new EmbeddedScriptObject(_element, _state, scriptInfo.Methods));
+            }
+
             // DOM Level 0 methods are real built-ins, not HTML attributes.
             // Keep them ahead of routed-attribute handling so `typeof
             // element.setAttribute` and `typeof element.getAttribute` are
