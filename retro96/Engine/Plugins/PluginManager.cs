@@ -28,6 +28,7 @@ public sealed class PluginManager : IDisposable
     private bool _disposed;
     private readonly Dictionary<DomElement, EmbeddedRuntime> _embedded = new();
     private readonly object _embedLock = new();
+    private readonly System.Windows.Forms.Timer _embedRenderTimer;
 
     public PluginManager(Form1 browser)
     {
@@ -45,6 +46,14 @@ public sealed class PluginManager : IDisposable
             LoadEnabledPlugins();
         else
             _browser.HandleCreated += (_, _) => LoadEnabledPlugins();
+
+        // Drive embedded content repaints at ~30 fps. The pull-based render
+        // model (ResolveEmbeddedFrame returns LastFrame) means the host only
+        // shows whatever was cached at the last RequestEmbeddedRender call.
+        // Without this timer the frame never updates after the initial render.
+        _embedRenderTimer = new System.Windows.Forms.Timer { Interval = 33 };
+        _embedRenderTimer.Tick += OnEmbedRenderTick;
+        _embedRenderTimer.Start();
     }
 
     public IReadOnlyList<PluginRecord> Plugins => _plugins.Values.OrderBy(p => p.Manifest.Name, StringComparer.OrdinalIgnoreCase).ToArray();
@@ -690,10 +699,24 @@ public sealed class PluginManager : IDisposable
         record.Status = "Disabled";
     }
 
+    private void OnEmbedRenderTick(object? sender, EventArgs e)
+    {
+        if (_disposed) return;
+        EmbeddedRuntime[] runtimes;
+        lock (_embedLock) { runtimes = _embedded.Values.ToArray(); }
+        foreach (var runtime in runtimes)
+        {
+            if (runtime.Instance != null && runtime.LastWidth > 0 && runtime.LastHeight > 0)
+                RequestEmbeddedRender(runtime, runtime.LastWidth, runtime.LastHeight, false);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        _embedRenderTimer.Stop();
+        _embedRenderTimer.Dispose();
         _browser.PluginCanvas.PageChanged -= OnPageChanged;
         _browser.PluginCanvas.EmbeddedFrameResolver = null;
         _browser.PluginCanvas.EmbeddedInputDispatcher = null;
@@ -725,4 +748,3 @@ public sealed class PluginManager : IDisposable
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
     }
 }
-
