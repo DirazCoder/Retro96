@@ -139,6 +139,7 @@ public class BrowserCanvas : Control
     private readonly Retro96.Engine.Java.JavaAppletHost _javaApplets;
     private DomElement? _focusedJavaAppletElement;
     private DomElement? _pressedJavaAppletElement;
+    private DomElement? _hoveredJavaAppletElement;
 
     // Internal callbacks are fields rather than Control properties so WinForms
     // designer serialization never tries to persist delegates from the host.
@@ -372,6 +373,7 @@ public class BrowserCanvas : Control
         _pressedEmbeddedElement = null;
         _focusedJavaAppletElement = null;
         _pressedJavaAppletElement = null;
+        _hoveredJavaAppletElement = null;
         _fieldDragging = false;
         _lastFieldClickElement = null;
         _lastFieldClickFrame = null;
@@ -924,6 +926,7 @@ public class BrowserCanvas : Control
         _embeddedMidiRect = RectangleF.Empty;
         _focusedJavaAppletElement = null;
         _pressedJavaAppletElement = null;
+        _hoveredJavaAppletElement = null;
         _javaApplets.StopPage();
         _scrollOffset = PointF.Empty;
         UpdateScrollBars();
@@ -2531,7 +2534,7 @@ public class BrowserCanvas : Control
         if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jb))
         {
             SendJavaAppletInput(_focusedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
-                Retro96.Engine.Java.JavaInputKind.KeyDown, 0, 0, 0, 0, (int)e.KeyCode, '\0', e.Shift, e.Control, e.Alt));
+                Retro96.Engine.Java.JavaInputKind.KeyDown, 0, 0, 0, 0, (int)e.KeyCode, '\0', (e.Modifiers & Keys.Shift) != 0, (e.Modifiers & Keys.Control) != 0, (e.Modifiers & Keys.Alt) != 0));
             return;
         }
         if (_focusedEmbeddedElement == null) return;
@@ -2547,7 +2550,7 @@ public class BrowserCanvas : Control
         if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jb))
         {
             SendJavaAppletInput(_focusedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
-                Retro96.Engine.Java.JavaInputKind.KeyUp, 0, 0, 0, 0, (int)e.KeyCode, '\0', e.Shift, e.Control, e.Alt));
+                Retro96.Engine.Java.JavaInputKind.KeyUp, 0, 0, 0, 0, (int)e.KeyCode, '\0', (e.Modifiers & Keys.Shift) != 0, (e.Modifiers & Keys.Control) != 0, (e.Modifiers & Keys.Alt) != 0));
             return;
         }
         if (_focusedEmbeddedElement == null) return;
@@ -2560,8 +2563,13 @@ public class BrowserCanvas : Control
     {
         if (_focusedJavaAppletElement != null && _focusedInput == null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var keyAppletBox))
         {
-            SendJavaAppletInput(_focusedJavaAppletElement, keyAppletBox, new Retro96.Engine.Java.JavaInput(
-                Retro96.Engine.Java.JavaInputKind.KeyDown, 0, 0, 0, 0, 0, e.KeyChar, (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+            var typed = new Retro96.Engine.Java.JavaInput(
+                Retro96.Engine.Java.JavaInputKind.KeyTyped, 0, 0, 0, 0, 0, e.KeyChar, (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0);
+            SendJavaAppletInput(_focusedJavaAppletElement, keyAppletBox, typed);
+            // Keep the existing 1.0 compatibility path: old applets receive
+            // character input through keyDown(int). The bridge suppresses this
+            // path when only 1.1 listeners are registered.
+            SendJavaAppletInput(_focusedJavaAppletElement, keyAppletBox, typed with { Kind = Retro96.Engine.Java.JavaInputKind.KeyDown });
             return;
         }
         if (_focusedEmbeddedElement != null && _focusedInput == null)
@@ -3765,6 +3773,7 @@ public class BrowserCanvas : Control
         {
             if (old != null) SendEmbeddedInput(old, new EmbeddedInputEvent(EmbeddedInputEventKind.FocusLost));
             _focusedEmbeddedElement = element;
+            _focusedJavaAppletElement = null;
             SendEmbeddedInput(element, new EmbeddedInputEvent(EmbeddedInputEventKind.FocusGained));
         }
         _pressedEmbeddedElement = element;
@@ -3814,9 +3823,36 @@ public class BrowserCanvas : Control
             float py = e.Y / _pluginZoom + _scrollOffset.Y;
             if (TryGetJavaAppletBox(_pressedJavaAppletElement, out var jb))
                 SendJavaAppletInput(_pressedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
-                    Retro96.Engine.Java.JavaInputKind.MouseMove, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
+                    Retro96.Engine.Java.JavaInputKind.MouseDrag, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
                     0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
             return;
+        }
+
+        // AWT 1.0/1.1 has explicit mouse enter/exit events. Track the applet
+        // under the pointer even when no button is pressed; dragging remains
+        // captured by the pressed applet above.
+        if (_rootBox != null)
+        {
+            float hx = e.X / _pluginZoom + _scrollOffset.X;
+            float hy = e.Y / _pluginZoom + _scrollOffset.Y;
+            var hit = HitTestDeepestBox(_rootBox, hx, hy);
+            var hovered = hit?.Element?.TagName.Equals("applet", StringComparison.OrdinalIgnoreCase) == true ? hit!.Element : null;
+            if (!ReferenceEquals(hovered, _hoveredJavaAppletElement))
+            {
+                if (_hoveredJavaAppletElement != null && TryGetJavaAppletBox(_hoveredJavaAppletElement, out var oldBox))
+                    SendJavaAppletInput(_hoveredJavaAppletElement, oldBox, new Retro96.Engine.Java.JavaInput(
+                        Retro96.Engine.Java.JavaInputKind.MouseExit, (int)Math.Round(hx - oldBox.X), (int)Math.Round(hy - oldBox.Y),
+                        0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+                _hoveredJavaAppletElement = hovered;
+                if (hovered != null && hit != null)
+                    SendJavaAppletInput(hovered, hit, new Retro96.Engine.Java.JavaInput(
+                        Retro96.Engine.Java.JavaInputKind.MouseEnter, (int)Math.Round(hx - hit.X), (int)Math.Round(hy - hit.Y),
+                        0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+            }
+            if (hovered != null && hit != null)
+                SendJavaAppletInput(hovered, hit, new Retro96.Engine.Java.JavaInput(
+                    Retro96.Engine.Java.JavaInputKind.MouseMove, (int)Math.Round(hx - hit.X), (int)Math.Round(hy - hit.Y),
+                    0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
         }
 
         if (_pressedEmbeddedElement != null && Capture)

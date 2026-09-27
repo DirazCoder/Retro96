@@ -2,7 +2,7 @@ using Retro96.Drawing;
 
 namespace Retro96.Engine.Java;
 
-public enum JavaInputKind { MouseDown, MouseUp, MouseMove, MouseDrag, KeyDown, KeyUp, MouseEnter, MouseExit, MouseWheel }
+public enum JavaInputKind { MouseDown, MouseUp, MouseMove, MouseDrag, KeyDown, KeyUp, KeyTyped, MouseEnter, MouseExit, MouseWheel }
 
 public readonly record struct JavaInput(JavaInputKind Kind, int X, int Y, int Button, int WheelDelta, int KeyCode, char KeyChar, bool Shift, bool Control, bool Alt);
 
@@ -195,9 +195,9 @@ internal static class JavaComponentBridge
         });
         vm.RegisterNative(c.Name, "setLayout", "(Ljava/awt/LayoutManager;)V", i => { State(i.Receiver.AsObject()!).Layout = i.Arguments[0].AsObject(); LayoutChildren(i.Receiver.AsObject()!); return JValue.Void; });
         vm.RegisterNative(c.Name, "getLayout", "()Ljava/awt/LayoutManager;", i => JValue.Ref(State(i.Receiver.AsObject()!).Layout));
-        vm.RegisterNative(c.Name, "validate", "()V", i => LayoutChildren(i.Receiver.AsObject()!));
-        vm.RegisterNative(c.Name, "layout", "()V", i => LayoutChildren(i.Receiver.AsObject()!));
-        vm.RegisterNative(c.Name, "doLayout", "()V", i => LayoutChildren(i.Receiver.AsObject()!));
+        vm.RegisterNative(c.Name, "validate", "()V", i => { LayoutChildren(i.Receiver.AsObject()!); return JValue.Void; });
+        vm.RegisterNative(c.Name, "layout", "()V", i => { LayoutChildren(i.Receiver.AsObject()!); return JValue.Void; });
+        vm.RegisterNative(c.Name, "doLayout", "()V", i => { LayoutChildren(i.Receiver.AsObject()!); return JValue.Void; });
         vm.RegisterNative(c.Name, "paintComponents", "(Ljava/awt/Graphics;)V", i => { PaintChildren(vm, i.Receiver.AsObject()!, i.Arguments[0]); return JValue.Void; });
     }
 
@@ -275,9 +275,9 @@ internal static class JavaComponentBridge
 
     internal static void RegisterFlowLayout(JavaVm vm, JClass c)
     {
-        vm.RegisterNative(c.Name, "<init>", "()V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, JavaLayoutState.Left, 5, 5, 0, 0));
-        vm.RegisterNative(c.Name, "<init>", "(I)V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, i.Arguments[0].AsInt(), 5, 5, 0, 0));
-        vm.RegisterNative(c.Name, "<init>", "(III)V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, i.Arguments[0].AsInt(), i.Arguments[1].AsInt(), i.Arguments[2].AsInt(), 0, 0));
+        vm.RegisterNative(c.Name, "<init>", "()V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, JavaLayoutState.Left, 5, 5, 0, 0); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(I)V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, i.Arguments[0].AsInt(), 5, 5, 0, 0); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(III)V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Flow, i.Arguments[0].AsInt(), i.Arguments[1].AsInt(), i.Arguments[2].AsInt(), 0, 0); return JValue.Void; });
         RegisterLayoutManagerCommon(vm, c);
         vm.SetStatic(c, "LEFT", "I", JValue.Int(0));
         vm.SetStatic(c, "CENTER", "I", JValue.Int(1));
@@ -288,8 +288,8 @@ internal static class JavaComponentBridge
 
     internal static void RegisterBorderLayout(JavaVm vm, JClass c)
     {
-        vm.RegisterNative(c.Name, "<init>", "()V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Border, 0, 5, 5, 0, 0));
-        vm.RegisterNative(c.Name, "<init>", "(II)V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Border, 0, i.Arguments[0].AsInt(), i.Arguments[1].AsInt(), 0, 0));
+        vm.RegisterNative(c.Name, "<init>", "()V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Border, 0, 5, 5, 0, 0); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(II)V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Border, 0, i.Arguments[0].AsInt(), i.Arguments[1].AsInt(), 0, 0); return JValue.Void; });
         RegisterLayoutManagerCommon(vm, c);
         vm.SetStatic(c, "NORTH", "Ljava/lang/String;", JValue.Ref(vm.CreateString("North")));
         vm.SetStatic(c, "SOUTH", "Ljava/lang/String;", JValue.Ref(vm.CreateString("South")));
@@ -300,9 +300,9 @@ internal static class JavaComponentBridge
 
     internal static void RegisterGridLayout(JavaVm vm, JClass c)
     {
-        vm.RegisterNative(c.Name, "<init>", "()V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, 5, 5, 1, 0));
-        vm.RegisterNative(c.Name, "<init>", "(II)V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, 5, 5, i.Arguments[0].AsInt(), i.Arguments[1].AsInt()));
-        vm.RegisterNative(c.Name, "<init>", "(IIII)V", i => i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[0].AsInt(), i.Arguments[1].AsInt()));
+        vm.RegisterNative(c.Name, "<init>", "()V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, 5, 5, 1, 0); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(II)V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, 5, 5, i.Arguments[0].AsInt(), i.Arguments[1].AsInt()); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(IIII)V", i => { i.Receiver.AsObject()!.NativeState = new JavaLayoutState(JavaLayoutKind.Grid, JavaLayoutState.Left, i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[0].AsInt(), i.Arguments[1].AsInt()); return JValue.Void; });
         RegisterLayoutManagerCommon(vm, c);
     }
 
@@ -341,8 +341,8 @@ internal static class JavaComponentBridge
         if (c.Name == "java.awt.TextField") vm.RegisterNative(c.Name, "getColumns", "()I", _ => JValue.Int(12));
         if (c.Name is "java.awt.TextField" or "java.awt.TextArea")
         {
-            vm.RegisterNative(c.Name, "setEditable", "(Z)V", _ => JValue.Void);
-            vm.RegisterNative(c.Name, "isEditable", "()Z", _ => JValue.Int(1));
+            vm.RegisterNative(c.Name, "setEditable", "(Z)V", i => { State(i.Receiver.AsObject()!).Editable = i.Arguments[0].AsInt() != 0; return JValue.Void; });
+            vm.RegisterNative(c.Name, "isEditable", "()Z", i => JValue.Int(State(i.Receiver.AsObject()!).Editable ? 1 : 0));
         }
         if (c.Name == "java.awt.TextArea")
         {
@@ -492,8 +492,8 @@ internal static class JavaComponentBridge
     {
         // FIX: the old code registered the malformed descriptor "(Ljava/lang/Object;I;Ljava/lang/Object;)V".
         vm.RegisterNative(c.Name, "<init>", "()V", _ => JValue.Void);
-        vm.RegisterNative(c.Name, "<init>", "(Ljava/lang/Object;JIIII)V", i => InitEvent(vm, i.Receiver.AsObject()!, c, i.Arguments[0], (int)i.Arguments[1].AsLong(), i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[4].AsInt(), i.Arguments[5].AsInt(), 0, JValue.Ref(null)));
-        vm.RegisterNative(c.Name, "<init>", "(Ljava/lang/Object;JIIIIILjava/lang/Object;)V", i => InitEvent(vm, i.Receiver.AsObject()!, c, i.Arguments[0], (int)i.Arguments[1].AsLong(), i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[4].AsInt(), i.Arguments[5].AsInt(), i.Arguments[6].AsInt(), i.Arguments[7]));
+        vm.RegisterNative(c.Name, "<init>", "(Ljava/lang/Object;JIIII)V", i => { InitEvent(vm, i.Receiver.AsObject()!, c, i.Arguments[0], (int)i.Arguments[1].AsLong(), i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[4].AsInt(), i.Arguments[5].AsInt(), 0, JValue.Ref(null)); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(Ljava/lang/Object;JIIIIILjava/lang/Object;)V", i => { InitEvent(vm, i.Receiver.AsObject()!, c, i.Arguments[0], (int)i.Arguments[1].AsLong(), i.Arguments[2].AsInt(), i.Arguments[3].AsInt(), i.Arguments[4].AsInt(), i.Arguments[5].AsInt(), i.Arguments[6].AsInt(), i.Arguments[7]); return JValue.Void; });
         vm.SetStatic(c, "SHIFT_MASK", "I", JValue.Int(1));
         vm.SetStatic(c, "CTRL_MASK", "I", JValue.Int(2));
         vm.SetStatic(c, "META_MASK", "I", JValue.Int(4));
@@ -707,7 +707,7 @@ internal static class JavaComponentBridge
     {
         JavaInputKind.MouseDown or JavaInputKind.MouseUp or JavaInputKind.MouseEnter or JavaInputKind.MouseExit => s.MouseListeners.Count > 0,
         JavaInputKind.MouseMove or JavaInputKind.MouseDrag => s.MouseMotionListeners.Count > 0,
-        JavaInputKind.KeyDown or JavaInputKind.KeyUp => s.KeyListeners.Count > 0,
+        JavaInputKind.KeyDown or JavaInputKind.KeyUp or JavaInputKind.KeyTyped => s.KeyListeners.Count > 0,
         _ => false
     };
 
@@ -758,6 +758,23 @@ internal static class JavaComponentBridge
                 foreach (var l in ts.ItemListeners.ToArray()) InvokeSafe(vm, l, "itemStateChanged", "(Ljava/awt/event/ItemEvent;)V", item);
                 if (ts.ItemListeners.Count == 0) PostOldAction(vm, target, JValue.Ref(vm.CreateString(ts.Items[idx])));
             }
+        }
+        else if ((name is "java.awt.TextField" or "java.awt.TextArea") && local.Kind == JavaInputKind.KeyTyped && ts.Editable)
+        {
+            char ch = local.KeyChar;
+            if (ch == '\b')
+            {
+                if (ts.Text.Length > 0) ts.Text = ts.Text[..^1];
+            }
+            else if (ch == '\r' || ch == '\n')
+            {
+                if (name == "java.awt.TextArea") ts.Text += '\n';
+            }
+            else if (!char.IsControl(ch))
+            {
+                ts.Text += ch;
+            }
+            vm.Repaint();
         }
         else if (name == "java.awt.TextField" && local.Kind == JavaInputKind.KeyDown && (local.KeyCode == 10 || local.KeyChar == '\n'))
         {
@@ -880,6 +897,12 @@ internal static class JavaComponentBridge
             {
                 var evt = MakeKeyEvent(vm, target, input, 402);
                 foreach (var l in s.KeyListeners.ToArray()) { InvokeSafe(vm, l, "keyReleased", "(Ljava/awt/event/KeyEvent;)V", evt); any = true; }
+                break;
+            }
+            case JavaInputKind.KeyTyped:
+            {
+                var evt = MakeKeyEvent(vm, target, input, 400);
+                foreach (var l in s.KeyListeners.ToArray()) { InvokeSafe(vm, l, "keyTyped", "(Ljava/awt/event/KeyEvent;)V", evt); any = true; }
                 break;
             }
             case JavaInputKind.MouseDown:

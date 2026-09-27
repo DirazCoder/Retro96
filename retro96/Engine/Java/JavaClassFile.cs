@@ -145,10 +145,11 @@ public sealed class JClassFile
         var r = new BigEndianReader(bytes);
         if (r.U4() != Magic) throw new InvalidDataException("Not a Java class file.");
         ushort minor = r.U2(), major = r.U2();
-        // Primary target is 45.0-45.3 (JDK 1.0/1.1); accept later majors that
-        // use the same constant-pool tag set so mixed-era pages degrade gracefully.
-        if (major is < 45 or > 51)
-            throw new InvalidDataException($"Unsupported class version {major}.{minor}; expected 45.x (JDK 1.0/1.1).");
+        // The engine deliberately targets only the authentic JDK 1.0/1.1
+        // class-file range.  Do not silently accept later class files: their
+        // opcode/constant-pool semantics are outside this VM's contract.
+        if (major != 45 || minor > 3)
+            throw new InvalidDataException($"Unsupported class version {major}.{minor}; expected 45.0 through 45.3 (JDK 1.0/1.1).");
 
         ushort cpCount = r.U2();
         var cp = new JConstant?[cpCount];

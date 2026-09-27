@@ -392,7 +392,7 @@ public sealed partial class JavaVm
                 Owner = declaring,
                 Method = method,
                 Locals = new JValue[Math.Max(code.MaxLocals, slots)], // FIX: never smaller than the argument list
-                Stack = new JValue[Math.Max(4, code.MaxStack)]
+                Stack = new JValue[Math.Max(4, (int)code.MaxStack)]
             };
             int li = 0;
             if (!method.IsStatic && receiver.Tag != JTag.Void) frame.Locals[li++] = receiver;
@@ -639,4 +639,6 @@ public sealed class JavaAppletStubState
     public ParsedUrl CodeBase { get; init; } = null!;
     public Dictionary<string, string> Parameters { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public JavaAppletContextState Context { get; init; } = new();
+    public Action<int, int>? Resize { get; set; }
+    public bool Active { get; set; }
 }

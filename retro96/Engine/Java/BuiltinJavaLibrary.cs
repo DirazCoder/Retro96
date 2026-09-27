@@ -21,6 +21,7 @@ internal static class BuiltinJavaLibrary
         "java.lang.ArithmeticException","java.lang.NegativeArraySizeException","java.lang.ArrayStoreException",
         "java.lang.InterruptedException","java.lang.OutOfMemoryError","java.lang.IllegalArgumentException",
         "java.lang.NumberFormatException","java.lang.CloneNotSupportedException",
+        "java.lang.Cloneable","java.io.Serializable",
         "java.lang.Character","java.lang.SecurityManager","java.lang.Integer","java.lang.Long","java.lang.Float",
         "java.lang.Double","java.lang.Boolean","java.lang.Byte","java.lang.Short","java.lang.Math",
         // net / applet
@@ -61,6 +62,7 @@ internal static class BuiltinJavaLibrary
             "java.lang.Throwable" => "java.lang.Object",
             "java.lang.Exception" => "java.lang.Throwable",
             "java.lang.CloneNotSupportedException" => "java.lang.Exception",
+            "java.lang.Cloneable" or "java.io.Serializable" => null,
             "java.lang.RuntimeException" => "java.lang.Exception",
             "java.lang.Error" => "java.lang.Throwable",
             "java.lang.IllegalArgumentException" => "java.lang.RuntimeException",
@@ -82,10 +84,14 @@ internal static class BuiltinJavaLibrary
                 or "java.awt.TextArea" or "java.awt.Checkbox" or "java.awt.Choice" or "java.awt.List" or "java.awt.Scrollbar" => "java.awt.Container",
             "java.awt.Graphics" or "java.awt.Image" or "java.awt.Cursor" or "java.awt.Color" or "java.awt.Font"
                 or "java.awt.FontMetrics" or "java.awt.Dimension" or "java.awt.Insets" or "java.awt.Point" or "java.awt.Rectangle"
-                or "java.awt.Event" or "java.awt.AWTEvent" or "java.awt.Toolkit" or "java.awt.MediaTracker"
+                or "java.awt.Event" or "java.awt.Toolkit" or "java.awt.MediaTracker"
                 or "java.awt.FlowLayout" or "java.awt.BorderLayout" or "java.awt.GridLayout" or "java.awt.LayoutManager"
                 or "java.awt.image.ImageObserver" => "java.lang.Object",
+            "java.awt.AWTEvent" => "java.lang.Object",
             "java.awt.Component" => "java.lang.Object",
+            "java.awt.event.InputEvent" => "java.awt.AWTEvent",
+            "java.awt.event.MouseEvent" or "java.awt.event.KeyEvent" => "java.awt.event.InputEvent",
+            "java.awt.event.ActionEvent" or "java.awt.event.ItemEvent" => "java.awt.AWTEvent",
             _ when name.StartsWith("java.awt.event.", StringComparison.Ordinal) => "java.lang.Object",
             _ when name.StartsWith("java.util.", StringComparison.Ordinal) => "java.lang.Object",
             _ => "java.lang.Object"
@@ -138,6 +144,9 @@ internal static class BuiltinJavaLibrary
             case "java.lang.OutOfMemoryError":
                 Method(c, "<init>", "()V", 0); Method(c, "<init>", "(Ljava/lang/String;)V", 0);
                 Method(c, "getMessage", "()Ljava/lang/String;"); Method(c, "toString", "()Ljava/lang/String;");
+                break;
+            case "java.lang.Cloneable":
+            case "java.io.Serializable":
                 break;
             case "java.lang.Class":
                 Method(c, "getName", "()Ljava/lang/String;"); Method(c, "toString", "()Ljava/lang/String;");
@@ -302,6 +311,7 @@ internal static class BuiltinJavaLibrary
                 Method(c, "getParameter", "(Ljava/lang/String;)Ljava/lang/String;");
                 Method(c, "getCodeBase", "()Ljava/net/URL;"); Method(c, "getDocumentBase", "()Ljava/net/URL;");
                 Method(c, "getAppletContext", "()Ljava/applet/AppletContext;");
+                Method(c, "setStub", "(Ljava/applet/AppletStub;)V"); Method(c, "getStub", "()Ljava/applet/AppletStub;");
                 Method(c, "isActive", "()Z"); Method(c, "resize", "(II)V");
                 Method(c, "showStatus", "(Ljava/lang/String;)V");
                 Method(c, "getImage", "(Ljava/net/URL;)Ljava/awt/Image;");
@@ -528,6 +538,9 @@ internal static class BuiltinJavaLibrary
                 Field(c, "SHIFT_MASK", "I", 0x0008); Field(c, "CTRL_MASK", "I", 0x0008);
                 Field(c, "META_MASK", "I", 0x0008); Field(c, "ALT_MASK", "I", 0x0008);
                 break;
+            case "java.awt.AWTEvent":
+                Method(c, "getID", "()I"); Method(c, "getSource", "()Ljava/lang/Object;");
+                break;
             case "java.awt.event.MouseEvent":
                 Method(c, "<init>", "(Ljava/awt/Component;IJIIIIIZ)V", 0);
                 Method(c, "getX", "()I"); Method(c, "getY", "()I"); Method(c, "getID", "()I");
@@ -693,6 +706,7 @@ internal static class BuiltinJavaLibrary
             case "java.util.Random": RegisterRandom(vm, c); break;
             case "java.net.URL": RegisterUrl(vm, c); break;
             case "java.applet.Applet": RegisterApplet(vm, c); break;
+            case "java.applet.AppletStub": RegisterAppletStub(vm, c); break;
             case "java.applet.AppletContext": RegisterAppletContext(vm, c); break;
             case "java.applet.AudioClip":
                 vm.RegisterNative(c.Name, "play", "()V", _ => JValue.Void);
@@ -763,8 +777,8 @@ internal static class BuiltinJavaLibrary
         vm.RegisterNative(c.Name, "toString", "()Ljava/lang/String;", i => { var o = i.Receiver.AsObject()!; return JValue.Ref(vm.CreateString(o.Class.Name + "@" + RuntimeHelpers.GetHashCode(o).ToString("x", CultureInfo.InvariantCulture))); });
         vm.RegisterNative(c.Name, "getClass", "()Ljava/lang/Class;", i => JValue.Ref(vm.CreateClassObject(i.Receiver.AsObject()!.Class)));
         vm.RegisterNative(c.Name, "wait", "()V", i => { try { System.Threading.Monitor.Wait(i.Receiver.AsObject()!); } catch (SynchronizationLockException) { } return JValue.Void; });
-        vm.RegisterNative(c.Name, "wait", "(J)V", i => { long ms = i.Arguments[0].AsLong(); try { System.Threading.Monitor.Wait(i.Receiver.AsObject()!, Math.Clamp(ms, 0, int.MaxValue)); } catch (SynchronizationLockException) { } return JValue.Void; });
-        vm.RegisterNative(c.Name, "wait", "(JI)V", i => { long ms = i.Arguments[0].AsLong(); try { System.Threading.Monitor.Wait(i.Receiver.AsObject()!, Math.Clamp(ms, 0, int.MaxValue)); } catch (SynchronizationLockException) { } return JValue.Void; });
+        vm.RegisterNative(c.Name, "wait", "(J)V", i => { long ms = i.Arguments[0].AsLong(); try { System.Threading.Monitor.Wait(i.Receiver.AsObject()!, Math.Clamp(ms, 0L, (long)int.MaxValue) > int.MaxValue ? int.MaxValue : (int)Math.Clamp(ms, 0L, (long)int.MaxValue)); } catch (SynchronizationLockException) { } return JValue.Void; });
+        vm.RegisterNative(c.Name, "wait", "(JI)V", i => { long ms = i.Arguments[0].AsLong(); try { System.Threading.Monitor.Wait(i.Receiver.AsObject()!, Math.Clamp(ms, 0L, (long)int.MaxValue) > int.MaxValue ? int.MaxValue : (int)Math.Clamp(ms, 0L, (long)int.MaxValue)); } catch (SynchronizationLockException) { } return JValue.Void; });
         vm.RegisterNative(c.Name, "notify", "()V", i => { try { System.Threading.Monitor.Pulse(i.Receiver.AsObject()!); } catch (SynchronizationLockException) { } return JValue.Void; });
         vm.RegisterNative(c.Name, "notifyAll", "()V", i => { try { System.Threading.Monitor.PulseAll(i.Receiver.AsObject()!); } catch (SynchronizationLockException) { } return JValue.Void; });
     }
@@ -866,7 +880,7 @@ internal static class BuiltinJavaLibrary
         vm.RegisterNative(c.Name, "endsWith", "(Ljava/lang/String;)Z", i => JValue.Int(vm.StringValue(i.Receiver).EndsWith(vm.StringValue(i.Arguments[0]), StringComparison.Ordinal) ? 1 : 0));
         vm.RegisterNative(c.Name, "concat", "(Ljava/lang/String;)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(vm.StringValue(i.Receiver) + vm.StringValue(i.Arguments[0]))));
         vm.RegisterNative(c.Name, "compareTo", "(Ljava/lang/String;)I", i => JValue.Int(string.CompareOrdinal(vm.StringValue(i.Receiver), vm.StringValue(i.Arguments[0]))));
-        vm.RegisterNative(c.Name, "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(vm.ToJavaString(i.Arguments[0])));
+        vm.RegisterNative(c.Name, "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(vm.ToJavaString(i.Arguments[0]))));
         vm.RegisterNative(c.Name, "valueOf", "(I)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(i.Arguments[0].AsInt().ToString(CultureInfo.InvariantCulture))));
         vm.RegisterNative(c.Name, "valueOf", "(J)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(i.Arguments[0].AsLong().ToString(CultureInfo.InvariantCulture))));
         vm.RegisterNative(c.Name, "valueOf", "(C)Ljava/lang/String;", i => JValue.Ref(vm.CreateString(((char)i.Arguments[0].AsInt()).ToString())));
@@ -889,8 +903,8 @@ internal static class BuiltinJavaLibrary
         vm.RegisterNative(c.Name, "length", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState as StringBuilder)?.Length ?? 0));
         vm.RegisterNative(c.Name, "charAt", "(I)C", i => JValue.Int((i.Receiver.AsObject()?.NativeState as StringBuilder)?[i.Arguments[0].AsInt()] ?? '\0'));
         vm.RegisterNative(c.Name, "setCharAt", "(IC)V", i => { var sb = i.Receiver.AsObject()?.NativeState as StringBuilder; if (sb != null) sb[i.Arguments[0].AsInt()] = (char)i.Arguments[1].AsInt(); return JValue.Void; });
-        vm.RegisterNative(c.Name, "setLength", "(I)V", i => { (i.Receiver.AsObject()?.NativeState as StringBuilder)?.Length(i.Arguments[0].AsInt()); return JValue.Void; });
-        vm.RegisterNative(c.Name, "reverse", "()Ljava/lang/StringBuffer;", i => { var sb = i.Receiver.AsObject()?.NativeState as StringBuilder; sb?.Reverse(); return i.Receiver; });
+        vm.RegisterNative(c.Name, "setLength", "(I)V", i => { var sb = i.Receiver.AsObject()?.NativeState as StringBuilder; if (sb != null) { int n = Math.Max(0, i.Arguments[0].AsInt()); if (n < sb.Length) sb.Length = n; else if (n > sb.Length) sb.Append('\0', n - sb.Length); } return JValue.Void; });
+        vm.RegisterNative(c.Name, "reverse", "()Ljava/lang/StringBuffer;", i => { var sb = i.Receiver.AsObject()?.NativeState as StringBuilder; if (sb != null) { var chars = sb.ToString().ToCharArray(); Array.Reverse(chars); sb.Clear(); sb.Append(chars); } return i.Receiver; });
         vm.RegisterNative(c.Name, "deleteCharAt", "(I)Ljava/lang/StringBuffer;", i => { (i.Receiver.AsObject()?.NativeState as StringBuilder)?.Remove(i.Arguments[0].AsInt(), 1); return i.Receiver; });
         vm.RegisterNative(c.Name, "insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;", i => { (i.Receiver.AsObject()?.NativeState as StringBuilder)?.Insert(i.Arguments[0].AsInt(), vm.StringValue(i.Arguments[1])); return i.Receiver; });
         // FIX: descriptor-aware conversion (old code appended int 65 as 'A')
@@ -924,9 +938,41 @@ internal static class BuiltinJavaLibrary
         vm.RegisterNative(c.Name, "currentTimeMillis", "()J", _ => JValue.Long(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
         vm.RegisterNative(c.Name, "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V", i =>
         {
-            var src = i.Arguments[0].AsArray() ?? throw new InvalidOperationException("arraycopy src");
-            var dst = i.Arguments[2].AsArray() ?? throw new InvalidOperationException("arraycopy dst");
-            Array.Copy(src.Elements, i.Arguments[1].AsInt(), dst.Elements, i.Arguments[3].AsInt(), i.Arguments[4].AsInt());
+            var src = i.Arguments[0].AsArray();
+            var dst = i.Arguments[2].AsArray();
+            if (src == null || dst == null) throw new JvmException(vm.CreateExceptionObject("java.lang.NullPointerException"), 0);
+            int srcPos = i.Arguments[1].AsInt(), dstPos = i.Arguments[3].AsInt(), len = i.Arguments[4].AsInt();
+            if (srcPos < 0 || dstPos < 0 || len < 0 || srcPos > src.Elements.Length - len || dstPos > dst.Elements.Length - len)
+                throw new JvmException(vm.CreateExceptionObject("java.lang.ArrayIndexOutOfBoundsException"), 0);
+
+            // System.arraycopy has overlap-safe memmove semantics and performs
+            // ArrayStoreException checks for reference arrays.  Copy backwards
+            // when the ranges overlap in the same array.
+            bool srcRef = src.ComponentDescriptor.StartsWith("L", StringComparison.Ordinal) || src.ComponentDescriptor.StartsWith("[", StringComparison.Ordinal);
+            bool dstRef = dst.ComponentDescriptor.StartsWith("L", StringComparison.Ordinal) || dst.ComponentDescriptor.StartsWith("[", StringComparison.Ordinal);
+            if (src.ComponentDescriptor == dst.ComponentDescriptor)
+            {
+                if (ReferenceEquals(src, dst) && dstPos > srcPos && dstPos < srcPos + len)
+                    for (int n = len - 1; n >= 0; n--) dst.Elements[dstPos + n] = src.Elements[srcPos + n];
+                else
+                    for (int n = 0; n < len; n++) dst.Elements[dstPos + n] = src.Elements[srcPos + n];
+            }
+            else if (!srcRef || !dstRef)
+            {
+                throw new JvmException(vm.CreateExceptionObject("java.lang.ArrayStoreException"), 0);
+            }
+            else
+            {
+                var temp = new JValue[len];
+                for (int n = 0; n < len; n++) temp[n] = src.Elements[srcPos + n];
+                for (int n = 0; n < len; n++)
+                {
+                    var v = temp[n];
+                    if (v.AsReference() is not null && !ArrayComponentAssignable(vm, dst.ComponentDescriptor, v))
+                        throw new JvmException(vm.CreateExceptionObject("java.lang.ArrayStoreException"), 0);
+                    dst.Elements[dstPos + n] = v;
+                }
+            }
             return JValue.Void;
         });
         vm.RegisterNative(c.Name, "exit", "(I)V", _ => JValue.Void);
@@ -953,6 +999,24 @@ internal static class BuiltinJavaLibrary
         });
         vm.SetStatic(c, "out", "Ljava/io/PrintStream;", JValue.Ref(new JObject { Class = vm.LoadClass("java.io.PrintStream"), NativeState = "stdout" }));
         vm.SetStatic(c, "err", "Ljava/io/PrintStream;", JValue.Ref(new JObject { Class = vm.LoadClass("java.io.PrintStream"), NativeState = "stderr" }));
+    }
+
+    private static bool ArrayComponentAssignable(JavaVm vm, string descriptor, JValue value)
+    {
+        if (value.AsReference() is null) return true;
+        if (descriptor.StartsWith("L", StringComparison.Ordinal) && descriptor.EndsWith(";"))
+        {
+            var target = vm.LoadClass(descriptor[1..^1]);
+            return value.AsReference() switch
+            {
+                JObject o => o.Class.IsAssignableTo(target),
+                JArray a => a.Class.IsAssignableTo(target),
+                _ => false
+            };
+        }
+        if (descriptor.StartsWith("[", StringComparison.Ordinal))
+            return value.AsReference() is JArray a && a.Class.IsAssignableTo(vm.LoadClass(descriptor));
+        return false;
     }
 
     private static void RegisterCharacter(JavaVm vm, JClass c)
@@ -1154,8 +1218,8 @@ internal static class BuiltinJavaLibrary
     private static void RegisterRandom(JavaVm vm, JClass c)
     {
         vm.RegisterNative(c.Name, "<init>", "()V", i => { i.Receiver.AsObject()!.NativeState = new System.Random(); return JValue.Void; });
-        vm.RegisterNative(c.Name, "<init>", "(J)V", i => { i.Receiver.AsObject()!.NativeState = new System.Random(i.Arguments[0].AsLong()); return JValue.Void; });
-        vm.RegisterNative(c.Name, "setSeed", "(J)V", i => { i.Receiver.AsObject()!.NativeState = new System.Random(i.Arguments[0].AsLong()); return JValue.Void; });
+        vm.RegisterNative(c.Name, "<init>", "(J)V", i => { i.Receiver.AsObject()!.NativeState = new System.Random(unchecked((int)i.Arguments[0].AsLong())); return JValue.Void; });
+        vm.RegisterNative(c.Name, "setSeed", "(J)V", i => { i.Receiver.AsObject()!.NativeState = new System.Random(unchecked((int)i.Arguments[0].AsLong())); return JValue.Void; });
         vm.RegisterNative(c.Name, "nextInt", "()I", i => JValue.Int(Rand(i).Next()));
         vm.RegisterNative(c.Name, "nextInt", "(I)I", i => { int n = Math.Max(1, i.Arguments[0].AsInt()); return JValue.Int(Rand(i).Next(n)); });
         vm.RegisterNative(c.Name, "nextLong", "()J", i => JValue.Long(Rand(i).NextInt64()));
@@ -1205,6 +1269,12 @@ internal static class BuiltinJavaLibrary
         });
         vm.RegisterNative(c.Name, "getCodeBase", "()Ljava/net/URL;", i => JValue.Ref(StubUrl(vm, i, false)));
         vm.RegisterNative(c.Name, "getDocumentBase", "()Ljava/net/URL;", i => JValue.Ref(StubUrl(vm, i, true)));
+        vm.RegisterNative(c.Name, "setStub", "(Ljava/applet/AppletStub;)V", i =>
+        {
+            if (i.Receiver.AsObject()?.NativeState is JavaAppletNativeState st) st.JavaStubObject = i.Arguments[0].AsObject();
+            return JValue.Void;
+        });
+        vm.RegisterNative(c.Name, "getStub", "()Ljava/applet/AppletStub;", i => JValue.Ref((i.Receiver.AsObject()?.NativeState as JavaAppletNativeState)?.JavaStubObject));
         vm.RegisterNative(c.Name, "getAppletContext", "()Ljava/applet/AppletContext;", i =>
         {
             var st = i.Receiver.AsObject()?.NativeState as JavaAppletNativeState;
@@ -1235,9 +1305,6 @@ internal static class BuiltinJavaLibrary
             var u = i.Arguments[0].AsObject()?.NativeState as ParsedUrl;
             return JValue.Ref(vm.GraphicsFactory.LoadImage(u?.ToAbsolute() ?? ""));
         });
-        foreach (var d in new[] { "(Ljava/net/URL;)", "(Ljava/net/URL;Ljava/lang/String;)" })
-            vm.RegisterNative(c.Name, d.Contains(';') && d.EndsWith("Ljava/lang/String;)") ? "getAudioClip" : "getAudioClip", d.Replace("(", "(Ljava/applet/AudioClip;"), _ => JValue.Void); // placeholder replaced below
-        // (rewritten explicitly below to keep descriptors exact)
         vm.RegisterNative(c.Name, "getAudioClip", "(Ljava/net/URL;)Ljava/applet/AudioClip;", _ => JValue.Ref(new JObject { Class = vm.LoadClass("java.applet.AudioClip") }));
         vm.RegisterNative(c.Name, "getAudioClip", "(Ljava/net/URL;Ljava/lang/String;)Ljava/applet/AudioClip;", _ => JValue.Ref(new JObject { Class = vm.LoadClass("java.applet.AudioClip") }));
         vm.RegisterNative(c.Name, "play", "(Ljava/net/URL;)V", _ => JValue.Void);
@@ -1250,6 +1317,31 @@ internal static class BuiltinJavaLibrary
         var p = doc ? st?.Stub?.DocumentBase : st?.Stub?.CodeBase;
         if (p == null) return null;
         return new JObject { Class = vm.LoadClass("java.net.URL"), NativeState = p };
+    }
+
+    private static void RegisterAppletStub(JavaVm vm, JClass c)
+    {
+        vm.RegisterNative(c.Name, "isActive", "()Z", i => JValue.Int((i.Receiver.AsObject()?.NativeState as JavaAppletStubState)?.Active == true ? 1 : 0));
+        vm.RegisterNative(c.Name, "getDocumentBase", "()Ljava/net/URL;", i =>
+        {
+            var p = (i.Receiver.AsObject()?.NativeState as JavaAppletStubState)?.DocumentBase;
+            return JValue.Ref(p == null ? null : new JObject { Class = vm.LoadClass("java.net.URL"), NativeState = p });
+        });
+        vm.RegisterNative(c.Name, "getCodeBase", "()Ljava/net/URL;", i =>
+        {
+            var p = (i.Receiver.AsObject()?.NativeState as JavaAppletStubState)?.CodeBase;
+            return JValue.Ref(p == null ? null : new JObject { Class = vm.LoadClass("java.net.URL"), NativeState = p });
+        });
+        vm.RegisterNative(c.Name, "getParameter", "(Ljava/lang/String;)Ljava/lang/String;", i =>
+        {
+            var st = i.Receiver.AsObject()?.NativeState as JavaAppletStubState;
+            return st?.Parameters.TryGetValue(vm.StringValue(i.Arguments[0]), out var value) == true ? JValue.Ref(vm.CreateString(value)) : JValue.Ref(null);
+        });
+        vm.RegisterNative(c.Name, "appletResize", "(II)V", i =>
+        {
+            if (i.Receiver.AsObject()?.NativeState is JavaAppletStubState st) st.Resize?.Invoke(i.Arguments[0].AsInt(), i.Arguments[1].AsInt());
+            return JValue.Void;
+        });
     }
 
     private static void RegisterAppletContext(JavaVm vm, JClass c)
@@ -1392,17 +1484,17 @@ internal static class BuiltinJavaLibrary
             i.Receiver.AsObject()!.NativeState = Color.FromArgb(Math.Clamp(i.Arguments[3].AsInt(), 0, 255), Math.Clamp(i.Arguments[0].AsInt(), 0, 255), Math.Clamp(i.Arguments[1].AsInt(), 0, 255), Math.Clamp(i.Arguments[2].AsInt(), 0, 255));
             return JValue.Void;
         });
-        foreach (var p in new[] { ("black", Color.Black), ("white", Color.White), ("red", Color.Red), ("green", Color.Green), ("blue", Color.Blue), ("yellow", Color.Yellow), ("gray", Color.Gray), ("lightGray", Color.LightGray), ("darkGray", Color.DarkGray), ("orange", Color.Orange), ("magenta", Color.Magenta), ("cyan", Color.Cyan), ("pink", Color.Pink) })
+        foreach (var p in new[] { ("black", Color.Black), ("white", Color.White), ("red", Color.Red), ("green", Color.Green), ("blue", Color.Blue), ("yellow", Color.Yellow), ("gray", Color.Gray), ("lightGray", Color.LightGray), ("darkGray", Color.DarkGray), ("orange", Color.Orange), ("magenta", Color.FromArgb(255, 0, 255)), ("cyan", Color.FromArgb(0, 255, 255)), ("pink", Color.FromArgb(255, 192, 203)) })
             vm.SetStatic(c, p.Item1, "Ljava/awt/Color;", JValue.Ref(new JObject { Class = c, NativeState = p.Item2 }));
         vm.RegisterNative(c.Name, "getRed", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1) ? c1.R : 0));
         vm.RegisterNative(c.Name, "getGreen", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1) ? c1.G : 0));
         vm.RegisterNative(c.Name, "getBlue", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1) ? c1.B : 0));
         vm.RegisterNative(c.Name, "getAlpha", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1) ? c1.A : 255));
-        vm.RegisterNative(c.Name, "getRGB", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1 ? c1.ToArgb() : 0xFF000000)));
+        vm.RegisterNative(c.Name, "getRGB", "()I", i => JValue.Int(i.Receiver.AsObject()?.NativeState is Color c1 ? unchecked((int)((uint)c1.A << 24 | (uint)c1.R << 16 | (uint)c1.G << 8 | (uint)c1.B)) : unchecked((int)0xFF000000u)));
         vm.RegisterNative(c.Name, "brighter", "()Ljava/awt/Color;", i => JValue.Ref(new JObject { Class = c, NativeState = Scale((Color)(i.Receiver.AsObject()?.NativeState ?? Color.Black), 1.0 / 0.7) }));
         vm.RegisterNative(c.Name, "darker", "()Ljava/awt/Color;", i => JValue.Ref(new JObject { Class = c, NativeState = Scale((Color)(i.Receiver.AsObject()?.NativeState ?? Color.Black), 0.7) }));
-        vm.RegisterNative(c.Name, "equals", "(Ljava/lang/Object;)Z", i => JValue.Int(i.Receiver.AsObject()?.NativeState is Color a && i.Arguments[0].AsObject()?.NativeState is Color b && a.ToArgb() == b.ToArgb() ? 1 : 0));
-        vm.RegisterNative(c.Name, "hashCode", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1 ? c1.ToArgb() : 0)));
+        vm.RegisterNative(c.Name, "equals", "(Ljava/lang/Object;)Z", i => JValue.Int(i.Receiver.AsObject()?.NativeState is Color a && i.Arguments[0].AsObject()?.NativeState is Color b && a == b ? 1 : 0));
+        vm.RegisterNative(c.Name, "hashCode", "()I", i => JValue.Int((i.Receiver.AsObject()?.NativeState is Color c1 ? unchecked((int)((uint)c1.A << 24 | (uint)c1.R << 16 | (uint)c1.G << 8 | c1.B)) : 0)));
     }
     private static Color Scale(Color c, double f) =>
         Color.FromArgb(c.A, (int)Math.Clamp(c.R * f, 0, 255), (int)Math.Clamp(c.G * f, 0, 255), (int)Math.Clamp(c.B * f, 0, 255));
@@ -1496,7 +1588,15 @@ internal static class BuiltinJavaLibrary
             catch (ThreadInterruptedException) { throw new JvmException(vm.CreateExceptionObject("java.lang.InterruptedException"), -1); }
             return JValue.Void;
         });
-        vm.RegisterNative(c.Name, "stop", "()V", i => { if (i.Receiver.AsObject()?.NativeState is JavaThreadNativeState s) s.Alive = false; return JValue.Void; });
+        vm.RegisterNative(c.Name, "stop", "()V", i =>
+        {
+            if (i.Receiver.AsObject()?.NativeState is JavaThreadNativeState s)
+            {
+                s.Alive = false;
+                try { s.Thread?.Interrupt(); } catch { }
+            }
+            return JValue.Void;
+        });
         vm.RegisterNative(c.Name, "interrupt", "()V", i =>
         {
             if (i.Receiver.AsObject()?.NativeState is JavaThreadNativeState s)
@@ -1561,7 +1661,7 @@ internal static class JavaText
 public sealed class JavaThreadNativeState { public Thread? Thread; public JObject? Target; public bool Alive; public bool Interrupted; public string Name = ""; }
 public sealed class JavaAppletNativeState
 {
-    public JavaAppletStubState? Stub; public bool Active; public int Width = 300; public int Height = 200;
+    public JavaAppletStubState? Stub; public JObject? JavaStubObject; public bool Active; public int Width = 300; public int Height = 200;
     public readonly List<JObject> Listeners = new();
     public JavaComponentState Component = new();
 }
@@ -1588,6 +1688,7 @@ public sealed class JavaComponentState
     public JObject? Layout;
     public string? LayoutConstraint;
     public string Text = "";
+    public bool Editable = true;
     public bool Checked;
     public readonly List<string> Items = new();
     public int Selected = -1;

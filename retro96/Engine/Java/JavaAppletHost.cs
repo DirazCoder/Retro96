@@ -108,8 +108,8 @@ public sealed class JavaAppletHost : IDisposable
         if (instance == null) return false;
         try
         {
-            int x = Math.Max(0, input.X - (int)Math.Round(box.ContentRect.X - box.X));
-            int y = Math.Max(0, input.Y - (int)Math.Round(box.ContentRect.Y - box.Y));
+            int x = input.X - (int)Math.Round(box.ContentRect.X - box.X);
+            int y = input.Y - (int)Math.Round(box.ContentRect.Y - box.Y);
             return JavaComponentBridge.Dispatch(instance.Vm, instance.Object, input with { X = x, Y = y });
         }
         catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.input", ex); return false; }
@@ -126,6 +126,7 @@ public sealed class JavaAppletHost : IDisposable
         {
             instance.Started = true;
             instance.State.Active = true;
+            if (instance.State.Stub != null) instance.State.Stub.Active = true;
             instance.Vm.InvokeVirtual(instance.Object, "start", "()V");
         }
         catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.start", ex); }
@@ -141,6 +142,7 @@ public sealed class JavaAppletHost : IDisposable
             {
                 if (i.Started) i.Vm.InvokeVirtual(i.Object, "stop", "()V");
                 i.State.Active = false;
+                if (i.State.Stub != null) i.State.Stub.Active = false;
                 if (i.Initialized) i.Vm.InvokeVirtual(i.Object, "destroy", "()V");
             }
             catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.stop", ex); }
@@ -265,11 +267,22 @@ public sealed class JavaAppletHost : IDisposable
         if (obj.NativeState is not JavaAppletNativeState) obj.NativeState = new JavaAppletNativeState();
         var state = (JavaAppletNativeState)obj.NativeState!;
         state.Stub = stub;
+        stub.Resize = (w, h) =>
+        {
+            state.Width = Math.Max(1, w);
+            state.Height = Math.Max(1, h);
+            state.Component.Width = state.Width;
+            state.Component.Height = state.Height;
+            RepaintRequested?.Invoke();
+        };
+        var stubObject = new JObject { Class = vm.LoadClass("java.applet.AppletStub"), NativeState = stub };
+        state.JavaStubObject = stubObject;
         state.Active = false;
         state.Width = Math.Max(1, element.GetAttrInt("width", 300));
         state.Height = Math.Max(1, element.GetAttrInt("height", 200));
         state.Component.Width = state.Width;
         state.Component.Height = state.Height;
+        vm.InvokeVirtual(obj, "setStub", "(Ljava/applet/AppletStub;)V", JValue.Ref(stubObject));
 
         lock (_gate) _instances[element] = new Instance { Element = element, Class = klass, Object = obj, Vm = vm, State = state };
         try { vm.InvokeVirtual(obj, "init", "()V"); }
