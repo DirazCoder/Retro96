@@ -136,6 +136,9 @@ public class BrowserCanvas : Control
     private bool _embeddedMidiVolumeDragging;
     private DomElement? _focusedEmbeddedElement;
     private DomElement? _pressedEmbeddedElement;
+    private readonly Retro96.Engine.Java.JavaAppletHost _javaApplets;
+    private DomElement? _focusedJavaAppletElement;
+    private DomElement? _pressedJavaAppletElement;
 
     // Internal callbacks are fields rather than Control properties so WinForms
     // designer serialization never tries to persist delegates from the host.
@@ -244,6 +247,10 @@ public class BrowserCanvas : Control
 
     public BrowserCanvas()
     {
+        _javaApplets = new Retro96.Engine.Java.JavaAppletHost();
+        _javaApplets.RepaintRequested = RequestRerender;
+        _javaApplets.NavigateRequested = NavigateTo;
+        _javaApplets.StatusChanged = SetStatus;
         DoubleBuffered = true;
         SetStyle(
             ControlStyles.OptimizedDoubleBuffer |
@@ -319,6 +326,7 @@ public class BrowserCanvas : Control
             _taCacheLines = null;
             _taCacheText = null;
             _taCacheFont = null;
+            _javaApplets.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -362,6 +370,8 @@ public class BrowserCanvas : Control
         _focusedInputFrame = null;
         _focusedEmbeddedElement = null;
         _pressedEmbeddedElement = null;
+        _focusedJavaAppletElement = null;
+        _pressedJavaAppletElement = null;
         _fieldDragging = false;
         _lastFieldClickElement = null;
         _lastFieldClickFrame = null;
@@ -414,6 +424,7 @@ public class BrowserCanvas : Control
         _blinkTimer.Stop();
 
         _lastStatus = "";
+        _ = _javaApplets.PreparePageAsync(doc, _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"));
         PageChanged?.Invoke();
     }
 
@@ -911,9 +922,25 @@ public class BrowserCanvas : Control
         _embeddedMidiPressedAction = null;
         _embeddedMidiVolumeDragging = false;
         _embeddedMidiRect = RectangleF.Empty;
+        _focusedJavaAppletElement = null;
+        _pressedJavaAppletElement = null;
+        _javaApplets.StopPage();
         _scrollOffset = PointF.Empty;
         UpdateScrollBars();
         Invalidate();
+    }
+
+    private Bitmap? ResolveEmbeddedContent(DomElement element, LayoutBox box, bool printRendering)
+    {
+        if (element.TagName == "applet")
+            return _javaApplets.Resolve(element, box, printRendering);
+        return EmbeddedFrameResolver?.Invoke(element, box, printRendering);
+    }
+
+    internal void PrepareJavaAppletsAsync(DomDocument document)
+    {
+        if (_resourceLoader == null) return;
+        _ = _javaApplets.PreparePageAsync(document, _resourceLoader);
     }
 
     public void ReRenderPage(FontCache fontCache, ImageCache imageCache,
@@ -936,7 +963,7 @@ public class BrowserCanvas : Control
                 PressedElement = _pressedControl,
                 TextareaStateResolver = GetTextareaRenderState,
                 SelectScrollResolver = GetSelectScrollOffset,
-                EmbeddedFrameResolver = EmbeddedFrameResolver
+                EmbeddedFrameResolver = ResolveEmbeddedContent
             };
 
             var newBitmap = renderer.Render(
@@ -988,7 +1015,7 @@ public class BrowserCanvas : Control
                 PressedElement = _pressedControlFrame == view ? _pressedControl : null,
                 TextareaStateResolver = GetTextareaRenderState,
                 SelectScrollResolver = GetSelectScrollOffset,
-                EmbeddedFrameResolver = EmbeddedFrameResolver
+                EmbeddedFrameResolver = ResolveEmbeddedContent
             };
             var bmp = renderer.Render(
                 view.RootBox, view.Document,
@@ -2165,6 +2192,13 @@ public class BrowserCanvas : Control
         base.OnMouseWheel(e);
         float px = e.X / _pluginZoom + _scrollOffset.X;
         float py = e.Y / _pluginZoom + _scrollOffset.Y;
+        if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jab) && jab.HitTest(px, py))
+        {
+            SendJavaAppletInput(_focusedJavaAppletElement, jab, new Retro96.Engine.Java.JavaInput(
+                Retro96.Engine.Java.JavaInputKind.MouseWheel, (int)Math.Round(px - jab.X), (int)Math.Round(py - jab.Y),
+                0, e.Delta, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+            return;
+        }
         if (_focusedEmbeddedElement != null && TryGetEmbeddedBox(_focusedEmbeddedElement, out var feb) &&
             feb.HitTest(px, py))
         {
@@ -2493,7 +2527,14 @@ public class BrowserCanvas : Control
     private void OnEmbeddedKeyDown(object? sender, KeyEventArgs e)
     {
         if (e.KeyCode is Keys.F11 or Keys.F12) return;
-        if (_focusedEmbeddedElement == null || _focusedInput != null) return;
+        if (_focusedInput != null) return;
+        if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jb))
+        {
+            SendJavaAppletInput(_focusedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
+                Retro96.Engine.Java.JavaInputKind.KeyDown, 0, 0, 0, 0, (int)e.KeyCode, '\0', e.Shift, e.Control, e.Alt));
+            return;
+        }
+        if (_focusedEmbeddedElement == null) return;
         SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
             EmbeddedInputEventKind.KeyDown, KeyCode: (int)e.KeyCode, Shift: e.Shift,
             Control: e.Control, Alt: e.Alt, Meta: e.KeyData.HasFlag(Keys.LWin) || e.KeyData.HasFlag(Keys.RWin)));
@@ -2502,7 +2543,14 @@ public class BrowserCanvas : Control
     private void OnEmbeddedKeyUp(object? sender, KeyEventArgs e)
     {
         if (e.KeyCode is Keys.F11 or Keys.F12) return;
-        if (_focusedEmbeddedElement == null || _focusedInput != null) return;
+        if (_focusedInput != null) return;
+        if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jb))
+        {
+            SendJavaAppletInput(_focusedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
+                Retro96.Engine.Java.JavaInputKind.KeyUp, 0, 0, 0, 0, (int)e.KeyCode, '\0', e.Shift, e.Control, e.Alt));
+            return;
+        }
+        if (_focusedEmbeddedElement == null) return;
         SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
             EmbeddedInputEventKind.KeyUp, KeyCode: (int)e.KeyCode, Shift: e.Shift,
             Control: e.Control, Alt: e.Alt, Meta: e.KeyData.HasFlag(Keys.LWin) || e.KeyData.HasFlag(Keys.RWin)));
@@ -2510,6 +2558,12 @@ public class BrowserCanvas : Control
 
     private void OnCanvasKeyPress(object? sender, KeyPressEventArgs e)
     {
+        if (_focusedJavaAppletElement != null && _focusedInput == null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var keyAppletBox))
+        {
+            SendJavaAppletInput(_focusedJavaAppletElement, keyAppletBox, new Retro96.Engine.Java.JavaInput(
+                Retro96.Engine.Java.JavaInputKind.KeyDown, 0, 0, 0, 0, 0, e.KeyChar, (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+            return;
+        }
         if (_focusedEmbeddedElement != null && _focusedInput == null)
         {
             SendEmbeddedInput(_focusedEmbeddedElement, new EmbeddedInputEvent(
@@ -3378,6 +3432,12 @@ public class BrowserCanvas : Control
         float x = e.X / _pluginZoom + _scrollOffset.X;
         float y = e.Y / _pluginZoom + _scrollOffset.Y;
 
+        if (e.Button == MouseButtons.Left && TryBeginJavaAppletInput(x, y, e))
+        {
+            Capture = true;
+            return;
+        }
+
         if (e.Button == MouseButtons.Left && TryBeginEmbeddedInput(x, y, e))
         {
             Capture = true;
@@ -3662,6 +3722,38 @@ public class BrowserCanvas : Control
         Invalidate();
     }
 
+    private bool TryGetJavaAppletBox(DomElement element, out LayoutBox box)
+    {
+        box = null!;
+        if (_rootBox == null) return false;
+        box = FindBoxForElement(_rootBox, element)!;
+        return box != null;
+    }
+
+    private void SendJavaAppletInput(DomElement element, LayoutBox box, Retro96.Engine.Java.JavaInput input)
+    {
+        try { _javaApplets.DispatchInput(element, box, input); RequestRerender(); }
+        catch (Exception ex) { Retro96.DebugLog.WriteException("JavaAppletInput", ex); }
+    }
+
+    private bool TryBeginJavaAppletInput(float x, float y, MouseEventArgs e)
+    {
+        if (_rootBox == null || _document == null) return false;
+        var box = HitTestDeepestBox(_rootBox, x, y);
+        var element = box?.Element;
+        if (element?.TagName != "applet" || box == null) return false;
+        if (!ReferenceEquals(_focusedJavaAppletElement, element))
+        {
+            _focusedJavaAppletElement = element;
+            _focusedEmbeddedElement = null;
+        }
+        _pressedJavaAppletElement = element;
+        SendJavaAppletInput(element, box, new Retro96.Engine.Java.JavaInput(
+            Retro96.Engine.Java.JavaInputKind.MouseDown, (int)Math.Round(x - box.X), (int)Math.Round(y - box.Y),
+            (int)e.Button, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+        return true;
+    }
+
     private bool TryBeginEmbeddedInput(float x, float y, MouseEventArgs e)
     {
         if (_rootBox == null || _document == null || EmbeddedInputDispatcher == null) return false;
@@ -3715,6 +3807,17 @@ public class BrowserCanvas : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+
+        if (_pressedJavaAppletElement != null && Capture)
+        {
+            float px = e.X / _pluginZoom + _scrollOffset.X;
+            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            if (TryGetJavaAppletBox(_pressedJavaAppletElement, out var jb))
+                SendJavaAppletInput(_pressedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
+                    Retro96.Engine.Java.JavaInputKind.MouseMove, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
+                    0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
+            return;
+        }
 
         if (_pressedEmbeddedElement != null && Capture)
         {
@@ -4068,6 +4171,20 @@ public class BrowserCanvas : Control
             _selectScrollbarDragging = false;
             _selectScrollbarDragSelect = null;
             _selectScrollbarDragFrame = null;
+            Capture = false;
+            return;
+        }
+
+        if (_pressedJavaAppletElement != null)
+        {
+            var applet = _pressedJavaAppletElement;
+            _pressedJavaAppletElement = null;
+            float px = e.X / _pluginZoom + _scrollOffset.X;
+            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            if (TryGetJavaAppletBox(applet, out var jb))
+                SendJavaAppletInput(applet, jb, new Retro96.Engine.Java.JavaInput(
+                    Retro96.Engine.Java.JavaInputKind.MouseUp, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
+                    (int)e.Button, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
             Capture = false;
             return;
         }
@@ -6597,7 +6714,7 @@ public class BrowserCanvas : Control
             var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
             {
                 PressedElement = null,
-                EmbeddedFrameResolver = EmbeddedFrameResolver,
+                EmbeddedFrameResolver = ResolveEmbeddedContent,
                 IsPrintRendering = true
             };
 

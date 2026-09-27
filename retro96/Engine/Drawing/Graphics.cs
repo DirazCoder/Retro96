@@ -176,6 +176,29 @@ public sealed class Graphics : IDisposable
         _canvas.DrawPath(path, sb.Prepare(ShapeAntiAlias));
     }
 
+    public void DrawPolygon(Pen pen, PointF[] points)
+    {
+        if (pen == null || points == null || points.Length < 2) return;
+        using var path = new SKPath();
+        var skPoints = new SKPoint[points.Length];
+        for (int i = 0; i < points.Length; i++)
+            skPoints[i] = new SKPoint(points[i].X, points[i].Y);
+        path.AddPoly(skPoints, true);
+        _canvas.DrawPath(path, pen.Prepare(ShapeAntiAlias));
+    }
+
+    public void DrawArc(Pen pen, float x, float y, float width, float height, float startAngle, float sweepAngle)
+    {
+        if (pen == null || width <= 0f || height <= 0f) return;
+        _canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, false, pen.Prepare(ShapeAntiAlias));
+    }
+
+    public void FillPie(Brush brush, float x, float y, float width, float height, float startAngle, float sweepAngle)
+    {
+        if (brush is not SolidBrush sb || width <= 0f || height <= 0f) return;
+        _canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, true, sb.Prepare(ShapeAntiAlias));
+    }
+
     // ── Images ─────────────────────────────────────────────────────────
 
     private SKSamplingOptions Sampling =>

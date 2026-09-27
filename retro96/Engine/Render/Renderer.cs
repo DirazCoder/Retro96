@@ -1040,6 +1040,7 @@ public class Renderer
                         }
                     case "hr":
                         return;   // painted as border
+                    case "applet":
                     case "embed":
                         if (EmbeddedFrameResolver?.Invoke(box.Element, box, IsPrintRendering) is { } embeddedFrame)
                         {
