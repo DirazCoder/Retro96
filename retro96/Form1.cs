@@ -504,6 +504,14 @@ public partial class Form1 : Form
             requestedUrl = localUrl;
         rawUrl = requestedUrl;
 
+        // Keep the address bar/history URL synchronized with the navigation
+        // attempt before any error page is rendered.  Local file failures use
+        // RenderErrorAsync(), which historically took _txtUrl.Text; leaving
+        // the old page URL there caused the generated error page to be
+        // treated as a duplicate of the current entry, so Back skipped the
+        // page that was actually being left.
+        _txtUrl.Text = rawUrl;
+
         if (rawUrl.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
             !_hostOpenedLocalDocument && !BrowserRuntime.AllowPageFileAccess)
         {

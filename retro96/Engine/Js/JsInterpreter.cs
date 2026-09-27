@@ -611,11 +611,14 @@ public class JsInterpreter
             }
             catch (Exception ex)
             {
+                // An uncaught exception from an asynchronous timer is a page-script
+                // error. Modern browsers report it to the developer console; they do
+                // not replace the page's normal status text with the exception.
+                // Keep the browser running and leave the rendered document untouched.
                 string message = ex.Message.StartsWith("Error: ", StringComparison.Ordinal)
                     ? ex.Message[7..]
                     : ex.Message;
-                _setStatus($"Page timer exception was caught; the browser continued running: {message}");
-                PublishConsole("error", $"Timer error: {message}");
+                PublishConsole("error", $"Uncaught timer exception: {message}");
             }
             finally
             {
