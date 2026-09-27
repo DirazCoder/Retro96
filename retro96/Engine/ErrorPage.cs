@@ -18,22 +18,24 @@ public static class ErrorPage
     private static string Footer => @"
 <table width=""100%"" cellpadding=""0"" cellspacing=""0"" border=""0"">
 <tr>
-  <td align=""left""><font face=""Arial,Helvetica"" size=""-2"" color=""#808080"">
-    &copy; 2026 Retro96 Project &mdash; Netscape Navigator 3.0 Compatible
+  <td align=""left""><font face=""Arial,Helvetica"" size=""+1"" color=""#808080"">
+    &copy; 2026 Retro96 Project
   </font></td>
-  <td align=""right""><font face=""Arial,Helvetica"" size=""-2"" color=""#808080"">
+  <td align=""right""><font face=""Arial,Helvetica"" size=""+1"" color=""#808080"">
     <a href=""retro96://home"">Home</a>
   </font></td>
 </tr>
 </table>";
 
     // NOTE: The page uses a 100%x100% table to perfectly vertically and 
-    // horizontally centre the dialog. The dialog itself is much wider (760px)
-    // and uses nested tables for correct 1996-era cellular padding.
+    // horizontally centre the dialog. The dialog itself is wider (820px) and 
+    // uses nested tables for correct 1996-era cellular padding.
     //
-    // All entities here are BMP codepoints (&#9888; ⚠, &#8635; ↻, …).
-    // Astral-plane entities postdate 1996 and cannot survive a naive 
-    // (char)code entity decode, so they have been omitted.
+    // WARNING: All emoji and astral-plane symbols (e.g. &#9888; &#9201; &#8635;
+    // &#9733;) have been removed. They postdate the Unicode 1.1 / 2.0 era and 
+    // cannot survive a naive (char)code entity decode in 1996 browsers, so 
+    // the error pages now use only plain ASCII text, <blink>, <marquee>, and 
+    // coloured <font> tags to get that authentic 1996 look.
     private static string MakePageShell(string titleColor, string titleText, string bodyContent) => $@"<html>
 <head><title>{EscapeHtml(titleText)}</title></head>
 <body bgcolor=""#c0c0c0"" text=""#000000"" link=""#0000ff"" vlink=""#800080"">
@@ -41,23 +43,23 @@ public static class ErrorPage
 <tr>
   <td align=""center"" valign=""middle"">
     
-    <table bgcolor=""#c0c0c0"" border=""2"" cellpadding=""1"" cellspacing=""0"" width=""760"" style=""border-style:outset"">
+    <table bgcolor=""#c0c0c0"" border=""2"" cellpadding=""1"" cellspacing=""0"" width=""820"" style=""border-style:outset"">
     <tr><td>
       <table bgcolor=""#ffffff"" border=""2"" cellpadding=""0"" cellspacing=""0"" width=""100%"" style=""border-style:inset"">
         
         <tr><td bgcolor=""{titleColor}"">
-          <table width=""100%"" cellpadding=""6"" cellspacing=""0"" border=""0"">
+          <table width=""100%"" cellpadding=""10"" cellspacing=""0"" border=""0"">
           <tr>
-            <td align=""left""><font color=""#ffffff"" size=""+2"" face=""Arial,Helvetica""><b>{EscapeHtml(titleText)}</b></font></td>
-            <td align=""right""><font color=""#c0c0c0"" size=""-1"" face=""Arial,Helvetica"">Retro96</font></td>
+            <td align=""left""><font color=""#ffffff"" size=""+3"" face=""Arial,Helvetica""><b>{EscapeHtml(titleText)}</b></font></td>
+            <td align=""right""><font color=""#c0c0c0"" size=""+1"" face=""Arial,Helvetica""><b>Retro96</b></font></td>
           </tr>
           </table>
         </td></tr>
         
         <tr><td>
-          <table width=""100%"" cellpadding=""24"" cellspacing=""0"" border=""0"">
+          <table width=""100%"" cellpadding=""32"" cellspacing=""0"" border=""0"">
           <tr><td align=""left"" valign=""top"">
-          <font face=""Arial,Helvetica"">
+          <font face=""Arial,Helvetica"" size=""+1"">
 {bodyContent}
 <br>
 {Footer}
@@ -76,6 +78,23 @@ public static class ErrorPage
 </body>
 </html>";
 
+    // Big, friendly 1996-style warning banner used at the top of each error.
+    private static string WarningBanner(string title, string subtitle, string bg, string border, string fg) => $@"
+<table bgcolor=""{bg}"" border=""2"" bordercolor=""{border}"" cellpadding=""14"" cellspacing=""0"" width=""100%"" style=""border-style:outset"">
+<tr><td>
+  <table cellpadding=""0"" cellspacing=""0"" border=""0"">
+  <tr>
+    <td width=""40"" align=""center""><font color=""{fg}"" size=""+4"" face=""Arial,Helvetica""><b>!</b></font></td>
+    <td>
+      <font color=""{fg}"" face=""Arial,Helvetica""><b><span style=""font-size:larger"">{EscapeHtml(title)}</span></b></font><br>
+      <font color=""{fg}"" size=""+1"" face=""Arial,Helvetica"">{EscapeHtml(subtitle)}</font>
+    </td>
+  </tr>
+  </table>
+</td></tr>
+</table>
+<br>";
+
     /// <summary>
     /// Generate HTML for network errors (connection failed, DNS failure, etc.)
     /// </summary>
@@ -84,12 +103,12 @@ public static class ErrorPage
         string escapedUrl = EscapeHtml(url);
         string escapedMessage = EscapeHtml(message);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Unable to Connect</font></h2>
-<p>I couldn't open a connection to this address:</p>
+{WarningBanner("Unable to Connect", "A network connection could not be established.", "#ffcccc", "#cc0000", "#800000")}
+<font size=""+2""><b>The address I tried to reach:</b></font>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <p><b>The technical reason:</b> {escapedMessage}</p>
 <hr noshade color=""#c0c0c0"">
-<p>Here are a few things you can try to fix this:</p>
+<p><b>Here are a few things you can try to fix this:</b></p>
 <ul>
   <li>Double-check the address for any typos.</li>
   <li>Make sure your internet connection is actually plugged in and working.</li>
@@ -106,13 +125,13 @@ public static class ErrorPage
     {
         string escapedHost = EscapeHtml(host);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Server Not Found</font></h2>
+{WarningBanner("Server Not Found", "The host name could not be resolved by DNS.", "#ffffcc", "#cc9900", "#996600")}
 <marquee behavior=""scroll"" direction=""left"" scrollamount=""3"" bgcolor=""#ffff00"">
-  <font color=""#000000"" size=""-1""><b>&nbsp;Looking for the server... no luck! &nbsp;</b></font>
+  <font color=""#000000"" size=""+1""><b>&nbsp;&nbsp;Looking for the server... no luck! &nbsp;&nbsp;</b></font>
 </marquee>
-<br>
-<p>I looked, but I couldn't find <b><tt>{escapedHost}</tt></b> on the network.</p>
-<p>This usually means one of a few things:</p>
+<br><br>
+<p><font size=""+2"">I looked, but I couldn't find <b><tt>{escapedHost}</tt></b> on the network.</font></p>
+<p><b>This usually means one of a few things:</b></p>
 <ul>
   <li>You might have accidentally mistyped the address.</li>
   <li>The website might not exist anymore, or the domain expired.</li>
@@ -133,23 +152,17 @@ public static class ErrorPage
         string escapedUrl = EscapeHtml(url);
         string escapedMessage = EscapeHtml(message);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Security Warning</font></h2>
-<table bgcolor=""#ffffcc"" border=""1"" bordercolor=""#cc9900"" cellpadding=""8"" width=""100%"">
-<tr><td>
-  <font color=""#996600"">
-  <b>Heads up!</b> This site's security certificate couldn't be verified.<br>
-  Proceeding could expose your personal info to prying eyes.
-  </font>
-</td></tr>
-</table>
-<br>
+{WarningBanner("Security Warning", "This site's certificate could not be verified.", "#ffffcc", "#cc9900", "#996600")}
+<p><b><font color=""#996600"" size=""+1"">Heads up!</font></b> This site's security certificate couldn't be verified.
+Proceeding could expose your personal info to prying eyes.</p>
+<hr noshade color=""#c0c0c0"">
 <p><b>URL:</b> <tt>{escapedUrl}</tt></p>
 <p><b>What went wrong:</b> {escapedMessage}</p>
-<p>A valid certificate is how a website proves it is who it claims to be. 
-Without one, your connection isn't secure, and someone else might be able to 
+<p>A valid certificate is how a website proves it is who it claims to be.
+Without one, your connection isn't secure, and someone else might be able to
 read the information you send.</p>
 <hr noshade color=""#c0c0c0"">
-<p>Are you sure you want to continue anyway?</p>
+<p><b><font size=""+1"">Are you sure you want to continue anyway?</font></b></p>
 <form onsubmit=""if(confirm('WARNING: You are about to accept an untrusted certificate.\n\nProceed only if you understand the risks.\n\nContinue?')) {{ window.acceptCertRisk && window.acceptCertRisk(); }} return false;"">
   <input type=""submit"" value=""  Accept Risk and Continue  "">&nbsp;&nbsp;
   <input type=""button"" value=""  Go Back (Recommended)  "" onclick=""history.back()"">
@@ -165,8 +178,8 @@ read the information you send.</p>
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">&#9201; Connection Timed Out</font></h2>
-<p>I tried reaching <b><tt>{escapedUrl}</tt></b>, but it's taking way too long to respond.</p>
+{WarningBanner("Connection Timed Out", "The server did not respond in time.", "#ffcccc", "#cc0000", "#800000")}
+<p><font size=""+2"">I tried reaching <b><tt>{escapedUrl}</tt></b>, but it's taking way too long to respond.</font></p>
 <p>I waited as long as I could, but eventually had to give up.</p>
 <hr noshade color=""#c0c0c0"">
 <p><b>Why did this happen?</b></p>
@@ -176,7 +189,7 @@ read the information you send.</p>
   <li>A firewall might be blocking the connection.</li>
   <li>The website might have crashed or gone offline.</li>
 </ul>
-<p><a href=""retro96://reload"">&#8635; Try Again</a></p>";
+<p><a href=""retro96://reload""><b>Reload this page</b></a></p>";
         return MakePageShell("#000080", "Connection Timed Out", body);
     }
 
@@ -187,14 +200,14 @@ read the information you send.</p>
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">&#8635; Redirect Loop Detected</font></h2>
-<p>I had to stop trying to load this page because it seems to be stuck in an 
-infinite loop, bouncing me around without ever showing the actual content.</p>
+{WarningBanner("Redirect Loop Detected", "The page redirected too many times.", "#ffcccc", "#cc0000", "#800000")}
+<p><font size=""+2"">I had to stop trying to load this page because it seems to be stuck in an
+infinite loop, bouncing me around without ever showing the actual content.</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
-<p>The page redirected more than <b>5 times</b>. This is almost always a mistake 
+<p>The page redirected more than <b>5 times</b>. This is almost always a mistake
 on the website's end.</p>
 <hr noshade color=""#c0c0c0"">
-<p><b>There's not much you can do here.</b> You might want to let the website 
+<p><b>There's not much you can do here.</b> You might want to let the website
 administrator know so they can fix their server configuration.</p>";
         return MakePageShell("#000080", "Too Many Redirects", body);
     }
@@ -206,11 +219,11 @@ administrator know so they can fix their server configuration.</p>";
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">404 &mdash; Page Not Found</font></h2>
+{WarningBanner("404 \u2014 Page Not Found", "The requested URL could not be found on the server.", "#ffcccc", "#cc0000", "#800000")}
 <marquee behavior=""alternate"" scrollamount=""2"">
-  <font color=""#000080"" size=""-1""><b>Sorry, I looked everywhere but couldn't find that page!</b></font>
+  <font color=""#000080"" size=""+1""><b>Sorry, I looked everywhere but couldn't find that page!</b></font>
 </marquee>
-<br>
+<br><br>
 <p>The page or file you're looking for doesn't seem to exist:</p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <hr noshade color=""#c0c0c0"">
@@ -231,15 +244,8 @@ administrator know so they can fix their server configuration.</p>";
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Access Denied</font></h2>
-<table bgcolor=""#ffcccc"" border=""1"" bordercolor=""#cc0000"" cellpadding=""8"" width=""100%"">
-<tr><td>
-  <font color=""#800000"">
-  Sorry, you don't have permission to view this page.
-  </font>
-</td></tr>
-</table>
-<br>
+{WarningBanner("403 \u2014 Access Denied", "You do not have permission to view this page.", "#ffcccc", "#cc0000", "#800000")}
+<p>Sorry, you don't have permission to view this page.</p>
 <p><b>URL:</b> <tt>{escapedUrl}</tt></p>
 <p>The server understood the request, but it's refusing to show you anything. This could be because:</p>
 <ul>
@@ -263,9 +269,9 @@ administrator know so they can fix their server configuration.</p>";
             ? ""
             : $"<p><b>Message from server:</b> {EscapeHtml(detail!)}</p>";
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Internal Server Error</font></h2>
-<p>Something went wrong on the website's end, and it couldn't finish loading 
-the page you wanted.</p>
+{WarningBanner("500 \u2014 Internal Server Error", "Something went wrong on the server.", "#ffcccc", "#cc0000", "#800000")}
+<p><font size=""+2"">Something went wrong on the website's end, and it couldn't finish loading
+the page you wanted.</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 {detailHtml}
 <hr noshade color=""#c0c0c0"">
@@ -285,7 +291,7 @@ the page you wanted.</p>
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Invalid Address</font></h2>
+{WarningBanner("Invalid Address", "The address you entered could not be parsed.", "#ffcccc", "#cc0000", "#800000")}
 <p>I can't open this address because it doesn't look quite right:</p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <p><b>Common mistakes to look out for:</b></p>
@@ -308,9 +314,9 @@ the page you wanted.</p>
         string escapedProxy = EscapeHtml(proxyHost);
         string escapedMessage = EscapeHtml(message);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Proxy Server Error</font></h2>
+{WarningBanner("Proxy Server Error", "The proxy server could not be reached or returned an error.", "#ffcccc", "#cc0000", "#800000")}
 <p>You're set up to use a proxy server, but I couldn't reach it or it sent back an error.</p>
-<table cellpadding=""4"" cellspacing=""0"" bgcolor=""#f0f0f0"" border=""1"" bordercolor=""#c0c0c0"" width=""100%"">
+<table cellpadding=""6"" cellspacing=""0"" bgcolor=""#f0f0f0"" border=""1"" bordercolor=""#c0c0c0"" width=""100%"">
 <tr><td width=""120""><b>Proxy server:</b></td><td><tt>{escapedProxy}</tt></td></tr>
 <tr><td><b>Error:</b></td><td>{escapedMessage}</td></tr>
 </table>
@@ -334,7 +340,7 @@ the page you wanted.</p>
         string escapedUrl = EscapeHtml(url);
         string escapedProtocol = EscapeHtml(protocol);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Protocol Not Supported</font></h2>
+{WarningBanner("Protocol Not Supported", "Retro96 does not know how to handle this URL scheme.", "#ffcccc", "#cc0000", "#800000")}
 <p>I'm not sure how to open this kind of address:</p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <p>The <b><tt>{escapedProtocol}://</tt></b> part of that link isn't something I know how to handle.</p>
@@ -358,7 +364,7 @@ the page you wanted.</p>
     {
         string escapedPath = EscapeHtml(path);
         string body = $@"
-<h2><font color=""#cc0000"">File Not Found</font></h2>
+{WarningBanner("File Not Found", "The local file could not be found on disk.", "#ffcccc", "#cc0000", "#800000")}
 <p>I looked on your computer, but I couldn't find this file:</p>
 <blockquote><tt><b>{escapedPath}</b></tt></blockquote>
 <p><b>A few things to check:</b></p>
@@ -380,19 +386,19 @@ the page you wanted.</p>
         string escapedMime = EscapeHtml(mimeType);
         string escapedPlugin = EscapeHtml(pluginName);
         string body = $@"
-<h2><font color=""#cc0000"">Plugin Required</font></h2>
+{WarningBanner("Plugin Required", "You need extra software to view this content.", "#ccffcc", "#006600", "#004400")}
 <marquee behavior=""scroll"" direction=""left"" scrollamount=""2"" bgcolor=""#ccffcc"">
-  <font color=""#004400"" size=""-1""><b>&nbsp;&#9733; You need an extra piece of software to view this &#9733;&nbsp;</b></font>
+  <font color=""#004400"" size=""+1""><b>&nbsp;&nbsp;You need an extra piece of software to view this&nbsp;&nbsp;</b></font>
 </marquee>
-<br>
-<p>To see this content, you'll need to install a little extra software.</p>
-<table cellpadding=""6"" cellspacing=""0"" bgcolor=""#f0f0f0"" border=""1"" bordercolor=""#c0c0c0"" width=""100%"">
+<br><br>
+<p><font size=""+1"">To see this content, you'll need to install a little extra software.</font></p>
+<table cellpadding=""8"" cellspacing=""0"" bgcolor=""#f0f0f0"" border=""1"" bordercolor=""#c0c0c0"" width=""100%"">
 <tr><td width=""140""><b>Content type:</b></td><td><tt>{escapedMime}</tt></td></tr>
 <tr><td><b>You need:</b></td><td><b>{escapedPlugin}</b></td></tr>
 </table>
 <br>
-<p>Just hop over to the plugin author's website, download it, and install it. 
-Once it's set up, <a href=""retro96://reload"">reload this page</a>.</p>
+<p>Just hop over to the plugin author's website, download it, and install it.
+Once it's set up, <a href=""retro96://reload""><b>reload this page</b></a>.</p>
 <hr noshade color=""#c0c0c0"">
 <p><font color=""#808080"" size=""-1"">Retro96 supports Netscape-style plugins (.dll).</font></p>";
         return MakePageShell("#006600", "Plugin Required", body);
@@ -405,7 +411,7 @@ Once it's set up, <a href=""retro96://reload"">reload this page</a>.</p>
     {
         string escapedFeature = EscapeHtml(feature);
         string body = $@"
-<h2><font color=""#cc0000"">Feature Not Supported</font></h2>
+{WarningBanner("Feature Not Supported", "Retro96 cannot handle this feature yet.", "#ffcccc", "#cc0000", "#800000")}
 <p>I don't quite know how to handle this feature yet:</p>
 <blockquote><b>{escapedFeature}</b></blockquote>
 <p>This is probably because:</p>
@@ -427,8 +433,8 @@ Once it's set up, <a href=""retro96://reload"">reload this page</a>.</p>
         string escapedUrl = EscapeHtml(url);
         string escapedMessage = EscapeHtml(message);
         string body = $@"
-<h2><font color=""#cc0000"">FTP Error</font></h2>
-<p>I ran into a snag while trying to connect to this FTP server:</p>
+{WarningBanner("FTP Error", "The FTP server could not be contacted or returned an error.", "#ffcccc", "#cc0000", "#800000")}
+<p><font size=""+1"">I ran into a snag while trying to connect to this FTP server:</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <p><b>The server said:</b> {escapedMessage}</p>
 <hr noshade color=""#c0c0c0"">
@@ -453,12 +459,12 @@ Once it's set up, <a href=""retro96://reload"">reload this page</a>.</p>
             ? ""
             : $"<p><b>Message from server:</b> {EscapeHtml(detail!)}</p>";
         string body = $@"
-<h2><font color=""#cc0000"">400 &mdash; Bad Request</font></h2>
+{WarningBanner("400 \u2014 Bad Request", "The server could not understand the request.", "#ffcccc", "#cc0000", "#800000")}
 <p>The server couldn't understand the request I sent for this address:</p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 {detailHtml}
 <hr noshade color=""#c0c0c0"">
-<p>This usually means the address was typed in a way the server refuses to 
+<p>This usually means the address was typed in a way the server refuses to
 understand. Look out for weird characters and try again.</p>
 <p><font color=""#808080"" size=""-1"">HTTP 400 Bad Request</font></p>";
         return MakePageShell("#000080", "400 \u2014 Bad Request", body);
@@ -475,14 +481,14 @@ understand. Look out for weird characters and try again.</p>
             ? ""
             : $"<p>Restricted area: <b>{EscapeHtml(realm!)}</b></p>";
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Authorization Required</font></h2>
-<p>The server at this address is asking for a username and password before it 
-will let you in:</p>
+{WarningBanner("401 \u2014 Authorization Required", "This site requires a username and password.", "#ffffcc", "#cc9900", "#996600")}
+<p><font size=""+1"">The server at this address is asking for a username and password before it
+will let you in:</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 {realmHtml}
 <hr noshade color=""#c0c0c0"">
-<p>Type your login details into the prompt, or hit <b>Cancel</b> to stay where 
-you are. If you think you shouldn't be seeing this, you might want to reach out 
+<p>Type your login details into the prompt, or hit <b>Cancel</b> to stay where
+you are. If you think you shouldn't be seeing this, you might want to reach out
 to the site's admin.</p>
 <p><font color=""#808080"" size=""-1"">HTTP 401 Unauthorized &mdash; WWW-Authenticate: Basic</font></p>";
         return MakePageShell("#800000", "401 \u2014 Authorization Required", body);
@@ -495,13 +501,13 @@ to the site's admin.</p>
     {
         string escapedUrl = EscapeHtml(url);
         string body = $@"
-<h2><font color=""#cc0000"">&#9888; Service Unavailable</font></h2>
-<p>The server is temporarily refusing to handle requests for this page:</p>
+{WarningBanner("503 \u2014 Service Unavailable", "The server is temporarily unavailable.", "#ffffcc", "#cc9900", "#996600")}
+<p><font size=""+1"">The server is temporarily refusing to handle requests for this page:</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
-<p>Don't worry, this is usually temporary! The server might just be overwhelmed 
+<p>Don't worry, this is usually temporary! The server might just be overwhelmed
 with visitors or down for a quick tune-up.</p>
 <hr noshade color=""#c0c0c0"">
-<p><a href=""retro96://reload"">&#8635; Try Again</a> in a few minutes.</p>
+<p><a href=""retro96://reload""><b>Reload this page</b></a> in a few minutes.</p>
 <p><font color=""#808080"" size=""-1"">HTTP 503 Service Unavailable</font></p>";
         return MakePageShell("#800000", "503 \u2014 Service Unavailable", body);
     }
@@ -512,13 +518,14 @@ with visitors or down for a quick tune-up.</p>
     public static string GenericHttpError(int statusCode, string url)
     {
         string escapedUrl = EscapeHtml(url);
+        string statusText = $"HTTP {statusCode}";
         string body = $@"
-<h2><font color=""#cc0000"">HTTP {statusCode}</font></h2>
-<p>The server responded with an unexpected status code (<b>{statusCode}</b>) for:</p>
+{WarningBanner(statusText, "The server returned an unexpected status code.", "#ffcccc", "#cc0000", "#800000")}
+<p><font size=""+1"">The server responded with an unexpected status code (<b>{statusCode}</b>) for:</font></p>
 <blockquote><tt><b>{escapedUrl}</b></tt></blockquote>
 <hr noshade color=""#c0c0c0"">
 <p>If the server included any extra info, it will be shown below:</p>";
-        return MakePageShell("#000080", $"HTTP {statusCode}", body);
+        return MakePageShell("#000080", statusText, body);
     }
 
     /// <summary>
@@ -526,13 +533,13 @@ with visitors or down for a quick tune-up.</p>
     /// </summary>
     public static string OutOfMemory()
     {
-        string body = @"
-<h2><font color=""#cc0000"">&#9888; Out of Memory</font></h2>
-<blink><font color=""#ff0000""><b>Yikes! Retro96 has completely run out of memory.</b></font></blink>
+        string body = $@"
+{WarningBanner("Out of Memory", "Retro96 has run out of memory and cannot continue.", "#ffcccc", "#cc0000", "#800000")}
+<blink><font color=""#ff0000"" size=""+2""><b>Yikes! Retro96 has completely run out of memory.</b></font></blink>
 <br><br>
-<p>I tried to finish what I was doing, but there just isn't enough free memory 
-left to complete the operation. The page might be massive, or it might have 
-way too many images.</p>
+<p><font size=""+1"">I tried to finish what I was doing, but there just isn't enough free memory
+left to complete the operation. The page might be massive, or it might have
+way too many images.</font></p>
 <hr noshade color=""#c0c0c0"">
 <p><b>Here's what you can do to fix it:</b></p>
 <ul>
