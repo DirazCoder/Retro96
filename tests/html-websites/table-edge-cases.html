@@ -1,0 +1,20 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Table Edge Cases</TITLE></HEAD>
+<BODY BGCOLOR="#FFFFFF">
+<H1>Table Edge Cases</H1>
+<P>Whitespace between rows should not create a row. Stray text should be foster-parented above the table.</P>
+stray text between rows -- this should render before the first row.
+<TABLE BORDER="1" CELLPADDING="4" CELLSPACING="2">
+  <TR><TD>A1</TD><TD ROWSPAN="2">rowspan cell</TD><TD>C1</TD></TR>
+
+  stray text inside table between rows
+
+  <TR><TD>A2</TD><TD COLSPAN="1">C2</TD></TR>
+  <TR><TD>empty neighbor</TD><TD></TD><TD>last row</TD></TR>
+</TABLE>
+<P>Nested table:</P>
+<TABLE BORDER="1" CELLPADDING="3"><TR><TD>outer left</TD><TD>
+<TABLE BORDER="1"><TR><TD>inner 1</TD><TD>inner 2</TD></TR></TABLE>
+</TD></TR></TABLE>
+<P>Following content must remain outside both tables.</P>
+</BODY></HTML>

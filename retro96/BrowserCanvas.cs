@@ -1274,7 +1274,7 @@ public class BrowserCanvas : Control
 
         var face = box.ContentRect;
         string text = GetFieldText(el);
-        bool password = el.GetAttrOrDefault("type", "text") == "password";
+        bool password = el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase);
         if (password) text = new string('*', text.Length);
 
         var font = ResolveFieldFont(el);
@@ -1283,10 +1283,13 @@ public class BrowserCanvas : Control
 
         float scrollX = PaintScrollX;
         float scrollY = PaintScrollY;
-        float fieldScroll = EnsureSingleLineCaretVisible(g, text, font, face, _fieldCaret);
+        float fieldScroll = EnsureSingleLineCaretVisible(g, text, font, face, _fieldCaret, password);
         bool needsTextRepaint = fieldScroll > 0.01f;
 
-        float MeasureTo(int n) => n <= 0 ? 0f
+        float passwordAdvance = password ? GetPasswordGlyphAdvance(g, font, fmt) : 0f;
+        float MeasureTo(int n) => password
+            ? Math.Clamp(n, 0, text.Length) * passwordAdvance
+            : n <= 0 ? 0f
             : g.MeasureString(text[..Math.Min(n, text.Length)], font, int.MaxValue, fmt).Width;
 
         int caret = Math.Clamp(_fieldCaret, 0, text.Length);
@@ -1299,38 +1302,86 @@ public class BrowserCanvas : Control
         float bottom = Math.Min(top + lineH, face.Bottom - 1 - scrollY);
 
         var oldClip = g.Save();
+        g.TextRenderingHint = password
+            ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
+            : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
         g.SetClip(new RectangleF(face.X + 2 - scrollX, face.Y - scrollY,
                                  Math.Max(1, face.Width - 4), face.Height),
                   CombineMode.Intersect);
 
-        // The unfocused page bitmap already contains the exact control text.
-        // Do not redraw it merely because the control gained focus: that was
-        // the source of the scroll-position-dependent one-pixel jump. Only
-        // repaint the control interior when the field has its own horizontal
-        // scrolling, which is not represented in the page bitmap.
-        if (needsTextRepaint)
+        var fieldStyle = el.Style;
+        Color fieldBackground = fieldStyle != null && fieldStyle.OwnBackground && fieldStyle.BackgroundColor != Color.Transparent
+            ? fieldStyle.BackgroundColor : Color.White;
+        Color fieldForeground = fieldStyle != null && fieldStyle.OwnColor ? fieldStyle.Color : Color.Black;
+
+        // Selection in text/password inputs is painted from the logical value
+        // rather than relying on the already-rasterized page bitmap.  Password
+        // fields are especially sensitive here: the renderer has already
+        // replaced every character with '*', while a focused-field overlay can
+        // otherwise measure/paint a slightly different run and leave the last
+        // visible mask glyph outside the highlight. Repainting the content face
+        // when a selection exists keeps the masked text, its character advances,
+        // and the selection rectangle on exactly the same coordinate system.
+        bool paintLiveFieldText = needsTextRepaint || selEnd > selStart;
+        using var focusedTextFormat = NewFieldFormat(noWrap: true);
+        focusedTextFormat.LineAlignment = StringAlignment.Center;
+
+        if (paintLiveFieldText)
         {
-            var style = el.Style;
-            Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
-                ? style.BackgroundColor : Color.White;
-            Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
             using (var background = new SolidBrush(fieldBackground))
                 g.FillRectangle(background, face.X + 2 - scrollX, face.Y - scrollY,
                     Math.Max(1, face.Width - 4), face.Height);
-            using var focusedTextFormat = NewFieldFormat(noWrap: true);
-            focusedTextFormat.LineAlignment = StringAlignment.Center;
-            using (var foreground = new SolidBrush(fieldForeground))
-                g.DrawString(text, font, foreground,
-                    new RectangleF(textX, face.Y - scrollY,
-                        Math.Max(face.Width, MeasureTo(text.Length) + 8), face.Height), focusedTextFormat);
-        }
 
-        if (selEnd > selStart)
-        {
-            using var selBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-            float x1 = textX + MeasureTo(selStart);
-            float x2 = textX + MeasureTo(selEnd);
-            g.FillRectangle(selBrush, x1, top, Math.Max(1f, x2 - x1), Math.Max(1f, bottom - top));
+            float visibleLeft = face.X + 2 - scrollX;
+            float visibleRight = face.Right - 2 - scrollX;
+            float x = textX;
+
+            void DrawSegment(int from, int to, Color color)
+            {
+                if (to <= from) return;
+                using var brush = new SolidBrush(color);
+                if (password)
+                {
+                    // Password glyphs are laid out one-by-one using the exact same
+                    // fixed advance used for caret hit-testing and selection bounds.
+                    // This prevents star overlap, last-glyph drift, and a caret that
+                    // lands between masked characters.
+                    for (int i = from; i < to; i++)
+                    {
+                        float gx = x + i * passwordAdvance;
+                        if (gx + passwordAdvance <= visibleLeft || gx >= visibleRight) continue;
+                        PasswordMaskLayout.DrawRange(g, text.Length, font, brush,
+                            textX, face.Y - scrollY, face.Height, i, i + 1, focusedTextFormat);
+                    }
+                    return;
+                }
+
+                float x1 = x + MeasureTo(from);
+                float x2 = x + MeasureTo(to);
+                if (x2 <= visibleLeft || x1 >= visibleRight) return;
+                g.DrawString(text.Substring(from, to - from), font, brush,
+                    new RectangleF(x1, face.Y - scrollY,
+                        Math.Max(x2 - x1, 1f), face.Height), focusedTextFormat);
+            }
+
+            if (selEnd > selStart)
+            {
+                float sx1 = Math.Max(visibleLeft, x + MeasureTo(selStart));
+                float sx2 = Math.Min(visibleRight, x + MeasureTo(selEnd));
+                if (sx2 > sx1)
+                {
+                    using var selBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
+                    g.FillRectangle(selBrush, sx1, top, sx2 - sx1, Math.Max(1f, bottom - top));
+                }
+
+                DrawSegment(0, selStart, fieldForeground);
+                DrawSegment(selStart, selEnd, Color.White);
+                DrawSegment(selEnd, text.Length, fieldForeground);
+            }
+            else
+            {
+                DrawSegment(0, text.Length, fieldForeground);
+            }
         }
 
         if ((uint)Environment.TickCount / 500 % 2 == 0)
@@ -1390,9 +1441,10 @@ public class BrowserCanvas : Control
         if (font == null) return;
 
         string text = GetFieldText(el);
-        if (el.TagName == "input" &&
+        bool password = el.TagName == "input" &&
             el.GetAttrOrDefault("type", "text").Trim().Equals("password",
-                StringComparison.OrdinalIgnoreCase))
+                StringComparison.OrdinalIgnoreCase);
+        if (password)
             text = new string('*', text.Length);
 
         int caret = Math.Clamp(_fieldCaret, 0, text.Length);
@@ -1400,6 +1452,9 @@ public class BrowserCanvas : Control
         int selStart = Math.Min(anchor, caret);
         int selEnd = Math.Max(anchor, caret);
         var state = g.Save();
+        g.TextRenderingHint = password
+            ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
+            : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
         g.SetClip(face, CombineMode.Intersect);
 
         if (el.TagName == "textarea")
@@ -1463,31 +1518,67 @@ public class BrowserCanvas : Control
         {
             using var format = NewFieldFormat(noWrap: true);
             format.LineAlignment = StringAlignment.Center;
-            float scroll = EnsureSingleLineCaretVisible(g, text, font, box.ContentRect, caret);
+            float scroll = EnsureSingleLineCaretVisible(g, text, font, box.ContentRect, caret, password);
             float textX = face.X + 3 - scroll;
-            float MeasureTo(int n) => n <= 0 ? 0f
+            float passwordAdvance = password ? GetPasswordGlyphAdvance(g, font, format) : 0f;
+            float MeasureTo(int n) => password
+                ? Math.Clamp(n, 0, text.Length) * passwordAdvance
+                : n <= 0 ? 0f
                 : g.MeasureString(text[..Math.Min(n, text.Length)], font, int.MaxValue, format).Width;
 
-            if (scroll > 0.01f)
-            {
-                var style = el.Style;
-                Color backgroundColor = style != null && style.OwnBackground &&
-                    style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
-                Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
-                using var background = new SolidBrush(backgroundColor);
-                using var foreground = new SolidBrush(foregroundColor);
-                g.FillRectangle(background, face);
-                float textWidth = g.MeasureString(text, font, int.MaxValue, format).Width;
-                g.DrawString(text, font, foreground,
-                    new RectangleF(textX, face.Y, Math.Max(face.Width, textWidth + 8), face.Height), format);
-            }
+            var style = el.Style;
+            Color backgroundColor = style != null && style.OwnBackground &&
+                style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
+            Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
+            bool paintLiveFieldText = scroll > 0.01f || selEnd > selStart;
 
-            if (selEnd > selStart)
+            if (paintLiveFieldText)
             {
-                using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-                float x1 = textX + MeasureTo(selStart);
-                float x2 = textX + MeasureTo(selEnd);
-                g.FillRectangle(highlight, x1, face.Y, Math.Max(1f, x2 - x1), face.Height);
+                using var background = new SolidBrush(backgroundColor);
+                g.FillRectangle(background, face);
+
+                float visibleLeft = face.X + 2;
+                float visibleRight = face.Right - 2;
+                void DrawFrameSegment(int from, int to, Color color)
+                {
+                    if (to <= from) return;
+                    using var brush = new SolidBrush(color);
+                    if (password)
+                    {
+                        for (int i = from; i < to; i++)
+                        {
+                            float gx = textX + i * passwordAdvance;
+                            if (gx + passwordAdvance <= visibleLeft || gx >= visibleRight) continue;
+                            PasswordMaskLayout.DrawRange(g, text.Length, font, brush,
+                                textX, face.Y, face.Height, i, i + 1, format);
+                        }
+                        return;
+                    }
+
+                    float x1 = textX + MeasureTo(from);
+                    float x2 = textX + MeasureTo(to);
+                    if (x2 <= visibleLeft || x1 >= visibleRight) return;
+                    g.DrawString(text.Substring(from, to - from), font, brush,
+                        new RectangleF(x1, face.Y, Math.Max(x2 - x1, 1f), face.Height), format);
+                }
+
+                if (selEnd > selStart)
+                {
+                    float sx1 = Math.Max(visibleLeft, textX + MeasureTo(selStart));
+                    float sx2 = Math.Min(visibleRight, textX + MeasureTo(selEnd));
+                    if (sx2 > sx1)
+                    {
+                        using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
+                        g.FillRectangle(highlight, sx1, face.Y, sx2 - sx1, face.Height);
+                    }
+                    DrawFrameSegment(0, selStart, foregroundColor);
+                    DrawFrameSegment(selStart, selEnd, Color.White);
+                    DrawFrameSegment(selEnd, text.Length, foregroundColor);
+                }
+                else
+                {
+                    DrawFrameSegment(0, text.Length, foregroundColor);
+                }
             }
             if ((uint)Environment.TickCount / 500 % 2 == 0)
             {
@@ -2413,7 +2504,7 @@ public class BrowserCanvas : Control
             {
                 _measureBmp = new Bitmap(1, 1);
                 _measureGfx = Graphics.FromImage(_measureBmp);
-                _measureGfx.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                _measureGfx.TextRenderingHint = Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
             }
             return _measureGfx;
         }
@@ -2596,8 +2687,15 @@ public class BrowserCanvas : Control
                 docX - (face.X + 3) + _fieldScrollX);
         }
 
-        bool password = el.GetAttrOrDefault("type", "text") == "password";
-        if (password) text = new string('*', text.Length);
+        bool password = el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase);
+        if (password)
+        {
+            float advance = GetPasswordGlyphAdvance(MeasureGraphics, font, fmt);
+            float relX = docX - (face.X + 3) + _fieldScrollX;
+            if (relX <= 0f) return 0;
+            int index = (int)Math.Floor((relX / Math.Max(advance, 1f)) + 0.5f);
+            return Math.Clamp(index, 0, text.Length);
+        }
         float visibleWidth = Math.Max(1f, face.Width - 6f);
         float textWidth = MeasureGraphics.MeasureString(text, font, int.MaxValue, fmt).Width;
         if (textWidth > visibleWidth && docX >= face.Right - 6f)
@@ -2606,15 +2704,23 @@ public class BrowserCanvas : Control
             docX - (face.X + 3) + _fieldScrollX);
     }
 
+    private static float GetPasswordGlyphAdvance(Graphics g, Font font, StringFormat fmt)
+        => PasswordMaskLayout.GetAdvance(g, font);
+
     private float EnsureSingleLineCaretVisible(Graphics g, string text, Font font,
-                                                RectangleF face, int caret)
+                                                RectangleF face, int caret, bool password = false)
     {
         using var fmt = NewFieldFormat(noWrap: true);
         float visibleWidth = Math.Max(1f, face.Width - 6f);
-        float caretX = caret <= 0 ? 0f
+        float advance = password ? GetPasswordGlyphAdvance(g, font, fmt) : 0f;
+        float caretX = password
+            ? Math.Clamp(caret, 0, text.Length) * advance
+            : caret <= 0 ? 0f
             : g.MeasureString(text[..Math.Min(caret, text.Length)], font,
                               int.MaxValue, fmt).Width;
-        float totalWidth = g.MeasureString(text, font, int.MaxValue, fmt).Width;
+        float totalWidth = password
+            ? text.Length * advance
+            : g.MeasureString(text, font, int.MaxValue, fmt).Width;
         float maxScroll = Math.Max(0f, totalWidth - visibleWidth);
         if (caretX - _fieldScrollX > visibleWidth)
             _fieldScrollX = caretX - visibleWidth;
@@ -2740,8 +2846,11 @@ public class BrowserCanvas : Control
         if (el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase))
             text = new string('*', text.Length);
         using var fmt = NewFieldFormat(noWrap: true);
+        bool password = el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase);
         float visible = Math.Max(1f, box.ContentRect.Width - 6f);
-        float width = MeasureGraphics.MeasureString(text, font, int.MaxValue, fmt).Width;
+        float width = password
+            ? text.Length * GetPasswordGlyphAdvance(MeasureGraphics, font, fmt)
+            : MeasureGraphics.MeasureString(text, font, int.MaxValue, fmt).Width;
         return Math.Max(0f, width - visible);
     }
 

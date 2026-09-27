@@ -1,0 +1,24 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>CSS and Layout Edge Cases</TITLE>
+<STYLE TYPE="text/css">
+body { margin: 12px; }
+.outer { background: #E8E8FF; border: 2px solid #404080; padding: 12px; }
+.inner { margin: 10px; padding: 8px; border: 1px solid #808080; background: #FFFFCC; }
+.floatbox { float: left; width: 120px; height: 70px; margin: 5px; padding: 5px; border: 2px solid #800000; background: #FFCCCC; }
+.clearbox { clear: both; border: 1px solid #008000; padding: 5px; background: #CCFFCC; }
+.inlineA { color: #000080; background: #EEEEFF; }
+.inlineB { color: #800080; background: #FFFFDD; }
+</STYLE></HEAD>
+<BODY BGCOLOR="#FFFFFF">
+<H1>CSS/Layout Edge Cases</H1>
+<DIV CLASS="outer">
+This outer box has padding and a border.
+<DIV CLASS="inner">This inner box has its own margin, padding, border and background.</DIV>
+</DIV>
+<P>Inline runs should remain inline: <SPAN CLASS="inlineA">first inline run</SPAN> <B>bold middle</B> <SPAN CLASS="inlineB">second inline run</SPAN> and then ordinary text.</P>
+<DIV CLASS="floatbox">FLOAT BOX<br>120 x 70</DIV>
+<P>Text should wrap around the float on the same side until the clear element appears below.</P>
+<DIV CLASS="clearbox">CLEAR: this block must start below the float.</DIV>
+<HR>
+<P>Check that margins do not become selection highlight, that backgrounds stay inside their elements, and that inline runs do not create phantom block gaps.</P>
+</BODY></HTML>

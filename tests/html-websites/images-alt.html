@@ -1,0 +1,12 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Image and Alternate Text</TITLE></HEAD>
+<BODY BGCOLOR="#FFFFFF">
+<H1>Image and Alt Text</H1>
+<P>Loaded image:</P>
+<IMG SRC="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" WIDTH="120" HEIGHT="40" BORDER="1" ALT="loaded 1x1 image stretched to 120x40">
+<P>Broken image with alt text:</P>
+<IMG SRC="definitely-missing-image.gif" WIDTH="160" HEIGHT="50" BORDER="2" ALT="BROKEN IMAGE ALT TEXT">
+<P>Image without explicit dimensions:</P>
+<IMG SRC="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" ALT="natural-size placeholder">
+<P>Check that successful images do not paint alt text over the image, and broken images do.</P>
+</BODY></HTML>

@@ -1,0 +1,18 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Frame Child</TITLE>
+<SCRIPT LANGUAGE="JavaScript">
+function hover(){var d=document.getElementById("state");if(d)d.innerHTML="hover fired";}
+function clicker(){var d=document.getElementById("state");if(d)d.innerHTML="click fired";return false;}
+function mutate(){var d=document.getElementById("mutable");if(d)d.innerHTML="The frame DOM was mutated successfully.";}
+</SCRIPT></HEAD>
+<BODY BGCOLOR="#FFFFCC">
+<H2>Frame child document</H2>
+<P><A HREF="#bottom" onmouseover="hover()" onclick="return clicker()">Hover/click this link</A></P>
+<P ID="state">state: idle</P>
+<P ID="mutable">mutable text before change</P>
+<INPUT TYPE="BUTTON" VALUE="Mutate frame DOM" onclick="mutate()">
+<TEXTAREA ROWS="5" COLS="30">This textarea is intentionally long enough to test internal scrolling in a frame. Add more text here if you want to test vertical and horizontal behavior.</TEXTAREA>
+<P><A HREF="frames-interaction.html">Reload frames page</A></P>
+<H3 ID="bottom">Bottom anchor</H3>
+<P>More text after the anchor so fragment scrolling is visible.</P>
+</BODY></HTML>

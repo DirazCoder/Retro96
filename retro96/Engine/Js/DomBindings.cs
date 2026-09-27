@@ -1275,7 +1275,10 @@ public static class DomBindings
                 var attr = _element.GetAttr(name);
                 if (attr == null) return JsValue.From("");
                 if (name == "checked")
-                    return JsValue.From(attr.Length > 0);
+                    // Boolean HTML attributes are true by presence. A checked
+                    // control is represented internally as checked="" as well
+                    // as checked="checked", so testing string length is wrong.
+                    return JsValue.From(attr != null);
                 if (name == "width" || name == "height" || name == "size" ||
                     name == "maxlength" || name == "cols" || name == "rows")
                     return JsValue.From(JsValue.StringToNumber(attr));

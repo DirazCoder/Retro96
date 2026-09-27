@@ -155,7 +155,7 @@ public class Renderer
 
         using var g = Graphics.FromImage(bmp);
 
-        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        g.TextRenderingHint = Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.Default;
 
@@ -1475,7 +1475,7 @@ public class Renderer
             default:    // text, password, and unknown → text field
                 string value = elem.GetAttr("value") ?? "";
                 if (type == "password") value = new string('*', value.Length);
-                PaintTextControl(g, box, fonts, style, value, isFocused);
+                PaintTextControl(g, box, fonts, style, value, isFocused, type == "password");
                 return;
         }
     }
@@ -1735,7 +1735,8 @@ public class Renderer
     }
 
     private static void PaintTextControl(Graphics g, LayoutBox box, FontCache fonts,
-                                         ComputedStyle style, string text, bool isFocused)
+                                         ComputedStyle style, string text, bool isFocused,
+                                         bool isPassword)
     {
         var rect = box.BorderRect;   // chrome sits on the layout-reserved ring
         var face = box.ContentRect;
@@ -1784,10 +1785,34 @@ public class Renderer
 
         var textRect = new RectangleF(face.X + 3, face.Y,
                                       Math.Max(0, face.Width - 6), face.Height);
-        var clip = g.Save();
+        // TextRenderingHint is a mutable Graphics state.  Password masks may
+        // use single-bit grid fitting for crisp '*' glyphs, but that setting
+        // must never leak into the text painted after this control.  Save the
+        // full graphics state and explicitly select the correct hint for this
+        // one draw.
+        var textState = g.Save();
         g.SetClip(textRect, CombineMode.Intersect);
-        g.DrawString(text, font, brush, textRect, sf);
-        g.Restore(clip);
+        g.TextRenderingHint = isPassword
+            ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
+            : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
+        if (isPassword && box.Element != null)
+        {
+            using var maskFormat = new StringFormat(StringFormat.GenericTypographic)
+            {
+                FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
+                Trimming = StringTrimming.None,
+                LineAlignment = StringAlignment.Center,
+                Alignment = StringAlignment.Near
+            };
+            int length = text.Length;
+            PasswordMaskLayout.DrawRange(g, length, font, brush, textRect.X, textRect.Y,
+                textRect.Height, 0, length, maskFormat);
+        }
+        else
+        {
+            g.DrawString(text, font, brush, textRect, sf);
+        }
+        g.Restore(textState);
     }
 
     private static void PaintCheckboxOrRadio(Graphics g, LayoutBox box, bool isRadio)
