@@ -1662,7 +1662,7 @@ public class Renderer
         }
     }
 
-    private static void PaintFileInput(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintFileInput(Graphics g, LayoutBox box, FontCache fonts,
                                        ComputedStyle style)
     {
         var rect = box.BorderRect;
@@ -1687,7 +1687,18 @@ public class Renderer
 
         using (var buttonBrush = new SolidBrush(buttonFace))
             g.FillRectangle(buttonBrush, button.X, button.Y, button.Width, button.Height);
-        PaintRaisedRect(g, button, 2, buttonFace);
+
+        bool pressed = box.Element != null && ReferenceEquals(box.Element, PressedElement);
+        if (pressed)
+        {
+            // File-input controls contain a real button-like sub-face. Keep
+            // the same Win95 press-in treatment as ordinary buttons.
+            PaintSunkenRect(g, button, 2, buttonFace);
+        }
+        else
+        {
+            PaintRaisedRect(g, button, 2, buttonFace);
+        }
 
         var font = ResolveFont(fonts, style);
         using var brush = new SolidBrush(textColor);
@@ -1699,7 +1710,10 @@ public class Renderer
             Trimming = StringTrimming.EllipsisCharacter
         };
 
-        g.DrawString("Choose File", font, brush, button, fmt);
+        var labelButtonRect = pressed
+            ? new RectangleF(button.X + 1, button.Y + 1, Math.Max(0, button.Width - 1), Math.Max(0, button.Height - 1))
+            : button;
+        g.DrawString("Choose File", font, brush, labelButtonRect, fmt);
 
         string chosen = box.Element?.GetAttr("data-file-name") ?? "";
         string label = chosen.Length == 0 ? "No file chosen" : chosen;

@@ -67,13 +67,26 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
                     break;   // hierarchical — continue below
 
                 case "ftp":
+                    {
+                        string ftpPath = rest;
+                        string ftpFragment = "";
+                        int ftpHashIdx = ftpPath.IndexOf('#');
+                        if (ftpHashIdx >= 0)
+                        {
+                            ftpFragment = ftpPath[(ftpHashIdx + 1)..];
+                            ftpPath = ftpPath[..ftpHashIdx];
+                        }
+                        return new ParsedUrl(scheme, "", 0, ftpPath, "", ftpFragment);
+                    }
+
                 case "file":
                     {
-                        // recognised but unsupported for fetching; the shell
-                        // renders a clean error instead of mangling the URL.
-                        // Still split off the fragment so in-page "#Home"
-                        // links resolve and scroll like they do on http(s).
+                        // Local file URLs need their query and fragment kept as
+                        // separate URL components.  If ?params stays in Path,
+                        // the filesystem loader looks for a literal filename
+                        // such as "multi.html?fruits=apple".
                         string filePath = rest;
+                        string fileQuery = "";
                         string fileFragment = "";
                         int fileHashIdx = filePath.IndexOf('#');
                         if (fileHashIdx >= 0)
@@ -81,7 +94,13 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
                             fileFragment = filePath[(fileHashIdx + 1)..];
                             filePath = filePath[..fileHashIdx];
                         }
-                        return new ParsedUrl(scheme, "", 0, filePath, "", fileFragment);
+                        int fileQueryIdx = filePath.IndexOf('?');
+                        if (fileQueryIdx >= 0)
+                        {
+                            fileQuery = filePath[(fileQueryIdx + 1)..];
+                            filePath = filePath[..fileQueryIdx];
+                        }
+                        return new ParsedUrl(scheme, "", 0, filePath, fileQuery, fileFragment);
                     }
 
                 default:

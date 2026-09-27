@@ -3151,9 +3151,12 @@ public class BrowserCanvas : Control
                 return;
             }
             if (el.TagName == "button" ||
-                (el.TagName == "input" && type is "submit" or "reset" or "button"))
+                (el.TagName == "input" && type is "submit" or "reset" or "button" or "file"))
             {
-                // Win95 press-in bevel while held
+                // Win95 press-in bevel while held.  File inputs have a
+                // native-looking "Choose File" button inside the control,
+                // but they still participate in the same pressed-control
+                // rendering path so the bevel visibly depresses on mouse-down.
                 _pressedControl = el;
                 _pressedControlFrame = null;
                 RerenderNow();
