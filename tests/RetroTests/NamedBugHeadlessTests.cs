@@ -442,7 +442,7 @@ public class NamedBugHeadlessTests
             var hit = HitTester.ElementAt(root, x, y);
             Check.That(hit == anchor,
                 $"{id} is clickable inside its table cell",
-                hit == null ? "hit=<null>" : $"hit=<{hit.TagName}> id={hit.GetAttr(\"id\")}");
+                hit == null ? "hit=<null>" : $"hit=<{hit.TagName}> id={hit.GetAttr("id")}");
         }
         Check.Done();
     }
@@ -745,6 +745,89 @@ public class NamedBugHeadlessTests
         Check.Done();
     }
 
+    // Password/selection regressions ─────────────────────────────────
+    [Fact]
+    public void Bug_PasswordGraphicsStateDoesNotLeakIntoLaterPageText()
+    {
+        using var surface = new Retro96.Drawing.Bitmap(8, 8);
+        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        int state = g.Save();
+        g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
+        g.Restore(state);
+
+        Check.That(g.TextRenderingHint == TextRenderingHint.ClearTypeGridFit,
+            "restoring a password-style draw restores the page text rendering mode",
+            $"hint={g.TextRenderingHint}");
+
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_InlineSpaceFragmentsKeepRealAdvance()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><p>alpha beta gamma</p></body></html>");
+
+        var textBoxes = root.Descendants()
+            .Where(b => !string.IsNullOrEmpty(b.TextRun))
+            .ToList();
+        var alpha = textBoxes.FirstOrDefault(b => b.TextRun == "alpha");
+        var space1 = textBoxes.FirstOrDefault(b => b.TextRun == " ");
+        var beta = textBoxes.FirstOrDefault(b => b.TextRun == "beta");
+
+        Check.That(alpha != null && space1 != null && beta != null,
+            "word/space/word fragmentation keeps all three inline runs");
+
+        if (alpha != null && space1 != null && beta != null)
+        {
+            Check.That(space1.Width > 0.5f,
+                "a standalone ASCII space has a real layout advance",
+                $"space width={space1.Width:0.###}");
+            Check.That(beta.X >= alpha.X + alpha.Width + space1.Width - 1.0f,
+                "the second word starts after the first word plus the space advance",
+                $"alphaRight={alpha.X + alpha.Width:0.###}, spaceWidth={space1.Width:0.###}, betaX={beta.X:0.###}");
+        }
+
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_PageSelectionMergesWordAndSpaceRuns()
+    {
+        var spans = new[]
+        {
+            new RectangleF(10f, 20f, 30f, 16f),
+            new RectangleF(40f, 20f, 5f, 16f),
+            new RectangleF(45f, 20f, 28f, 16f),
+        };
+
+        var merged = SelectionOverlay.MergeSpans(spans);
+        Check.That(merged.Count == 1,
+            "word + selected whitespace + word merge into one continuous selection band",
+            $"merged spans={merged.Count}");
+        if (merged.Count == 1)
+        {
+            Check.That(MathF.Abs(merged[0].X - 10f) < 0.01f &&
+                       MathF.Abs(merged[0].Right - 73f) < 0.01f,
+                "the merged band covers the complete inter-word advance",
+                $"band={merged[0]}");
+        }
+
+        var separated = SelectionOverlay.MergeSpans(new[]
+        {
+            new RectangleF(10f, 20f, 30f, 16f),
+            new RectangleF(100f, 20f, 30f, 16f),
+            new RectangleF(10f, 40f, 30f, 16f),
+        });
+        Check.That(separated.Count == 3,
+            "large gaps and different lines remain separate selection regions",
+            $"merged spans={separated.Count}");
+
+        Check.Done();
+    }
+
     // 13 ──────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_ClockWidgetFrozenOnLoad()
@@ -828,6 +911,50 @@ public class NamedBugHeadlessTests
     }
 
     // 15 ──────────────────────────────────────────────────────────────
+    [Fact]
+    public void Bug_TextareaHardBreaksAreNotDuplicated()
+    {
+        using var surface = new Retro96.Drawing.Bitmap(1, 1);
+        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
+
+        var a = TextareaOverlay.BreakLines(g, "a\nb", font, 200f, wrapOff: false);
+        var b = TextareaOverlay.BreakLines(g, "a\r\nb", font, 200f, wrapOff: false);
+        var c = TextareaOverlay.BreakLines(g, "\n", font, 200f, wrapOff: false);
+
+        Check.That(a.Count == 2 && b.Count == 2,
+            "LF and CRLF each create exactly one visual break",
+            $"LF={a.Count}, CRLF={b.Count}");
+        Check.That(c.Count == 2,
+            "a single newline produces exactly two textarea lines",
+            $"blank-break lines={c.Count}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_TextareaScrollbarReservesTextGutter()
+    {
+        using var surface = new Retro96.Drawing.Bitmap(1, 1);
+        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
+        string text = string.Join("\n", Enumerable.Range(1, 8).Select(i => $"line {i}"));
+
+        var layout = TextareaOverlay.CalculateLayout(g, text, font,
+            faceWidth: 220f, faceHeight: 38f, wrapOff: false);
+
+        Check.That(layout.NeedsVerticalScrollbar,
+            "overflowing textarea layout reports a vertical scrollbar");
+        Check.That(layout.TextViewportWidth < 220f - 5f,
+            "the text viewport is narrower than the full face when the scrollbar is needed",
+            $"viewport={layout.TextViewportWidth:0.#}");
+        Check.That(layout.Lines.Count >= 8 && layout.VisibleLines >= 1,
+            "scrollbar calculation preserves all hard-break lines and a valid visible-line count",
+            $"lines={layout.Lines.Count}, visible={layout.VisibleLines}");
+        Check.Done();
+    }
+
     [Fact]
     public void Bug_EmbedCodeTextareaLayoutBreak()
     {

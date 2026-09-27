@@ -78,6 +78,7 @@
     <Compile Include="../../retro96/Engine/Render/DataUriDecoder.cs" />
     <Compile Include="../../retro96/Engine/Render/Renderer.cs" />
     <Compile Include="../../retro96/Engine/Render/TextareaOverlay.cs" />
+    <Compile Include="../../retro96/Engine/Render/SelectionOverlay.cs" />
     <Compile Include="../../retro96/Engine/Network/ResourceLoader.cs" />
     <Compile Include="../../retro96/Engine/Network/HttpClient.cs" />
     <Compile Include="../../retro96/Engine/Network/FrameLoader.cs" />
