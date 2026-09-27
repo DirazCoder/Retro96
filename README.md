@@ -1,12 +1,12 @@
 # Retro96
 
-A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way it looked in 1996. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, DOM-0 scripting, the whole cursed thing.
+A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way it looked in 1996. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, DOM-0 scripting, the whole cursed thing. And has its own Java 1.1-1.2 Applet from scratch
 
 Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** `retro96/` alone is around 43k lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/` and `Js/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** `retro96/` alone is around 48k lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/` and `Js/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -107,7 +107,7 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project is roughly 25k lines. Retro96 is roughly 43k. one of them works
+the Rust project is roughly 25k lines. Retro96 is roughly 48k. one of them works
 
 ## Status
 
