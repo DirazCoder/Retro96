@@ -199,8 +199,11 @@ public sealed class PluginManager : IDisposable
                 return runtime.LastPrintFrame;
             try
             {
+                // Safe to build the Bitmap synchronously here — this method
+                // is only ever called from ReRenderPage on the UI thread.
                 var request = new EmbeddedRenderRequest(width, height, checked(width * 4), 300, 300, true);
-                var bitmap = ConvertFrame(runtime.Instance.RenderAsync(request, CancellationToken.None).GetAwaiter().GetResult());
+                var frame = runtime.Instance.RenderAsync(request, CancellationToken.None).GetAwaiter().GetResult();
+                var bitmap = BuildBitmap(ExtractPixels(frame), width, height);
                 runtime.LastPrintFrame?.Dispose();
                 runtime.LastPrintFrame = bitmap;
                 runtime.LastPrintWidth = width;
@@ -224,22 +227,43 @@ public sealed class PluginManager : IDisposable
         runtime.StartTask = StartEmbeddedAsync(runtime, element, width, height);
     }
 
-    private static Bitmap ConvertFrame(EmbeddedFrameBuffer frame)
+    // IMPORTANT: GDI+ Bitmap objects are not thread-safe and must only be
+    // constructed, drawn, or disposed on the UI thread. Building the Bitmap
+    // here (background thread) while OnPaint draws/disposes the previous one
+    // concurrently on the UI thread is a real GDI+ handle-table hazard —
+    // it manifests as a full-process hang (multiple threads blocked in
+    // combase.dll/coreclr.dll waiting on GDI+'s internal synchronization),
+    // not a clean crash. This was rare before the ~30fps render timer, but
+    // firing RequestEmbeddedRender continuously makes the race window nearly
+    // guaranteed to be hit. Only decode into a plain byte[] here; the actual
+    // Bitmap gets built on the UI thread inside the BeginInvoke callback below.
+    private static byte[] ExtractPixels(EmbeddedFrameBuffer frame)
     {
-        using var bitmap = new Bitmap(frame.Width, frame.Height);
-        var data = bitmap.LockBits(new Rectangle(0, 0, frame.Width, frame.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        // Frame is already tightly packed (stride == width*4) coming out of
+        // RenderAsync's own conversion; if not, re-pack it here so the UI
+        // thread's Bitmap construction is a straight LockBits copy.
+        if (frame.Stride == frame.Width * 4)
+            return frame.Pixels;
+
+        byte[] packed = new byte[frame.Width * frame.Height * 4];
+        int srcStride = frame.Stride;
+        int dstStride = frame.Width * 4;
+        for (int y = 0; y < frame.Height; y++)
+            Buffer.BlockCopy(frame.Pixels, y * srcStride, packed, y * dstStride, dstStride);
+        return packed;
+    }
+
+    // Must be called on the UI thread only.
+    private static Bitmap BuildBitmap(byte[] pixels, int width, int height)
+    {
+        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        var data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
         try
         {
-            if (data.Stride == frame.Stride)
-                System.Runtime.InteropServices.Marshal.Copy(frame.Pixels, 0, data.Scan0, frame.Pixels.Length);
-            else
-            {
-                for (int y = 0; y < frame.Height; y++)
-                    System.Runtime.InteropServices.Marshal.Copy(frame.Pixels, y * frame.Stride, data.Scan0 + y * data.Stride, Math.Min(frame.Stride, data.Stride));
-            }
+            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, data.Scan0, Math.Min(pixels.Length, data.Stride * height));
         }
         finally { bitmap.UnlockBits(data); }
-        return bitmap.Clone();
+        return bitmap;
     }
 
     private void RequestEmbeddedRender(EmbeddedRuntime runtime, int width, int height, bool isPrint)
@@ -252,12 +276,21 @@ public sealed class PluginManager : IDisposable
                 int stride = checked(width * 4);
                 int dpi = isPrint ? 300 : 96;
                 var frame = await runtime.Instance.RenderAsync(new EmbeddedRenderRequest(width, height, stride, dpi, dpi, isPrint), runtime.Lifetime.Token).ConfigureAwait(false);
-                var bitmap = ConvertFrame(frame);
-                if (runtime.IsDisposed) { bitmap.Dispose(); return; }
-                if (isPrint) runtime.LastPrintFrame?.Dispose(); else runtime.LastFrame?.Dispose();
-                if (isPrint) runtime.LastPrintFrame = bitmap; else { runtime.LastFrame = bitmap; runtime.LastWidth = width; runtime.LastHeight = height; }
+                byte[] pixels = ExtractPixels(frame);
+                if (runtime.IsDisposed) return;
+
+                // Hop to the UI thread before touching any GDI+ object.
                 if (_browser.IsHandleCreated && !_browser.IsDisposed)
-                    _browser.BeginInvoke((Action)(() => _browser.Invalidate()));
+                {
+                    _browser.BeginInvoke((Action)(() =>
+                    {
+                        if (runtime.IsDisposed) return;
+                        var bitmap = BuildBitmap(pixels, width, height);
+                        if (isPrint) { runtime.LastPrintFrame?.Dispose(); runtime.LastPrintFrame = bitmap; runtime.LastPrintWidth = width; runtime.LastPrintHeight = height; }
+                        else { runtime.LastFrame?.Dispose(); runtime.LastFrame = bitmap; runtime.LastWidth = width; runtime.LastHeight = height; }
+                        _browser.Invalidate();
+                    }));
+                }
             }
             catch (Exception ex) { runtime.Error = ex.Message; }
             finally { Volatile.Write(ref runtime.Rendering, 0); }
