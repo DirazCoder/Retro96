@@ -97,7 +97,8 @@ public sealed class PluginManager : IDisposable
                     Enabled = enableImmediately,
                     GrantedPermissions = PluginPermission.None,
                     InstalledUtc = DateTimeOffset.UtcNow,
-                    DllSha256 = newHash
+                    DllSha256 = newHash,
+                    ActivityPersistence = SaveState
                 };
                 _plugins.Add(record.Manifest.Id, record);
                 SaveState();
@@ -224,14 +225,12 @@ public sealed class PluginManager : IDisposable
     public void SetGrantedPermissions(string id, PluginPermission permissions)
     {
         if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginPermission old = record.GrantedPermissions;
         PluginPermission sanitized = permissions & record.Manifest.RequestedPermissions;
         record.GrantedPermissions = sanitized;
         record.PendingNewPermissions = PluginPermission.None;
-        if (record.Enabled)
-        {
-            DisableRecord(record);
-            TryLoad(record);
-        }
+        if (old != sanitized)
+            record.Sandbox?.PushGrantedPermissions(sanitized);
         SaveState();
         PluginsChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -242,6 +241,12 @@ public sealed class PluginManager : IDisposable
         DisableRecord(record);
         if (record.Enabled) TryLoad(record);
         PluginsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public IReadOnlyList<PluginActivitySummary> GetActivitySummary(string id)
+    {
+        if (!_plugins.TryGetValue(id, out var record)) return Array.Empty<PluginActivitySummary>();
+        return record.BuildActivitySummary();
     }
 
     public PluginPermission ConsumePendingNewPermissions(string id)
@@ -840,8 +845,10 @@ public sealed class PluginManager : IDisposable
                         DllSha256 = string.IsNullOrWhiteSpace(state.DllSha256) ? SafeComputeDllSha256(dir, manifest) : state.DllSha256,
                         PermissionChanges = state.PermissionChanges ?? new List<PluginPermissionVersionChange>(),
                         LastCrashReason = state.LastCrashReason,
-                        LastCrashUtc = state.LastCrashUtc
+                        LastCrashUtc = state.LastCrashUtc,
+                        Activity = state.Activity ?? new List<PluginActivityEntry>()
                     };
+                    _plugins[state.Id].ActivityPersistence = SaveState;
                 }
                 catch { /* a broken installed plugin should not prevent startup */ }
             }
@@ -861,7 +868,8 @@ public sealed class PluginManager : IDisposable
             DllSha256 = p.DllSha256,
             PermissionChanges = p.PermissionChanges,
             LastCrashReason = p.LastCrashReason,
-            LastCrashUtc = p.LastCrashUtc
+            LastCrashUtc = p.LastCrashUtc,
+            Activity = p.SnapshotActivity()
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
     }
@@ -928,6 +936,7 @@ public sealed class PluginManager : IDisposable
         public List<PluginPermissionVersionChange>? PermissionChanges { get; set; }
         public string? LastCrashReason { get; set; }
         public DateTimeOffset? LastCrashUtc { get; set; }
+        public List<PluginActivityEntry>? Activity { get; set; }
     }
 
     public sealed class PluginRecord
@@ -945,10 +954,61 @@ public sealed class PluginManager : IDisposable
         public string? LastCrashReason { get; internal set; }
         public DateTimeOffset? LastCrashUtc { get; internal set; }
         public PluginPermission PendingNewPermissions { get; internal set; }
+        internal List<PluginActivityEntry> Activity { get; set; } = new();
+        internal readonly object ActivitySync = new();
+        internal Action? ActivityPersistence { get; set; }
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
+
+        internal void RecordActivity(PluginPermission permission, string? host)
+        {
+            string permissionName = PluginPermissionNames.ToNames(permission).FirstOrDefault() ?? permission.ToString();
+            lock (ActivitySync)
+            {
+                Activity.Add(new PluginActivityEntry
+                {
+                    Permission = permissionName,
+                    UsedUtc = DateTimeOffset.UtcNow,
+                    NetworkHost = string.IsNullOrWhiteSpace(host) ? null : host
+                });
+                if (Activity.Count > 1000)
+                    Activity.RemoveRange(0, Activity.Count - 1000);
+            }
+            try { ActivityPersistence?.Invoke(); } catch { }
+        }
+
+        internal List<PluginActivityEntry> SnapshotActivity()
+        {
+            lock (ActivitySync) return Activity.ToList();
+        }
+
+        internal IReadOnlyList<PluginActivitySummary> BuildActivitySummary()
+        {
+            var entries = SnapshotActivity();
+            return entries.GroupBy(x => x.Permission, StringComparer.OrdinalIgnoreCase)
+                .Select(group => new PluginActivitySummary(
+                    group.Key,
+                    group.Count(),
+                    group.Max(x => x.UsedUtc),
+                    group.Where(x => !string.IsNullOrWhiteSpace(x.NetworkHost))
+                         .Select(x => x.NetworkHost!)
+                         .Distinct(StringComparer.OrdinalIgnoreCase)
+                         .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                         .ToArray()))
+                .OrderBy(x => x.Permission, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
     }
+
+    public sealed class PluginActivityEntry
+    {
+        public string Permission { get; set; } = "";
+        public DateTimeOffset UsedUtc { get; set; }
+        public string? NetworkHost { get; set; }
+    }
+
+    public sealed record PluginActivitySummary(string Permission, int Calls, DateTimeOffset LastUsedUtc, IReadOnlyList<string> NetworkHosts);
 
     public sealed class PluginPermissionVersionChange
     {

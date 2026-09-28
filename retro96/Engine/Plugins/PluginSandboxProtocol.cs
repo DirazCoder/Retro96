@@ -107,6 +107,7 @@ internal static class PluginSandboxProtocol
     public sealed record EventTimerPayload(string Token);
     public sealed record EventClipboardPayload();
     public sealed record EventPlaybackPayload();
+    public sealed record EventPermissionsPayload(ulong GrantedPermissions);
     public sealed record ScreenshotReply(string PngBase64);
     public sealed record PanelInvokePayload(string Token, string? Text = null, bool? Checked = null, int? Index = null);
 

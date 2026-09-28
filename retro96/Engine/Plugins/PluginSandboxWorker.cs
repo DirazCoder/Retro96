@@ -264,6 +264,10 @@ internal static class PluginSandboxWorker
                         case "event.ui.panel.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PanelInvokePayload>(envelope) is { } pInvoke && _panelCallbacks.TryGetValue(pInvoke.Token, out var pAction)) _ = Task.Run(() => InvokePluginCallback("Panel", () => pAction(pInvoke.Text, pInvoke.Checked, pInvoke.Index))); break;
                         case "event.clipboard.changed": _clipboard?.RaiseChanged(); break;
                         case "event.audio.complete": _audio?.RaisePlaybackComplete(); break;
+                        case "event.permissions.changed":
+                            if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPermissionsPayload>(envelope) is { } permissions)
+                                _grantedPermissions = (PluginPermission)permissions.GrantedPermissions;
+                            break;
                         case "event.notification.click": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NotificationPayload>(envelope) is { Token: { } token } && _invokeCallbacks.TryGetValue(token, out var ncb)) _ = Task.Run(() => InvokePluginCallback("NotificationClick", ncb)); break;
                     }
                 }

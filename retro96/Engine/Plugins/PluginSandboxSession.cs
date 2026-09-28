@@ -204,6 +204,7 @@ internal sealed class PluginSandboxSession : IDisposable
     public void RaiseWindowFocusChanged(bool hasFocus) => SendEvent("event.focus", new PluginSandboxProtocol.EventFocusPayload(hasFocus));
     public void RaiseClipboardChanged() => SendEvent("event.clipboard.changed", new PluginSandboxProtocol.EventClipboardPayload());
     public void RaiseAudioComplete() => SendEvent("event.audio.complete", new PluginSandboxProtocol.EventPlaybackPayload());
+    public void PushGrantedPermissions(PluginPermission permissions) => SendEvent("event.permissions.changed", new PluginSandboxProtocol.EventPermissionsPayload((ulong)permissions));
 
     private void SendEvent(string op, object payload)
     {
@@ -420,12 +421,14 @@ internal sealed class PluginSandboxSession : IDisposable
                     Demand(PluginPermission.FileSystem); var fm = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.FilePayload>(envelope) ?? throw new InvalidDataException(); Directory.CreateDirectory(GetDataPath(fm.RelativePath)); await ReplyOkAsync(envelope); break;
 
                 case "network.get":
-                    Demand(PluginPermission.Network); var ng = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkRequestPayload>(envelope) ?? throw new InvalidDataException();
+                    var ng = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkRequestPayload>(envelope) ?? throw new InvalidDataException();
+                    Demand(PluginPermission.Network, GetNetworkHost(ng.Url));
                     EnsurePluginHeaders(ng.Headers);
                     string networkText = await _browser.PluginNetworkSendRequestAsync(new HttpPluginRequest(ng.Method, ng.Url, ng.Headers, string.IsNullOrEmpty(ng.BodyBase64) ? null : Convert.FromBase64String(ng.BodyBase64), ng.ContentType), _lifetime.Token).ConfigureAwait(false);
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkReply(true, Text: networkText)); break;
                 case "network.bytes":
-                    Demand(PluginPermission.Network); var nb = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkRequestPayload>(envelope) ?? throw new InvalidDataException();
+                    var nb = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkRequestPayload>(envelope) ?? throw new InvalidDataException();
+                    Demand(PluginPermission.Network, GetNetworkHost(nb.Url));
                     EnsurePluginHeaders(nb.Headers);
                     byte[] bytes = Convert.FromBase64String(await _browser.PluginNetworkSendRequestAsync(new HttpPluginRequest(nb.Method, nb.Url, nb.Headers, string.IsNullOrEmpty(nb.BodyBase64) ? null : Convert.FromBase64String(nb.BodyBase64), nb.ContentType), _lifetime.Token, binary: true).ConfigureAwait(false));
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkReply(true, BytesBase64: Convert.ToBase64String(bytes))); break;
@@ -509,8 +512,8 @@ internal sealed class PluginSandboxSession : IDisposable
                     await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
                     break;
                 case "network.stream.open":
-                    Demand(PluginPermission.Network);
                     var ns = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkStreamOpenPayload>(envelope) ?? throw new InvalidDataException();
+                    Demand(PluginPermission.Network, GetNetworkHost(ns.Request.Url));
                     EnsurePluginHeaders(ns.Request.Headers);
                     var net = await _browser.OpenPluginNetworkStreamAsync(ns.Request, _record, _lifetime.Token).ConfigureAwait(true);
                     string networkStreamToken = Guid.NewGuid().ToString("N");
@@ -521,8 +524,8 @@ internal sealed class PluginSandboxSession : IDisposable
                         net.EffectiveUrl, networkStreamToken, net.CanSeek, net.Length)).ConfigureAwait(false);
                     break;
                 case "embed.network.stream.open":
-                    Demand(PluginPermission.EmbedNetwork);
                     var ens = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkStreamOpenPayload>(envelope) ?? throw new InvalidDataException();
+                    Demand(PluginPermission.EmbedNetwork, GetNetworkHost(ens.Request.Url));
                     EnsurePluginHeaders(ens.Request.Headers);
                     var embedNet = await _browser.OpenPluginNetworkStreamAsync(ens.Request, _record, _lifetime.Token).ConfigureAwait(true);
                     string embedNetworkStreamToken = Guid.NewGuid().ToString("N");
@@ -833,6 +836,11 @@ internal sealed class PluginSandboxSession : IDisposable
         await PluginSandboxProtocol.WriteBinaryAsync(_pipe, op, id, payload, data, _writeLock, cancellationToken).ConfigureAwait(false);
     }
 
+    private static string? GetNetworkHost(string? url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : null;
+    }
+
     private void EnsurePluginHeaders(IReadOnlyDictionary<string, string>? headers)
     {
         foreach (string name in (headers ?? new Dictionary<string, string>()).Keys)
@@ -844,10 +852,11 @@ internal sealed class PluginSandboxSession : IDisposable
         }
     }
 
-    private void Demand(PluginPermission permission)
+    private void Demand(PluginPermission permission, string? networkHost = null)
     {
         if (!_record.HasPermission(permission))
             throw new SecurityException($"Plugin '{_record.Manifest.Name}' lacks permission '{string.Join(", ", PluginPermissionNames.ToNames(permission))}'.");
+        _record.RecordActivity(permission, networkHost);
     }
 
     private async Task ReplyOkAsync(string id) => await ReplyAsync(id, "response", new { success = true }).ConfigureAwait(false);
