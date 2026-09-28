@@ -296,7 +296,7 @@ internal sealed class PluginSandboxSession : IDisposable
                     }
                 case "host.info":
                     {
-                        string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger" };
+                        string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger", "permissions" };
                         var info = new PluginSandboxProtocol.HostInfoReply(
                             Application.ProductVersion, Retro96PluginApi.ApiVersion, supported, "classic",
                             System.Globalization.CultureInfo.CurrentUICulture.Name, Math.Max(96, _browser.DeviceDpi));
