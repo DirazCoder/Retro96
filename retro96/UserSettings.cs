@@ -63,6 +63,7 @@ public sealed class UserSettings
     public TrustMode TrustMode { get; set; } = TrustMode.Medium;
     public bool HostCheckImages { get; set; } = true;
     public bool DiscardPageStateOnClose { get; set; } = true;
+    public bool PluginDevMode { get; set; } = false;
 
     private static string ConfigDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Retro96");
@@ -105,7 +106,8 @@ public sealed class UserSettings
         MarqueeText = MarqueeText,
         TrustMode = TrustMode,
         HostCheckImages = HostCheckImages,
-        DiscardPageStateOnClose = DiscardPageStateOnClose
+        DiscardPageStateOnClose = DiscardPageStateOnClose,
+        PluginDevMode = PluginDevMode
     };
 
     public static UserSettings Load()
@@ -225,6 +227,9 @@ public sealed class UserSettings
                     case "security.discardstate":
                         s.DiscardPageStateOnClose = ParseBool(value, s.DiscardPageStateOnClose);
                         break;
+                    case "plugins.devmode":
+                        s.PluginDevMode = ParseBool(value, s.PluginDevMode);
+                        break;
                 }
             }
         }
@@ -264,6 +269,7 @@ public sealed class UserSettings
         sb.AppendLine("Security.Mode=" + TrustMode);
         sb.AppendLine("Security.HostImageCheck=" + BoolText(HostCheckImages));
         sb.AppendLine("Security.DiscardState=" + BoolText(DiscardPageStateOnClose));
+        sb.AppendLine("Plugins.DevMode=" + BoolText(PluginDevMode));
         string contents = sb.ToString();
 
         bool userSaved = false;

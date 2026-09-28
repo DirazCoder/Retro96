@@ -27,6 +27,7 @@ internal sealed class PreferencesDialog : Form
     private readonly CheckBox _discardState = new();
     private readonly PluginManager? _pluginManager;
     private readonly Dictionary<string, Control> _pluginSettingControls = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CheckBox _pluginDevMode = new();
 
     // Advanced engine feature switches. Kept in one long, scrollable list
     // so the Advanced tab acts as the low-level control panel.
@@ -432,6 +433,13 @@ internal sealed class PreferencesDialog : Form
     {
         var page = NewTab("Plugins");
         var panel = StackPanel();
+        ConfigureCheckBox(_pluginDevMode, "Enable developer mode");
+        _pluginDevMode.CheckedChanged += (_, _) => UpdatePluginDevWarning(panel);
+        panel.Controls.Add(Group("Developer mode", new Control[]
+        {
+            _pluginDevMode,
+            new Label { Text = "Load Unpacked is intended only for development. It disables the normal packaged-plugin workflow for developer-loaded plugins and is not a security boundary.", AutoSize = true, MaximumSize = new Size(680, 0), ForeColor = SystemColors.GrayText }
+        }));
         bool any = false;
         foreach (var record in _pluginManager!.Plugins)
         {
@@ -464,6 +472,17 @@ internal sealed class PreferencesDialog : Form
             panel.Controls.Add(new Label { Text = "No installed plugins declare host-rendered settings.", AutoSize = true, ForeColor = SystemColors.GrayText });
         page.Controls.Add(panel);
         return page;
+    }
+
+    private void UpdatePluginDevWarning(Control panel)
+    {
+        var warning = panel.Controls.OfType<GroupBox>().FirstOrDefault(g => g.Text == "Developer mode");
+        if (warning == null) return;
+        var label = warning.Controls.OfType<FlowLayoutPanel>().SelectMany(x => x.Controls.OfType<Label>()).FirstOrDefault(l => l.Text.StartsWith("Developer mode is ON", StringComparison.Ordinal));
+        if (_pluginDevMode.Checked && label == null)
+        {
+            warning.Controls[0].Controls.Add(new Label { Text = "Developer mode is ON. Unpacked plugins are code under active development; this warning remains visible while the mode is enabled.", AutoSize = true, MaximumSize = new Size(680, 0), ForeColor = SystemColors.WindowText });
+        }
     }
 
     private static string SettingKey(PluginManager.PluginRecord record, PluginSettingDefinition definition) => record.Manifest.Id + "\n" + definition.Name;
@@ -502,6 +521,7 @@ internal sealed class PreferencesDialog : Form
         _trust.Value = Math.Clamp((int)_settings.TrustMode, _trust.Minimum, _trust.Maximum);
         _hostImageCheck.Checked = _settings.HostCheckImages;
         _discardState.Checked = _settings.DiscardPageStateOnClose;
+        _pluginDevMode.Checked = _settings.PluginDevMode;
         _loadStylesheets.Checked = _settings.LoadStylesheets;
         _loadFrames.Checked = _settings.LoadFrames;
         _allowForms.Checked = _settings.AllowFormSubmissions;
@@ -531,6 +551,7 @@ internal sealed class PreferencesDialog : Form
         target.TrustMode = (TrustMode)Math.Clamp(_trust.Value, 0, 2);
         target.HostCheckImages = _hostImageCheck.Checked || target.TrustMode == TrustMode.High;
         target.DiscardPageStateOnClose = _discardState.Checked;
+        target.PluginDevMode = _pluginDevMode.Checked;
         target.LoadStylesheets = _loadStylesheets.Checked;
         target.LoadFrames = _loadFrames.Checked;
         target.AllowFormSubmissions = _allowForms.Checked;

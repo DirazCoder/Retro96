@@ -162,6 +162,8 @@ public partial class Form1 : Form
     internal BrowserCanvas PluginCanvas => _canvas;
 
     internal string? PluginCurrentUrl => _currentPageUrl;
+    internal bool PluginDevMode => _settings.PluginDevMode;
+
     internal string PluginCurrentTitle => Text.EndsWith(" — Retro96", StringComparison.Ordinal)
         ? Text[..^10] : Text;
 
@@ -612,6 +614,7 @@ public partial class Form1 : Form
         _settings.TrustMode = updated.TrustMode;
         _settings.HostCheckImages = updated.HostCheckImages;
         _settings.DiscardPageStateOnClose = updated.DiscardPageStateOnClose;
+        _settings.PluginDevMode = updated.PluginDevMode;
         _settings.Save();
         BrowserRuntime.Apply(_settings);
 

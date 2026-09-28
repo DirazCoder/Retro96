@@ -66,6 +66,7 @@ public sealed class PluginManager : IDisposable
 
     public IReadOnlyList<PluginRecord> Plugins => _plugins.Values.OrderBy(p => p.Manifest.Name, StringComparer.OrdinalIgnoreCase).ToArray();
     internal string HostVersion => Application.ProductVersion;
+    internal bool IsDeveloperModeEnabled => _browser.PluginDevMode;
 
     public event EventHandler? PluginsChanged;
 
@@ -214,6 +215,92 @@ public sealed class PluginManager : IDisposable
         {
             if (!string.IsNullOrEmpty(temp)) TryDeleteDirectory(temp);
             throw;
+        }
+    }
+
+    public PluginRecord LoadUnpacked(string sourceDirectory, bool enableImmediately = true)
+    {
+        if (!_browser.PluginDevMode)
+            throw new InvalidOperationException("Developer mode is disabled. Enable it in Preferences → Plugins first.");
+        string source = Path.GetFullPath(sourceDirectory ?? string.Empty).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string manifestPath = Path.Combine(source, "plugin.json");
+        string libPath = Path.Combine(source, "lib");
+        if (!Directory.Exists(source) || !File.Exists(manifestPath) || !Directory.Exists(libPath))
+            throw new InvalidDataException("Load Unpacked requires a folder containing plugin.json and lib/.");
+        PluginManifest manifest = LoadManifest(manifestPath);
+        ValidateManifest(manifest);
+        ValidateEntryAssembly(source, manifest);
+
+        string destination = GetPluginDirectory(manifest.Id);
+        string temp = destination + ".unpacked-" + Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(temp);
+        try
+        {
+            CopyDirectory(source, temp, skipGit: true);
+            var copied = LoadManifest(Path.Combine(temp, "plugin.json"));
+            ValidateManifest(copied);
+            ValidateEntryAssembly(temp, copied);
+            string hash = ComputeDllSha256(temp, copied);
+            _plugins.TryGetValue(copied.Id, out var existing);
+            if (existing == null)
+            {
+                Directory.Move(temp, destination);
+                var record = new PluginRecord { Manifest = copied, Directory = destination, Enabled = enableImmediately, GrantedPermissions = PluginPermission.None, InstalledUtc = DateTimeOffset.UtcNow, DllSha256 = hash, IsDev = true, DevSourceDirectory = source, ActivityPersistence = SaveState };
+                _plugins.Add(record.Manifest.Id, record);
+                SaveState();
+                if (record.Enabled) TryLoad(record);
+                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                return record;
+            }
+
+            bool wasEnabled = existing.Enabled;
+            PluginPermission oldGranted = existing.GrantedPermissions;
+            PluginPermission oldRequested = existing.RequestedPermissions;
+            DisableRecord(existing);
+            string backup = destination + ".unpacked-backup-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                Directory.Move(destination, backup);
+                Directory.Move(temp, destination); temp = string.Empty;
+                string oldData = Path.Combine(backup, "data"); string newData = Path.Combine(destination, "data");
+                if (Directory.Exists(oldData)) { TryDeleteDirectory(newData); Directory.Move(oldData, newData); }
+                TryDeleteDirectory(backup);
+            }
+            catch
+            {
+                TryDeleteDirectory(destination);
+                if (Directory.Exists(backup)) Directory.Move(backup, destination);
+                throw;
+            }
+            existing.Manifest = copied;
+            existing.Directory = destination;
+            existing.DllSha256 = hash;
+            existing.IsDev = true;
+            existing.DevSourceDirectory = source;
+            existing.GrantedPermissions = oldGranted & copied.AvailablePermissions;
+            existing.PendingNewPermissions = copied.RequestedPermissions & ~oldRequested;
+            existing.Error = null;
+            existing.Status = wasEnabled ? "Loading (unpacked)" : "Disabled";
+            SaveState();
+            if (wasEnabled || enableImmediately) { existing.Enabled = true; TryLoad(existing); }
+            PluginsChanged?.Invoke(this, EventArgs.Empty);
+            return existing;
+        }
+        catch { if (!string.IsNullOrEmpty(temp)) TryDeleteDirectory(temp); throw; }
+    }
+
+    private static void CopyDirectory(string source, string destination, bool skipGit)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (string file in Directory.GetFiles(source))
+        {
+            if (skipGit && Path.GetFileName(file).Equals(".git", StringComparison.OrdinalIgnoreCase)) continue;
+            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), true);
+        }
+        foreach (string dir in Directory.GetDirectories(source))
+        {
+            if (skipGit && Path.GetFileName(dir).Equals(".git", StringComparison.OrdinalIgnoreCase)) continue;
+            CopyDirectory(dir, Path.Combine(destination, Path.GetFileName(dir)), skipGit);
         }
     }
 
@@ -1163,7 +1250,9 @@ public sealed class PluginManager : IDisposable
                         Activity = state.Activity ?? new List<PluginActivityEntry>(),
                         CrashTimes = state.CrashTimes ?? new List<DateTimeOffset>(),
                         RestartAttempt = state.RestartAttempt,
-                        RejectedShortcuts = state.RejectedShortcuts ?? new List<string>()
+                        RejectedShortcuts = state.RejectedShortcuts ?? new List<string>(),
+                        IsDev = state.IsDev,
+                        DevSourceDirectory = state.DevSourceDirectory
                     };
                     _plugins[state.Id].ActivityPersistence = SaveState;
                 }
@@ -1189,7 +1278,9 @@ public sealed class PluginManager : IDisposable
             Activity = p.SnapshotActivity(),
             CrashTimes = p.CrashTimes.ToList(),
             RestartAttempt = p.RestartAttempt,
-            RejectedShortcuts = p.RejectedShortcuts.ToList()
+            RejectedShortcuts = p.RejectedShortcuts.ToList(),
+            IsDev = p.IsDev,
+            DevSourceDirectory = p.DevSourceDirectory
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
     }
@@ -1264,6 +1355,8 @@ public sealed class PluginManager : IDisposable
         public List<DateTimeOffset>? CrashTimes { get; set; }
         public int RestartAttempt { get; set; }
         public List<string>? RejectedShortcuts { get; set; }
+        public bool IsDev { get; set; }
+        public string? DevSourceDirectory { get; set; }
     }
 
     public sealed class PluginRecord
@@ -1287,6 +1380,8 @@ public sealed class PluginManager : IDisposable
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
+        public bool IsDev { get; internal set; }
+        public string? DevSourceDirectory { get; internal set; }
         public int CrashCountInWindow => CrashTimes.Count(t => DateTimeOffset.UtcNow - t <= PluginCrashWindow);
 
         internal void RecordActivity(PluginPermission permission, string? host)

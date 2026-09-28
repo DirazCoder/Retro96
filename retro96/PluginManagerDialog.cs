@@ -19,6 +19,7 @@ public sealed class PluginManagerDialog : Form
     private readonly Button _permissions = new() { Text = "Permissions..." };
     private readonly Button _reload = new() { Text = "Reload" };
     private readonly Button _folder = new() { Text = "Open Folder" };
+    private readonly Button _loadUnpacked = new() { Text = "Load Unpacked" };
     private readonly Button _close = new() { Text = "Close" };
     private readonly ContextMenuStrip _contextMenu = new();
 
@@ -135,7 +136,7 @@ public sealed class PluginManagerDialog : Form
             Margin = Padding.Empty
         };
 
-        foreach (var button in new[] { _add, _remove, _enable, _disable, _detailsButton, _permissions, _reload, _folder, _close })
+        foreach (var button in new[] { _add, _remove, _enable, _disable, _detailsButton, _permissions, _reload, _folder, _loadUnpacked, _close })
         {
             button.AutoSize = false;
             button.Width = 164;
@@ -168,6 +169,7 @@ public sealed class PluginManagerDialog : Form
         _permissions.Click += (s, e) => EditPermissions();
         _reload.Click += (s, e) => ReloadPlugin();
         _folder.Click += (s, e) => OpenFolder();
+        _loadUnpacked.Click += (s, e) => LoadUnpacked();
         _close.Click += (s, e) => Close();
 
         body.Resize += (s, e) => UpdateListColumnWidths();
@@ -259,6 +261,8 @@ public sealed class PluginManagerDialog : Form
         _permissions.Enabled = has;
         _reload.Enabled = has && record!.Enabled;
         _folder.Enabled = has;
+        _loadUnpacked.Visible = _manager.IsDeveloperModeEnabled;
+        _loadUnpacked.Enabled = _manager.IsDeveloperModeEnabled;
         _close.Enabled = true;
         if (record == null)
         {
@@ -335,6 +339,32 @@ public sealed class PluginManagerDialog : Form
         var record = SelectedRecord();
         if (record == null) return;
         _manager.Reload(record.Manifest.Id);
+    }
+
+    private void LoadUnpacked()
+    {
+        if (!_manager.IsDeveloperModeEnabled) return;
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Select an unpacked Retro96 plugin folder containing plugin.json and lib/.",
+            UseDescriptionForTitle = true
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            var record = _manager.LoadUnpacked(dialog.SelectedPath);
+            PluginPermission newlyRequested = _manager.ConsumePendingNewPermissions(record.Manifest.Id);
+            if (newlyRequested != PluginPermission.None)
+            {
+                using var permissionsDialog = new PluginPermissionsDialog(record, newlyRequested);
+                if (permissionsDialog.ShowDialog(this) == DialogResult.OK)
+                    _manager.SetGrantedPermissions(record.Manifest.Id, record.GrantedPermissions | permissionsDialog.GrantedPermissions);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Load Unpacked Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void OpenFolder()
