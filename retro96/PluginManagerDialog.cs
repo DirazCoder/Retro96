@@ -289,9 +289,18 @@ public sealed class PluginManagerDialog : Form
 
         try
         {
-            var permissions = ReadRequestedPermissions(dialog.FileName);
-            using var review = new PluginInstallReviewDialog(permissions);
-            if (review.ShowDialog(this) != DialogResult.OK) return;
+            var manifest = ReadManifest(dialog.FileName);
+            bool updating = _manager.Plugins.Any(p => p.Manifest.Id.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase));
+            if (!updating)
+            {
+                using var review = new PluginInstallReviewDialog(manifest.Permissions);
+                if (review.ShowDialog(this) != DialogResult.OK) return;
+                var newRecord = _manager.InstallPackage(dialog.FileName, enableImmediately: false);
+                if (review.GrantedPermissions != PluginPermission.None)
+                    _manager.SetGrantedPermissions(newRecord.Manifest.Id, review.GrantedPermissions);
+                return;
+            }
+
             var record = _manager.InstallPackage(dialog.FileName, enableImmediately: false);
             PluginPermission newlyRequested = _manager.ConsumePendingNewPermissions(record.Manifest.Id);
             if (newlyRequested != PluginPermission.None)
@@ -307,14 +316,13 @@ public sealed class PluginManagerDialog : Form
         }
     }
 
-    private static IReadOnlyList<string> ReadRequestedPermissions(string packagePath)
+    private static PluginManifest ReadManifest(string packagePath)
     {
         using var archive = System.IO.Compression.ZipFile.OpenRead(packagePath);
-        var entry = archive.GetEntry("plugin.json");
-        if (entry == null) return Array.Empty<string>();
+        var entry = archive.GetEntry("plugin.json") ?? throw new InvalidDataException("The package does not contain plugin.json.");
         using var stream = entry.Open();
-        var manifest = System.Text.Json.JsonSerializer.Deserialize(stream, PluginManifestJsonContext.Default.PluginManifest);
-        return manifest?.Permissions ?? new List<string>();
+        return System.Text.Json.JsonSerializer.Deserialize(stream, PluginManifestJsonContext.Default.PluginManifest)
+            ?? throw new InvalidDataException("The package manifest is empty or invalid.");
     }
 
     private void DeletePlugin()
@@ -613,6 +621,14 @@ internal sealed class PermissionConfirmationDialog : Form
 
 internal sealed class PluginInstallReviewDialog : Form
 {
+    private readonly Dictionary<PluginPermission, CheckBox> _checks = new();
+    private bool _changingCheck;
+
+    public PluginPermission GrantedPermissions => _checks
+        .Where(p => p.Value.Checked)
+        .Select(p => p.Key)
+        .Aggregate(PluginPermission.None, (current, permission) => current | permission);
+
     public PluginInstallReviewDialog(IReadOnlyList<string> permissionNames)
     {
         Text = "Install Plugin";
@@ -630,28 +646,43 @@ internal sealed class PluginInstallReviewDialog : Form
             AutoSize = true,
             MaximumSize = new Size(640, 0),
             Padding = new Padding(12),
-            Text = "Retro96 plugins run in a separate sandbox worker. Requested permissions are checked by the host broker. Plugin packages are not signed. Review the requested capabilities below before installing."
+            Text = "Choose the permissions to grant. Sensitive permissions start unchecked and require a separate confirmation. Plugin packages are not signed. Review the capability details before installing."
         };
         var rows = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(12), Margin = Padding.Empty };
         var permissions = permissionNames
             .Select(name => PluginPermissionNames.Parse(new[] { name }))
             .Where(p => p != PluginPermission.None)
             .Select(PluginPermissionCatalog.Get)
+            .GroupBy(x => x.Permission)
+            .Select(x => x.First())
+            .OrderBy(x => x.Tier)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        foreach (var info in permissions)
+
+        foreach (var tier in new[] { PluginPermissionTier.Standard, PluginPermissionTier.Elevated, PluginPermissionTier.Sensitive })
         {
-            var row = new TableLayoutPanel { Width = 620, Height = 58, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 6) };
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28f));
-            row.Controls.Add(new Label
+            var tierPermissions = permissions.Where(x => x.Tier == tier).ToArray();
+            if (tierPermissions.Length == 0) continue;
+            rows.Controls.Add(new Label { Text = tier + " permissions", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(0, 4, 0, 4) });
+            foreach (var info in tierPermissions)
             {
-                Dock = DockStyle.Fill,
-                AutoSize = false,
-                Text = $"{info.Name} — {info.Tier}\r\n{info.Description}",
-                Padding = new Padding(0, 2, 0, 2)
-            }, 0, 0);
-            row.Controls.Add(new PermissionInfoButton(info.Name, (_, _) => PermissionInfoDialog.Show(this, info.Permission)), 1, 0);
-            rows.Controls.Add(row);
+                var row = new TableLayoutPanel { Width = 620, Height = 40, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 4), Padding = Padding.Empty };
+                row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+                row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28f));
+                var check = new CheckBox
+                {
+                    Text = info.Name + " — " + info.Description,
+                    AutoSize = false,
+                    Dock = DockStyle.Fill,
+                    Checked = info.Tier != PluginPermissionTier.Sensitive,
+                    Margin = new Padding(0, 5, 0, 0)
+                };
+                check.CheckedChanged += (_, _) => OnPermissionChecked(info, check);
+                _checks[info.Permission] = check;
+                row.Controls.Add(check, 0, 0);
+                row.Controls.Add(new PermissionInfoButton(info.Name, (_, _) => PermissionInfoDialog.Show(this, info.Permission)), 1, 0);
+                rows.Controls.Add(row);
+            }
         }
 
         var bottom = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(10, 8, 10, 8), Margin = Padding.Empty };
@@ -664,9 +695,9 @@ internal sealed class PluginInstallReviewDialog : Form
         AcceptButton = install;
         CancelButton = cancel;
 
-        var introWrap = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1 };
+        var introWrap = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
         introWrap.Controls.Add(intro, 0, 0);
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = Padding.Empty, Margin = Padding.Empty };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54f));
@@ -674,6 +705,19 @@ internal sealed class PluginInstallReviewDialog : Form
         layout.Controls.Add(rows, 0, 1);
         layout.Controls.Add(bottom, 0, 2);
         Controls.Add(layout);
+    }
+
+    private void OnPermissionChecked(PluginPermissionInfo info, CheckBox check)
+    {
+        if (_changingCheck || !check.Checked || info.Tier != PluginPermissionTier.Sensitive) return;
+        bool hasNetwork = _checks.TryGetValue(PluginPermission.Network, out var network) && network.Checked;
+        bool readsData = _checks.Any(x => PluginPermissionCatalog.IsDataReading(x.Key) && x.Value.Checked);
+        if (!PermissionConfirmationDialog.Confirm(this, info, hasNetwork && readsData))
+        {
+            _changingCheck = true;
+            check.Checked = false;
+            _changingCheck = false;
+        }
     }
 }
 

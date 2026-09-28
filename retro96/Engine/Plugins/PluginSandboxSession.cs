@@ -420,14 +420,17 @@ internal sealed class PluginSandboxSession : IDisposable
                     await ReplyOkAsync(envelope);
                     break;
                 case "page.read.text":
+                    Demand(PluginPermission.PageRead);
                     var pageText = await GetPageTextAsync(_lifetime.Token).ConfigureAwait(true);
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageReadReply(pageText));
                     break;
                 case "page.read.links":
+                    Demand(PluginPermission.PageRead);
                     var pageLinks = await GetPageLinksAsync(_lifetime.Token).ConfigureAwait(true);
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageLinksReply(pageLinks.ToArray()));
                     break;
                 case "page.read.selection":
+                    Demand(PluginPermission.PageRead);
                     var selection = await GetSelectionAsync(_lifetime.Token).ConfigureAwait(true);
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageSelectionReply(selection));
                     break;
@@ -1268,6 +1271,48 @@ internal sealed class PluginSandboxSession : IDisposable
             if (name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) && !_record.HasPermission(PluginPermission.BrowserCookies))
                 throw new SecurityException("Setting the Cookie header requires 'browser.cookies'.");
         }
+    }
+
+    private async Task<string> GetPageTextAsync(CancellationToken cancellationToken)
+    {
+        string text = await RunOnUiAsync(_browser.PluginGetPageText, cancellationToken).ConfigureAwait(false);
+        return text.Length <= 512 * 1024 ? text : text[..(512 * 1024)];
+    }
+
+    private async Task<IReadOnlyList<PluginPageLink>> GetPageLinksAsync(CancellationToken cancellationToken)
+    {
+        var links = await RunOnUiAsync(_browser.PluginGetPageLinks, cancellationToken).ConfigureAwait(false);
+        return links.Take(2000).ToArray();
+    }
+
+    private Task<string?> GetSelectionAsync(CancellationToken cancellationToken)
+    {
+        return RunOnUiAsync(_browser.PluginGetSelection, cancellationToken);
+    }
+
+    private async Task<T> RunOnUiAsync<T>(Func<T> func, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!_browser.IsHandleCreated || _browser.IsDisposed)
+            throw new InvalidOperationException("Browser window is unavailable.");
+        if (!_browser.InvokeRequired)
+            return func();
+
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+        try
+        {
+            _browser.BeginInvoke(new Action(() =>
+            {
+                try { completion.TrySetResult(func()); }
+                catch (Exception ex) { completion.TrySetException(ex); }
+            }));
+        }
+        catch (Exception ex)
+        {
+            completion.TrySetException(ex);
+        }
+        return await completion.Task.ConfigureAwait(false);
     }
 
     private void Demand(PluginPermission permission, string? networkHost = null)
