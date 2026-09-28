@@ -112,6 +112,23 @@ public static class PluginPermissionNames
     }
 }
 
+public sealed record PluginContentTransformScope
+{
+    [JsonPropertyName("url")]
+    public string UrlPattern { get; init; } = "";
+
+    [JsonPropertyName("mime")]
+    public string MimePattern { get; init; } = "";
+
+    public PluginContentTransformScope() { }
+
+    public PluginContentTransformScope(string urlPattern, string mimePattern)
+    {
+        UrlPattern = urlPattern;
+        MimePattern = mimePattern;
+    }
+}
+
 public sealed class PluginManifest
 {
     public string Id { get; set; } = "";
@@ -127,6 +144,8 @@ public sealed class PluginManifest
     public List<string> OptionalPermissions { get; set; } = new();
     [JsonPropertyName("embed_types")]
     public List<string> EmbedTypes { get; set; } = new();
+    [JsonPropertyName("content_transform_scopes")]
+    public List<PluginContentTransformScope> ContentTransformScopes { get; set; } = new();
     public List<PluginSettingDefinition> Settings { get; set; } = new();
 
     [JsonPropertyName("script_name")]

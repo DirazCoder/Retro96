@@ -361,6 +361,8 @@ internal sealed class PluginSandboxSession : IDisposable
                     Demand(PluginPermission.ContentTransform);
                     var transformRegister = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformRegisterPayload>(envelope) ?? throw new InvalidDataException();
                     ValidateContentType(transformRegister.ContentType);
+                    if (!_record.Manifest.ContentTransformScopes.Any(scope => PluginContentTransformPolicy.GlobMatches(scope.MimePattern, transformRegister.ContentType)))
+                        throw new SecurityException("The registered transform MIME type is outside the manifest content_transform_scopes.");
                     lock (_contentTransforms) _contentTransforms[transformRegister.ContentType] = transformRegister.Token;
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.ContentTransformRegisterReply(transformRegister.Token));
                     break;
@@ -958,7 +960,7 @@ internal sealed class PluginSandboxSession : IDisposable
         var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformResponsePayload>(binary) ?? throw new InvalidDataException("Transform response metadata is missing.");
         if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
         if (binary.Data.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform output exceeds its size cap.");
-        return Encoding.UTF8.GetString(binary.Data);
+        return PluginContentTransformPolicy.SanitizeHtml(Encoding.UTF8.GetString(binary.Data));
     }
 
     internal IReadOnlyList<string> PageStyles { get { lock (_pageStyles) return _pageStyles.ToArray(); } }

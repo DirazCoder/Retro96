@@ -977,6 +977,7 @@ public sealed class PluginManager : IDisposable
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.ContentTransform)) continue;
             if (!record.Sandbox.GetContentTransformTypes().Any(t => contentType.Equals(t, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!record.Manifest.ContentTransformScopes.Any(scope => PluginContentTransformPolicy.ScopeMatches(scope, url, contentType))) continue;
             return await record.Sandbox.TransformContentAsync(contentType, url, charset, body, ct).ConfigureAwait(true);
         }
         return null;
@@ -1261,6 +1262,20 @@ public sealed class PluginManager : IDisposable
             throw new InvalidDataException("A permission cannot be listed in both permissions and optional_permissions.");
         manifest.OptionalPermissions ??= new List<string>();
         manifest.EmbedTypes ??= new List<string>();
+        manifest.ContentTransformScopes ??= new List<PluginContentTransformScope>();
+        bool transform = manifest.RequestedPermissions.HasFlag(PluginPermission.ContentTransform) ||
+                         manifest.OptionalPermissionSet.HasFlag(PluginPermission.ContentTransform);
+        if (transform && manifest.ContentTransformScopes.Count == 0)
+            throw new InvalidDataException("Plugins declaring 'content.transform' must declare at least one content_transform_scopes entry with both url and mime patterns.");
+        if (manifest.ContentTransformScopes.Count > 32)
+            throw new InvalidDataException("At most 32 content_transform_scopes entries are allowed.");
+        foreach (var scope in manifest.ContentTransformScopes)
+        {
+            if (!PluginContentTransformPolicy.IsSafeTransformUrlPattern(scope.UrlPattern))
+                throw new InvalidDataException("Each content_transform_scopes url pattern must be 1-2048 characters and may use * or ? wildcards.");
+            if (!PluginContentTransformPolicy.IsSafeTransformMimePattern(scope.MimePattern))
+                throw new InvalidDataException("Each content_transform_scopes mime pattern must be a MIME type pattern such as text/*.");
+        }
         bool renderer = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedRenderer);
         bool script = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedScript);
         if (renderer && manifest.EmbedTypes.Count == 0)

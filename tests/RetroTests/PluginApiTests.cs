@@ -124,3 +124,27 @@ public sealed class PluginPermissionSecurityTests
         Assert.True((ulong)permissions > uint.MaxValue);
     }
 }
+
+
+public sealed class PluginContentTransformTests
+{
+    [Fact]
+    public void ScopeMatchesUrlAndMimeOnlyWhenBothMatch()
+    {
+        var scope = new PluginContentTransformScope("https://example.test/private/*", "text/*");
+        Assert.True(Retro96.Plugins.PluginContentTransformPolicy.ScopeMatches(scope, "https://example.test/private/page", "text/html"));
+        Assert.False(Retro96.Plugins.PluginContentTransformPolicy.ScopeMatches(scope, "https://example.test/public/page", "text/html"));
+        Assert.False(Retro96.Plugins.PluginContentTransformPolicy.ScopeMatches(scope, "https://example.test/private/page", "image/png"));
+    }
+
+    [Fact]
+    public void TransformOutputStripsScriptHandlersAndJavascriptUrls()
+    {
+        string clean = Retro96.Plugins.PluginContentTransformPolicy.SanitizeHtml(
+            "<html><body><script>alert(1)</script><a href=\"javascript:alert(2)\" onclick=\"evil()\">ok</a><img src=\"java&#x73;cript:alert(3)\"></body></html>");
+        Assert.DoesNotContain("<script", clean, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("onclick", clean, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("javascript:", clean, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ok", clean, StringComparison.Ordinal);
+    }
+}

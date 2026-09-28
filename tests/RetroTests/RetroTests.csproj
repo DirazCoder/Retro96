@@ -58,6 +58,7 @@
     <Compile Include="../../retro96/Engine/Plugins/PluginApi.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginPermissionCatalog.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginPermissionSecurity.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginContentTransformPolicy.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginJsValueCodec.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginSandboxProtocol.cs" />
     <!-- Java 1.1 applet engine (JavaEngineTests.cs; class fixtures in html-websites/java) -->
