@@ -349,19 +349,8 @@ public sealed class PluginManagerDialog : Form
     {
         var record = SelectedRecord();
         if (record == null) return;
-        string requested = string.Join(", ", PluginPermissionNames.ToNames(record.RequestedPermissions));
-        string granted = string.Join(", ", PluginPermissionNames.ToNames(record.GrantedPermissions));
-        string text =
-            $"Name: {record.Manifest.Name}\r\n" +
-            $"ID: {record.Manifest.Id}\r\n" +
-            $"Version: {record.Manifest.Version}\r\n" +
-            $"Author: {record.Manifest.Author}\r\n" +
-            $"API: {record.Manifest.ApiVersion}\r\n" +
-            $"Entry: {record.Manifest.EntryPoint}\r\n" +
-            $"Requested: {(string.IsNullOrWhiteSpace(requested) ? "None" : requested)}\r\n" +
-            $"Granted: {(string.IsNullOrWhiteSpace(granted) ? "None" : granted)}\r\n" +
-            $"Folder: {record.Directory}";
-        MessageBox.Show(this, text, "Plugin Details", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        using var dialog = new PluginDetailsDialog(_manager, record);
+        dialog.ShowDialog(this);
     }
 
     private void EditPermissions()
@@ -655,6 +644,103 @@ internal sealed class PluginInstallReviewDialog : Form
         layout.Controls.Add(rows, 0, 1);
         layout.Controls.Add(bottom, 0, 2);
         Controls.Add(layout);
+    }
+}
+
+
+internal sealed class PluginDetailsDialog : Form
+{
+    public PluginDetailsDialog(PluginManager manager, PluginManager.PluginRecord record)
+    {
+        Text = "Plugin Details — " + record.Manifest.Name;
+        StartPosition = FormStartPosition.CenterParent;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        MinimumSize = new Size(660, 560);
+        ClientSize = new Size(820, 700);
+
+        var text = new StringBuilder();
+        text.AppendLine($"Name: {record.Manifest.Name}");
+        text.AppendLine($"ID: {record.Manifest.Id}");
+        text.AppendLine($"Version: {record.Manifest.Version}");
+        text.AppendLine($"Author: {record.Manifest.Author}");
+        text.AppendLine($"API: {record.Manifest.ApiVersion}");
+        text.AppendLine($"Status: {record.Status}");
+        text.AppendLine($"Install date (UTC): {record.InstalledUtc:O}");
+        text.AppendLine($"DLL SHA-256: {record.DllSha256}");
+        text.AppendLine($"Entry point: {record.Manifest.EntryPoint}");
+        text.AppendLine();
+        text.AppendLine("Permissions");
+        text.AppendLine("────────────────────────────────────────");
+        foreach (var info in PluginPermissionCatalog.All.Where(x => record.RequestedPermissions.HasFlag(x.Permission)))
+        {
+            bool granted = record.GrantedPermissions.HasFlag(info.Permission);
+            text.AppendLine($"{info.Name} [{info.Tier}] — {(granted ? "GRANTED" : "not granted")}");
+            text.AppendLine("  " + info.Description);
+        }
+
+        text.AppendLine();
+        text.AppendLine("Permission changes between versions");
+        text.AppendLine("────────────────────────────────────────");
+        if (record.PermissionChanges.Count == 0)
+            text.AppendLine("None recorded.");
+        foreach (var change in record.PermissionChanges)
+        {
+            string oldNames = string.Join(", ", PluginPermissionNames.ToNames(change.OldRequested));
+            string newNames = string.Join(", ", PluginPermissionNames.ToNames(change.NewRequested));
+            text.AppendLine($"{change.ChangedUtc:O}: {change.FromVersion} -> {change.ToVersion}");
+            text.AppendLine($"  Requested: {(string.IsNullOrWhiteSpace(oldNames) ? "None" : oldNames)} -> {(string.IsNullOrWhiteSpace(newNames) ? "None" : newNames)}");
+            text.AppendLine($"  Author changed: {(change.AuthorChanged ? "YES" : "no")}");
+            text.AppendLine($"  DLL SHA-256: {change.OldDllSha256} -> {change.NewDllSha256}");
+        }
+
+        text.AppendLine();
+        text.AppendLine("Activity summary");
+        text.AppendLine("────────────────────────────────────────");
+        var activity = manager.GetActivitySummary(record.Manifest.Id);
+        if (activity.Count == 0)
+            text.AppendLine("No brokered permission calls recorded.");
+        foreach (var entry in activity)
+        {
+            string hosts = entry.NetworkHosts.Count == 0 ? "" : $"; hosts: {string.Join(", ", entry.NetworkHosts)}";
+            text.AppendLine($"{entry.Permission}: {entry.Calls} calls; last used {entry.LastUsedUtc:O}{hosts}");
+        }
+        if (!string.IsNullOrWhiteSpace(record.Error))
+        {
+            text.AppendLine();
+            text.AppendLine("Last error");
+            text.AppendLine(record.Error);
+        }
+
+        var body = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Text = text.ToString(),
+            Margin = Padding.Empty,
+            BackColor = SystemColors.Window
+        };
+        var close = new Button { Text = "Close", Width = 92, Height = 34 };
+        close.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        var bottom = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Height = 54,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(10, 8, 10, 8),
+            Margin = Padding.Empty
+        };
+        bottom.Controls.Add(close);
+        Controls.Add(body);
+        Controls.Add(bottom);
+        AcceptButton = close;
+        CancelButton = close;
     }
 }
 
