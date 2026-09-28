@@ -14,6 +14,8 @@
     <RootNamespace>Retro96</RootNamespace>
     <Deterministic>true</Deterministic>
     <WarningLevel>5</WarningLevel>
+    <!-- Allows building the -windows TFM from non-Windows hosts; no effect when built on Windows. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
 
     <!-- ========================================== -->
     <!-- FORCE BYPASS THE HARD WINFORMS TRIM GUARD  -->

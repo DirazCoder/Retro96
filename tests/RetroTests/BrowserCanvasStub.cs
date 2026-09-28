@@ -37,6 +37,22 @@ public class BrowserCanvas
     public Size GetViewportSize() => new(800, 600);
     public void SubmitForm(DomElement? form, object? clickCoords) { }
     public void UpdateDocumentTitle(string title) { }
+    // WinForms affinity members referenced by DomBindings callbacks; in the
+    // headless stub everything runs synchronously on the test thread.
+    public bool IsHandleCreated => true;
+    public bool IsDisposed => false;
+    public IAsyncResult BeginInvoke(Delegate method, params object?[] args)
+    {
+        method.DynamicInvoke(args);
+        return new CompletedAsyncResult();
+    }
+    private sealed class CompletedAsyncResult : IAsyncResult
+    {
+        public bool IsCompleted => true;
+        public WaitHandle AsyncWaitHandle => new ManualResetEvent(true);
+        public object? AsyncState => null;
+        public bool CompletedSynchronously => true;
+    }
     public void RequestRerender() { Log.Rerenders++; }
     public void ReflowDocument() { Log.Reflows++; }
     public void PrefetchImage(string url) { Log.PrefetchedImages.Add(url); }

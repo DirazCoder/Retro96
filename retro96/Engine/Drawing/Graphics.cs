@@ -34,6 +34,12 @@ public sealed class Graphics : IDisposable
     public float DpiX => 96f;
     public float DpiY => 96f;
 
+    // Same-assembly escape hatch for the Java applet engine, which needs
+    // XOR compositing, copyArea and subimage blits that the GDI-shaped
+    // surface does not model. Nothing outside Retro96.Drawing sees these.
+    internal SKCanvas Canvas => _canvas;
+    internal Bitmap Bitmap => _bitmap;
+
     // Skia Save/Restore preserves the canvas matrix/clip, but these rendering
     // properties live on the Retro96 wrapper (and some also mutate the cached
     // SkFont). A password control temporarily switches to aliased text; without

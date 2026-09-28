@@ -1042,6 +1042,7 @@ public class Renderer
                         return;   // painted as border
                     case "applet":
                     case "embed":
+                    case "object":
                         if (EmbeddedFrameResolver?.Invoke(box.Element, box, IsPrintRendering) is { } embeddedFrame)
                         {
                             g.DrawImage(embeddedFrame, box.X, box.Y, box.Width, box.Height);

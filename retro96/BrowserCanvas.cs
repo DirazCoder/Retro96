@@ -935,7 +935,10 @@ public class BrowserCanvas : Control
 
     private Bitmap? ResolveEmbeddedContent(DomElement element, LayoutBox box, bool printRendering)
     {
-        if (element.TagName == "applet")
+        // Java applets arrive through <applet>, <embed code=...> and
+        // <object classid="java:...">; everything else keeps the legacy
+        // embedded-content path.
+        if (Retro96.Engine.Java.JavaAppletHost.IsJavaElement(element))
             return _javaApplets.Resolve(element, box, printRendering);
         return EmbeddedFrameResolver?.Invoke(element, box, printRendering);
     }

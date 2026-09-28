@@ -7,12 +7,10 @@ using Retro96.Engine.Network;
 
 namespace Retro96.Engine.Java;
 
-/// <summary>
-/// Owns one 1.0/1.1-era JVM per page and the applet instances embedded in the
-/// page. Resource loading is page-relative and class loading supports both
-/// CODEBASE and ARCHIVE. Rendering is pull-based so it composes naturally with
-/// BrowserCanvas/Renderer without creating a native child window.
-/// </summary>
+// Owns one 1.0/1.1-era JVM per applet instance embedded in the page.
+// Resource loading is page-relative and class loading supports both
+// CODEBASE and ARCHIVE. Rendering is pull-based so it composes naturally
+// with BrowserCanvas/Renderer without creating a native child window.
 public sealed class JavaAppletHost : IDisposable
 {
     private sealed class Instance
@@ -46,11 +44,7 @@ public sealed class JavaAppletHost : IDisposable
         _resources = resources;
         if (_pageBase == null) return;
 
-        // FIX: real 1996 pages write <APPLET> in any case
-        var applets = document.ElementDescendants()
-            .Where(e => string.Equals(e.TagName, "applet", StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        foreach (var element in applets)
+        foreach (var element in CollectAppletElements(document))
         {
             try { await Task.Run(() => PrepareAppletAsync(element, _pageBase, resources, document.Cookies, ct), ct).ConfigureAwait(false); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -59,34 +53,65 @@ public sealed class JavaAppletHost : IDisposable
         RepaintRequested?.Invoke();
     }
 
+    // <applet> plus the 1996 alternatives: <embed code=...> and
+    // <object classid="java:...">.
+    private static List<DomElement> CollectAppletElements(DomDocument document)
+    {
+        var result = new List<DomElement>();
+        foreach (var e in document.ElementDescendants())
+        {
+            if (string.Equals(e.TagName, "applet", StringComparison.OrdinalIgnoreCase)) { result.Add(e); continue; }
+            if (string.Equals(e.TagName, "embed", StringComparison.OrdinalIgnoreCase) && e.HasAttr("code")) { result.Add(e); continue; }
+            if (string.Equals(e.TagName, "object", StringComparison.OrdinalIgnoreCase))
+            {
+                var classid = e.GetAttr("classid");
+                if (classid != null && classid.StartsWith("java:", StringComparison.OrdinalIgnoreCase)) result.Add(e);
+            }
+        }
+        return result;
+    }
+
+    public static bool IsJavaElement(DomElement element) =>
+        string.Equals(element.TagName, "applet", StringComparison.OrdinalIgnoreCase)
+        || (string.Equals(element.TagName, "embed", StringComparison.OrdinalIgnoreCase) && element.HasAttr("code"))
+        || (string.Equals(element.TagName, "object", StringComparison.OrdinalIgnoreCase)
+            && element.GetAttr("classid")?.StartsWith("java:", StringComparison.OrdinalIgnoreCase) == true);
+
     public Bitmap? Resolve(DomElement element, LayoutBox box, bool printRendering)
     {
-        if (_disposed || !string.Equals(element.TagName, "applet", StringComparison.OrdinalIgnoreCase)) return null;
+        if (_disposed || !IsJavaElement(element)) return null;
         Instance? instance;
         lock (_gate) _instances.TryGetValue(element, out instance);
-        if (instance == null || !instance.Initialized) return null;
+        if (instance == null || !instance.Initialized) return RenderFallback(element, box);
         try
         {
             int w = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Width > 0 ? box.ContentRect.Width : instance.State.Width));
             int h = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Height > 0 ? box.ContentRect.Height : instance.State.Height));
-            instance.State.Width = w; instance.State.Height = h;
+            instance.State.Width = w;
+            instance.State.Height = h;
             var componentState = JavaComponentBridge.State(instance.Object);
-            componentState.Width = w; componentState.Height = h;
+            componentState.Width = w;
+            componentState.Height = h;
 
             var bitmap = new Bitmap(w, h);
             using var g = Graphics.FromImage(bitmap);
             g.Clear(componentState.Background);
+            // The applet's own coordinate system starts at the top-left of
+            // its area with the clip set to its bounds.
+            g.SetClip(new RectangleF(0, 0, w, h));
             instance.Vm.HostGraphics = g;
             try
             {
                 var graphics = instance.Vm.GraphicsFactory.CreateGraphics(g, w, h);
                 if (graphics.NativeState is JavaGraphicsState gs) gs.Background = componentState.Background;
-                // Applet's own paint first (user override), then native child painting.
-                instance.Vm.InvokeVirtual(instance.Object, "paint", "(Ljava/awt/Graphics;)V", JValue.Ref(graphics));
-                JavaComponentBridge.PaintChildren(instance.Vm, instance.Object, JValue.Ref(graphics));
+                // The repaint loop drives update() virtually; the default
+                // implementation fills the background and calls paint().
+                instance.Vm.InvokeVirtual(instance.Object, "update", "(Ljava/awt/Graphics;)V", JValue.Ref(graphics));
             }
             finally { instance.Vm.HostGraphics = null; }
-            var old = instance.LastFrame; instance.LastFrame = bitmap; old?.Dispose();
+            var old = instance.LastFrame;
+            instance.LastFrame = bitmap;
+            old?.Dispose();
             return new Bitmap(bitmap);
         }
         catch (JvmException ex)
@@ -143,6 +168,7 @@ public sealed class JavaAppletHost : IDisposable
                 if (i.Started) i.Vm.InvokeVirtual(i.Object, "stop", "()V");
                 i.State.Active = false;
                 if (i.State.Stub != null) i.State.Stub.Active = false;
+                JoinAnimationThreads(i.Vm);
                 if (i.Initialized) i.Vm.InvokeVirtual(i.Object, "destroy", "()V");
             }
             catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.stop", ex); }
@@ -151,9 +177,24 @@ public sealed class JavaAppletHost : IDisposable
         }
     }
 
+    // stop() is the signal for animation threads to exit; give them a
+    // bounded window to actually leave before destroy() runs so a slow
+    // thread cannot hang navigation forever.
+    private static void JoinAnimationThreads(JavaVm vm)
+    {
+        foreach (var thread in vm.LiveThreads.Keys.ToArray())
+        {
+            var host = thread.Thread;
+            if (host == null || !host.IsAlive) continue;
+            try { host.Join(1500); }
+            catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.threadJoin", ex); }
+        }
+    }
+
     private async Task PrepareAppletAsync(DomElement element, ParsedUrl pageBase, ResourceLoader resources, CookieStore cookies, CancellationToken ct)
     {
-        string code = element.GetAttrOrDefault("code", "").Trim();
+        string code = (element.GetAttr("code") ?? element.GetAttr("classid") ?? "").Trim();
+        if (code.StartsWith("java:", StringComparison.OrdinalIgnoreCase)) code = code[5..].Trim();
         if (code.Length == 0) return;
         string codebaseAttr = element.GetAttr("codebase")?.Trim() ?? "";
         ParsedUrl codeBase = string.IsNullOrWhiteSpace(codebaseAttr) ? pageBase : pageBase.Resolve(codebaseAttr);
@@ -175,11 +216,14 @@ public sealed class JavaAppletHost : IDisposable
         }
 
         string codePath = code.Replace('\\', '/').TrimStart('/');
-        ParsedUrl codeUrl = codeBase.Resolve(codePath);
+        if (codePath.EndsWith(".class", StringComparison.OrdinalIgnoreCase)) codePath = codePath[..^6];
+        // The CODE attribute may carry a package path; strip ".class" so the
+        // class NAME and the fetch path agree either way.
         byte[]? mainBytes =
-            archiveClasses.TryGetValue(codePath, out var inJar) ? inJar :
-            archiveClasses.TryGetValue(Path.GetFileName(codePath), out inJar) ? inJar :
-            await FetchBytesAsync(codeUrl, resources, cookies, ct).ConfigureAwait(false);
+            archiveClasses.TryGetValue(codePath.Replace('/', '.'), out var inJar) ? inJar :
+            archiveClasses.TryGetValue(codePath, out inJar) ? inJar :
+            await FetchBytesAsync(codeBase.Resolve(codePath.Replace('/', '/') + ".class"), resources, cookies, ct).ConfigureAwait(false)
+            ?? await FetchBytesAsync(codeBase.Resolve(codePath), resources, cookies, ct).ConfigureAwait(false);
         if (mainBytes == null) return;
 
         var stub = new JavaAppletStubState
@@ -187,6 +231,7 @@ public sealed class JavaAppletHost : IDisposable
             DocumentBase = pageBase,
             CodeBase = codeBase,
             Parameters = parameters,
+            Name = element.GetAttr("name") ?? "",
             Context = new JavaAppletContextState { Status = StatusChanged, Navigate = NavigateRequested }
         };
 
@@ -197,6 +242,11 @@ public sealed class JavaAppletHost : IDisposable
             if (n.EndsWith(".class", StringComparison.OrdinalIgnoreCase)) n = n[..^6];
             classCache[n] = kv.Value;
         }
+
+        // Applet security: the sandbox allows file: resources only when the
+        // page itself was loaded from file: (local development); remote
+        // applets never touch the local disk.
+        bool localPage = pageBase.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase);
 
         static string? LocalPathFor(ParsedUrl u)
         {
@@ -214,7 +264,7 @@ public sealed class JavaAppletHost : IDisposable
             if (classCache.TryGetValue(name.Replace('/', '.'), out var b)) return b;
             var u = codeBase.Resolve(name + ".class");
             var local = LocalPathFor(u);
-            if (local != null && File.Exists(local)) return File.ReadAllBytes(local);
+            if (local != null && localPage && File.Exists(local)) return File.ReadAllBytes(local);
             try
             {
                 var r = resources.FetchAsync(u.ToAbsolute(), u, cookies).ConfigureAwait(false).GetAwaiter().GetResult();
@@ -231,12 +281,13 @@ public sealed class JavaAppletHost : IDisposable
                 if (resourceCache.TryGetValue(abs, out var cached)) return cached;
                 var u = ParsedUrl.Parse(abs);
                 var local = LocalPathFor(u);
-                if (local != null && File.Exists(local))
+                if (local != null && localPage && File.Exists(local))
                 {
                     var bytes = File.ReadAllBytes(local);
                     resourceCache[abs] = bytes;
                     return bytes;
                 }
+                if (u.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)) return null;
                 _ = FetchBytesAsync(u, resources, cookies, CancellationToken.None).ContinueWith(t =>
                 {
                     if (t.Status == TaskStatus.RanToCompletion && t.Result is { Length: > 0 } bytes)
@@ -258,11 +309,10 @@ public sealed class JavaAppletHost : IDisposable
             Status = StatusChanged,
             Navigate = NavigateRequested,
             RepaintRequested = RepaintRequested,
-            AllowFileAccess = true
+            AllowFileAccess = localPage
         });
 
         var klass = vm.LoadClassBytes(mainBytes);
-        // FIX: run the constructor chain (old code allocated without <init>)
         var obj = vm.Construct(klass);
         if (obj.NativeState is not JavaAppletNativeState) obj.NativeState = new JavaAppletNativeState();
         var state = (JavaAppletNativeState)obj.NativeState!;
@@ -321,6 +371,29 @@ public sealed class JavaAppletHost : IDisposable
         }
         var result = await resources.FetchAsync(url.ToAbsolute(), url, cookies).ConfigureAwait(false);
         return result is HttpSuccess s ? s.Body : null;
+    }
+
+    // Alt/fallback rendering: the ALT attribute (or the element's inline
+    // fallback text) drawn on the classic gray placeholder when the applet
+    // cannot run.
+    private static Bitmap? RenderFallback(DomElement element, LayoutBox box)
+    {
+        int w = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Width));
+        int h = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Height));
+        if (w <= 1 && h <= 1) return null;
+        string? alt = element.GetAttr("alt");
+        if (string.IsNullOrWhiteSpace(alt)) alt = element.InnerText?.Trim();
+        if (string.IsNullOrWhiteSpace(alt)) return null;
+        var bitmap = new Bitmap(w, h);
+        using var g = Graphics.FromImage(bitmap);
+        using var bg = new SolidBrush(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        g.FillRectangle(bg, 0, 0, w, h);
+        using var border = new Pen(Color.Gray, 1);
+        g.DrawRectangle(border, 0, 0, Math.Max(1, w - 1), Math.Max(1, h - 1));
+        using var font = new Font(FontFamily.GenericSansSerif, 12, FontStyle.Regular, GraphicsUnit.Pixel);
+        using var fg = new SolidBrush(Color.Black);
+        g.DrawString(alt, font, fg, 6, Math.Max(2, (h - 14) / 2));
+        return bitmap;
     }
 
     public void Dispose()

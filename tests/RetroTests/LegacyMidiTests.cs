@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using Retro96;
 
 namespace RetroTests;
 

@@ -56,8 +56,13 @@
     <Compile Include="../../retro96/Engine/Forms/FormSubmitter.cs" />
     <Compile Include="../../retro96/Engine/Forms/HitTester.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginApi.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginJsValueCodec.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginSandboxProtocol.cs" />
+    <!-- Java 1.1 applet engine (JavaEngineTests.cs; class fixtures in html-websites/java) -->
+    <Compile Include="../../retro96/Engine/Java/*.cs" />
     <!-- test sources -->
     <Compile Include="TestHelpers.cs" />
+    <Compile Include="JavaEngineTests.cs" />
     <Compile Include="EngineRegressionTests.cs" />
     <Compile Include="HtmlParserTests.cs" />
     <Compile Include="CssParserTests.cs" />
@@ -79,8 +84,17 @@
     <Compile Include="../../retro96/Engine/Render/Renderer.cs" />
     <Compile Include="../../retro96/Engine/Render/TextareaOverlay.cs" />
     <Compile Include="../../retro96/Engine/Render/SelectionOverlay.cs" />
+    <Compile Include="../../retro96/Engine/Render/PasswordMaskLayout.cs" />
     <Compile Include="../../retro96/Engine/Network/ResourceLoader.cs" />
     <Compile Include="../../retro96/Engine/Network/HttpClient.cs" />
+    <Compile Include="../../retro96/Engine/Network/ResourceKind.cs" />
+    <Compile Include="../../retro96/SandboxProtocol.cs" />
+    <Compile Include="../../retro96/SandboxContext.cs" />
+    <Compile Include="../../retro96/SandboxBrokerClient.cs" />
+    <Compile Include="../../retro96/StartupDiagnostics.cs" />
+    <Compile Include="../../retro96/WindowsSecurity.cs" />
+    <Compile Include="../../retro96/BrowserRuntime.cs" />
+    <Compile Include="../../retro96/UserSettings.cs" />
     <Compile Include="../../retro96/Engine/Network/FrameLoader.cs" />
     <Compile Include="NamedBugHeadlessTests.cs" />
     <Compile Include="ExtendedCorpusRegressionTests.cs" />
