@@ -52,6 +52,7 @@ internal static class PluginSandboxProtocol
 
     public sealed record HelloPayload(string PluginId, int ProcessId);
     public sealed record HelloReply(bool Accepted, string ManifestJson, ulong GrantedPermissions, string Error = "");
+    public sealed record HostInfoReply(string HostVersion, int ApiVersion, string[] Supported, string Theme, string Locale, int Dpi);
     public sealed record ReadyPayload(bool Ready, string Error = "");
     public sealed record ErrorPayload(string Error);
     public sealed record BrowserState(string? Url, string Title, float Zoom, int Width, int Height);

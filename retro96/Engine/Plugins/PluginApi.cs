@@ -129,6 +129,8 @@ public sealed class PluginManifest
     [JsonPropertyName("script_name")]
     public string ScriptName { get; set; } = "";
     public string Website { get; set; } = "";
+    [JsonPropertyName("min_host_version")]
+    public string MinHostVersion { get; set; } = "";
     public PluginPermission RequestedPermissions => PluginPermissionNames.Parse(Permissions);
 }
 
@@ -150,6 +152,7 @@ public interface IRetro96PluginHost
     IPluginDialogs Dialogs { get; }
     IPluginEmbeddedContentService Embeds { get; }
     IPluginLogger Log { get; }
+    IPluginHostInfo Info { get; }
     bool HasPermission(PluginPermission permission);
 
     IBrowserService BrowserService => Browser;
@@ -186,6 +189,16 @@ public interface IBrowserService
 }
 
 public interface IPluginBrowser : IBrowserService { }
+
+public interface IPluginHostInfo
+{
+    string HostVersion { get; }
+    int ApiVersion { get; }
+    bool IsSupported(string name);
+    string Theme { get; }
+    string Locale { get; }
+    int Dpi { get; }
+}
 
 public sealed record CookieOptions(string? Path = null, string? Domain = null, DateTimeOffset? Expires = null, bool Secure = false);
 

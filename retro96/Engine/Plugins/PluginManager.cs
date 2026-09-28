@@ -60,8 +60,19 @@ public sealed class PluginManager : IDisposable
     }
 
     public IReadOnlyList<PluginRecord> Plugins => _plugins.Values.OrderBy(p => p.Manifest.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    internal string HostVersion => Application.ProductVersion;
 
     public event EventHandler? PluginsChanged;
+
+    internal bool IsSupportedCapability(string name)
+    {
+        return name switch
+        {
+            "host.info" or "browser" or "ui" or "storage" or "network" or "filesystem" or
+            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" => true,
+            _ => false
+        };
+    }
 
     public PluginRecord InstallPackage(string packagePath, bool enableImmediately = false)
     {
@@ -772,6 +783,9 @@ public sealed class PluginManager : IDisposable
             throw new InvalidDataException("plugin.json requires id and name.");
         if (manifest.ApiVersion != Retro96PluginApi.ApiVersion)
             throw new InvalidDataException($"Unsupported plugin API version {manifest.ApiVersion}; this host supports {Retro96PluginApi.ApiVersion}.");
+        if (!string.IsNullOrWhiteSpace(manifest.MinHostVersion) &&
+            ComparePluginVersions(Application.ProductVersion, manifest.MinHostVersion) < 0)
+            throw new InvalidDataException($"This plugin requires Retro96 {manifest.MinHostVersion} or newer; this host is {Application.ProductVersion}.");
         if (string.IsNullOrWhiteSpace(manifest.Assembly) || string.IsNullOrWhiteSpace(manifest.EntryPoint))
             throw new InvalidDataException("plugin.json requires assembly and entryPoint.");
         if (!manifest.Id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_'))

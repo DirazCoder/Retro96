@@ -285,6 +285,15 @@ internal sealed class PluginSandboxSession : IDisposable
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.ReadyPayload(ready?.Ready == true, ready?.Error ?? ""));
                     break;
 
+                case "host.info":
+                    {
+                        string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger" };
+                        var info = new PluginSandboxProtocol.HostInfoReply(
+                            Application.ProductVersion, Retro96PluginApi.ApiVersion, supported, "classic",
+                            System.Globalization.CultureInfo.CurrentUICulture.Name, Math.Max(96, _browser.DeviceDpi));
+                        await ReplyAsync(envelope.Id, "response", info).ConfigureAwait(false);
+                        break;
+                    }
                 case "browser.state":
                     Demand(PluginPermission.BrowserRead);
                     var viewport = RunOnUi(() => _browser.PluginViewportSize);

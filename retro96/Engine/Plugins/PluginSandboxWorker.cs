@@ -76,6 +76,7 @@ internal static class PluginSandboxWorker
         public IPluginDialogs Dialogs { get; private set; } = null!;
         public IPluginEmbeddedContentService Embeds => _embeds!;
         public IPluginLogger Log { get; private set; } = null!;
+        public IPluginHostInfo Info { get; private set; } = null!;
         public bool HasPermission(PluginPermission permission) => (_grantedPermissions & permission) == permission;
 
         public async Task RunAsync()
@@ -87,6 +88,8 @@ internal static class PluginSandboxWorker
             var brokerManifest = JsonSerializer.Deserialize(hello.ManifestJson, PluginManifestJsonContext.Default.PluginManifest) ?? throw new InvalidDataException("Plugin manifest was invalid.");
             if (!string.Equals(brokerManifest.Id, _manifest.Id, StringComparison.OrdinalIgnoreCase)) throw new SecurityException("Plugin manifest identity mismatch.");
             _grantedPermissions = (PluginPermission)hello.GrantedPermissions;
+            var hostInfo = await SendRequestAsync<PluginSandboxProtocol.HostInfoReply>("host.info", null, _lifetime.Token).ConfigureAwait(false);
+            Info = new WorkerHostInfo(hostInfo);
             LoadPlugin();
             Browser = new WorkerBrowser(this);
             Ui = new WorkerUi(this);
@@ -409,6 +412,26 @@ internal static class PluginSandboxWorker
             protected readonly PluginWorkerHost Host;
             protected RpcService(PluginWorkerHost host) => Host = host;
             protected void Demand(PluginPermission permission) { if (!Host.HasPermission(permission)) throw new SecurityException($"Permission '{string.Join(", ", PluginPermissionNames.ToNames(permission))}' has not been granted."); }
+        }
+
+        private sealed class WorkerHostInfo : IPluginHostInfo
+        {
+            private readonly HashSet<string> _supported;
+            public WorkerHostInfo(PluginSandboxProtocol.HostInfoReply info)
+            {
+                HostVersion = info.HostVersion;
+                ApiVersion = info.ApiVersion;
+                Theme = info.Theme;
+                Locale = info.Locale;
+                Dpi = info.Dpi;
+                _supported = new HashSet<string>(info.Supported ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+            }
+            public string HostVersion { get; }
+            public int ApiVersion { get; }
+            public string Theme { get; }
+            public string Locale { get; }
+            public int Dpi { get; }
+            public bool IsSupported(string name) => !string.IsNullOrWhiteSpace(name) && _supported.Contains(name.Trim());
         }
 
         private sealed class WorkerBrowser : RpcService, IPluginBrowser
