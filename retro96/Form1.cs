@@ -324,6 +324,7 @@ public partial class Form1 : Form
             _pluginManager?.RaiseHostShuttingDown();
             _pluginManager?.Dispose();
             _pluginManager = null;
+            _pluginPcmMixer.Dispose();
             DisposeBuiltInFeatures();
             _resourceLoader?.Dispose();
             _imageCache?.Dispose();

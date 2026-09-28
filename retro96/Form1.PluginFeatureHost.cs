@@ -20,6 +20,7 @@ public partial class Form1
     private readonly object _pluginUiSync = new();
     private readonly System.Windows.Forms.Timer _clipboardPollTimer = new() { Interval = 750 };
     private string? _clipboardFingerprint;
+    private readonly PluginPcmMixer _pluginPcmMixer = new();
 
     private void InitializePluginHostUi()
     {
@@ -208,6 +209,14 @@ public partial class Form1
     internal bool PluginAudioPlaying => _midiPlayer.IsPlaying;
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     [System.ComponentModel.Browsable(false)]
+    internal Task PlayPluginPcmAsync(string sourceKey, byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken) =>
+        _pluginPcmMixer.PlayAsync(sourceKey, pcm, format, cancellationToken);
+    internal Task PushPluginEmbeddedAudioAsync(string sourceKey, byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken, bool initiallyMuted) =>
+        _pluginPcmMixer.PushAsync(sourceKey, pcm, format, cancellationToken, initiallyMuted);
+    internal void SetPluginEmbeddedAudioMuted(string sourceKey, bool muted) => _pluginPcmMixer.SetMuted(sourceKey, muted);
+    internal void ActivatePluginEmbeddedAudio(string sourceKey) => _pluginPcmMixer.Unmute(sourceKey);
+    internal void RemovePluginEmbeddedAudio(string sourceKey) => _pluginPcmMixer.Remove(sourceKey);
+
     internal float PluginAudioVolume { get => _midiPlayer.Volume; set => _midiPlayer.Volume = Math.Clamp(value, 0f, 1f); }
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     [System.ComponentModel.Browsable(false)]

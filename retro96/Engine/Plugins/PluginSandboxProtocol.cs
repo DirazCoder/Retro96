@@ -131,6 +131,7 @@ internal static class PluginSandboxProtocol
     public sealed record DialogSaveReply(bool Success);
     public sealed record AudioPlayPayload(string RelativePath, bool Loop = false);
     public sealed record AudioStatePayload(bool IsPlaying, float Volume, bool Loop, string? FileName);
+    public sealed record AudioBytesPayload(string PcmBase64, PluginPcmFormat Format);
     public sealed record NotificationPayload(string Title, string Body, string? Token = null);
     public sealed record EventNavigatedPayload(string Url);
     public sealed record EventPageLoadedPayload(string Url, string Title);
@@ -179,6 +180,12 @@ internal static class PluginSandboxProtocol
     public sealed record EmbedScriptPageCallPayload(string InstanceToken, string Name, JsValueWire[] Args);
     public sealed record EmbedStatusPayload(string InstanceToken, string Text);
     public sealed record EmbedNavigatePayload(string InstanceToken, string Url);
+    public sealed record EmbedAudioPayload(string InstanceToken, PluginPcmFormat Format, string PcmBase64);
+    public sealed record EmbedMutePayload(string InstanceToken, bool Muted);
+    public sealed record EmbedCursorPayload(string InstanceToken, EmbeddedCursor Cursor);
+    public sealed record EventEmbedVisibilityPayload(string InstanceToken, bool Visible);
+    public sealed record EventEmbedPausePayload(string InstanceToken, bool Paused);
+    public sealed record EventEmbedResizePayload(string InstanceToken, int Width, int Height);
     public sealed record NetworkStreamOpenPayload(NetworkRequestPayload Request);
     public sealed record NetworkStreamOpenReply(bool Success, int StatusCode, Dictionary<string, string> Headers,
                                                   string? ContentType, string? Charset, string EffectiveUrl,

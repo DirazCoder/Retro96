@@ -246,7 +246,7 @@ internal static class PluginSandboxWorker
                                 foreach (string methodName in methods.Keys)
                                     ValidateScriptName(methodName);
                                 var publishedMethods = methods.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
-                                lock (_embeddedInstances) _embeddedInstances[create.InstanceToken] = new WorkerEmbeddedInstance(create.InstanceToken, pluginInstance, stream, scriptBridge);
+                                lock (_embeddedInstances) _embeddedInstances[create.InstanceToken] = new WorkerEmbeddedInstance(create.InstanceToken, pluginInstance, stream, scriptBridge, hostBridge);
                                 await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedCreateReply(create.InstanceToken, _manifest.ScriptName, publishedMethods)).ConfigureAwait(false);
                             }
                             break;
@@ -293,6 +293,9 @@ internal static class PluginSandboxWorker
                         case "event.ui.panel.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PanelInvokePayload>(envelope) is { } pInvoke && _panelCallbacks.TryGetValue(pInvoke.Token, out var pAction)) _ = Task.Run(() => InvokePluginCallback("Panel", () => pAction(pInvoke.Text, pInvoke.Checked, pInvoke.Index))); break;
                         case "event.clipboard.changed": _clipboard?.RaiseChanged(); break;
                         case "event.audio.complete": _audio?.RaisePlaybackComplete(); break;
+                        case "event.embed.visibility": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedVisibilityPayload>(envelope) is { } ev) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ev.InstanceToken, out var ei)) ei.Host.RaiseVisibility(ev.Visible); } break;
+                        case "event.embed.pause": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedPausePayload>(envelope) is { } ep) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ep.InstanceToken, out var ei)) ei.Host.RaisePause(ep.Paused); } break;
+                        case "event.embed.resize": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedResizePayload>(envelope) is { } er) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(er.InstanceToken, out var ei)) ei.Host.RaiseResize(er.Width, er.Height); } break;
                         case "event.permissions.changed":
                             if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPermissionsPayload>(envelope) is { } permissions)
                                 _grantedPermissions = (PluginPermission)permissions.GrantedPermissions;
@@ -362,6 +365,16 @@ internal static class PluginSandboxWorker
 
         private async Task HandleBinaryAsync(PluginSandboxProtocol.BinaryEnvelope binary)
         {
+            if (binary.Op == "embed.input")
+            {
+                if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
+                var input = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedInputPayload>(binary) ?? throw new InvalidDataException();
+                WorkerEmbeddedInstance? instance;
+                lock (_embeddedInstances) _embeddedInstances.TryGetValue(input.InstanceToken, out instance);
+                if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
+                await instance.HandleInputAsync(input.Event, _lifetime.Token).ConfigureAwait(false);
+                return;
+            }
             if (binary.Op == "protocol.response" || binary.Op == "content.transform.response")
                 throw new InvalidOperationException($"Unexpected plugin response '{binary.Op}'.");
             if (binary.Op == "embed.frame") return;
@@ -690,10 +703,17 @@ internal static class PluginSandboxWorker
             private readonly string _instanceToken;
             private readonly string? _currentUrl;
             private readonly string _userAgent;
+            private bool _visible = true; private bool _paused; private bool _muted = true;
             public WorkerEmbeddedHost(PluginWorkerHost host, string instanceToken, string? currentUrl, string userAgent)
             { _host = host; _instanceToken = instanceToken; _currentUrl = currentUrl; _userAgent = userAgent; }
             public string? CurrentUrl => _currentUrl;
             public string UserAgent => _userAgent;
+            public bool IsVisible => _visible;
+            public bool IsPaused => _paused;
+            public bool IsAudioMuted => _muted;
+            public event EventHandler<EmbeddedVisibilityEventArgs>? VisibilityChanged;
+            public event EventHandler<EmbeddedPauseEventArgs>? PauseChanged;
+            public event EventHandler<EmbeddedResizeEventArgs>? Resized;
             public Task SetStatusAsync(string text, CancellationToken cancellationToken = default)
             {
                 Demand(PluginPermission.EmbedStatus);
@@ -717,6 +737,16 @@ internal static class PluginSandboxWorker
                 lock (_host._streams) _host._streams[reply.StreamToken] = stream;
                 return new WorkerNetworkResponse(reply.StatusCode, reply.Headers, reply.ContentType, reply.Charset, reply.EffectiveUrl, stream);
             }
+            public Task PushAudioAsync(byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken = default)
+            { if (pcm == null || pcm.Length > 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(pcm)); Demand(PluginPermission.EmbedAudio); return _host.SendRequestAsync<object>("embed.audio.push", new PluginSandboxProtocol.EmbedAudioPayload(_instanceToken, format, Convert.ToBase64String(pcm)), cancellationToken); }
+            public async Task SetMutedAsync(bool muted, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.EmbedAudio); _muted = muted; await _host.SendRequestAsync<object>("embed.audio.mute", new PluginSandboxProtocol.EmbedMutePayload(_instanceToken, muted), cancellationToken).ConfigureAwait(false); }
+            public Task SetCursorAsync(EmbeddedCursor cursor, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.EmbedExtras); return _host.SendRequestAsync<object>("embed.cursor.set", new PluginSandboxProtocol.EmbedCursorPayload(_instanceToken, cursor), cancellationToken); }
+            internal void RaiseVisibility(bool visible) { _visible = visible; VisibilityChanged?.Invoke(this, new EmbeddedVisibilityEventArgs(visible)); }
+            internal void RaisePause(bool paused) { _paused = paused; PauseChanged?.Invoke(this, new EmbeddedPauseEventArgs(paused)); }
+            internal void RaiseResize(int width, int height) { Resized?.Invoke(this, new EmbeddedResizeEventArgs(width, height)); }
+
             private void Demand(PluginPermission permission)
             { if (!_host.HasPermission(permission)) throw new SecurityException($"Permission '{string.Join(", ", PluginPermissionNames.ToNames(permission))}' has not been granted."); }
         }
@@ -761,12 +791,13 @@ internal static class PluginSandboxWorker
 
         private sealed class WorkerEmbeddedInstance : IDisposable
         {
-            public WorkerEmbeddedInstance(string token, IEmbeddedContentInstance instance, WorkerByteStream stream, WorkerScriptBridge script)
-            { Token=token; Instance=instance; Stream=stream; Script=script; }
+            public WorkerEmbeddedInstance(string token, IEmbeddedContentInstance instance, WorkerByteStream stream, WorkerScriptBridge script, WorkerEmbeddedHost host)
+            { Token=token; Instance=instance; Stream=stream; Script=script; Host=host; }
             public string Token { get; }
             public IEmbeddedContentInstance Instance { get; }
             public WorkerByteStream Stream { get; }
             public WorkerScriptBridge Script { get; }
+            public WorkerEmbeddedHost Host { get; }
             public Task HandleInputAsync(EmbeddedInputEvent input, CancellationToken ct) => Instance.HandleInputAsync(input, ct);
             public void Dispose() { try { Instance.Dispose(); } catch { } try { Stream.Dispose(); } catch { } }
         }
@@ -801,6 +832,8 @@ internal static class PluginSandboxWorker
             private bool _loop;
             public PluginAudio(PluginWorkerHost host) : base(host) { }
             public async Task PlayFileAsync(string path) { Demand(PluginPermission.AudioPlayback); await Host.SendRequestAsync<object>("audio.play", new PluginSandboxProtocol.AudioPlayPayload(path, _loop), CancellationToken.None).ConfigureAwait(false); }
+            public Task PlayBytesAsync(byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.AudioPlayback); if (pcm == null || pcm.Length > 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(pcm)); return Host.SendRequestAsync<object>("audio.play.bytes", new PluginSandboxProtocol.AudioBytesPayload(Convert.ToBase64String(pcm), format), cancellationToken); }
             public void Stop() { Demand(PluginPermission.AudioPlayback); Host.SendRequestAsync<object>("audio.stop", null, CancellationToken.None).GetAwaiter().GetResult(); }
             public bool IsPlaying { get { Demand(PluginPermission.AudioPlayback); return Host.SendRequestAsync<PluginSandboxProtocol.AudioStatePayload>("audio.state", null, CancellationToken.None).GetAwaiter().GetResult().IsPlaying; } }
             public float Volume { get { Demand(PluginPermission.AudioPlayback); return Host.SendRequestAsync<PluginSandboxProtocol.AudioStatePayload>("audio.state", null, CancellationToken.None).GetAwaiter().GetResult().Volume; } set { Demand(PluginPermission.AudioPlayback); Host.SendRequestAsync<object>("audio.volume.set", new PluginSandboxProtocol.AudioStatePayload(false, value, false, null), CancellationToken.None).GetAwaiter().GetResult(); } }

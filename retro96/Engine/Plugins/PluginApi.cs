@@ -127,6 +127,7 @@ public sealed class PluginManifest
     public List<string> OptionalPermissions { get; set; } = new();
     [JsonPropertyName("embed_types")]
     public List<string> EmbedTypes { get; set; } = new();
+    public List<PluginSettingDefinition> Settings { get; set; } = new();
 
     [JsonPropertyName("script_name")]
     public string ScriptName { get; set; } = "";
@@ -165,6 +166,9 @@ public interface IRetro96PluginHost
     IPluginTabs Tabs { get; }
     IPluginHistory History { get; }
     IPluginBookmarks Bookmarks { get; }
+    IPluginDownloads Downloads { get; }
+    IPluginOmnibox Omnibox { get; }
+    IPluginUiExtras UiExtras { get; }
     bool HasPermission(PluginPermission permission);
     Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default);
 
@@ -363,16 +367,28 @@ public interface IEventsService
     event EventHandler<PluginPageEventArgs>? PageLoaded;
     event EventHandler? HostShuttingDown;
     event EventHandler<FocusEventArgs>? WindowFocusChanged;
+    event EventHandler<PluginNavigationFailedEventArgs>? NavigationFailed;
+    event EventHandler<PluginTitleChangedEventArgs>? TitleChanged;
+    event EventHandler<PluginLoadProgressEventArgs>? LoadProgress;
+    event EventHandler<PluginZoomChangedEventArgs>? ZoomChanged;
     IDisposable CreateTimer(TimeSpan interval, Action callback);
 }
 
 public sealed class PluginNavigationEventArgs : EventArgs { public PluginNavigationEventArgs(string url) => Url = url; public string Url { get; } }
+public sealed class PluginNavigationFailedEventArgs : EventArgs { public PluginNavigationFailedEventArgs(string url, string message) { Url = url; Message = message; } public string Url { get; } public string Message { get; } }
+public sealed class PluginTitleChangedEventArgs : EventArgs { public PluginTitleChangedEventArgs(string url, string title) { Url = url; Title = title; } public string Url { get; } public string Title { get; } }
+public sealed class PluginLoadProgressEventArgs : EventArgs { public PluginLoadProgressEventArgs(string url, double fraction) { Url = url; Fraction = Math.Clamp(fraction, 0d, 1d); } public string Url { get; } public double Fraction { get; } }
+public sealed class PluginZoomChangedEventArgs : EventArgs { public PluginZoomChangedEventArgs(float zoom) => Zoom = zoom; public float Zoom { get; } }
 public sealed class PluginPageEventArgs : EventArgs { public PluginPageEventArgs(string url, string title) { Url = url; Title = title; } public string Url { get; } public string Title { get; } }
 public sealed class FocusEventArgs : EventArgs { public FocusEventArgs(bool hasFocus) => HasFocus = hasFocus; public bool HasFocus { get; } }
+
+public enum PluginPcmSampleFormat { PcmS16Le, Float32Le }
+public sealed record PluginPcmFormat(int SampleRate, int Channels, PluginPcmSampleFormat SampleFormat);
 
 public interface IAudioService
 {
     Task PlayFileAsync(string path);
+    Task PlayBytesAsync(byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken = default);
     void Stop();
     bool IsPlaying { get; }
     float Volume { get; set; }
@@ -391,6 +407,30 @@ public interface IDialogsService
     Task<string?> OpenFilePickerAsync(string title, string filter);
     Task<bool> SaveFilePickerAsync(string sandboxRelativePath, string suggestedFilename, string filter);
 }
+
+public sealed record PluginDownloadProgress(string Url, string RelativePath, long BytesDownloaded, long? TotalBytes, bool Completed, string? Error = null);
+public interface IPluginDownloads
+{
+    Task<string?> DownloadAsync(string url, string suggestedFileName, CancellationToken cancellationToken = default);
+    event EventHandler<PluginDownloadProgress>? Progress;
+}
+
+public sealed record PluginOmniboxSuggestion(string Text, string? Url = null, string? Description = null);
+public interface IPluginOmnibox
+{
+    IDisposable RegisterKeyword(string keyword, Func<string, CancellationToken, Task<IReadOnlyList<PluginOmniboxSuggestion>>> handler);
+}
+
+public enum PluginMenuChoice { File, View, Tools, Help }
+public sealed record PluginKeyboardShortcut(string Shortcut, string Description);
+public interface IPluginUiExtras
+{
+    IDisposable AddToolbarButton(string label, string tooltip, byte[]? pngIcon, Action onClick, PluginMenuChoice menu = PluginMenuChoice.File);
+    void SetBadge(string text);
+    IDisposable RegisterShortcut(string shortcut, string description, Action callback);
+}
+
+public sealed record PluginSettingDefinition(string Name, string Type, string Label, string? Description = null, string? DefaultValue = null, string[]? Options = null);
 
 public interface IPluginStorage : IStorageService { }
 public interface IPluginNetwork : INetworkService { }
@@ -609,13 +649,27 @@ public sealed record EmbeddedContentRegistration(
     IReadOnlyList<string> MimeTypes,
     Func<EmbeddedContentContext, IPluginByteStream, IEmbeddedContentHost, IEmbeddedScriptBridge, IEmbeddedContentInstance> Factory);
 
+public enum EmbeddedCursor { Default, Arrow, Hand, IBeam, Cross, SizeAll, SizeNS, SizeWE }
+public sealed class EmbeddedVisibilityEventArgs : EventArgs { public EmbeddedVisibilityEventArgs(bool visible) => Visible = visible; public bool Visible { get; } }
+public sealed class EmbeddedPauseEventArgs : EventArgs { public EmbeddedPauseEventArgs(bool paused) => Paused = paused; public bool Paused { get; } }
+public sealed class EmbeddedResizeEventArgs : EventArgs { public EmbeddedResizeEventArgs(int width, int height) { Width = width; Height = height; } public int Width { get; } public int Height { get; } }
+
 public interface IEmbeddedContentHost
 {
     string? CurrentUrl { get; }
     string UserAgent { get; }
+    bool IsVisible { get; }
+    bool IsPaused { get; }
+    bool IsAudioMuted { get; }
+    event EventHandler<EmbeddedVisibilityEventArgs>? VisibilityChanged;
+    event EventHandler<EmbeddedPauseEventArgs>? PauseChanged;
+    event EventHandler<EmbeddedResizeEventArgs>? Resized;
     Task SetStatusAsync(string text, CancellationToken cancellationToken = default);
     Task RequestNavigationAsync(string url, CancellationToken cancellationToken = default);
     Task<IPluginNetworkResponse> OpenStreamAsync(HttpPluginRequest request, CancellationToken cancellationToken = default);
+    Task PushAudioAsync(byte[] pcm, PluginPcmFormat format, CancellationToken cancellationToken = default);
+    Task SetMutedAsync(bool muted, CancellationToken cancellationToken = default);
+    Task SetCursorAsync(EmbeddedCursor cursor, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

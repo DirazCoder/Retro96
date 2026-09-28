@@ -176,6 +176,7 @@ internal sealed class PluginSandboxSession : IDisposable
     internal Task SendEmbeddedInputAsync(EmbeddedHostInstance instance, EmbeddedInputEvent inputEvent, CancellationToken cancellationToken = default)
     {
         Demand(PluginPermission.EmbedRenderer);
+        RunOnUi(() => _browser.ActivatePluginEmbeddedAudio("embed:" + _record.Manifest.Id + ":" + instance.InstanceToken));
         return SendBinaryAsync("embed.input", Guid.NewGuid().ToString("N"),
             new PluginSandboxProtocol.EmbedInputPayload(instance.InstanceToken, inputEvent), Array.Empty<byte>(), cancellationToken);
     }
@@ -574,6 +575,11 @@ internal sealed class PluginSandboxSession : IDisposable
                     Demand(PluginPermission.AudioPlayback); var av = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.AudioStatePayload>(envelope) ?? throw new InvalidDataException(); RunOnUi(() => _browser.PluginAudioVolume = av.Volume); await ReplyOkAsync(envelope); break;
                 case "audio.loop.set":
                     Demand(PluginPermission.AudioPlayback); var al = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.AudioStatePayload>(envelope) ?? throw new InvalidDataException(); RunOnUi(() => _browser.PluginAudioLoop = al.Loop); await ReplyOkAsync(envelope); break;
+                case "audio.play.bytes":
+                    Demand(PluginPermission.AudioPlayback); var audioBytes = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.AudioBytesPayload>(envelope) ?? throw new InvalidDataException();
+                    byte[] audioPcm = DecodeCappedBase64(audioBytes.PcmBase64, 1024 * 1024);
+                    await _browser.PlayPluginPcmAsync("plugin:" + _record.Manifest.Id, audioPcm, audioBytes.Format, _lifetime.Token).ConfigureAwait(true);
+                    await ReplyOkAsync(envelope); break;
                 case "dialogs.open":
                     Demand(PluginPermission.Dialogs); string? importPath = await _browser.PluginOpenFilePickerAsync(_record.Manifest.Id, PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Title ?? "Open File", PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Filter ?? "All files (*.*)|*.*", Path.Combine(_rootDirectory, "data")).ConfigureAwait(false); await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DialogOpenReply(importPath)); break;
                 case "dialogs.save":
@@ -674,6 +680,29 @@ internal sealed class PluginSandboxSession : IDisposable
                     RunOnUi(() => _browser.SetEmbeddedPluginStatus(_record.Manifest.Id, status.Text));
                     await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
                     break;
+                case "embed.audio.push":
+                    Demand(PluginPermission.EmbedAudio);
+                    var ea = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedAudioPayload>(envelope) ?? throw new InvalidDataException();
+                    var eaInstance = EnsureEmbeddedInstance(ea.InstanceToken);
+                    byte[] eaPcm = DecodeCappedBase64(ea.PcmBase64, 1024 * 1024);
+                    ValidatePcmFormat(ea.Format);
+                    await _browser.PushPluginEmbeddedAudioAsync("embed:" + _record.Manifest.Id + ":" + ea.InstanceToken, eaPcm, ea.Format, _lifetime.Token, initiallyMuted: true).ConfigureAwait(true);
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "embed.audio.mute":
+                    Demand(PluginPermission.EmbedAudio);
+                    var em = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedMutePayload>(envelope) ?? throw new InvalidDataException();
+                    EnsureEmbeddedInstance(em.InstanceToken);
+                    RunOnUi(() => _browser.SetPluginEmbeddedAudioMuted("embed:" + _record.Manifest.Id + ":" + em.InstanceToken, em.Muted));
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "embed.cursor.set":
+                    Demand(PluginPermission.EmbedExtras);
+                    var ec = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedCursorPayload>(envelope) ?? throw new InvalidDataException();
+                    var ecInstance = EnsureEmbeddedInstance(ec.InstanceToken);
+                    RunOnUi(() => _browser.SetPluginEmbeddedCursor(ecInstance.Element, ec.Cursor));
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
                 case "embed.navigate":
                     Demand(PluginPermission.EmbedNavigate);
                     var navigate = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedNavigatePayload>(envelope) ?? throw new InvalidDataException();
@@ -721,6 +750,20 @@ internal sealed class PluginSandboxSession : IDisposable
     {
         string value = (contentType ?? string.Empty).Trim().ToLowerInvariant();
         if (value.Length is < 1 or > 256 || !value.Contains('/')) throw new InvalidDataException("Invalid content type.");
+    }
+
+    private static byte[] DecodeCappedBase64(string value, int cap)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return Array.Empty<byte>();
+        if (value.Length > ((cap + 2) / 3) * 4 + 8) throw new InvalidDataException("Plugin binary payload exceeds its size cap.");
+        byte[] bytes; try { bytes = Convert.FromBase64String(value); } catch { throw new InvalidDataException("Plugin binary payload is not valid base64."); }
+        if (bytes.Length > cap) throw new InvalidDataException("Plugin binary payload exceeds its size cap.");
+        return bytes;
+    }
+
+    private static void ValidatePcmFormat(PluginPcmFormat format)
+    {
+        if (format.SampleRate is < 8000 or > 48000 || format.Channels is < 1 or > 2 || format.SampleFormat is not (PluginPcmSampleFormat.PcmS16Le or PluginPcmSampleFormat.Float32Le)) throw new InvalidDataException("Unsupported PCM format.");
     }
 
     private static string SanitizePluginCss(string css)
