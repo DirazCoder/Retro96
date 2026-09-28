@@ -78,3 +78,22 @@ public sealed class PluginPermissionCatalogTests
         }
     }
 }
+
+public sealed class PluginSandboxProtocolTests
+{
+    [Fact]
+    public void CallTimeoutsAreFiniteAndRenderIsShorter()
+    {
+        Assert.InRange(PluginSandboxProtocol.DefaultCallTimeoutMs, 1, 300000);
+        Assert.InRange(PluginSandboxProtocol.RenderCallTimeoutMs, 1, PluginSandboxProtocol.DefaultCallTimeoutMs);
+        Assert.InRange(PluginSandboxProtocol.BeforeNavigateTimeoutMs, 1, PluginSandboxProtocol.RenderCallTimeoutMs);
+    }
+
+    [Fact]
+    public void SizeCapsAreFiniteAndOrdered()
+    {
+        Assert.True(PluginSandboxProtocol.MaxStreamChunkBytes > 0);
+        Assert.True(PluginSandboxProtocol.MaxJsonBytes >= PluginSandboxProtocol.MaxStreamChunkBytes);
+        Assert.True(PluginSandboxProtocol.MaxBinaryFrameBytes >= PluginSandboxProtocol.MaxJsonBytes);
+    }
+}

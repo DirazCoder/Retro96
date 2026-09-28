@@ -805,13 +805,19 @@ internal sealed class PluginSandboxSession : IDisposable
         string id = Guid.NewGuid().ToString("N");
         var completion = new TaskCompletionSource<PluginSandboxProtocol.Envelope>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[id] = completion;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        timeout.CancelAfter(GetCallTimeout(op));
         try
         {
-            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
-            var envelope = await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, timeout.Token).ConfigureAwait(false);
+            var envelope = await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
             if (envelope.Op == "error")
                 throw new InvalidOperationException(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ErrorPayload>(envelope)?.Error ?? "Plugin worker request failed.");
             return PluginSandboxProtocol.GetPayload<T>(envelope) ?? throw new InvalidOperationException("Plugin worker returned an invalid response.");
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Plugin call '{op}' timed out after {GetCallTimeout(op).TotalMilliseconds:0} ms.");
         }
         finally { _pending.TryRemove(id, out _); }
     }
@@ -822,12 +828,27 @@ internal sealed class PluginSandboxSession : IDisposable
         string id = Guid.NewGuid().ToString("N");
         var completion = new TaskCompletionSource<PluginSandboxProtocol.BinaryEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingBinary[id] = completion;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        timeout.CancelAfter(GetCallTimeout(op));
         try
         {
-            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
-            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, timeout.Token).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Plugin call '{op}' timed out after {GetCallTimeout(op).TotalMilliseconds:0} ms.");
         }
         finally { _pendingBinary.TryRemove(id, out _); }
+    }
+
+    private static TimeSpan GetCallTimeout(string op)
+    {
+        if (op.Equals("tabs.beforeNavigate", StringComparison.Ordinal))
+            return TimeSpan.FromMilliseconds(PluginSandboxProtocol.BeforeNavigateTimeoutMs);
+        if (op.StartsWith("embed.render", StringComparison.Ordinal))
+            return TimeSpan.FromMilliseconds(PluginSandboxProtocol.RenderCallTimeoutMs);
+        return TimeSpan.FromMilliseconds(PluginSandboxProtocol.DefaultCallTimeoutMs);
     }
 
     private async Task SendBinaryAsync(string op, string id, object payload, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)

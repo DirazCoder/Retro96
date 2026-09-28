@@ -17,6 +17,9 @@ internal static class PluginSandboxProtocol
     public const int MaxBinaryFrameBytes = 64 * 1024 * 1024;
     public const int MaxStreamChunkBytes = 1024 * 1024;
     public const int BinaryHeaderBytes = 1 + 4 + 4 + 4;
+    public const int DefaultCallTimeoutMs = 30_000;
+    public const int RenderCallTimeoutMs = 1_000;
+    public const int BeforeNavigateTimeoutMs = 750;
 
     public static readonly JsonSerializerOptions JsonOptions = new()
     {
