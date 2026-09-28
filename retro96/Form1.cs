@@ -131,6 +131,7 @@ public partial class Form1 : Form
     private string? _metaRefreshChainStartUrl;
     private int _metaRefreshChainCount;
     private bool _isMetaRefreshNav;
+    private int _pluginRedirectDepth;
     private const int MaxMetaRefreshChain = 10;
 
     private long _navGeneration;
@@ -677,6 +678,39 @@ public partial class Form1 : Form
         {
             var url = ParsedUrl.Parse(rawUrl.Trim());
 
+            if (_pluginManager != null)
+            {
+                var decision = await _pluginManager.BeforeNavigateAsync(rawUrl, CancellationToken.None).ConfigureAwait(true);
+                if (decision.Action == PluginBeforeNavigateAction.Cancel)
+                {
+                    _statusLabel.Text = "Navigation cancelled by a plugin.";
+                    return;
+                }
+                if (decision.Action == PluginBeforeNavigateAction.Redirect && !string.IsNullOrWhiteSpace(decision.RedirectUrl))
+                {
+                    if (decision.RedirectUrl.Equals(rawUrl, StringComparison.OrdinalIgnoreCase)) return;
+                    if (_pluginRedirectDepth >= 3)
+                    {
+                        await RenderErrorAsync(ErrorPage.NetworkError(rawUrl, "Too many plugin navigation redirects."), myGeneration);
+                        return;
+                    }
+                    _pluginRedirectDepth++;
+                    try { await NavigateAsync(decision.RedirectUrl, postData, replaceHistory).ConfigureAwait(true); }
+                    finally { _pluginRedirectDepth--; }
+                    return;
+                }
+            }
+
+            if (_pluginManager != null && !url.IsHttp && url.Scheme is not ("about" or "file" or "mailto" or "retro96" or "data" or "javascript"))
+            {
+                var protocolResponse = await _pluginManager.HandleProtocolAsync(url.Scheme, rawUrl, postData == null ? "GET" : "POST", CancellationToken.None).ConfigureAwait(true);
+                if (protocolResponse != null)
+                {
+                    await RenderPluginProtocolResponseAsync(rawUrl, protocolResponse, replaceHistory, myGeneration).ConfigureAwait(true);
+                    return;
+                }
+            }
+
             switch (url.Scheme)
             {
                 case "about":
@@ -989,6 +1023,15 @@ public partial class Form1 : Form
             return;
         }
 
+        if (success.Body.Length <= 8 * 1024 * 1024 && _pluginManager != null)
+        {
+            string? transformed = await _pluginManager.TransformContentAsync(success.ContentType, url.ToAbsolute(), success.Charset, success.Body, ct).ConfigureAwait(true);
+            if (transformed != null)
+            {
+                success = success with { Body = Encoding.UTF8.GetBytes(transformed), ContentType = "text/html", Charset = "utf-8" };
+            }
+        }
+
         if (await TryHandleBinaryNavigationAsync(success, url, ct, myGeneration).ConfigureAwait(true))
             return;
 
@@ -1037,6 +1080,7 @@ public partial class Form1 : Form
         BeginInvoke(() => _statusLabel.Text = "Fetching stylesheets…");
         if (BrowserRuntime.StylesheetsEnabled)
             await FetchStylesheetsAsync(document, url, ct);
+        ApplyPluginPageStyle(document);
 
         BeginInvoke(() => _statusLabel.Text = "Laying out…");
         _visitedUrls.Add(url.ToAbsolute());
@@ -2149,6 +2193,46 @@ public partial class Form1 : Form
     // Errors (rendered as era pages)
     // ─────────────────────────────────────────────────────────────────────
 
+    private void ApplyPluginPageStyle(DomDocument document)
+    {
+        string css = _pluginManager?.BuildPageStyleCss() ?? string.Empty;
+        if (css.Length == 0) return;
+        var head = document.ElementDescendants().FirstOrDefault(x => x.TagName == "head") ?? document;
+        var style = new DomElement("style");
+        style.AppendChild(new DomText(css));
+        head.AppendChild(style);
+    }
+
+    private async Task RenderPluginProtocolResponseAsync(string url, PluginProtocolResponse response, bool replaceHistory, long generation)
+    {
+        string contentType = (response.ContentType ?? "text/plain").Split(';', 2)[0].Trim().ToLowerInvariant();
+        if (response.StatusCode >= 400)
+        {
+            await RenderErrorAsync(ErrorPage.GenericHttpError(response.StatusCode, url), generation);
+            return;
+        }
+        if (contentType.StartsWith("image/", StringComparison.Ordinal))
+        {
+            string dataUrl = "data:" + contentType + ";base64," + Convert.ToBase64String(response.Body);
+            string html = "<html><head><title>" + EscapeHtmlText(url) + "</title></head><body bgcolor=\"#c0c0c0\"><img src=\"" + EscapeHtmlText(dataUrl) + "\"></body></html>";
+            await RenderHtmlAsync(html, url, replaceHistory, generation);
+            return;
+        }
+        if (contentType == "text/html" || contentType.EndsWith("+html", StringComparison.Ordinal))
+        {
+            string html = BodyDecoder.Decode(response.Body, response.Charset);
+            await RenderHtmlAsync(html, url, replaceHistory, generation);
+            return;
+        }
+        if (contentType.StartsWith("text/", StringComparison.Ordinal) || contentType is "application/json" or "application/xml")
+        {
+            string text = EscapeHtmlText(BodyDecoder.Decode(response.Body, response.Charset));
+            await RenderHtmlAsync("<html><head><title>" + EscapeHtmlText(url) + "</title></head><body><pre>" + text + "</pre></body></html>", url, replaceHistory, generation);
+            return;
+        }
+        await RenderErrorAsync(ErrorPage.NetworkError(url, $"Protocol '{contentType}' returned content that Retro96 cannot render inline."), generation);
+    }
+
     private async Task RenderErrorAsync(string html, long? generation = null)
     {
         await RenderHtmlAsync(html, _txtUrl.Text, replaceHistory: false, generation);
@@ -2172,6 +2256,7 @@ public partial class Form1 : Form
             // path called it), so a local page's CSS silently vanished.
             if (BrowserRuntime.StylesheetsEnabled)
                 await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
+            ApplyPluginPageStyle(document);
 
             // The visited session store must be copied onto the document
             // BEFORE CSS matching. Resolving first meant a:visited saw an

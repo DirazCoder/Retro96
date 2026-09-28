@@ -300,7 +300,7 @@ internal sealed class PluginSandboxSession : IDisposable
                     }
                 case "host.info":
                     {
-                        string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger", "permissions" };
+                        string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger", "permissions", "page.read", "network.rules", "protocol", "content.transform", "page.style", "tabs", "history", "bookmarks", "downloads", "omnibox", "settings", "ui.extras", "embed.audio", "embed.extras" };
                         var info = new PluginSandboxProtocol.HostInfoReply(
                             Application.ProductVersion, Retro96PluginApi.ApiVersion, supported, "classic",
                             System.Globalization.CultureInfo.CurrentUICulture.Name, Math.Max(96, _browser.DeviceDpi));
@@ -316,6 +316,83 @@ internal sealed class PluginSandboxSession : IDisposable
                 case "network.rules.clear":
                     Demand(PluginPermission.NetworkRules);
                     ClearNetworkRules();
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "protocol.register":
+                    Demand(PluginPermission.Protocol);
+                    var protocolRegister = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    ValidateProtocolScheme(protocolRegister.Scheme);
+                    _manager.RegisterPluginProtocol(_record, protocolRegister.Scheme, protocolRegister.Token);
+                    lock (_protocols) _protocols[protocolRegister.Scheme] = protocolRegister.Token;
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.ProtocolRegisterReply(protocolRegister.Token));
+                    break;
+                case "protocol.unregister":
+                    Demand(PluginPermission.Protocol);
+                    var protocolUnregister = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    _manager.UnregisterPluginProtocol(_record, protocolUnregister.Scheme, protocolUnregister.Token);
+                    UnregisterProtocol(protocolUnregister.Scheme, protocolUnregister.Token);
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "content.transform.register":
+                    Demand(PluginPermission.ContentTransform);
+                    var transformRegister = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    ValidateContentType(transformRegister.ContentType);
+                    lock (_contentTransforms) _contentTransforms[transformRegister.ContentType] = transformRegister.Token;
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.ContentTransformRegisterReply(transformRegister.Token));
+                    break;
+                case "content.transform.unregister":
+                    Demand(PluginPermission.ContentTransform);
+                    var transformUnregister = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    UnregisterContentTransform(transformUnregister.ContentType, transformUnregister.Token);
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "page.style.set":
+                    Demand(PluginPermission.PageStyle);
+                    var styleSet = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PageStylePayload>(envelope) ?? throw new InvalidDataException();
+                    SetPageStyle(styleSet.Token, SanitizePluginCss(styleSet.Css));
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "page.style.remove":
+                    Demand(PluginPermission.PageStyle);
+                    var styleRemove = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PageStyleRemovePayload>(envelope) ?? throw new InvalidDataException();
+                    RemovePageStyle(styleRemove.Token);
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "tabs.list":
+                    Demand(PluginPermission.Tabs);
+                    var tabs = RunOnUi(() => new[] { new PluginTabInfo("active", _browser.PluginCurrentUrl ?? "about:blank", _browser.PluginCurrentTitle ?? "", true) });
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.TabsListReply(tabs));
+                    break;
+                case "tabs.beforeNavigate":
+                    Demand(PluginPermission.Tabs);
+                    var before = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.BeforeNavigatePayload>(envelope) ?? throw new InvalidDataException();
+                    var decision = await RunBeforeNavigateAsync(before.TabId, before.Url, _lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.BeforeNavigateReply(decision.Action, decision.RedirectUrl));
+                    break;
+                case "history.search":
+                    Demand(PluginPermission.History);
+                    var history = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HistorySearchPayload>(envelope) ?? throw new InvalidDataException();
+                    var historyEntries = RunOnUi(() => _browser.PluginHistorySearch(history.Query, Math.Clamp(history.MaxResults, 1, 100)))
+                        .Select(x => new PluginHistoryEntry(x.Url, x.Title, x.Visited)).ToArray();
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.HistoryReply(historyEntries));
+                    break;
+                case "bookmarks.list":
+                    Demand(PluginPermission.Bookmarks);
+                    var bl = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.BookmarksListPayload>(envelope) ?? throw new InvalidDataException();
+                    var bookmarkEntries = RunOnUi(() => _browser.PluginBookmarksList(Math.Clamp(bl.MaxResults, 1, 500)))
+                        .Select(x => new PluginBookmarkEntry(x.Title, x.Url, x.Added)).ToArray();
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.BookmarksReply(bookmarkEntries));
+                    break;
+                case "bookmarks.add":
+                    Demand(PluginPermission.Bookmarks);
+                    var ba = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.BookmarkMutationPayload>(envelope) ?? throw new InvalidDataException();
+                    RunOnUi(() => _browser.PluginBookmarkAdd(ba.Title, ba.Url));
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "bookmarks.remove":
+                    Demand(PluginPermission.Bookmarks);
+                    var br = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.BookmarkRemovePayload>(envelope) ?? throw new InvalidDataException();
+                    RunOnUi(() => _browser.PluginBookmarkRemove(br.Url));
                     await ReplyOkAsync(envelope);
                     break;
                 case "page.read.text":
@@ -633,10 +710,53 @@ internal sealed class PluginSandboxSession : IDisposable
         throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{envelope.Op}'.");
     }
 
+    private static void ValidateProtocolScheme(string scheme)
+    {
+        string value = (scheme ?? string.Empty).Trim().ToLowerInvariant();
+        if (value.Length is < 1 or > 32 || !value.All(c => char.IsLetterOrDigit(c) || c is '+' or '-' or '.')) throw new InvalidDataException("Invalid protocol scheme.");
+        if (value is "http" or "https" or "file" or "about" or "data" or "javascript" or "mailto" or "retro96") throw new SecurityException("That URL scheme is reserved by Retro96.");
+    }
+
+    private static void ValidateContentType(string contentType)
+    {
+        string value = (contentType ?? string.Empty).Trim().ToLowerInvariant();
+        if (value.Length is < 1 or > 256 || !value.Contains('/')) throw new InvalidDataException("Invalid content type.");
+    }
+
+    private static string SanitizePluginCss(string css)
+    {
+        if (css == null || css.Length > 64 * 1024) throw new InvalidDataException("Plugin CSS exceeds its size cap.");
+        css = System.Text.RegularExpressions.Regex.Replace(css, @"url\s*\([^)]*\)", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        css = System.Text.RegularExpressions.Regex.Replace(css, @"@import\s+[^;]+;?", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        css = System.Text.RegularExpressions.Regex.Replace(css, @"(?:-moz-binding|behavior)\s*:[^;]+;?", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return css;
+    }
+
+    private async Task<PluginBeforeNavigateDecision> RunBeforeNavigateAsync(string tabId, string url, CancellationToken ct)
+    {
+        var reply = await SendRequestAsync<PluginSandboxProtocol.BeforeNavigateReply>(
+            "tabs.beforeNavigate", new PluginSandboxProtocol.BeforeNavigatePayload(tabId, url), ct).ConfigureAwait(true);
+        var action = reply.Action;
+        if (action == PluginBeforeNavigateAction.Redirect)
+        {
+            if (string.IsNullOrWhiteSpace(reply.RedirectUrl) || reply.RedirectUrl.Length > 8192) return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Cancel);
+            try { _ = ParsedUrl.Parse(reply.RedirectUrl); } catch { return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Cancel); }
+            return new PluginBeforeNavigateDecision(action, reply.RedirectUrl);
+        }
+        return new PluginBeforeNavigateDecision(action);
+    }
+
+    internal async Task<PluginBeforeNavigateDecision> BeforeNavigateAsync(string tabId, string url, CancellationToken ct)
+    {
+        Demand(PluginPermission.Tabs);
+        return await RunBeforeNavigateAsync(tabId, url, ct).ConfigureAwait(true);
+    }
+
     internal void RegisterProtocol(string scheme, string token)
     {
         Demand(PluginPermission.Protocol);
-        if (string.IsNullOrWhiteSpace(scheme) || scheme.Length > 32) throw new InvalidDataException("Invalid protocol scheme.");
+        ValidateProtocolScheme(scheme);
+        _manager.RegisterPluginProtocol(_record, scheme, token);
         lock (_protocols) _protocols[scheme] = token;
     }
 
@@ -666,7 +786,7 @@ internal sealed class PluginSandboxSession : IDisposable
         Demand(PluginPermission.Protocol);
         string token;
         lock (_protocols) if (!_protocols.TryGetValue(scheme, out token!)) return null;
-        var binary = await SendBinaryRequestAsync("protocol.request", new PluginSandboxProtocol.ProtocolRequestPayload(token, scheme, url, method), ct).ConfigureAwait(true);
+        var binary = await SendBinaryRequestAsync("protocol.request", new PluginSandboxProtocol.ProtocolRequestPayload(token, scheme, url, method), Array.Empty<byte>(), ct).ConfigureAwait(true);
         var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolResponsePayload>(binary) ?? throw new InvalidDataException("Protocol response metadata is missing.");
         if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
         if (binary.Data.Length > 32 * 1024 * 1024) throw new InvalidDataException("Protocol response exceeds its size cap.");
@@ -684,7 +804,7 @@ internal sealed class PluginSandboxSession : IDisposable
             token = pair.Value;
         }
         if (body.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform input exceeds its size cap.");
-        var binary = await SendBinaryRequestAsync("content.transform.request", new PluginSandboxProtocol.ContentTransformRequestPayload(token, url, contentType, charset), ct).ConfigureAwait(true);
+        var binary = await SendBinaryRequestAsync("content.transform.request", new PluginSandboxProtocol.ContentTransformRequestPayload(token, url, contentType, charset), body, ct).ConfigureAwait(true);
         var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformResponsePayload>(binary) ?? throw new InvalidDataException("Transform response metadata is missing.");
         if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
         if (binary.Data.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform output exceeds its size cap.");
@@ -949,7 +1069,9 @@ internal sealed class PluginSandboxSession : IDisposable
         finally { _pending.TryRemove(id, out _); }
     }
 
-    private async Task<PluginSandboxProtocol.BinaryEnvelope> SendBinaryRequestAsync(string op, object? payload, CancellationToken cancellationToken)
+    private Task<PluginSandboxProtocol.BinaryEnvelope> SendBinaryRequestAsync(string op, object? payload, CancellationToken cancellationToken) => SendBinaryRequestAsync(op, payload, Array.Empty<byte>(), cancellationToken);
+
+    private async Task<PluginSandboxProtocol.BinaryEnvelope> SendBinaryRequestAsync(string op, object? payload, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(PluginSandboxSession));
         string id = Guid.NewGuid().ToString("N");
@@ -959,7 +1081,7 @@ internal sealed class PluginSandboxSession : IDisposable
         timeout.CancelAfter(GetCallTimeout(op));
         try
         {
-            await PluginSandboxProtocol.WriteAsync(_pipe!, op, id, payload, _writeLock, timeout.Token).ConfigureAwait(false);
+            await PluginSandboxProtocol.WriteBinaryAsync(_pipe!, op, id, payload, data, _writeLock, timeout.Token).ConfigureAwait(false);
             return await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
@@ -1099,6 +1221,11 @@ internal sealed class PluginSandboxSession : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        lock (_protocols)
+        {
+            foreach (var pair in _protocols.ToArray()) _manager.UnregisterPluginProtocol(_record, pair.Key, pair.Value);
+            _protocols.Clear();
+        }
         _lifetime.Cancel();
         foreach (var completion in _pending.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginSandboxSession)));
         _pending.Clear();

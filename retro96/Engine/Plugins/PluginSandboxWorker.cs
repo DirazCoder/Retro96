@@ -364,8 +364,46 @@ internal static class PluginSandboxWorker
         {
             if (binary.Op == "protocol.response" || binary.Op == "content.transform.response")
                 throw new InvalidOperationException($"Unexpected plugin response '{binary.Op}'.");
-            if (binary.Op == "embed.frame")
+            if (binary.Op == "embed.frame") return;
+            if (binary.Op == "protocol.request")
+            {
+                if (!HasPermission(PluginPermission.Protocol)) throw new SecurityException("Permission 'protocol' has not been granted.");
+                var request = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolRequestPayload>(binary) ?? throw new InvalidDataException();
+                if (!_protocolCallbacks.TryGetValue(request.Token, out var callback)) throw new InvalidOperationException("Protocol handler is unavailable.");
+                try
+                {
+                    var response = await callback(new PluginProtocolRequest(request.Scheme, request.Url, request.Method), _lifetime.Token).ConfigureAwait(false);
+                    if (response == null || response.Body == null || response.Body.Length > 32 * 1024 * 1024 || string.IsNullOrWhiteSpace(response.ContentType) || response.ContentType.Length > 256) throw new InvalidDataException("Plugin protocol response is invalid or too large.");
+                    var meta = new PluginSandboxProtocol.ProtocolResponsePayload(null, response.StatusCode, response.ContentType, response.Charset);
+                    await SendBinaryAsync("protocol.response", binary.Id, meta, response.Body, _lifetime.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    var meta = new PluginSandboxProtocol.ProtocolResponsePayload(ex.Message, 500, "text/plain", "utf-8");
+                    await SendBinaryAsync("protocol.response", binary.Id, meta, Array.Empty<byte>(), _lifetime.Token).ConfigureAwait(false);
+                }
                 return;
+            }
+            if (binary.Op == "content.transform.request")
+            {
+                if (!HasPermission(PluginPermission.ContentTransform)) throw new SecurityException("Permission 'content.transform' has not been granted.");
+                if (binary.Data.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform input exceeds its size cap.");
+                var request = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformRequestPayload>(binary) ?? throw new InvalidDataException();
+                if (!_contentTransformCallbacks.TryGetValue(request.Token, out var callback)) throw new InvalidOperationException("Content transform handler is unavailable.");
+                try
+                {
+                    string html = await callback(new PluginContentTransformRequest(request.Url, request.ContentType, request.Charset, binary.Data), _lifetime.Token).ConfigureAwait(false);
+                    if (html == null || html.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform output exceeds its size cap.");
+                    byte[] bytes = Encoding.UTF8.GetBytes(html);
+                    if (bytes.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform output exceeds its size cap.");
+                    await SendBinaryAsync("content.transform.response", binary.Id, new PluginSandboxProtocol.ContentTransformResponsePayload(null, null), bytes, _lifetime.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    await SendBinaryAsync("content.transform.response", binary.Id, new PluginSandboxProtocol.ContentTransformResponsePayload(null, ex.Message), Array.Empty<byte>(), _lifetime.Token).ConfigureAwait(false);
+                }
+                return;
+            }
             throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{binary.Op}'.");
         }
 

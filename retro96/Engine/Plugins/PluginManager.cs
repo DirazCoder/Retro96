@@ -32,6 +32,7 @@ public sealed class PluginManager : IDisposable
     private readonly Dictionary<DomElement, EmbeddedRuntime> _embedded = new();
     private readonly object _embedLock = new();
     private readonly System.Windows.Forms.Timer _embedRenderTimer;
+    private readonly Dictionary<string, (PluginRecord Record, string Token)> _pluginProtocols = new(StringComparer.OrdinalIgnoreCase);
 
     public PluginManager(Form1 browser)
     {
@@ -670,6 +671,69 @@ public sealed class PluginManager : IDisposable
                 record.Sandbox.RaiseAudioComplete();
     }
 
+    internal void RegisterPluginProtocol(PluginRecord record, string scheme, string token)
+    {
+        scheme = scheme.Trim().ToLowerInvariant();
+        lock (_pluginProtocols)
+        {
+            if (_pluginProtocols.TryGetValue(scheme, out var existing) && !ReferenceEquals(existing.Record, record))
+                throw new InvalidOperationException($"Protocol scheme '{scheme}' is already registered by another plugin.");
+            _pluginProtocols[scheme] = (record, token);
+        }
+    }
+
+    internal void UnregisterPluginProtocol(PluginRecord record, string scheme, string token)
+    {
+        scheme = scheme.Trim().ToLowerInvariant();
+        lock (_pluginProtocols)
+        {
+            if (_pluginProtocols.TryGetValue(scheme, out var existing) && ReferenceEquals(existing.Record, record) && existing.Token == token)
+                _pluginProtocols.Remove(scheme);
+        }
+    }
+
+    internal async Task<PluginProtocolResponse?> HandleProtocolAsync(string scheme, string url, string method, CancellationToken ct)
+    {
+        PluginSandboxSession? session = null;
+        lock (_pluginProtocols)
+            if (_pluginProtocols.TryGetValue(scheme, out var item) && item.Record.Enabled && item.Record.HasPermission(PluginPermission.Protocol)) session = item.Record.Sandbox;
+        if (session == null) return null;
+        return await session.HandleProtocolAsync(scheme, url, method, ct).ConfigureAwait(true);
+    }
+
+    internal async Task<string?> TransformContentAsync(string contentType, string url, string charset, byte[] body, CancellationToken ct)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+        {
+            if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.ContentTransform)) continue;
+            if (!record.Sandbox.GetContentTransformTypes().Any(t => contentType.Equals(t, StringComparison.OrdinalIgnoreCase))) continue;
+            return await record.Sandbox.TransformContentAsync(contentType, url, charset, body, ct).ConfigureAwait(true);
+        }
+        return null;
+    }
+
+    internal string BuildPageStyleCss()
+    {
+        var styles = new List<string>();
+        foreach (var record in _plugins.Values.ToArray())
+        {
+            if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.PageStyle)) continue;
+            styles.AddRange(record.Sandbox.PageStyles);
+        }
+        return string.Join("\n", styles.Select(x => x[(x.IndexOf('\n') + 1)..]));
+    }
+
+    internal async Task<PluginBeforeNavigateDecision> BeforeNavigateAsync(string url, CancellationToken ct)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+        {
+            if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.Tabs)) continue;
+            var decision = await record.Sandbox.BeforeNavigateAsync("active", url, ct).ConfigureAwait(true);
+            if (decision.Action != PluginBeforeNavigateAction.Allow) return decision;
+        }
+        return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow);
+    }
+
     internal PluginNetworkRuleDecision EvaluateNetworkRules(string url, IReadOnlyDictionary<string, string> headers)
     {
         var strip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -967,6 +1031,8 @@ public sealed class PluginManager : IDisposable
 
     private void DisableRecord(PluginRecord record)
     {
+        lock (_pluginProtocols)
+            foreach (var key in _pluginProtocols.Where(x => ReferenceEquals(x.Value.Record, record)).Select(x => x.Key).ToArray()) _pluginProtocols.Remove(key);
         DisableRuntimeOnly(record);
         _browser.RemovePluginFileMenuItems(record.Manifest.Id);
         record.Status = "Disabled";

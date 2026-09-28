@@ -153,6 +153,23 @@ public partial class Form1
         return string.IsNullOrWhiteSpace(value) ? null : TruncatePluginText(value, 64 * 1024);
     }
 
+    internal IReadOnlyList<HistoryStoreEntry> PluginHistorySearch(string? query, int maxResults) =>
+        _historyStore.Search(query ?? string.Empty).Take(Math.Clamp(maxResults, 1, 100)).ToArray();
+
+    internal IReadOnlyList<BookmarkEntry> PluginBookmarksList(int maxResults) =>
+        _bookmarkStore.Items.Take(Math.Clamp(maxResults, 1, 500)).ToArray();
+
+    internal void PluginBookmarkAdd(string title, string url)
+    {
+        if (string.IsNullOrWhiteSpace(url) || url.Length > 8192) throw new ArgumentException("Invalid bookmark URL.", nameof(url));
+        if (!_bookmarkStore.Contains(url)) _bookmarkStore.Toggle(TruncatePluginText(title ?? string.Empty, 512), url);
+    }
+
+    internal void PluginBookmarkRemove(string url)
+    {
+        if (!string.IsNullOrWhiteSpace(url)) _bookmarkStore.Delete(url);
+    }
+
     private static string TruncatePluginText(string value, int max) =>
         value.Length <= max ? value : value[..max];
 
