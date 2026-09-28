@@ -42,6 +42,7 @@ internal sealed class PluginSandboxSession : IDisposable
     private WindowsSecurity.WorkerProcess? _worker;
     private string? _profileName;
     private int _disposed;
+    internal bool ExpectedShutdown { get; set; }
 
     public PluginSandboxSession(Form1 browser, PluginManager manager, PluginManager.PluginRecord record)
     {
@@ -81,6 +82,7 @@ internal sealed class PluginSandboxSession : IDisposable
                 runtimeDir,
                 useLpac: false,
                 ownsRuntimeDirectory: true,
+                cpuRatePercent: 25,
                 workerArguments: $"--plugin-worker \"{pipeName}\" \"PluginPayload\\{_record.Manifest.Id}\"");
 
             await _pipe.WaitForConnectionAsync(_lifetime.Token).ConfigureAwait(false);
@@ -266,6 +268,7 @@ internal sealed class PluginSandboxSession : IDisposable
         finally
         {
             _ready.TrySetException(new InvalidOperationException("Plugin sandbox disconnected."));
+            if (!ExpectedShutdown) _manager.RecordSandboxCrash(_record, _record.Error ?? "Plugin worker disconnected.");
         }
     }
 
@@ -589,7 +592,7 @@ internal sealed class PluginSandboxSession : IDisposable
 
                 case "log":
                     var log = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.LogPayload>(envelope);
-                    if (log != null) DebugLog.Write($"PLUGIN[{_record.Manifest.Id}] {log.Level}: {log.Message}{(string.IsNullOrEmpty(log.Exception) ? "" : " | " + log.Exception)}");
+                    if (log != null) { string line = $"{DateTimeOffset.UtcNow:O} [{log.Level}] {log.Message}{(string.IsNullOrEmpty(log.Exception) ? "" : " | " + log.Exception)}"; DebugLog.Write($"PLUGIN[{_record.Manifest.Id}] {line}"); _manager.AppendPluginLog(_record, line); }
                     await ReplyOkAsync(envelope); break;
 
                 case "embed.register":
@@ -1263,6 +1266,7 @@ internal sealed class PluginSandboxSession : IDisposable
 
     public void Dispose()
     {
+        ExpectedShutdown = true;
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         lock (_protocols)
         {

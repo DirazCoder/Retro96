@@ -23,6 +23,9 @@ public sealed class PluginManager : IDisposable
 {
     private const string PackageExtension = ".r96p";
     private const int MaxPermissionHistoryEntries = 32;
+    private const int MaxPluginCrashesInWindow = 3;
+    private static readonly TimeSpan PluginCrashWindow = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan[] PluginRestartBackoff = { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30) };
     private readonly Form1 _browser;
     private readonly string _rootDirectory;
     private readonly string _stateFile;
@@ -768,6 +771,58 @@ public sealed class PluginManager : IDisposable
         _browser.PopulatePluginContextMenu(menu, context);
     }
 
+    internal void AppendPluginLog(PluginRecord record, string line)
+    {
+        try
+        {
+            string path = Path.Combine(record.Directory, "data", "plugin.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.SequentialScan);
+            using var writer = new StreamWriter(stream);
+            writer.WriteLine(line.Length > 16 * 1024 ? line[..(16 * 1024)] : line);
+            writer.Flush();
+            var info = new FileInfo(path);
+            if (info.Length > 1024 * 1024) using (var input = File.OpenRead(path)) { input.Seek(info.Length - 1024 * 1024, SeekOrigin.Begin); using var output = File.Create(path + ".trim"); input.CopyTo(output); }
+            string trim = path + ".trim"; if (File.Exists(trim)) { File.Delete(path); File.Move(trim, path); }
+        } catch { }
+    }
+
+    internal string GetPluginLog(PluginRecord record)
+    {
+        try { string path = Path.Combine(record.Directory, "data", "plugin.log"); return File.Exists(path) ? File.ReadAllText(path) : "No plugin log has been written."; } catch (Exception ex) { return "Unable to read plugin log: " + ex.Message; }
+    }
+
+    internal void RecordSandboxCrash(PluginRecord record, string reason)
+    {
+        if (_disposed || !record.Enabled) return;
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        record.LastCrashUtc = now; record.LastCrashReason = string.IsNullOrWhiteSpace(reason) ? "Plugin worker disconnected." : reason;
+        record.CrashTimes.RemoveAll(t => now - t > PluginCrashWindow);
+        record.CrashTimes.Add(now);
+        record.RestartAttempt = Math.Min(record.RestartAttempt + 1, PluginRestartBackoff.Length);
+        record.Sandbox = null;
+        if (record.CrashTimes.Count >= MaxPluginCrashesInWindow)
+        {
+            record.Enabled = false;
+            record.Status = "Disabled after repeated crashes";
+        }
+        else
+        {
+            record.Status = "Crashed; restart scheduled";
+            TimeSpan delay = PluginRestartBackoff[Math.Max(0, record.RestartAttempt - 1)];
+            _ = RestartAfterCrashAsync(record, delay);
+        }
+        SaveState(); PluginsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private async Task RestartAfterCrashAsync(PluginRecord record, TimeSpan delay)
+    {
+        try { await Task.Delay(delay).ConfigureAwait(false); } catch { return; }
+        if (_disposed || !record.Enabled || record.Sandbox != null) return;
+        if (_browser.IsHandleCreated && !_browser.IsDisposed) _browser.BeginInvoke((Action)(() => TryLoad(record)));
+        else TryLoad(record);
+    }
+
     private void LoadEnabledPlugins()
     {
         foreach (var record in _plugins.Values.ToArray())
@@ -810,6 +865,7 @@ public sealed class PluginManager : IDisposable
                 _browser.RemovePluginFileMenuItems(record.Manifest.Id);
                 record.Status = "Error";
                 record.Error = ex.Message;
+                RecordSandboxCrash(record, ex.ToString());
             }
         }
         PluginsChanged?.Invoke(this, EventArgs.Empty);
@@ -984,7 +1040,9 @@ public sealed class PluginManager : IDisposable
                         PermissionChanges = state.PermissionChanges ?? new List<PluginPermissionVersionChange>(),
                         LastCrashReason = state.LastCrashReason,
                         LastCrashUtc = state.LastCrashUtc,
-                        Activity = state.Activity ?? new List<PluginActivityEntry>()
+                        Activity = state.Activity ?? new List<PluginActivityEntry>(),
+                        CrashTimes = state.CrashTimes ?? new List<DateTimeOffset>(),
+                        RestartAttempt = state.RestartAttempt
                     };
                     _plugins[state.Id].ActivityPersistence = SaveState;
                 }
@@ -1007,7 +1065,9 @@ public sealed class PluginManager : IDisposable
             PermissionChanges = p.PermissionChanges,
             LastCrashReason = p.LastCrashReason,
             LastCrashUtc = p.LastCrashUtc,
-            Activity = p.SnapshotActivity()
+            Activity = p.SnapshotActivity(),
+            CrashTimes = p.CrashTimes.ToList(),
+            RestartAttempt = p.RestartAttempt
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
     }
@@ -1025,7 +1085,7 @@ public sealed class PluginManager : IDisposable
 
     private static void DisableRuntimeOnly(PluginRecord record)
     {
-        try { record.Sandbox?.Dispose(); } catch { }
+        try { if (record.Sandbox is { } sandbox) sandbox.ExpectedShutdown = true; record.Sandbox?.Dispose(); } catch { }
         record.Sandbox = null;
     }
 
@@ -1077,6 +1137,8 @@ public sealed class PluginManager : IDisposable
         public string? LastCrashReason { get; set; }
         public DateTimeOffset? LastCrashUtc { get; set; }
         public List<PluginActivityEntry>? Activity { get; set; }
+        public List<DateTimeOffset>? CrashTimes { get; set; }
+        public int RestartAttempt { get; set; }
     }
 
     public sealed class PluginRecord
@@ -1100,6 +1162,7 @@ public sealed class PluginManager : IDisposable
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
+        public int CrashCountInWindow => CrashTimes.Count(t => DateTimeOffset.UtcNow - t <= PluginCrashWindow);
 
         internal void RecordActivity(PluginPermission permission, string? host)
         {

@@ -39,6 +39,9 @@ internal static class WindowsSecurity
     private const uint ProcessCreationAllApplicationPackagesOptOut = 0x00000001;
 
     private const uint JobObjectExtendedLimitInformation = 9;
+    private const uint JobObjectCpuRateControlInformation = 15;
+    private const uint JobObjectCpuRateControlEnable = 0x1;
+    private const uint JobObjectCpuRateControlHardCap = 0x4;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
     private const uint JobObjectLimitActiveProcess = 0x00000008;
     private const uint JobObjectLimitProcessMemory = 0x00000100;
@@ -122,6 +125,10 @@ internal static class WindowsSecurity
         uint jobObjectInformationClass,
         ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobObjectInformation,
         uint jobObjectInformationLength);
+
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "SetInformationJobObject")]
+    private static extern bool SetInformationJobObjectCpu(
+        IntPtr job, uint jobObjectInformationClass, ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION jobObjectInformation, uint jobObjectInformationLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
@@ -238,6 +245,13 @@ internal static class WindowsSecurity
         public UIntPtr Affinity;
         public uint PriorityClass;
         public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+    {
+        public uint ControlFlags;
+        public uint CpuRate;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -604,7 +618,8 @@ internal static class WindowsSecurity
         string workerWorkingDirectory,
         bool useLpac,
         bool ownsRuntimeDirectory,
-        string? workerArguments = null)
+        string? workerArguments = null,
+        int cpuRatePercent = 0)
     {
         StartupDiagnostics.Step("HOST", "StartWorker called. Mode=" + mode + " exe=" + workerExecutable + " cwd=" + workerWorkingDirectory + " LPAC=" + useLpac);
 
@@ -669,6 +684,24 @@ internal static class WindowsSecurity
                 int e = Marshal.GetLastWin32Error();
                 StartupDiagnostics.Win32Error("HOST", "SetInformationJobObject", e);
                 throw new Win32Exception(e, "SetInformationJobObject failed.");
+            }
+
+            if (cpuRatePercent is < 0 or > 100)
+                throw new ArgumentOutOfRangeException(nameof(cpuRatePercent));
+            if (cpuRatePercent > 0)
+            {
+                var cpu = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+                {
+                    ControlFlags = JobObjectCpuRateControlEnable | JobObjectCpuRateControlHardCap,
+                    CpuRate = checked((uint)(cpuRatePercent * 100))
+                };
+                if (!SetInformationJobObjectCpu(job, JobObjectCpuRateControlInformation, ref cpu,
+                        (uint)Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()))
+                {
+                    int e = Marshal.GetLastWin32Error();
+                    StartupDiagnostics.Win32Error("HOST", "SetInformationJobObject(CPU)", e);
+                    throw new Win32Exception(e, "SetInformationJobObject CPU limit failed.");
+                }
             }
 
             // Keep the declared count in lockstep with the attributes actually

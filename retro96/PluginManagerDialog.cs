@@ -670,6 +670,9 @@ internal sealed class PluginDetailsDialog : Form
         text.AppendLine($"Status: {record.Status}");
         text.AppendLine($"Install date (UTC): {record.InstalledUtc:O}");
         text.AppendLine($"DLL SHA-256: {record.DllSha256}");
+        text.AppendLine($"Last crash: {(record.LastCrashUtc.HasValue ? record.LastCrashUtc.Value.ToString("O") : "none")}");
+        text.AppendLine($"Crash count in last 5 minutes: {record.CrashCountInWindow}");
+        if (!string.IsNullOrWhiteSpace(record.LastCrashReason)) text.AppendLine($"Crash reason: {record.LastCrashReason}");
         text.AppendLine($"Entry point: {record.Manifest.EntryPoint}");
         text.AppendLine();
         text.AppendLine("Permissions");
@@ -726,7 +729,9 @@ internal sealed class PluginDetailsDialog : Form
             BackColor = SystemColors.Window
         };
         var close = new Button { Text = "Close", Width = 92, Height = 34 };
+        var viewLog = new Button { Text = "View log", Width = 100, Height = 34 };
         close.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        viewLog.Click += (_, _) => ShowLog(manager, record);
         var bottom = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -737,10 +742,21 @@ internal sealed class PluginDetailsDialog : Form
             Margin = Padding.Empty
         };
         bottom.Controls.Add(close);
+        bottom.Controls.Add(viewLog);
         Controls.Add(body);
         Controls.Add(bottom);
         AcceptButton = close;
         CancelButton = close;
+    }
+
+    private static void ShowLog(PluginManager manager, PluginManager.PluginRecord record)
+    {
+        using var dialog = new Form { Text = "Plugin Log — " + record.Manifest.Name, StartPosition = FormStartPosition.CenterParent, AutoScaleMode = AutoScaleMode.Dpi, MinimumSize = new Size(700, 460), ClientSize = new Size(900, 620) };
+        var body = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Text = manager.GetPluginLog(record) };
+        var close = new Button { Text = "Close", Width = 92, Height = 34, DialogResult = DialogResult.OK };
+        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 54, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(10, 8, 10, 8) };
+        bottom.Controls.Add(close); dialog.Controls.Add(body); dialog.Controls.Add(bottom); dialog.AcceptButton = close; dialog.CancelButton = close;
+        dialog.ShowDialog();
     }
 }
 
