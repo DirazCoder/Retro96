@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Globalization;
 using System.Security;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -20,6 +22,7 @@ namespace Retro96.Plugins;
 public sealed class PluginManager : IDisposable
 {
     private const string PackageExtension = ".r96p";
+    private const int MaxPermissionHistoryEntries = 32;
     private readonly Form1 _browser;
     private readonly string _rootDirectory;
     private readonly string _stateFile;
@@ -69,12 +72,11 @@ public sealed class PluginManager : IDisposable
         PluginManifest manifest = ReadManifestFromPackage(packagePath);
         ValidateManifest(manifest);
 
-        if (_plugins.ContainsKey(manifest.Id))
-            throw new InvalidOperationException($"A plugin with id '{manifest.Id}' is already installed.");
-
+        _plugins.TryGetValue(manifest.Id, out var existing);
         string destination = GetPluginDirectory(manifest.Id);
         string temp = destination + ".installing-" + Guid.NewGuid().ToString("N");
         Directory.CreateDirectory(temp);
+
         try
         {
             ExtractPackageSafely(packagePath, temp);
@@ -82,29 +84,118 @@ public sealed class PluginManager : IDisposable
             ValidateManifest(installedManifest);
             if (!installedManifest.Id.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("The package manifest changed during installation.");
-
             ValidateEntryAssembly(temp, installedManifest);
-            Directory.Move(temp, destination);
+            string newHash = ComputeDllSha256(temp, installedManifest);
 
-            var record = new PluginRecord
+            if (existing == null)
             {
-                Manifest = installedManifest,
-                Directory = destination,
-                Enabled = enableImmediately,
-                GrantedPermissions = PluginPermission.None
-            };
-            _plugins.Add(record.Manifest.Id, record);
-            SaveState();
-            if (record.Enabled)
-            {
-                TryLoad(record);
+                Directory.Move(temp, destination);
+                var record = new PluginRecord
+                {
+                    Manifest = installedManifest,
+                    Directory = destination,
+                    Enabled = enableImmediately,
+                    GrantedPermissions = PluginPermission.None,
+                    InstalledUtc = DateTimeOffset.UtcNow,
+                    DllSha256 = newHash
+                };
+                _plugins.Add(record.Manifest.Id, record);
+                SaveState();
+                if (record.Enabled) TryLoad(record);
+                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                return record;
             }
+
+            string oldHash = existing.DllSha256;
+            if (string.IsNullOrWhiteSpace(oldHash))
+            {
+                try { oldHash = ComputeDllSha256(existing.Directory, existing.Manifest); }
+                catch { oldHash = "unavailable"; }
+            }
+
+            int versionComparison = ComparePluginVersions(installedManifest.Version, existing.Manifest.Version);
+            bool authorChanged = !string.Equals(existing.Manifest.Author?.Trim(), installedManifest.Author?.Trim(), StringComparison.Ordinal);
+            string oldVersion = existing.Manifest.Version;
+            string oldAuthor = existing.Manifest.Author;
+            string updateMessage =
+                $"Retro96 will replace the installed files for '{existing.Manifest.Name}'.\r\n\r\n" +
+                $"Version: {existing.Manifest.Version} -> {installedManifest.Version}\r\n" +
+                $"Old DLL SHA-256: {oldHash}\r\n" +
+                $"New DLL SHA-256: {newHash}\r\n\r\n" +
+                (authorChanged
+                    ? $"WARNING: the manifest author changed:\r\n  {existing.Manifest.Author}\r\n  -> {installedManifest.Author}\r\n\r\n"
+                    : "") +
+                "Plugin packages are not signed. This confirmation is only a safety speed bump, not authentication.\r\n\r\n";
+
+            if (versionComparison < 0)
+                updateMessage = "WARNING: this package is a DOWNGRADE.\r\n\r\n" + updateMessage;
+            else if (versionComparison == 0)
+                updateMessage = "The package has the same version as the installed plugin and will replace its files.\r\n\r\n" + updateMessage;
+
+            if (MessageBox.Show(_browser, updateMessage, "Update Plugin", MessageBoxButtons.OKCancel,
+                    authorChanged || versionComparison < 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information) != DialogResult.OK)
+                return existing;
+
+            bool wasEnabled = existing.Enabled;
+            PluginPermission oldRequested = existing.RequestedPermissions;
+            PluginPermission oldGranted = existing.GrantedPermissions;
+            DisableRecord(existing);
+
+            string backup = destination + ".backup-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                Directory.Move(destination, backup);
+                Directory.Move(temp, destination);
+                temp = string.Empty;
+
+                string oldData = Path.Combine(backup, "data");
+                string newData = Path.Combine(destination, "data");
+                if (Directory.Exists(oldData))
+                {
+                    TryDeleteDirectory(newData);
+                    Directory.Move(oldData, newData);
+                }
+
+                TryDeleteDirectory(backup);
+            }
+            catch
+            {
+                TryDeleteDirectory(destination);
+                if (Directory.Exists(backup))
+                    Directory.Move(backup, destination);
+                throw;
+            }
+
+            existing.Manifest = installedManifest;
+            existing.DllSha256 = newHash;
+            existing.GrantedPermissions = oldGranted & installedManifest.RequestedPermissions;
+            existing.PendingNewPermissions = installedManifest.RequestedPermissions & ~oldRequested;
+            existing.PermissionChanges.Insert(0, new PluginPermissionVersionChange
+            {
+                ChangedUtc = DateTimeOffset.UtcNow,
+                FromVersion = oldVersion,
+                ToVersion = installedManifest.Version,
+                OldRequested = oldRequested,
+                NewRequested = installedManifest.RequestedPermissions,
+                OldGranted = oldGranted,
+                NewGranted = existing.GrantedPermissions,
+                AuthorChanged = authorChanged,
+                OldDllSha256 = oldHash,
+                NewDllSha256 = newHash
+            });
+            if (existing.PermissionChanges.Count > MaxPermissionHistoryEntries)
+                existing.PermissionChanges.RemoveRange(MaxPermissionHistoryEntries, existing.PermissionChanges.Count - MaxPermissionHistoryEntries);
+
+            existing.Error = null;
+            existing.Status = wasEnabled ? "Loading (sandboxed)" : "Disabled";
+            SaveState();
+            if (wasEnabled) TryLoad(existing);
             PluginsChanged?.Invoke(this, EventArgs.Empty);
-            return record;
+            return existing;
         }
         catch
         {
-            TryDeleteDirectory(temp);
+            if (!string.IsNullOrEmpty(temp)) TryDeleteDirectory(temp);
             throw;
         }
     }
@@ -135,6 +226,7 @@ public sealed class PluginManager : IDisposable
         if (!_plugins.TryGetValue(id, out var record)) return;
         PluginPermission sanitized = permissions & record.Manifest.RequestedPermissions;
         record.GrantedPermissions = sanitized;
+        record.PendingNewPermissions = PluginPermission.None;
         if (record.Enabled)
         {
             DisableRecord(record);
@@ -150,6 +242,14 @@ public sealed class PluginManager : IDisposable
         DisableRecord(record);
         if (record.Enabled) TryLoad(record);
         PluginsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public PluginPermission ConsumePendingNewPermissions(string id)
+    {
+        if (!_plugins.TryGetValue(id, out var record)) return PluginPermission.None;
+        PluginPermission value = record.PendingNewPermissions;
+        record.PendingNewPermissions = PluginPermission.None;
+        return value;
     }
 
     public void OpenFolder(string id)
@@ -580,6 +680,49 @@ public sealed class PluginManager : IDisposable
         PluginsChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    private static string ComputeDllSha256(string root, PluginManifest manifest)
+    {
+        string path = Path.GetFullPath(Path.Combine(root, manifest.Assembly));
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static int ComparePluginVersions(string left, string right)
+    {
+        static (int number, string[] prerelease) Parse(string value)
+        {
+            string main = value?.Trim() ?? "0";
+            string[] parts = main.Split('-', 2, StringSplitOptions.TrimEntries);
+            string[] nums = parts[0].Split('.', StringSplitOptions.RemoveEmptyEntries);
+            int number = 0;
+            foreach (string part in nums.Take(4))
+            {
+                number = checked(number * 1000 + (int.TryParse(part, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? Math.Clamp(n, 0, 999) : 0));
+            }
+            string[] pre = parts.Length == 2 ? parts[1].Split('.', StringSplitOptions.RemoveEmptyEntries) : Array.Empty<string>();
+            return (number, pre);
+        }
+
+        var a = Parse(left);
+        var b = Parse(right);
+        int c = a.number.CompareTo(b.number);
+        if (c != 0) return c;
+        if (a.prerelease.Length == 0 && b.prerelease.Length == 0) return 0;
+        if (a.prerelease.Length == 0) return 1;
+        if (b.prerelease.Length == 0) return -1;
+        int count = Math.Max(a.prerelease.Length, b.prerelease.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (i >= a.prerelease.Length) return -1;
+            if (i >= b.prerelease.Length) return 1;
+            bool an = int.TryParse(a.prerelease[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out int av);
+            bool bn = int.TryParse(b.prerelease[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out int bv);
+            c = (an && bn) ? av.CompareTo(bv) : string.Compare(a.prerelease[i], b.prerelease[i], StringComparison.Ordinal);
+            if (c != 0) return c;
+        }
+        return 0;
+    }
+
     private static void ValidateEntryAssembly(string root, PluginManifest manifest)
     {
         string assemblyPath = Path.GetFullPath(Path.Combine(root, manifest.Assembly));
@@ -692,7 +835,12 @@ public sealed class PluginManager : IDisposable
                         Manifest = manifest,
                         Directory = dir,
                         Enabled = state.Enabled,
-                        GrantedPermissions = requested & (PluginPermission)state.GrantedPermissions
+                        GrantedPermissions = requested & (PluginPermission)state.GrantedPermissions,
+                        InstalledUtc = state.InstalledUtc == default ? new DateTimeOffset(File.GetCreationTimeUtc(manifestPath), TimeSpan.Zero) : state.InstalledUtc,
+                        DllSha256 = string.IsNullOrWhiteSpace(state.DllSha256) ? SafeComputeDllSha256(dir, manifest) : state.DllSha256,
+                        PermissionChanges = state.PermissionChanges ?? new List<PluginPermissionVersionChange>(),
+                        LastCrashReason = state.LastCrashReason,
+                        LastCrashUtc = state.LastCrashUtc
                     };
                 }
                 catch { /* a broken installed plugin should not prevent startup */ }
@@ -708,9 +856,19 @@ public sealed class PluginManager : IDisposable
         {
             Id = p.Manifest.Id,
             Enabled = p.Enabled,
-            GrantedPermissions = p.GrantedPermissions
+            GrantedPermissions = p.GrantedPermissions,
+            InstalledUtc = p.InstalledUtc,
+            DllSha256 = p.DllSha256,
+            PermissionChanges = p.PermissionChanges,
+            LastCrashReason = p.LastCrashReason,
+            LastCrashUtc = p.LastCrashUtc
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
+    }
+
+    private static string SafeComputeDllSha256(string root, PluginManifest manifest)
+    {
+        try { return ComputeDllSha256(root, manifest); } catch { return "unavailable"; }
     }
 
     private static void TryDeleteDirectory(string path)
@@ -765,6 +923,11 @@ public sealed class PluginManager : IDisposable
         public string Id { get; set; } = "";
         public bool Enabled { get; set; }
         public ulong GrantedPermissions { get; set; }
+        public DateTimeOffset InstalledUtc { get; set; }
+        public string DllSha256 { get; set; } = "";
+        public List<PluginPermissionVersionChange>? PermissionChanges { get; set; }
+        public string? LastCrashReason { get; set; }
+        public DateTimeOffset? LastCrashUtc { get; set; }
     }
 
     public sealed class PluginRecord
@@ -776,8 +939,28 @@ public sealed class PluginManager : IDisposable
         public PluginPermission GrantedPermissions { get; internal set; }
         public string Status { get; internal set; } = "Installed";
         public string? Error { get; internal set; }
+        public DateTimeOffset InstalledUtc { get; internal set; }
+        public string DllSha256 { get; internal set; } = "";
+        public List<PluginPermissionVersionChange> PermissionChanges { get; internal set; } = new();
+        public string? LastCrashReason { get; internal set; }
+        public DateTimeOffset? LastCrashUtc { get; internal set; }
+        public PluginPermission PendingNewPermissions { get; internal set; }
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
+    }
+
+    public sealed class PluginPermissionVersionChange
+    {
+        public DateTimeOffset ChangedUtc { get; set; }
+        public string FromVersion { get; set; } = "";
+        public string ToVersion { get; set; } = "";
+        public PluginPermission OldRequested { get; set; }
+        public PluginPermission NewRequested { get; set; }
+        public PluginPermission OldGranted { get; set; }
+        public PluginPermission NewGranted { get; set; }
+        public bool AuthorChanged { get; set; }
+        public string OldDllSha256 { get; set; } = "";
+        public string NewDllSha256 { get; set; } = "";
     }
 }

@@ -292,7 +292,14 @@ public sealed class PluginManagerDialog : Form
             if (MessageBox.Show(this, warning, "Install Plugin", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
                 return;
 
-            _manager.InstallPackage(dialog.FileName, enableImmediately: false);
+            var record = _manager.InstallPackage(dialog.FileName, enableImmediately: false);
+            PluginPermission newlyRequested = _manager.ConsumePendingNewPermissions(record.Manifest.Id);
+            if (newlyRequested != PluginPermission.None)
+            {
+                using var permissionsDialog = new PluginPermissionsDialog(record, newlyRequested);
+                if (permissionsDialog.ShowDialog(this) == DialogResult.OK)
+                    _manager.SetGrantedPermissions(record.Manifest.Id, record.GrantedPermissions | permissionsDialog.GrantedPermissions);
+            }
         }
         catch (Exception ex)
         {
@@ -374,13 +381,17 @@ public sealed class PluginManagerDialog : Form
 internal sealed class PluginPermissionsDialog : Form
 {
     private readonly PluginManager.PluginRecord _record;
+    private readonly PluginPermission _visiblePermissions;
+    private readonly bool _onlyNewPermissions;
     private readonly Dictionary<PluginPermission, CheckBox> _checks = new();
     public PluginPermission GrantedPermissions { get; private set; }
 
-    public PluginPermissionsDialog(PluginManager.PluginRecord record)
+    public PluginPermissionsDialog(PluginManager.PluginRecord record, PluginPermission? visiblePermissions = null)
     {
         _record = record;
-        GrantedPermissions = record.GrantedPermissions;
+        _onlyNewPermissions = visiblePermissions.HasValue;
+        _visiblePermissions = visiblePermissions ?? record.RequestedPermissions;
+        GrantedPermissions = _onlyNewPermissions ? PluginPermission.None : record.GrantedPermissions;
         Text = "Plugin Permissions — " + record.Manifest.Name;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.Sizable;
@@ -395,7 +406,9 @@ internal sealed class PluginPermissionsDialog : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             MaximumSize = new Size(0, 0),
-            Text = "Grant only the capabilities this plugin actually needs. The host checks the user's granted set before every privileged broker call.",
+            Text = _visiblePermissions == _record.RequestedPermissions
+                ? "Grant only the capabilities this plugin actually needs. The host checks the user's granted set before every privileged broker call."
+                : "This update requests new permissions. Existing grants are kept unchanged; only these newly requested capabilities can be added now.",
             Padding = new Padding(12, 10, 12, 10)
         };
 
@@ -410,6 +423,7 @@ internal sealed class PluginPermissionsDialog : Form
         foreach (var permission in Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None))
         {
             if (!record.RequestedPermissions.HasFlag(permission)) continue;
+            if (!_visiblePermissions.HasFlag(permission)) continue;
             AddPermissionRow(panel, permission);
         }
 
@@ -447,7 +461,7 @@ internal sealed class PluginPermissionsDialog : Form
         var row = new Panel
         { Width = 580, Height = 34, Margin = new Padding(0, 0, 0, 4), Padding = Padding.Empty };
         var check = new CheckBox
-        { Text = name, AutoSize = true, Dock = DockStyle.Fill, Checked = _record.GrantedPermissions.HasFlag(permission), Margin = new Padding(0, 5, 0, 0) };
+        { Text = name, AutoSize = true, Dock = DockStyle.Fill, Checked = !_onlyNewPermissions && _record.GrantedPermissions.HasFlag(permission), Margin = new Padding(0, 5, 0, 0) };
         _checks[permission] = check;
         row.Controls.Add(check);
         panel.Controls.Add(row);
