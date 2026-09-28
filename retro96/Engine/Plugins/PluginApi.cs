@@ -157,6 +157,14 @@ public interface IRetro96PluginHost
     IPluginEmbeddedContentService Embeds { get; }
     IPluginLogger Log { get; }
     IPluginHostInfo Info { get; }
+    IPluginPageRead Page { get; }
+    IPluginNetworkRules NetworkRules { get; }
+    IPluginProtocols Protocols { get; }
+    IPluginContentTransform ContentTransform { get; }
+    IPluginPageStyle PageStyle { get; }
+    IPluginTabs Tabs { get; }
+    IPluginHistory History { get; }
+    IPluginBookmarks Bookmarks { get; }
     bool HasPermission(PluginPermission permission);
     Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default);
 
@@ -203,6 +211,66 @@ public interface IPluginHostInfo
     string Theme { get; }
     string Locale { get; }
     int Dpi { get; }
+}
+
+
+public sealed record PluginPageLink(string Url, string Text, string Title);
+
+public interface IPluginPageRead
+{
+    Task<string> GetPageTextAsync(CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<PluginPageLink>> GetLinksAsync(CancellationToken cancellationToken = default);
+    Task<string?> GetSelectionAsync(CancellationToken cancellationToken = default);
+}
+
+public enum PluginNetworkRuleKind { Block, Redirect, StripHeader }
+public sealed record PluginNetworkRule(PluginNetworkRuleKind Kind, string Match, string? Replacement = null);
+public interface IPluginNetworkRules
+{
+    void SetRules(IEnumerable<PluginNetworkRule> rules);
+    void Clear();
+}
+
+public sealed record PluginProtocolRequest(string Scheme, string Url, string Method);
+public sealed record PluginProtocolResponse(byte[] Body, string ContentType, int StatusCode = 200, string? Charset = null);
+public interface IPluginProtocols
+{
+    IDisposable Register(string scheme, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>> handler);
+}
+
+public sealed record PluginContentTransformRequest(string Url, string ContentType, string? Charset, byte[] Body);
+public interface IPluginContentTransform
+{
+    IDisposable Register(string contentType, Func<PluginContentTransformRequest, CancellationToken, Task<string>> handler);
+}
+
+public interface IPluginPageStyle
+{
+    IDisposable SetCss(string css);
+}
+
+public sealed record PluginTabInfo(string Id, string Url, string Title, bool Active);
+public sealed record PluginBeforeNavigateEventArgs(string TabId, string Url);
+public enum PluginBeforeNavigateAction { Allow, Cancel, Redirect }
+public sealed record PluginBeforeNavigateDecision(PluginBeforeNavigateAction Action, string? RedirectUrl = null);
+public interface IPluginTabs
+{
+    Task<IReadOnlyList<PluginTabInfo>> ListAsync(CancellationToken cancellationToken = default);
+    event Func<PluginBeforeNavigateEventArgs, Task<PluginBeforeNavigateDecision>>? BeforeNavigate;
+}
+
+public sealed record PluginHistoryEntry(string Url, string Title, DateTimeOffset VisitedUtc);
+public interface IPluginHistory
+{
+    Task<IReadOnlyList<PluginHistoryEntry>> SearchAsync(string? query = null, int maxResults = 100, CancellationToken cancellationToken = default);
+}
+
+public sealed record PluginBookmarkEntry(string Title, string Url, DateTimeOffset AddedUtc);
+public interface IPluginBookmarks
+{
+    Task<IReadOnlyList<PluginBookmarkEntry>> ListAsync(int maxResults = 500, CancellationToken cancellationToken = default);
+    Task AddAsync(string title, string url, CancellationToken cancellationToken = default);
+    Task RemoveAsync(string url, CancellationToken cancellationToken = default);
 }
 
 public sealed record CookieOptions(string? Path = null, string? Domain = null, DateTimeOffset? Expires = null, bool Secure = false);
