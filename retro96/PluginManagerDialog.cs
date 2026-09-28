@@ -286,12 +286,8 @@ public sealed class PluginManagerDialog : Form
         try
         {
             var permissions = ReadRequestedPermissions(dialog.FileName);
-            var warning = "Retro96 plugins are compiled C# extensions that run in a separate Windows sandbox worker.\r\n" +
-                          "Requested permissions are checked by the Retro96 host broker before privileged API calls.\r\n\r\n" +
-                          "Requested permissions: " + (permissions.Count == 0 ? "None" : string.Join(", ", permissions)) + "\r\n\r\nThe plugin will be installed disabled. Grant permissions in Permissions... and then Enable it.";
-            if (MessageBox.Show(this, warning, "Install Plugin", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
-                return;
-
+            using var review = new PluginInstallReviewDialog(permissions);
+            if (review.ShowDialog(this) != DialogResult.OK) return;
             var record = _manager.InstallPackage(dialog.FileName, enableImmediately: false);
             PluginPermission newlyRequested = _manager.ConsumePendingNewPermissions(record.Manifest.Id);
             if (newlyRequested != PluginPermission.None)
@@ -384,6 +380,7 @@ internal sealed class PluginPermissionsDialog : Form
     private readonly PluginPermission _visiblePermissions;
     private readonly bool _onlyNewPermissions;
     private readonly Dictionary<PluginPermission, CheckBox> _checks = new();
+    private bool _changingCheck;
     public PluginPermission GrantedPermissions { get; private set; }
 
     public PluginPermissionsDialog(PluginManager.PluginRecord record, PluginPermission? visiblePermissions = null)
@@ -398,37 +395,43 @@ internal sealed class PluginPermissionsDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         AutoScaleMode = AutoScaleMode.Dpi;
-        MinimumSize = new Size(520, 520);
-        ClientSize = new Size(640, 640);
+        MinimumSize = new Size(560, 560);
+        ClientSize = new Size(700, 700);
 
         var intro = new Label
         {
             Dock = DockStyle.Fill,
             AutoSize = true,
-            MaximumSize = new Size(0, 0),
-            Text = _visiblePermissions == _record.RequestedPermissions
-                ? "Grant only the capabilities this plugin actually needs. The host checks the user's granted set before every privileged broker call."
-                : "This update requests new permissions. Existing grants are kept unchanged; only these newly requested capabilities can be added now.",
+            MaximumSize = new Size(640, 0),
+            Text = _onlyNewPermissions
+                ? "This update requests new permissions. Existing grants are kept unchanged; only these newly requested capabilities can be added now."
+                : "Grant only the capabilities this plugin actually needs. The host checks the user's granted set before every privileged broker call.",
             Padding = new Padding(12, 10, 12, 10)
         };
 
-        var introWrap = new TableLayoutPanel
-        { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
-        introWrap.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        introWrap.Controls.Add(intro, 0, 0);
-
         var panel = new FlowLayoutPanel
-        { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(12, 4, 12, 12), WrapContents = false, AutoScroll = true, Margin = Padding.Empty };
-
-        foreach (var permission in Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None))
         {
-            if (!record.RequestedPermissions.HasFlag(permission)) continue;
-            if (!_visiblePermissions.HasFlag(permission)) continue;
-            AddPermissionRow(panel, permission);
-        }
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            Padding = new Padding(12, 4, 12, 12),
+            WrapContents = false,
+            AutoScroll = true,
+            Margin = Padding.Empty
+        };
+
+        AddGroup(panel, PluginPermissionTier.Standard, "Standard");
+        AddGroup(panel, PluginPermissionTier.Elevated, "Elevated");
+        AddGroup(panel, PluginPermissionTier.Sensitive, "Sensitive — review carefully");
 
         var bottom = new FlowLayoutPanel
-        { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, AutoSize = true, Padding = new Padding(10, 8, 10, 8), Margin = Padding.Empty };
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            AutoSize = true,
+            Padding = new Padding(10, 8, 10, 8),
+            Margin = Padding.Empty
+        };
         var ok = new Button { Text = "OK", Width = 92, Height = 34, Margin = new Padding(8, 0, 0, 0) };
         var cancel = new Button { Text = "Cancel", Width = 92, Height = 34, Margin = new Padding(8, 0, 0, 0) };
         ok.Click += (_, _) =>
@@ -442,7 +445,13 @@ internal sealed class PluginPermissionsDialog : Form
         cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         bottom.Controls.Add(ok);
         bottom.Controls.Add(cancel);
-        AcceptButton = ok; CancelButton = cancel;
+        AcceptButton = ok;
+        CancelButton = cancel;
+
+        var introWrap = new TableLayoutPanel
+        { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
+        introWrap.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        introWrap.Controls.Add(intro, 0, 0);
 
         var layout = new TableLayoutPanel
         { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = Padding.Empty, Margin = Padding.Empty };
@@ -455,15 +464,231 @@ internal sealed class PluginPermissionsDialog : Form
         Controls.Add(layout);
     }
 
-    private void AddPermissionRow(FlowLayoutPanel panel, PluginPermission permission)
+    private void AddGroup(FlowLayoutPanel parent, PluginPermissionTier tier, string title)
     {
-        string name = PluginPermissionNames.ToNames(permission).FirstOrDefault() ?? permission.ToString();
-        var row = new Panel
-        { Width = 580, Height = 34, Margin = new Padding(0, 0, 0, 4), Padding = Padding.Empty };
+        var permissions = PluginPermissionCatalog.All
+            .Where(x => x.Tier == tier && _visiblePermissions.HasFlag(x.Permission))
+            .ToArray();
+        if (permissions.Length == 0) return;
+
+        var label = new Label
+        {
+            Text = title,
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
+            Margin = new Padding(0, 8, 0, 4)
+        };
+        parent.Controls.Add(label);
+        foreach (var entry in permissions)
+            AddPermissionRow(parent, entry);
+    }
+
+    private void AddPermissionRow(FlowLayoutPanel parent, PluginPermissionInfo entry)
+    {
+        var row = new TableLayoutPanel
+        {
+            Width = 620,
+            Height = 34,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0, 0, 0, 4),
+            Padding = Padding.Empty
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28f));
         var check = new CheckBox
-        { Text = name, AutoSize = true, Dock = DockStyle.Fill, Checked = !_onlyNewPermissions && _record.GrantedPermissions.HasFlag(permission), Margin = new Padding(0, 5, 0, 0) };
-        _checks[permission] = check;
-        row.Controls.Add(check);
-        panel.Controls.Add(row);
+        {
+            Text = entry.Name,
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            Checked = !_onlyNewPermissions && _record.GrantedPermissions.HasFlag(entry.Permission),
+            Margin = new Padding(0, 5, 0, 0)
+        };
+        check.CheckedChanged += (_, _) => OnPermissionChecked(entry, check);
+        _checks[entry.Permission] = check;
+        row.Controls.Add(check, 0, 0);
+        var info = new PermissionInfoButton(entry.Name, (_, _) => PermissionInfoDialog.Show(this, entry.Permission));
+        row.Controls.Add(info, 1, 0);
+        parent.Controls.Add(row);
+    }
+
+    private void OnPermissionChecked(PluginPermissionInfo entry, CheckBox check)
+    {
+        if (_changingCheck || !check.Checked || entry.Tier != PluginPermissionTier.Sensitive) return;
+        bool hasNetwork = _record.HasPermission(PluginPermission.Network) ||
+                          (_checks.TryGetValue(PluginPermission.Network, out var network) && network.Checked);
+        bool readsData = PluginPermissionCatalog.All
+            .Where(x => x.IsDataReading && _checks.TryGetValue(x.Permission, out _))
+            .Any(x => _checks[x.Permission].Checked || (entry.Permission == x.Permission && check.Checked));
+        if (!PermissionConfirmationDialog.Confirm(this, entry, hasNetwork && readsData))
+        {
+            _changingCheck = true;
+            check.Checked = false;
+            _changingCheck = false;
+        }
+    }
+}
+
+internal sealed class PermissionInfoDialog : Form
+{
+    public static void Show(IWin32Window owner, PluginPermission permission)
+    {
+        using var dialog = new PermissionInfoDialog(permission);
+        dialog.ShowDialog(owner);
+    }
+
+    private PermissionInfoDialog(PluginPermission permission)
+    {
+        PluginPermissionInfo info = PluginPermissionCatalog.Get(permission);
+        Text = "About permission " + info.Name;
+        StartPosition = FormStartPosition.CenterParent;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        MinimumSize = new Size(420, 360);
+        ClientSize = new Size(540, 460);
+
+        var text = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = false,
+            Padding = new Padding(14),
+            Text =
+                $"{info.FriendlyName}\r\n" +
+                $"Manifest name: {info.Name}\r\n" +
+                $"Tier: {info.Tier}\r\n\r\n" +
+                $"What it lets the plugin do\r\n{info.Description}\r\n\r\n" +
+                $"Allows\r\n{info.Allows}\r\n\r\n" +
+                $"Does not allow\r\n{info.DoesNotAllow}\r\n\r\n" +
+                $"Risk note\r\n{info.RiskNote}",
+            AutoEllipsis = false
+        };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = Padding.Empty };
+        scroll.Controls.Add(text);
+        text.MinimumSize = new Size(480, 0);
+        text.SizeChanged += (_, _) => text.Height = Math.Max(420, text.PreferredHeight);
+        var close = new Button { Text = "Close", Width = 92, Height = 34, DialogResult = DialogResult.OK };
+        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 54, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(10, 8, 10, 8), WrapContents = false };
+        bottom.Controls.Add(close);
+        Controls.Add(scroll);
+        Controls.Add(bottom);
+        AcceptButton = close;
+    }
+}
+
+internal sealed class PermissionConfirmationDialog : Form
+{
+    public static bool Confirm(IWin32Window owner, PluginPermissionInfo info, bool dataAndNetwork)
+    {
+        string message =
+            $"This plugin will gain the Sensitive permission '{info.Name}'.\r\n\r\n" +
+            info.Description + "\r\n\r\n" +
+            info.RiskNote;
+        if (dataAndNetwork)
+            message += "\r\n\r\nBecause this plugin also has network access, it could send that data to any site.";
+        return MessageBox.Show(owner, message, "Sensitive Permission", MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+}
+
+internal sealed class PluginInstallReviewDialog : Form
+{
+    public PluginInstallReviewDialog(IReadOnlyList<string> permissionNames)
+    {
+        Text = "Install Plugin";
+        StartPosition = FormStartPosition.CenterParent;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        MinimumSize = new Size(560, 520);
+        ClientSize = new Size(700, 620);
+
+        var intro = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            MaximumSize = new Size(640, 0),
+            Padding = new Padding(12),
+            Text = "Retro96 plugins run in a separate sandbox worker. Requested permissions are checked by the host broker. Plugin packages are not signed. Review the requested capabilities below before installing."
+        };
+        var rows = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(12), Margin = Padding.Empty };
+        var permissions = permissionNames
+            .Select(name => PluginPermissionNames.Parse(new[] { name }))
+            .Where(p => p != PluginPermission.None)
+            .Select(PluginPermissionCatalog.Get)
+            .ToArray();
+        foreach (var info in permissions)
+        {
+            var row = new TableLayoutPanel { Width = 620, Height = 58, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 6) };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28f));
+            row.Controls.Add(new Label
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                Text = $"{info.Name} — {info.Tier}\r\n{info.Description}",
+                Padding = new Padding(0, 2, 0, 2)
+            }, 0, 0);
+            row.Controls.Add(new PermissionInfoButton(info.Name, (_, _) => PermissionInfoDialog.Show(this, info.Permission)), 1, 0);
+            rows.Controls.Add(row);
+        }
+
+        var bottom = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(10, 8, 10, 8), Margin = Padding.Empty };
+        var install = new Button { Text = "Install", Width = 92, Height = 34 };
+        var cancel = new Button { Text = "Cancel", Width = 92, Height = 34 };
+        install.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+        bottom.Controls.Add(install);
+        bottom.Controls.Add(cancel);
+        AcceptButton = install;
+        CancelButton = cancel;
+
+        var introWrap = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1 };
+        introWrap.Controls.Add(intro, 0, 0);
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54f));
+        layout.Controls.Add(introWrap, 0, 0);
+        layout.Controls.Add(rows, 0, 1);
+        layout.Controls.Add(bottom, 0, 2);
+        Controls.Add(layout);
+    }
+}
+
+internal sealed class PermissionInfoButton : Button
+{
+    private readonly ToolTip _toolTip = new();
+
+    public PermissionInfoButton(string permissionName, EventHandler click)
+    {
+        AccessibleName = "About permission " + permissionName;
+        TabStop = true;
+        AccessibleRole = AccessibleRole.PushButton;
+        Width = 24;
+        Height = 24;
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        Text = string.Empty;
+        UseVisualStyleBackColor = false;
+        Margin = new Padding(2, 2, 0, 0);
+        _toolTip.SetToolTip(this, "About permission " + permissionName);
+        Click += click;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        int d = Math.Max(10, Math.Min(ClientSize.Width, ClientSize.Height) - 6);
+        int x = (ClientSize.Width - d) / 2;
+        int y = (ClientSize.Height - d) / 2;
+        using var pen = new Pen(SystemColors.WindowText, Math.Max(1f, DeviceDpi / 96f));
+        using var brush = new SolidBrush(SystemColors.WindowText);
+        e.Graphics.DrawEllipse(pen, x, y, d - 1, d - 1);
+        using var font = new Font(Font.FontFamily, Math.Max(7f, Font.Size - 1.5f), FontStyle.Bold, GraphicsUnit.Point);
+        var size = e.Graphics.MeasureString("i", font);
+        e.Graphics.DrawString("i", font, brush, (ClientSize.Width - size.Width) / 2f, (ClientSize.Height - size.Height) / 2f - 1f);
     }
 }

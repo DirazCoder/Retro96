@@ -55,3 +55,26 @@ public sealed class PluginApiTests
         Assert.False(manifest.RequestedPermissions.HasFlag(PluginPermission.Network));
     }
 }
+
+
+public sealed class PluginPermissionCatalogTests
+{
+    [Fact]
+    public void EveryPermissionHasMetadata()
+    {
+        var permissions = Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None).ToArray();
+        Assert.Equal(permissions.Length, PluginPermissionCatalog.All.Count);
+        foreach (var permission in permissions)
+        {
+            var info = PluginPermissionCatalog.Get(permission);
+            Assert.Equal(permission, info.Permission);
+            Assert.False(string.IsNullOrWhiteSpace(info.Name));
+            Assert.False(string.IsNullOrWhiteSpace(info.FriendlyName));
+            Assert.False(string.IsNullOrWhiteSpace(info.Description));
+            Assert.False(string.IsNullOrWhiteSpace(info.Allows));
+            Assert.False(string.IsNullOrWhiteSpace(info.DoesNotAllow));
+            Assert.False(string.IsNullOrWhiteSpace(info.RiskNote));
+            Assert.Equal(info.Name, PluginPermissionNames.ToNames(permission).Single());
+        }
+    }
+}

@@ -35,7 +35,21 @@ public enum PluginPermission : ulong
     EmbedNavigate = 1UL << 19,
     EmbedStatus = 1UL << 20,
     EmbedPrint = 1UL << 21,
-    EmbedScript = 1UL << 22
+    EmbedScript = 1UL << 22,
+    PageRead = 1UL << 23,
+    NetworkRules = 1UL << 24,
+    Protocol = 1UL << 25,
+    ContentTransform = 1UL << 26,
+    PageStyle = 1UL << 27,
+    Tabs = 1UL << 28,
+    History = 1UL << 29,
+    Bookmarks = 1UL << 30,
+    Downloads = 1UL << 31,
+    Omnibox = 1UL << 32,
+    Settings = 1UL << 33,
+    UiExtras = 1UL << 34,
+    EmbedAudio = 1UL << 35,
+    EmbedExtras = 1UL << 36
 }
 
 public static class PluginPermissionNames
@@ -65,7 +79,21 @@ public static class PluginPermissionNames
             [PluginPermission.EmbedNavigate] = "embed.navigate",
             [PluginPermission.EmbedStatus] = "embed.status",
             [PluginPermission.EmbedPrint] = "embed.print",
-            [PluginPermission.EmbedScript] = "embed.script"
+            [PluginPermission.EmbedScript] = "embed.script",
+            [PluginPermission.PageRead] = "page.read",
+            [PluginPermission.NetworkRules] = "network.rules",
+            [PluginPermission.Protocol] = "protocol",
+            [PluginPermission.ContentTransform] = "content.transform",
+            [PluginPermission.PageStyle] = "page.style",
+            [PluginPermission.Tabs] = "tabs",
+            [PluginPermission.History] = "history",
+            [PluginPermission.Bookmarks] = "bookmarks",
+            [PluginPermission.Downloads] = "downloads",
+            [PluginPermission.Omnibox] = "omnibox",
+            [PluginPermission.Settings] = "settings",
+            [PluginPermission.UiExtras] = "ui.extras",
+            [PluginPermission.EmbedAudio] = "embed.audio",
+            [PluginPermission.EmbedExtras] = "embed.extras"
         };
 
     public static IEnumerable<string> ToNames(PluginPermission permissions) =>
