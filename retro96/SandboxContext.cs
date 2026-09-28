@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Retro96;
@@ -11,11 +12,18 @@ namespace Retro96;
 internal static class SandboxContext
 {
     private static UserSettings? _settingsOverride;
+    private static string? _pipeName;
+    private static SandboxBrokerClient? _broker;
+    private static int _isWorker;
+    private static int _workerTrustMode = (int)TrustMode.High; // safe default: strictest tier
 
-    public static bool IsWorker { get; private set; }
-    public static TrustMode WorkerTrustMode { get; private set; } = TrustMode.High;
-    public static string? PipeName { get; private set; }
-    public static SandboxBrokerClient? Broker { get; private set; }
+    public static bool IsWorker => Volatile.Read(ref _isWorker) != 0;
+
+    public static TrustMode WorkerTrustMode => (TrustMode)Volatile.Read(ref _workerTrustMode);
+
+    public static string? PipeName => Volatile.Read(ref _pipeName);
+
+    public static SandboxBrokerClient? Broker => Volatile.Read(ref _broker);
 
     public static bool IsOsIsolated =>
         IsWorker &&
@@ -43,22 +51,32 @@ internal static class SandboxContext
         UserSettings settings,
         SandboxBrokerClient broker)
     {
-        PipeName = pipeName;
-        WorkerTrustMode = trustMode;
+        if (string.IsNullOrWhiteSpace(pipeName))
+            throw new ArgumentException("Worker pipe name is required.", nameof(pipeName));
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(broker);
+
+        // Publish the worker flag last (volatile write = release fence) so any
+        // reader that observes IsWorker == true also observes every other
+        // field of the worker context.
+        Volatile.Write(ref _pipeName, pipeName);
+        Volatile.Write(ref _workerTrustMode, (int)trustMode);
         _settingsOverride = settings.Clone();
-        Broker = broker;
-        IsWorker = true;
+        Volatile.Write(ref _broker, broker);
+        Volatile.Write(ref _isWorker, 1);
+
         BrowserRuntime.Apply(settings);
     }
 
     public static async Task<bool> SaveSettingsThroughBrokerAsync(UserSettings settings)
     {
-        if (!IsWorker || Broker == null)
+        SandboxBrokerClient? broker = Broker;
+        if (!IsWorker || broker is null)
             return false;
 
         try
         {
-            return await Broker.SaveSettingsAsync(settings).ConfigureAwait(false);
+            return await broker.SaveSettingsAsync(settings).ConfigureAwait(false);
         }
         catch
         {
@@ -68,12 +86,16 @@ internal static class SandboxContext
 
     public static bool TrySaveSettingsSynchronously(UserSettings settings)
     {
-        if (!IsWorker || Broker == null)
+        SandboxBrokerClient? broker = Broker;
+        if (!IsWorker || broker is null)
             return false;
 
         try
         {
-            return Broker.SaveSettingsAsync(settings).GetAwaiter().GetResult();
+            // Blocking is safe here: every await inside the broker client uses
+            // ConfigureAwait(false), so completing this call never needs to
+            // re-enter the calling thread's synchronization context.
+            return broker.SaveSettingsAsync(settings).GetAwaiter().GetResult();
         }
         catch
         {
@@ -83,11 +105,15 @@ internal static class SandboxContext
 
     public static void Reset()
     {
-        try { Broker?.Dispose(); } catch { }
-        Broker = null;
-        PipeName = null;
+        // Unpublish first so no new caller starts using the broker while it is
+        // being torn down.
+        Volatile.Write(ref _isWorker, 0);
+        Volatile.Write(ref _workerTrustMode, (int)TrustMode.High);
+
+        SandboxBrokerClient? broker = Interlocked.Exchange(ref _broker, null);
+        try { broker?.Dispose(); } catch { }
+
+        Volatile.Write(ref _pipeName, null);
         _settingsOverride = null;
-        IsWorker = false;
-        WorkerTrustMode = TrustMode.High;
     }
 }

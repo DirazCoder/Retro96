@@ -170,11 +170,11 @@ public static class CssParser
                     // query names this renderer; explicit `not` negates it.
                     SkipWhitespace(css, ref pos);
                     string media = ReadUntil(css, ref pos, '{').Trim().ToLowerInvariant();
-                    bool hasNot = media.Split(new[] {' ', '\t', ','}, StringSplitOptions.RemoveEmptyEntries)
+                    bool hasNot = media.Split(new[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries)
                         .FirstOrDefault() == "not";
                     bool apply = !hasNot && media.Split(',').Any(part =>
                     {
-                        string token = part.Trim().Split(new[] {' ', '\t'}, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                        string token = part.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
                         return token is "screen" or "all";
                     });
 
@@ -222,10 +222,23 @@ public static class CssParser
 
         while (pos < css.Length && inSelector)
         {
-            SkipWhitespace(css, ref pos);
+            bool hadWhitespace = false;
+            while (pos < css.Length && char.IsWhiteSpace(css[pos]))
+            {
+                hadWhitespace = true;
+                pos++;
+            }
             if (pos >= css.Length) break;
 
             char c = css[pos];
+
+            if (hadWhitespace && parts.Count > 0 &&
+                c is not ('{' or ',' or '>' or '+' or '~') &&
+                parts[^1].Kind is not (PartType.Descendant or PartType.Child or
+                    PartType.AdjacentSibling or PartType.GeneralSibling))
+            {
+                parts.Add(new SelectorPart(PartType.Descendant, null));
+            }
 
             if (c == '{')
             {

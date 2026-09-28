@@ -1325,14 +1325,24 @@ public partial class Form1 : Form
     private async Task FetchStylesheetsAsync(DomDocument document, ParsedUrl baseUrl,
                                              CancellationToken ct)
     {
+        ParsedUrl importBase = document.BaseUrl ?? baseUrl;
+        foreach (var styleElem in document.ElementDescendants()
+                     .Where(e => e.TagName == "style"))
+        {
+            foreach (var text in styleElem.Children.OfType<DomText>())
+            {
+                if (string.IsNullOrWhiteSpace(text.Data)) continue;
+                text.Data = await ExpandCssImportsAsync(text.Data, importBase, ct, 0,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            }
+        }
+
         var links = document.ElementDescendants()
             .Where(e => e.TagName == "link" &&
                         e.GetAttr("rel")?.Contains("stylesheet",
                             StringComparison.OrdinalIgnoreCase) == true &&
                         e.HasAttr("href"))
             .ToList();
-
-        if (links.Count == 0) return;
 
         foreach (var link in links)
         {

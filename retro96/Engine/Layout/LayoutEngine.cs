@@ -175,15 +175,15 @@ public static class LayoutEngine
         // Author CSS margins override the HTML attributes (NN4 behaviour).
         // Resolve percentage values against the containing block (the viewport for BODY).
         var style = body.Style;
-        float marginL = ResolveStyleLength(style?.MarginLeft ?? -1f, style?.MarginLeftPercent ?? -1f, attrL, viewportWidth);
-        float marginR = ResolveStyleLength(style?.MarginRight ?? -1f, style?.MarginRightPercent ?? -1f, attrR, viewportWidth);
-        float marginT = ResolveStyleLength(style?.MarginTop ?? -1f, style?.MarginTopPercent ?? -1f, attrT, viewportWidth);
-        float marginB = ResolveStyleLength(style?.MarginBottom ?? -1f, style?.MarginBottomPercent ?? -1f, attrB, viewportWidth);
+        float marginL = ResolveStyleLength(style?.MarginLeft, style?.MarginLeftPercent, attrL, viewportWidth, allowNegative: true);
+        float marginR = ResolveStyleLength(style?.MarginRight, style?.MarginRightPercent, attrR, viewportWidth, allowNegative: true);
+        float marginT = ResolveStyleLength(style?.MarginTop, style?.MarginTopPercent, attrT, viewportWidth, allowNegative: true);
+        float marginB = ResolveStyleLength(style?.MarginBottom, style?.MarginBottomPercent, attrB, viewportWidth, allowNegative: true);
 
-        float padL = ResolveStyleLength(style?.PaddingLeft ?? 0f, style?.PaddingLeftPercent ?? -1f, 0f, viewportWidth);
-        float padR = ResolveStyleLength(style?.PaddingRight ?? 0f, style?.PaddingRightPercent ?? -1f, 0f, viewportWidth);
-        float padT = ResolveStyleLength(style?.PaddingTop ?? 0f, style?.PaddingTopPercent ?? -1f, 0f, viewportWidth);
-        float padB = ResolveStyleLength(style?.PaddingBottom ?? 0f, style?.PaddingBottomPercent ?? -1f, 0f, viewportWidth);
+        float padL = ResolveStyleLength(style?.PaddingLeft, style?.PaddingLeftPercent, 0f, viewportWidth);
+        float padR = ResolveStyleLength(style?.PaddingRight, style?.PaddingRightPercent, 0f, viewportWidth);
+        float padT = ResolveStyleLength(style?.PaddingTop, style?.PaddingTopPercent, 0f, viewportWidth);
+        float padB = ResolveStyleLength(style?.PaddingBottom, style?.PaddingBottomPercent, 0f, viewportWidth);
 
         float borL = Math.Max(0f, style?.BorderLeftWidth ?? 0f);
         float borR = Math.Max(0f, style?.BorderRightWidth ?? 0f);
@@ -215,10 +215,16 @@ public static class LayoutEngine
         };
     }
 
-    private static float ResolveStyleLength(float absolute, float percent, float fallback, float containingWidth)
+    private static float ResolveStyleLength(float? absolute, float? percent, float fallback,
+        float containingWidth, bool allowNegative = false)
     {
-        if (percent >= 0f) return Math.Max(0f, containingWidth * percent / 100f);
-        if (absolute >= 0f) return Math.Max(0f, absolute);
+        if (percent.HasValue)
+        {
+            float value = containingWidth * percent.Value / 100f;
+            return allowNegative ? value : Math.Max(0f, value);
+        }
+        if (absolute.HasValue)
+            return allowNegative ? absolute.Value : Math.Max(0f, absolute.Value);
         return Math.Max(0f, fallback);
     }
 

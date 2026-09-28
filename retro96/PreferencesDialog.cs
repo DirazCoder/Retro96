@@ -119,16 +119,17 @@ internal sealed class PreferencesDialog : Form
         var page = NewTab("General");
         var panel = StackPanel();
 
+        _home.Name = "home";
+        _home.Width = 690;
+        _home.Height = 30;
+        _home.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+
         panel.Controls.Add(Group("Home page", new Control[]
         {
             new Label { Text = "Startup / home URL", AutoSize = true },
             _home
         }));
 
-        _home.Name = "home";
-        _home.Width = 690;
-        _home.Height = 30;
-        _home.Anchor = AnchorStyles.Left | AnchorStyles.Right;
         _search.Name = "search";
         _search.Width = 690;
         _search.Height = 30;
@@ -435,7 +436,9 @@ internal sealed class PreferencesDialog : Form
         _images.Checked = _settings.LoadImages;
         _javascript.Checked = _settings.EnableJavaScript;
         _scriptWindows.Checked = _settings.AllowScriptedWindows;
-        _trust.Value = (int)_settings.TrustMode;
+        // Clamp: a corrupt/hand-edited settings file with an out-of-range enum
+        // value would otherwise throw when assigned to the TrackBar.
+        _trust.Value = Math.Clamp((int)_settings.TrustMode, _trust.Minimum, _trust.Maximum);
         _hostImageCheck.Checked = _settings.HostCheckImages;
         _discardState.Checked = _settings.DiscardPageStateOnClose;
         _loadStylesheets.Checked = _settings.LoadStylesheets;
@@ -464,7 +467,7 @@ internal sealed class PreferencesDialog : Form
         target.LoadImages = _images.Checked;
         target.EnableJavaScript = _javascript.Checked;
         target.AllowScriptedWindows = _scriptWindows.Checked;
-        target.TrustMode = (TrustMode)_trust.Value;
+        target.TrustMode = (TrustMode)Math.Clamp(_trust.Value, 0, 2);
         target.HostCheckImages = _hostImageCheck.Checked || target.TrustMode == TrustMode.High;
         target.DiscardPageStateOnClose = _discardState.Checked;
         target.LoadStylesheets = _loadStylesheets.Checked;

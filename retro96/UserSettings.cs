@@ -60,7 +60,7 @@ public sealed class UserSettings
     public bool AnimateImages { get; set; } = true;
     public bool BlinkText { get; set; } = true;
     public bool MarqueeText { get; set; } = true;
-    public TrustMode TrustMode { get; set; } = TrustMode.High;
+    public TrustMode TrustMode { get; set; } = TrustMode.Medium;
     public bool HostCheckImages { get; set; } = true;
     public bool DiscardPageStateOnClose { get; set; } = true;
 

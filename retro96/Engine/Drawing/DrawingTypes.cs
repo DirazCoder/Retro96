@@ -227,6 +227,18 @@ public sealed class Region : IDisposable
         Path.AddRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height));
     }
 
+    public Region(PointF[] polygon)
+    {
+        if (polygon == null) throw new ArgumentNullException(nameof(polygon));
+        if (polygon.Length < 3) throw new ArgumentException("A clip polygon needs at least three points.", nameof(polygon));
+
+        Path = new SKPath();
+        Path.MoveTo(polygon[0].X, polygon[0].Y);
+        for (int i = 1; i < polygon.Length; i++)
+            Path.LineTo(polygon[i].X, polygon[i].Y);
+        Path.Close();
+    }
+
     public void Dispose()
     {
         Path.Dispose();

@@ -196,6 +196,15 @@ public static class StyleResolver
             // read it.
             ApplyHtmlAttributes(elem, style, doc);
 
+            if (style.BorderTopStyle is BorderStyleValue.None or BorderStyleValue.Hidden)
+                style.BorderTopWidth = 0f;
+            if (style.BorderRightStyle is BorderStyleValue.None or BorderStyleValue.Hidden)
+                style.BorderRightWidth = 0f;
+            if (style.BorderBottomStyle is BorderStyleValue.None or BorderStyleValue.Hidden)
+                style.BorderBottomWidth = 0f;
+            if (style.BorderLeftStyle is BorderStyleValue.None or BorderStyleValue.Hidden)
+                style.BorderLeftWidth = 0f;
+
             // CSS list-style-type:none has no marker to reserve the normal
             // list gutter for.  Keep an explicitly authored margin-left, but
             // remove the UA 40px list margin when the marker is suppressed.

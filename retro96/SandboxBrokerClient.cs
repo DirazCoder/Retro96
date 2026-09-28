@@ -1,16 +1,18 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Retro96.Engine.Network;
 
 namespace Retro96;
 
 /// <summary>
-/// Worker-side authenticated broker client. High/Medium workers cannot use
-/// the host filesystem or direct network policy; they ask this broker over a
+/// Worker-side broker client. High/Medium workers cannot use the host
+/// filesystem or direct network policy; they ask this broker over a
 /// per-window named pipe whose ACL contains the worker AppContainer SID.
 /// </summary>
 internal sealed class SandboxBrokerClient : IDisposable
@@ -18,6 +20,7 @@ internal sealed class SandboxBrokerClient : IDisposable
     private readonly NamedPipeClientStream _pipe;
     private readonly StreamReader _reader;
     private readonly StreamWriter _writer;
+    private readonly SandboxProtocol.EnvelopeReader _envelopeReader;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<SandboxProtocol.Envelope>> _pending = new();
     private readonly CancellationTokenSource _lifetime = new();
@@ -27,12 +30,13 @@ internal sealed class SandboxBrokerClient : IDisposable
     private SandboxBrokerClient(NamedPipeClientStream pipe)
     {
         _pipe = pipe;
-        _reader = new StreamReader(pipe, System.Text.Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
-        _writer = new StreamWriter(pipe, new System.Text.UTF8Encoding(false), 64 * 1024, leaveOpen: true)
+        _reader = new StreamReader(pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
+        _writer = new StreamWriter(pipe, new UTF8Encoding(false), 64 * 1024, leaveOpen: true)
         {
             AutoFlush = false,
             NewLine = "\n"
         };
+        _envelopeReader = new SandboxProtocol.EnvelopeReader(_reader);
         _readerLoop = Task.Run(ReadLoopAsync);
     }
 
@@ -52,11 +56,13 @@ internal sealed class SandboxBrokerClient : IDisposable
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
 
+        SandboxBrokerClient? client = null;
         try
         {
             await pipe.ConnectAsync(15_000, cancellationToken).ConfigureAwait(false);
             StartupDiagnostics.Step("WORKER", "NamedPipeClientStream.ConnectAsync succeeded.");
-            var client = new SandboxBrokerClient(pipe);
+
+            client = new SandboxBrokerClient(pipe);
             StartupDiagnostics.Step("WORKER", "Sending broker hello request.");
             var reply = await client.RequestAsync<SandboxProtocol.HelloReply>(
                 "hello",
@@ -65,7 +71,8 @@ internal sealed class SandboxBrokerClient : IDisposable
 
             StartupDiagnostics.Step("WORKER", "Broker hello reply received. Accepted=" + reply.Accepted);
             if (!reply.Accepted)
-                throw new InvalidOperationException(reply.Error.Length == 0 ? "Sandbox handshake rejected." : reply.Error);
+                throw new InvalidOperationException(
+                    string.IsNullOrEmpty(reply.Error) ? "Sandbox handshake rejected." : reply.Error);
 
             client.Settings = DeserializeSettings(reply.SettingsJson);
             client.StartupUrl = string.IsNullOrWhiteSpace(reply.StartupUrl)
@@ -77,7 +84,10 @@ internal sealed class SandboxBrokerClient : IDisposable
         catch (Exception ex)
         {
             StartupDiagnostics.Error("WORKER", "SandboxBrokerClient.ConnectAsync failed", ex);
-            pipe.Dispose();
+            if (client != null)
+                client.Dispose(); // also disposes the pipe and unwinds the reader loop
+            else
+                pipe.Dispose();
             throw;
         }
     }
@@ -86,8 +96,7 @@ internal sealed class SandboxBrokerClient : IDisposable
     {
         try
         {
-            var settings = System.Text.Json.JsonSerializer.Deserialize<UserSettings>(
-                json, SandboxProtocol.JsonOptions);
+            var settings = JsonSerializer.Deserialize<UserSettings>(json, SandboxProtocol.JsonOptions);
             return settings ?? new UserSettings();
         }
         catch
@@ -99,12 +108,13 @@ internal sealed class SandboxBrokerClient : IDisposable
     public async Task<SandboxProtocol.FetchReply> FetchRawAsync(
         string method,
         string url,
-        System.Collections.Generic.Dictionary<string, string> headers,
+        Dictionary<string, string>? headers,
         byte[]? body,
         string resourceType,
         int maxBytes,
         CancellationToken cancellationToken)
     {
+        headers ??= new Dictionary<string, string>();
         string? bodyBase64 = body is { Length: > 0 } ? Convert.ToBase64String(body) : null;
         return await RequestAsync<SandboxProtocol.FetchReply>(
             "fetch",
@@ -146,7 +156,7 @@ internal sealed class SandboxBrokerClient : IDisposable
     public async Task<bool> SaveSettingsAsync(UserSettings settings,
                                                CancellationToken cancellationToken = default)
     {
-        var json = System.Text.Json.JsonSerializer.Serialize(settings, SandboxProtocol.JsonOptions);
+        var json = JsonSerializer.Serialize(settings, SandboxProtocol.JsonOptions);
         var reply = await RequestAsync<SandboxProtocol.AckPayload>(
             "settings.save",
             new SandboxProtocol.SettingsPayload(json),
@@ -189,6 +199,7 @@ internal sealed class SandboxBrokerClient : IDisposable
 
     private async Task<T> RequestAsync<T>(string op, object? payload,
                                           CancellationToken cancellationToken)
+        where T : class
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(SandboxBrokerClient));
@@ -204,12 +215,14 @@ internal sealed class SandboxBrokerClient : IDisposable
             await SandboxProtocol.WriteAsync(
                 _writer, op, id, payload, _writeLock, cancellationToken).ConfigureAwait(false);
 
-            using var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
-            var envelope = await completion.Task.ConfigureAwait(false);
+            using CancellationTokenRegistration registration =
+                cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+
+            SandboxProtocol.Envelope envelope = await completion.Task.ConfigureAwait(false);
             if (!string.Equals(envelope.Op, "response", StringComparison.Ordinal))
                 throw new InvalidOperationException($"Unexpected sandbox IPC reply: {envelope.Op}");
 
-            var value = SandboxProtocol.GetPayload<T>(envelope);
+            T? value = SandboxProtocol.GetPayload<T>(envelope);
             if (value == null)
                 throw new InvalidOperationException("Malformed sandbox IPC response.");
             return value;
@@ -226,9 +239,11 @@ internal sealed class SandboxBrokerClient : IDisposable
         {
             while (!_lifetime.IsCancellationRequested)
             {
-                var envelope = await SandboxProtocol.ReadAsync(_reader, _lifetime.Token).ConfigureAwait(false);
+                SandboxProtocol.Envelope? envelope = await _envelopeReader
+                    .ReadAsync(_lifetime.Token)
+                    .ConfigureAwait(false);
                 if (envelope == null)
-                    break;
+                    break; // broker closed the pipe
 
                 if (envelope.Op == "event")
                     continue;

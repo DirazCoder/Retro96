@@ -1300,7 +1300,7 @@ public class BonusContractTests
         var a2Box = LayoutHarness.BoxOf(root, a2);
 
         Check.That(stageBox != null && Math.Abs(stageBox!.BorderRect.Width - 700f) < 2f,
-            ".stage width: 700px sizes the box", 
+            ".stage width: 700px sizes the box",
             stageBox == null ? "NO BOX" : $"w={stageBox.BorderRect.Width:0.#}");
 
         Check.That(a1Box != null && Math.Abs(a1Box!.BorderRect.Width - 400f) < 2f,
@@ -1326,6 +1326,35 @@ public class BonusContractTests
                 "margin: 0 auto 0 auto CENTRES the box (shorthand form)",
                 $"left gap {leftGap:0.#} vs right gap {rightGap:0.#}");
         }
+        Check.Done();
+    }
+
+    [Fact]
+    public void DottedCssBorderPaintsRoundDotsWithGaps()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><div id='dots' style='width:36px;height:48px;" +
+            "border-style:none dotted none none;border-width:0 4px 0 0;" +
+            "border-color:black blue black black'></div></body></html>");
+        var element = doc.ElementDescendants().First(e => e.GetAttr("id") == "dots");
+        var box = LayoutHarness.BoxOf(root, element)!;
+
+        Check.That(element.Style!.BorderRightStyle == BorderStyleValue.Dotted && box.BorderRight == 4f,
+            "CSS right border keeps dotted style and 4px width");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        int x = (int)Math.Floor(box.BorderRect.Right - 2f);
+        int dotY = (int)Math.Floor(box.BorderRect.Top + 2f);
+        int gapY = (int)Math.Floor(box.BorderRect.Top + 6f);
+        var dot = bitmap.GetPixel(x, dotY);
+        var gap = bitmap.GetPixel(x, gapY);
+
+        Check.That(dot.B > 200 && dot.R < 50 && dot.G < 50,
+            "dot center paints blue", dot.ToString());
+        Check.That(gap.R > 240 && gap.G > 240 && gap.B > 240,
+            "one-width gap remains white", gap.ToString());
         Check.Done();
     }
 
@@ -1356,6 +1385,162 @@ public class BonusContractTests
         Check.That(pixel.R >= 240 && pixel.B >= 240 && pixel.G <= 40,
             "<hr noshade color=\"#FF00FF\"> paints the authored colour instead of grey",
             pixel.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void NegativeMarginListItemAndBorderNoneRenderCorrectly()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><div id='parent' style='padding:10px;border:1px solid black;background-color:silver'>" +
+            "<div id='child' style='margin-top:-20px;padding:4px;background-color:yellow'>child</div></div>" +
+            "<div id='item' style='display:list-item;list-style-type:disc;margin-left:30px'>marker</div>" +
+            "<div id='groove' style='width:24px;height:20px;border-left:8px groove #CC9900'></div>" +
+            "<div id='none' style='width:24px;height:20px;border-style:none;border-width:8px'></div>" +
+            "</body></html>");
+        var elements = doc.ElementDescendants().Where(e => e.GetAttr("id") != null)
+            .ToDictionary(e => e.GetAttr("id")!, e => e);
+        var boxes = elements.ToDictionary(pair => pair.Key,
+            pair => LayoutHarness.BoxOf(root, pair.Value)!);
+
+        Check.That(boxes["child"].BorderRect.Top < boxes["parent"].ContentRect.Top,
+            "negative margin pulls the child over the parent's content edge",
+            $"child={boxes["child"].BorderRect.Top:0.#}, parent-content={boxes["parent"].ContentRect.Top:0.#}");
+        Check.That(boxes["item"].BoxType == BoxType.ListItem,
+            "display:list-item creates a marker-capable layout box");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        var item = boxes["item"];
+        int markerLeft = Math.Max(0, (int)item.X - 16);
+        int markerRight = Math.Min(bitmap.Width - 1, (int)item.X - 3);
+        int markerTop = Math.Max(0, (int)item.Y + 2);
+        int markerBottom = Math.Min(bitmap.Height - 1, (int)item.Y + 14);
+        bool markerInk = false;
+        for (int y = markerTop; y <= markerBottom && !markerInk; y++)
+            for (int x = markerLeft; x <= markerRight && !markerInk; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                markerInk = pixel.A > 0 && pixel.R < 80 && pixel.G < 80 && pixel.B < 80;
+            }
+        Check.That(markerInk, "standalone display:list-item paints its disc marker");
+
+        var none = boxes["none"].BorderRect;
+        var borderPixel = bitmap.GetPixel((int)(none.Left + none.Width / 2f), (int)none.Top);
+        Check.That(borderPixel.R > 240 && borderPixel.G > 240 && borderPixel.B > 240,
+            "explicit border-style:none leaves the page background visible", borderPixel.ToString());
+
+        var groove = boxes["groove"].BorderRect;
+        var groovePixel = bitmap.GetPixel((int)groove.Left + 1, (int)(groove.Top + groove.Height / 2f));
+        Check.That(groovePixel.R > groovePixel.G && groovePixel.G > groovePixel.B,
+            "groove shading derives from its authored gold border color", groovePixel.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void CssVerticalAlignAndCapitalizeUsePaintedTextMetrics()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><div style='font-size:30px;line-height:40px'>Base " +
+            "<span id='baseline' style='font-size:10px;vertical-align:baseline'>base</span> " +
+            "<span id='top' style='font-size:10px;vertical-align:top'>top</span> " +
+            "<span id='middle' style='font-size:10px;vertical-align:middle'>middle</span> " +
+            "<span id='bottom' style='font-size:10px;vertical-align:bottom'>bottom</span> " +
+            "<span id='text-top' style='font-size:10px;vertical-align:text-top'>texttop</span> " +
+            "<span id='text-bottom' style='font-size:10px;vertical-align:text-bottom'>textbottom</span> " +
+            "<span id='percent' style='font-size:10px;vertical-align:-50%'>percent</span></div>" +
+            "<div id='capitalize' style='text-transform:capitalize'>these words</div>");
+
+        float TextY(string id)
+        {
+            var element = doc.ElementDescendants().First(e => e.GetAttr("id") == id);
+            return root.Descendants().First(b => b.Element == element && b.TextRun != null).Y;
+        }
+
+        float baselineY = TextY("baseline");
+        Check.That(TextY("top") < baselineY, "vertical-align:top raises the label");
+        Check.That(TextY("middle") != baselineY, "vertical-align:middle moves the label");
+        Check.That(TextY("bottom") > baselineY, "vertical-align:bottom lowers the label");
+        Check.That(TextY("text-top") < baselineY, "vertical-align:text-top raises the label");
+        Check.That(TextY("text-bottom") > baselineY, "vertical-align:text-bottom lowers the label");
+        Check.That(TextY("percent") > TextY("bottom"), "negative vertical-align percentage lowers the label");
+
+        var capitalizeElement = doc.ElementDescendants().First(e => e.GetAttr("id") == "capitalize");
+        var capitalizedWord = root.Descendants().First(b => b.Element == capitalizeElement && b.TextRun == "these");
+        using var measureBitmap = new Bitmap(160, 50);
+        using var graphics = Graphics.FromImage(measureBitmap);
+        var style = capitalizeElement.Style!;
+        var font = LayoutHarness.Fonts.Resolve(style.FontFamily, style.FontSize,
+            (int)style.FontWeight, style.FontStyle == FontStyleValue.Italic,
+            style.FontStyle == FontStyleValue.Oblique);
+        using var format = new StringFormat(StringFormat.GenericTypographic);
+        float expectedWidth = graphics.MeasureString("These", font, int.MaxValue, format).Width;
+        Check.That(Math.Abs(capitalizedWord.Width - Math.Ceiling(expectedWidth)) < 2f,
+            "capitalize text is measured after case transformation",
+            $"layout={capitalizedWord.Width:0.##}, painted={expectedWidth:0.##}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void FixedBackgroundPositionUsesViewportAndTracksScroll()
+    {
+        string svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\">" +
+                     "<rect width=\"8\" height=\"8\" fill=\"#ff0000\"/></svg>";
+        string data = Convert.ToBase64String(Encoding.UTF8.GetBytes(svg));
+        string html = "<html><head><style>body{margin:0}#fixed{width:200px;height:200px;" +
+            $"background-color:#00ff00;background-image:url(data:image/svg+xml;base64,{data});" +
+            "background-repeat:no-repeat;background-position:50% 50%;background-attachment:fixed}</style></head>" +
+            "<body><div id='fixed'></div></body></html>";
+        var (doc, root) = LayoutHarness.Parse(html, 100);
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        var renderer = new Renderer(LayoutHarness.Fonts, images, loader);
+        using var atTop = renderer.Render(root, doc, LayoutHarness.Fonts, images,
+            100, 100, 0, 0, null, true);
+        using var scrolled = renderer.Render(root, doc, LayoutHarness.Fonts, images,
+            100, 100, 0, 20, null, true);
+
+        var topTile = atTop.GetPixel(47, 47);
+        var oldElementCenter = atTop.GetPixel(97, 97);
+        var scrolledTop = scrolled.GetPixel(47, 47);
+        var scrolledTile = scrolled.GetPixel(47, 67);
+        Check.That(topTile.R > 240 && topTile.G < 20,
+            "fixed background 50% position is centered in the viewport", topTile.ToString());
+        Check.That(oldElementCenter.G > 240 && oldElementCenter.R < 20,
+            "fixed position does not use the larger element dimensions", oldElementCenter.ToString());
+        Check.That(scrolledTop.G > 240 && scrolledTop.R < 20 &&
+                   scrolledTile.R > 240 && scrolledTile.G < 20,
+            "fixed background remains at the same viewport coordinate after scroll",
+            $"top={scrolledTop}, scrolled tile={scrolledTile}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ThreeDimensionalBordersRetainAuthoredColor()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body>" +
+            "<div id='groove' style='width:12px;height:12px;border-left:8px groove #CC9900'></div>" +
+            "<div id='ridge' style='width:12px;height:12px;border-left:8px ridge #CC9900'></div>" +
+            "<div id='inset' style='width:12px;height:12px;border-left:8px inset #CC9900'></div>" +
+            "<div id='outset' style='width:12px;height:12px;border-left:8px outset #CC9900'></div>" +
+            "</body></html>");
+        var elements = doc.ElementDescendants().Where(e => e.GetAttr("id") != null)
+            .ToDictionary(e => e.GetAttr("id")!, e => e);
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        foreach (string id in new[] { "groove", "ridge", "inset", "outset" })
+        {
+            var box = LayoutHarness.BoxOf(root, elements[id])!;
+            var pixel = bitmap.GetPixel((int)box.BorderRect.Left + 1,
+                (int)(box.BorderRect.Top + box.BorderRect.Height / 2f));
+            Check.That(pixel.R > pixel.G && pixel.G > pixel.B,
+                $"{id} border shade remains gold-derived", pixel.ToString());
+        }
         Check.Done();
     }
 

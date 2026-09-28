@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
-using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 using System.Threading;
 
 namespace Retro96;
@@ -16,13 +18,17 @@ namespace Retro96;
 /// </summary>
 internal static class WindowsSecurity
 {
-    private const int TokenIsAppContainer = 29;
+    private const int TokenIsAppContainer = 29; // TOKEN_INFORMATION_CLASS
+    private const int TokenAppContainerSid = 31;
     private const uint TokenQuery = 0x0008;
 
     private const uint ErrorInsufficientBuffer = 122;
     private const uint ExtendedStartupInfoPresent = 0x00080000;
     private const uint CreateSuspended = 0x00000004;
     private const uint CreateUnicodeEnvironment = 0x00000400;
+
+    private const uint WaitObject0 = 0x00000000;
+    private const uint WorkerExitWaitMilliseconds = 5000;
 
     private static readonly IntPtr ProcThreadAttributeMitigationPolicy = (IntPtr)0x00020007;
     private static readonly IntPtr ProcThreadAttributeSecurityCapabilities = (IntPtr)0x00020009;
@@ -44,14 +50,28 @@ internal static class WindowsSecurity
     private const ulong MitigationStrictHandleChecks = 0x0000000001000000UL;
     private const ulong MitigationExtensionPointDisable = 0x0000000100000000UL;
 
+    // The pipe name is embedded in a quoted --sandbox-worker argument; quotes
+    // or control characters would let it break out of the quoting.
+    private static readonly char[] InvalidPipeNameCharacters = { '"', '\r', '\n', '\0' };
+
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
 
+    // NOTE: this signature is only valid for token information classes whose
+    // native payload is a single DWORD (e.g. TokenIsAppContainer).
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool GetTokenInformation(
         IntPtr tokenHandle,
         int tokenInformationClass,
         out int tokenInformation,
+        int tokenInformationLength,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(
+        IntPtr tokenHandle,
+        int tokenInformationClass,
+        IntPtr tokenInformation,
         int tokenInformationLength,
         out int returnLength);
 
@@ -93,7 +113,7 @@ internal static class WindowsSecurity
     [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int DeleteAppContainerProfile(string appContainerName);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string? name);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -118,7 +138,7 @@ internal static class WindowsSecurity
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateProcess(
         string? applicationName,
-        System.Text.StringBuilder? commandLine,
+        StringBuilder? commandLine,
         IntPtr processAttributes,
         IntPtr threadAttributes,
         bool inheritHandles,
@@ -157,13 +177,15 @@ internal static class WindowsSecurity
         public uint Reserved;
     }
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    // String members are declared as IntPtr (they are always null here) so the
+    // struct is blittable and marshals as an exact STARTUPINFOW.
+    [StructLayout(LayoutKind.Sequential)]
     private struct STARTUPINFO
     {
         public uint cb;
-        public string? lpReserved;
-        public string? lpDesktop;
-        public string? lpTitle;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
         public uint dwX;
         public uint dwY;
         public uint dwXSize;
@@ -240,6 +262,14 @@ internal static class WindowsSecurity
         public UIntPtr PeakJobMemoryUsed;
     }
 
+    /// <summary>
+    /// A launched content worker together with the Windows objects that keep
+    /// it contained. Dispose terminates the Job (killing the worker), closes
+    /// all handles, removes the worker's AppContainer profile and (when owned)
+    /// its runtime copy.
+    /// Not thread-safe beyond dispose-once semantics; synchronize external
+    /// access to the handle properties if needed.
+    /// </summary>
     internal sealed class WorkerProcess : IDisposable
     {
         private int _disposed;
@@ -264,25 +294,36 @@ internal static class WindowsSecurity
             OwnsRuntimeDirectory = ownsRuntimeDirectory;
         }
 
-        public TrustMode TrustMode { get; }
-        public string? ProfileName { get; }
-        public IntPtr JobHandle { get; private set; }
-        public IntPtr ProcessHandle { get; private set; }
-        public IntPtr ThreadHandle { get; private set; }
-        public uint ProcessId { get; }
-        public string RuntimeDirectory { get; }
-        public bool OwnsRuntimeDirectory { get; }
+        /// <summary>Isolation tier the worker was launched with.</summary>
+        internal TrustMode TrustMode { get; }
 
-        public bool HasExited(out uint exitCode)
+        /// <summary>AppContainer profile owned by this worker (null in Low mode).</summary>
+        internal string? ProfileName { get; }
+
+        internal IntPtr JobHandle { get; private set; }
+        internal IntPtr ProcessHandle { get; private set; }
+        internal IntPtr ThreadHandle { get; private set; }
+        internal uint ProcessId { get; }
+
+        /// <summary>Directory the worker runs from; deleted on Dispose when owned.</summary>
+        internal string RuntimeDirectory { get; }
+        internal bool OwnsRuntimeDirectory { get; }
+
+        internal bool HasExited(out uint exitCode)
         {
             exitCode = 0;
-            if (ProcessHandle == IntPtr.Zero) return true;
-            uint state = WaitForSingleObject(ProcessHandle, 0);
-            if (state == 0)
+            IntPtr handle = ProcessHandle; // snapshot; Dispose may race
+            if (handle == IntPtr.Zero) return true;
+
+            uint state = WaitForSingleObject(handle, 0);
+            if (state == WaitObject0)
             {
-                GetExitCodeProcess(ProcessHandle, out exitCode);
+                GetExitCodeProcess(handle, out exitCode);
                 return true;
             }
+            // WAIT_TIMEOUT (still running) or WAIT_FAILED (unexpected, invalid
+            // handle): report the worker as alive so callers keep polling or
+            // tear it down explicitly.
             return false;
         }
 
@@ -292,11 +333,17 @@ internal static class WindowsSecurity
                 return;
 
             try { if (JobHandle != IntPtr.Zero) TerminateJobObject(JobHandle, 0); } catch { }
-            try { if (ProcessHandle != IntPtr.Zero) WaitForSingleObject(ProcessHandle, 5000); } catch { }
+            try { if (ProcessHandle != IntPtr.Zero) WaitForSingleObject(ProcessHandle, WorkerExitWaitMilliseconds); } catch { }
             try { if (ThreadHandle != IntPtr.Zero) CloseHandle(ThreadHandle); } catch { }
             try { if (ProcessHandle != IntPtr.Zero) CloseHandle(ProcessHandle); } catch { }
             try { if (JobHandle != IntPtr.Zero) CloseHandle(JobHandle); } catch { }
 
+            JobHandle = IntPtr.Zero;
+            ProcessHandle = IntPtr.Zero;
+            ThreadHandle = IntPtr.Zero;
+
+            // Cleanup happens after the worker has exited so it is not holding
+            // files open inside the profile / runtime directory.
             if (!string.IsNullOrEmpty(ProfileName))
             {
                 DeleteAppContainer(ProfileName);
@@ -305,22 +352,27 @@ internal static class WindowsSecurity
             if (OwnsRuntimeDirectory)
                 TryDeleteDirectory(RuntimeDirectory);
 
-            JobHandle = IntPtr.Zero;
-            ProcessHandle = IntPtr.Zero;
-            ThreadHandle = IntPtr.Zero;
+            GC.SuppressFinalize(this);
         }
     }
 
-    internal static string CurrentUserSid =>
-        WindowsIdentity.GetCurrent().User?.Value
-        ?? throw new InvalidOperationException("Unable to determine the current Windows user SID.");
+    internal static string CurrentUserSid
+    {
+        get
+        {
+            using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            return identity.User?.Value
+                ?? throw new InvalidOperationException("Unable to determine the current Windows user SID.");
+        }
+    }
 
-    public static bool IsCurrentProcessAppContainer()
+    internal static bool IsCurrentProcessAppContainer()
     {
         IntPtr token = IntPtr.Zero;
         try
         {
-            if (!OpenProcessToken(Process.GetCurrentProcess().Handle, TokenQuery, out token))
+            using Process current = Process.GetCurrentProcess();
+            if (!OpenProcessToken(current.Handle, TokenQuery, out token))
                 return false;
 
             return GetTokenInformation(token, TokenIsAppContainer, out int value,
@@ -336,7 +388,7 @@ internal static class WindowsSecurity
         }
     }
 
-    public static string GetHighModeStatusText()
+    internal static string GetHighModeStatusText()
     {
         if (!SandboxContext.IsWorker)
             return "Host broker active — each browser window is launched as its own isolated content worker.";
@@ -344,6 +396,10 @@ internal static class WindowsSecurity
         if (!IsCurrentProcessAppContainer())
             return "Windows isolation: FAILED — this content worker is not running in an AppContainer.";
 
+        // Heuristic: native-AOT publishes do not ship a .runtimeconfig.json,
+        // and the broker enables the LPAC-style opt-out for those workers.
+        // The worker cannot verify this from its token, so this text reflects
+        // the broker's launch policy rather than measured token state.
         bool nativeAotWorker = !File.Exists(
             Path.Combine(AppContext.BaseDirectory,
                 Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "Retro96.exe") + ".runtimeconfig.json"));
@@ -353,7 +409,12 @@ internal static class WindowsSecurity
             : "Windows isolation: ACTIVE — AppContainer worker + brokered resources + Job Object. LPAC is enabled automatically for the native-AOT published worker.";
     }
 
-    public static string PrepareWorkerRuntime(string sourceDirectory, string appContainerSid)
+    /// <summary>
+    /// Copies the worker binaries into the AppContainer's own local-data
+    /// folder so the lowbox token can execute them without re-ACLing anything
+    /// in the user's AppData tree. Returns the new runtime directory.
+    /// </summary>
+    internal static string PrepareWorkerRuntime(string sourceDirectory, string appContainerSid)
     {
         StartupDiagnostics.Step("HOST", "PrepareWorkerRuntime source=" + sourceDirectory + " SID=" + appContainerSid);
         if (!Directory.Exists(sourceDirectory))
@@ -405,6 +466,92 @@ internal static class WindowsSecurity
         }
     }
 
+    internal static void SweepStaleAppContainerProfiles()
+    {
+        const string mappingsPath = @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings";
+        const string profilePrefix = "Retro96.Content.";
+
+        try
+        {
+            using RegistryKey? mappings = Registry.CurrentUser.OpenSubKey(mappingsPath);
+            if (mappings == null) return;
+
+            var activeSids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Process process in Process.GetProcesses())
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (!string.Equals(process.ProcessName, "Retro96", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (!TryGetProcessAppContainerSid(process, out string? sid))
+                            return;
+                        if (!string.IsNullOrEmpty(sid)) activeSids.Add(sid);
+                    }
+                    catch
+                    {
+                        return;
+                    }
+                }
+            }
+
+            foreach (string mappingName in mappings.GetSubKeyNames())
+            {
+                try
+                {
+                    using RegistryKey? mapping = mappings.OpenSubKey(mappingName);
+                    string? profileName = mapping?.GetValue("AppContainerName") as string;
+                    if (string.IsNullOrEmpty(profileName) ||
+                        !profileName.StartsWith(profilePrefix, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string sid = new SecurityIdentifier(mappingName).Value;
+                    if (activeSids.Contains(sid)) continue;
+
+                    string localAppData = GetContainerLocalAppData(sid);
+                    TryDeleteDirectory(Path.Combine(localAppData, "Retro96", "WorkerRuntime"));
+                    DeleteAppContainer(profileName);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static bool TryGetProcessAppContainerSid(Process process, out string? sid)
+    {
+        sid = null;
+        IntPtr token = IntPtr.Zero;
+        IntPtr tokenInfo = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(process.Handle, TokenQuery, out token))
+                return false;
+            GetTokenInformation(token, TokenAppContainerSid, IntPtr.Zero, 0, out int required);
+            if (required < IntPtr.Size)
+                return false;
+
+            tokenInfo = Marshal.AllocHGlobal(required);
+            if (!GetTokenInformation(token, TokenAppContainerSid, tokenInfo, required, out _))
+                return false;
+
+            IntPtr appContainerSid = Marshal.ReadIntPtr(tokenInfo);
+            if (appContainerSid != IntPtr.Zero)
+                sid = new SecurityIdentifier(appContainerSid).Value;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (tokenInfo != IntPtr.Zero) Marshal.FreeHGlobal(tokenInfo);
+            if (token != IntPtr.Zero) CloseHandle(token);
+        }
+    }
+
     private static void CopyDirectory(string source, string destination)
     {
         Directory.CreateDirectory(destination);
@@ -421,11 +568,34 @@ internal static class WindowsSecurity
     private static void TryDeleteDirectory(string directory)
     {
         if (string.IsNullOrWhiteSpace(directory)) return;
-        try { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
-        catch { }
+
+        // Retry briefly: search indexers and antivirus can hold transient
+        // handles inside the tree, which makes a single recursive delete fail.
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+                return;
+            }
+            catch { }
+            Thread.Sleep(150 * (attempt + 1));
+        }
     }
 
-    public static WorkerProcess StartWorker(
+    /// <summary>
+    /// Launches an isolated content worker. The worker is created suspended,
+    /// placed on a kill-on-close Job, then resumed.
+    /// </summary>
+    /// <remarks>
+    /// On any failure after argument validation, the worker is terminated, all
+    /// handles are closed, and the per-worker AppContainer profile and owned
+    /// runtime copy are deleted — the same cleanup WorkerProcess.Dispose would
+    /// perform — so a failed launch leaves no isolation artifacts behind.
+    /// <paramref name="useLpac"/> only takes effect for <see cref="TrustMode.High"/>.
+    /// </remarks>
+    internal static WorkerProcess StartWorker(
         TrustMode mode,
         string pipeName,
         string? appContainerSid,
@@ -437,10 +607,33 @@ internal static class WindowsSecurity
         string? workerArguments = null)
     {
         StartupDiagnostics.Step("HOST", "StartWorker called. Mode=" + mode + " exe=" + workerExecutable + " cwd=" + workerWorkingDirectory + " LPAC=" + useLpac);
-        if ((mode is TrustMode.High or TrustMode.Medium) && string.IsNullOrWhiteSpace(appContainerSid))
+
+        bool applyAppContainer = mode is TrustMode.High or TrustMode.Medium;
+        bool applyLpac = mode == TrustMode.High && useLpac;
+
+        if (applyAppContainer && string.IsNullOrWhiteSpace(appContainerSid))
             throw new InvalidOperationException("An AppContainer SID is required for High/Medium workers.");
+
+        bool useDefaultArguments = string.IsNullOrWhiteSpace(workerArguments);
+        if (useDefaultArguments)
+        {
+            if (string.IsNullOrWhiteSpace(pipeName))
+                throw new ArgumentException("A broker pipe name is required when default worker arguments are used.", nameof(pipeName));
+            if (pipeName.IndexOfAny(InvalidPipeNameCharacters) >= 0)
+                throw new ArgumentException("The broker pipe name contains characters that cannot be embedded in the worker command line.", nameof(pipeName));
+        }
+
         if (!File.Exists(workerExecutable))
             throw new FileNotFoundException("Retro96 worker executable was not found.", workerExecutable);
+
+        if (!Directory.Exists(workerWorkingDirectory))
+            throw new DirectoryNotFoundException($"Worker working directory was not found: {workerWorkingDirectory}");
+
+        // Commit-based per-process limits. The Low-tier limit exceeds 4 GiB,
+        // which UIntPtr cannot represent in a 32-bit host.
+        long memoryLimit = GetWorkerMemoryLimit(mode);
+        if (!Environment.Is64BitProcess && (ulong)memoryLimit > uint.MaxValue)
+            throw new PlatformNotSupportedException("This trust mode's worker memory limit exceeds 4 GiB and requires a 64-bit broker process.");
 
         IntPtr job = IntPtr.Zero;
         IntPtr process = IntPtr.Zero;
@@ -466,7 +659,7 @@ internal static class WindowsSecurity
                     LimitFlags = JobLimitFlags.KillOnJobClose | JobLimitFlags.ActiveProcess | JobLimitFlags.ProcessMemory,
                     ActiveProcessLimit = 1
                 },
-                ProcessMemoryLimit = new UIntPtr((ulong)GetWorkerMemoryLimit(mode))
+                ProcessMemoryLimit = new UIntPtr((ulong)memoryLimit)
             };
 
             StartupDiagnostics.Step("HOST", "Configuring Job Object limits.");
@@ -478,21 +671,23 @@ internal static class WindowsSecurity
                 throw new Win32Exception(e, "SetInformationJobObject failed.");
             }
 
-            uint attributeCount = mode switch
-            {
-                TrustMode.High when useLpac => 4u,
-                TrustMode.High => 3u,
-                TrustMode.Medium => 3u,
-                _ => 2u
-            };
+            // Keep the declared count in lockstep with the attributes actually
+            // added below: mitigation policy + child-process policy always,
+            // security capabilities for AppContainer modes, AAP opt-out for
+            // LPAC-style High workers.
+            uint attributeCount = 2u;
+            if (applyAppContainer) attributeCount++;
+            if (applyLpac) attributeCount++;
 
             IntPtr attrSize = IntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero, attributeCount, 0, ref attrSize);
             int queryError = Marshal.GetLastWin32Error();
-            if (attrSize == IntPtr.Zero && queryError != (int)ErrorInsufficientBuffer)
+            if (attrSize == IntPtr.Zero)
             {
                 StartupDiagnostics.Win32Error("HOST", "InitializeProcThreadAttributeList(size)", queryError);
-                throw new Win32Exception(queryError, "InitializeProcThreadAttributeList size query failed.");
+                throw new Win32Exception(
+                    queryError != 0 ? queryError : unchecked((int)ErrorInsufficientBuffer),
+                    "InitializeProcThreadAttributeList size query failed.");
             }
 
             attrList = Marshal.AllocHGlobal(attrSize);
@@ -503,7 +698,7 @@ internal static class WindowsSecurity
                 throw new Win32Exception(e, "InitializeProcThreadAttributeList failed.");
             }
 
-            if (mode is TrustMode.High or TrustMode.Medium)
+            if (applyAppContainer)
             {
                 StartupDiagnostics.Step("HOST", "Applying AppContainer process attribute.");
                 if (!ConvertStringSidToSid(appContainerSid!, out capsSid))
@@ -555,8 +750,12 @@ internal static class WindowsSecurity
                 throw new Win32Exception(e, "UpdateProcThreadAttribute(CHILD_PROCESS_POLICY) failed.");
             }
 
-            if (mode == TrustMode.High && useLpac)
+            if (applyLpac)
             {
+                // Removes the worker's claim on the "ALL APPLICATION PACKAGES"
+                // (S-1-15-2-1) ACE so only resources ACLed for this specific
+                // package SID (plus brokered resources) remain reachable.
+                StartupDiagnostics.Step("HOST", "Applying all-application-packages opt-out (LPAC-style).");
                 lpacPolicy = Marshal.AllocHGlobal(sizeof(uint));
                 Marshal.WriteInt32(lpacPolicy, unchecked((int)ProcessCreationAllApplicationPackagesOptOut));
                 if (!UpdateProcThreadAttribute(attrList, 0, ProcThreadAttributeAllApplicationPackagesPolicy,
@@ -569,10 +768,12 @@ internal static class WindowsSecurity
             }
 
             StartupDiagnostics.Step("HOST", "Creating suspended worker process.");
-            string commandLineText = string.IsNullOrWhiteSpace(workerArguments)
+            string commandLineText = useDefaultArguments
                 ? $"\"{workerExecutable}\" --sandbox-worker \"{pipeName}\" {mode}"
                 : $"\"{workerExecutable}\" {workerArguments}";
-            var commandLine = new System.Text.StringBuilder(commandLineText);
+            // CreateProcessW is permitted to modify the command-line buffer in
+            // place, so give the marshaled StringBuilder room beyond its text.
+            var commandLine = new StringBuilder(commandLineText, commandLineText.Length + 32);
             var startup = new STARTUPINFOEX
             {
                 StartupInfo = new STARTUPINFO
@@ -617,9 +818,21 @@ internal static class WindowsSecurity
         catch (Exception ex)
         {
             StartupDiagnostics.Error("HOST", "StartWorker failed", ex);
+
+            // Full teardown: kill the Job, wait for the worker so it releases
+            // files, close every handle (including the Job), and clean up the
+            // isolation artifacts exactly as WorkerProcess.Dispose would.
             try { if (job != IntPtr.Zero) TerminateJobObject(job, 1); } catch { }
-            try { if (process != IntPtr.Zero) CloseHandle(process); } catch { }
+            try { if (process != IntPtr.Zero) WaitForSingleObject(process, WorkerExitWaitMilliseconds); } catch { }
             try { if (thread != IntPtr.Zero) CloseHandle(thread); } catch { }
+            try { if (process != IntPtr.Zero) CloseHandle(process); } catch { }
+            try { if (job != IntPtr.Zero) CloseHandle(job); } catch { }
+
+            if (mode is TrustMode.High or TrustMode.Medium)
+                DeleteAppContainer(profileName);
+            if (ownsRuntimeDirectory)
+                TryDeleteDirectory(workerWorkingDirectory);
+
             throw;
         }
         finally
@@ -634,18 +847,35 @@ internal static class WindowsSecurity
         }
     }
 
-    public static void DeleteAppContainer(string? profileName)
+    /// <summary>Best-effort deletion of an AppContainer profile; never throws.</summary>
+    internal static void DeleteAppContainer(string? profileName)
     {
         if (string.IsNullOrWhiteSpace(profileName)) return;
+
+        // Retry once: profile deletion can fail transiently while the worker's
+        // files are still being released by the OS.
+        try
+        {
+            if (DeleteAppContainerProfile(profileName) == 0)
+                return;
+        }
+        catch { }
+
+        Thread.Sleep(250);
         try { DeleteAppContainerProfile(profileName); } catch { }
     }
 
-    public static (string ProfileName, string Sid) CreateAppContainer(TrustMode mode)
+    /// <summary>
+    /// Creates a per-worker AppContainer profile. The returned profile is
+    /// owned by the resulting WorkerProcess and deleted when it is disposed.
+    /// </summary>
+    internal static (string ProfileName, string Sid) CreateAppContainer(TrustMode mode)
     {
         StartupDiagnostics.Step("HOST", "CreateAppContainer called. Mode=" + mode);
         if (mode == TrustMode.Low)
             throw new ArgumentOutOfRangeException(nameof(mode));
 
+        // Profile names are limited to 64 characters; the Guid suffix keeps them unique.
         string profile = "Retro96.Content." + mode + "." + Guid.NewGuid().ToString("N");
         profile = profile[..Math.Min(64, profile.Length)];
 

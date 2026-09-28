@@ -248,13 +248,15 @@ public sealed class JavaAppletHost : IDisposable
         // applets never touch the local disk.
         bool localPage = pageBase.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase);
 
-        static string? LocalPathFor(ParsedUrl u)
-        {
-            if (!u.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)) return null;
-            var raw = Uri.UnescapeDataString(u.Path);
-            if (raw.StartsWith("/") && raw.Length > 2 && raw[2] == ':') raw = raw[1..];
-            return raw;
-        }
+        // Use the browser-wide file: URL mapper. The Java host used to carry
+        // its own simplified conversion here, but canonical Windows URLs are
+        // file:///C:/... (three slashes). That helper only stripped the
+        // file://C:/ form, so every local .class lookup became
+        // "///C:/.../Applet.class", mainBytes stayed null, and Resolve()
+        // correctly fell back to the page's "Your browser does not support
+        // Java" text even though the class file was present.
+        static string? LocalPathFor(ParsedUrl u) =>
+            FileUrls.LocalPathFromFileUrl(u);
 
         byte[]? LoadClass(string path)
         {
@@ -364,11 +366,12 @@ public sealed class JavaAppletHost : IDisposable
     {
         if (url.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
         {
-            var raw = Uri.UnescapeDataString(url.Path);
-            if (raw.StartsWith("/") && raw.Length > 2 && raw[2] == ':') raw = raw[1..];
-            if (File.Exists(raw)) return await File.ReadAllBytesAsync(raw, ct).ConfigureAwait(false);
+            string? localPath = FileUrls.LocalPathFromFileUrl(url);
+            if (localPath != null && File.Exists(localPath))
+                return await File.ReadAllBytesAsync(localPath, ct).ConfigureAwait(false);
             return null;
         }
+
         var result = await resources.FetchAsync(url.ToAbsolute(), url, cookies).ConfigureAwait(false);
         return result is HttpSuccess s ? s.Body : null;
     }

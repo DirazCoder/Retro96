@@ -19,6 +19,8 @@ static class Program
             return;
         }
 
+        WindowsSecurity.SweepStaleAppContainerProfiles();
+
         // ISO-8859-1 and other legacy code pages are now registered above
         // before either the browser or plugin worker starts.
 

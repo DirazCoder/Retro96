@@ -36,6 +36,8 @@ public class ComputedStyle
     public TextTransform TextTransform { get; set; } = TextTransform.None;
     public WhiteSpaceValue WhiteSpace { get; set; } = WhiteSpaceValue.Normal;
     public VerticalAlign VerticalAlign { get; set; } = VerticalAlign.Baseline;
+    public float? VerticalAlignPercent { get; set; }
+    public bool OwnVerticalAlign { get; set; }
 
     // === BACKGROUND ===
     public Color BackgroundColor { get; set; } = Color.Transparent;
@@ -209,7 +211,7 @@ public class ComputedStyle
             case "word-spacing": WordSpacing = ParseLength(value, parentFontSize, viewportWidth); break;
             case "text-transform": TextTransform = ParseTextTransform(value); break;
             case "white-space": WhiteSpace = ParseWhiteSpace(value); break;
-            case "vertical-align": VerticalAlign = ParseVerticalAlign(value); break;
+            case "vertical-align": SetVerticalAlign(value); break;
 
             // === BACKGROUND ===
             case "background-color": BackgroundColor = ParseColor(value, BackgroundColor); OwnBackground = true; break;
@@ -250,6 +252,10 @@ public class ComputedStyle
             case "border-right-color": BorderRightColor = ParseColor(value, BorderRightColor); break;
             case "border-bottom-color": BorderBottomColor = ParseColor(value, BorderBottomColor); break;
             case "border-left-color": BorderLeftColor = ParseColor(value, BorderLeftColor); break;
+                        case "border-top": ParseBorderSideShorthand(value, "top", parentFontSize, viewportWidth); break;
+                        case "border-right": ParseBorderSideShorthand(value, "right", parentFontSize, viewportWidth); break;
+                        case "border-bottom": ParseBorderSideShorthand(value, "bottom", parentFontSize, viewportWidth); break;
+                        case "border-left": ParseBorderSideShorthand(value, "left", parentFontSize, viewportWidth); break;
             case "border-width": ParseBorderWidthShorthand(value, parentFontSize, viewportWidth); break;
             case "border-style": ParseBorderStyleShorthand(value); break;
             case "border-color": ParseBorderColorShorthand(value); break;
@@ -461,7 +467,9 @@ public class ComputedStyle
             FontFamily = ParseFontFamily(family);
 
         static bool LooksLikeSize(string p) =>
-            p.EndsWith("px") || p.EndsWith("pt") || p.EndsWith("em") || p.EndsWith("%") ||
+            p.EndsWith("px") || p.EndsWith("pt") || p.EndsWith("pc") ||
+            p.EndsWith("in") || p.EndsWith("cm") || p.EndsWith("mm") ||
+            p.EndsWith("em") || p.EndsWith("ex") || p.EndsWith("%") ||
             p is "xx-small" or "x-small" or "small" or "medium" or "large"
                    or "x-large" or "xx-large";
     }
@@ -611,8 +619,9 @@ public class ComputedStyle
     private static bool LooksLikeLengthToken(string v)
     {
         v = v.Trim().ToLowerInvariant();
-        return v.EndsWith("px") || v.EndsWith("pt") || v.EndsWith("em") || v.EndsWith("ex") || v.EndsWith("%") ||
-               v is "0px" or "0pt" or "0em" or "0%";
+         return v.EndsWith("px") || v.EndsWith("pt") || v.EndsWith("pc") || v.EndsWith("in") ||
+             v.EndsWith("cm") || v.EndsWith("mm") || v.EndsWith("em") || v.EndsWith("ex") || v.EndsWith("%") ||
+             v is "0px" or "0pt" or "0pc" or "0in" or "0cm" or "0mm" or "0em" or "0ex" or "0%";
     }
 
     /// <summary>
@@ -668,6 +677,21 @@ public class ComputedStyle
         };
     }
 
+    private void SetVerticalAlign(string value)
+    {
+        OwnVerticalAlign = true;
+        string token = value.Trim();
+        if (token.EndsWith('%') && TryParseFloat(token[..^1], out float percent))
+        {
+            VerticalAlignPercent = percent;
+            VerticalAlign = VerticalAlign.Baseline;
+            return;
+        }
+
+        VerticalAlignPercent = null;
+        VerticalAlign = ParseVerticalAlign(token);
+    }
+
     /// <summary>
     /// Parse a CSS length.  Bare numbers are pixels (HTML attr style);
     /// pt is converted at 4/3 px per pt; em/% relative to parentFontSize.
@@ -700,10 +724,35 @@ public class ComputedStyle
             if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
             result = result * 4f / 3f;
         }
+        else if (v.EndsWith("pc"))
+        {
+            if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
+            result *= 16f;
+        }
+        else if (v.EndsWith("in"))
+        {
+            if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
+            result *= 96f;
+        }
+        else if (v.EndsWith("cm"))
+        {
+            if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
+            result *= 96f / 2.54f;
+        }
+        else if (v.EndsWith("mm"))
+        {
+            if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
+            result *= 96f / 25.4f;
+        }
         else if (v.EndsWith("em"))
         {
             if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
             result = result * parentFontSize;
+        }
+        else if (v.EndsWith("ex"))
+        {
+            if (!TryParseFloat(v[..^2], out result)) return fallback ?? 0f;
+            result = result * parentFontSize * 0.5f;
         }
         else if (v.EndsWith('%'))
         {
@@ -1004,9 +1053,52 @@ public class ComputedStyle
         }
     }
 
+    private void ParseBorderSideShorthand(string value, string side, float fs, float vw)
+    {
+        float? width = null;
+        BorderStyleValue? borderStyle = null;
+        Color? borderColor = null;
+        foreach (string part in SplitTopLevel(value))
+        {
+            string token = part.ToLowerInvariant();
+            if (token is "none" or "hidden" or "dotted" or "dashed" or "solid" or
+                "double" or "groove" or "ridge" or "inset" or "outset")
+                borderStyle = ParseBorderStyle(part);
+            else if (token is "thin" or "medium" or "thick" || IsLengthToken(token))
+                width = ParseBorderWidth(part, fs, vw);
+            else
+                borderColor = ParseColor(part, Color.Black);
+        }
+
+        switch (side)
+        {
+            case "top":
+                if (width.HasValue) BorderTopWidth = width.Value;
+                if (borderStyle.HasValue) { BorderTopStyle = borderStyle.Value; OwnBorderTopStyle = true; }
+                if (borderColor.HasValue) BorderTopColor = borderColor.Value;
+                break;
+            case "right":
+                if (width.HasValue) BorderRightWidth = width.Value;
+                if (borderStyle.HasValue) { BorderRightStyle = borderStyle.Value; OwnBorderRightStyle = true; }
+                if (borderColor.HasValue) BorderRightColor = borderColor.Value;
+                break;
+            case "bottom":
+                if (width.HasValue) BorderBottomWidth = width.Value;
+                if (borderStyle.HasValue) { BorderBottomStyle = borderStyle.Value; OwnBorderBottomStyle = true; }
+                if (borderColor.HasValue) BorderBottomColor = borderColor.Value;
+                break;
+            case "left":
+                if (width.HasValue) BorderLeftWidth = width.Value;
+                if (borderStyle.HasValue) { BorderLeftStyle = borderStyle.Value; OwnBorderLeftStyle = true; }
+                if (borderColor.HasValue) BorderLeftColor = borderColor.Value;
+                break;
+        }
+    }
+
     /// <summary>Any token usable as a border width: px/pt/em or a bare number.</summary>
     private static bool IsLengthToken(string s) =>
-        s.EndsWith("px") || s.EndsWith("pt") || s.EndsWith("em") ||
+        s.EndsWith("px") || s.EndsWith("pt") || s.EndsWith("pc") || s.EndsWith("in") ||
+        s.EndsWith("cm") || s.EndsWith("mm") || s.EndsWith("em") || s.EndsWith("ex") ||
         (s.Length > 0 && (char.IsDigit(s[0]) || s[0] == '.') && !s.Contains('('));
 
     private static DisplayValue ParseDisplay(string value)

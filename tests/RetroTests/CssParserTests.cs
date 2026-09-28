@@ -18,7 +18,6 @@ public class CssParserTests
         return doc;
     }
 
-
     [Fact]
     public void VisitedPseudoClassUsesSessionHistoryAndStillAllowsHoverToWin()
     {
@@ -169,6 +168,88 @@ public class CssParserTests
         s = doc.AllTags("p")[0].Style!;
         Check.That(s.Color == Color.FromArgb(0, 255, 0),
             "class selector beats type selector", s.Color.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void StylesheetDescendantSelectorsMatchNestedElements()
+    {
+        var doc = ParseAndResolve(
+            "<div class='test-card'><h2 id='heading'>Heading</h2></div>" +
+            "<p class='inline-block-test'><span id='inline'>Inline</span></p>" +
+            "<div class='block-test'><span id='block'>Block</span></div>",
+            ".test-card h2 { color: #0056b3; font-size: 22px; } " +
+            ".inline-block-test span { background-color: #bbdefb; padding: 4px; } " +
+            ".block-test span { display: block; background-color: #c8e6c9; }");
+
+        var heading = doc.ElementDescendants().First(e => e.GetAttr("id") == "heading").Style!;
+        var inline = doc.ElementDescendants().First(e => e.GetAttr("id") == "inline").Style!;
+        var block = doc.ElementDescendants().First(e => e.GetAttr("id") == "block").Style!;
+
+        Check.That(heading.Color == Color.FromArgb(0, 0x56, 0xB3), "descendant heading color applies");
+        Check.That(heading.FontSize == 22f, "descendant heading size applies");
+        Check.That(inline.BackgroundColor == Color.FromArgb(0xBB, 0xDE, 0xFB) && inline.PaddingLeft == 4f,
+            "inline span background and padding apply");
+        Check.That(block.Display == DisplayValue.Block && block.BackgroundColor == Color.FromArgb(0xC8, 0xE6, 0xC9),
+            "block span display and background apply");
+        Check.Done();
+    }
+
+    [Fact]
+    public void CssComplianceUnitsAlignmentListsAndSideBordersResolve()
+    {
+        var doc = ParseAndResolve(
+            "<div id='ex' class='ex'></div><div id='pc' class='pc'></div>" +
+            "<div id='in' class='in'></div><div id='cm' class='cm'></div><div id='mm' class='mm'></div>" +
+            "<div id='neg-one' style='margin-top:-1px'></div>" +
+            "<span id='va-top' class='va-top'></span><span id='va-bottom' class='va-bottom'></span>" +
+            "<span id='va-pct' class='va-pct'></span><ol class='roman'><li></li></ol>" +
+            "<ol class='alpha'><li></li></ol><div id='groove'></div><div id='none'></div>",
+            ".ex { font-size: 2ex } .pc { font-size: 1.5pc } .in { font-size: .25in } " +
+            ".cm { font-size: .6cm } .mm { font-size: 6mm } " +
+            ".va-top { vertical-align: text-top } .va-bottom { vertical-align: bottom } " +
+            ".va-pct { vertical-align: -50% } ol.roman { list-style-type: upper-roman } " +
+            "ol.alpha { list-style-type: lower-alpha } " +
+            "#groove { border-left: 10px groove #CC9900 } " +
+            "#none { border-style: none; border-width: 8px }");
+
+        var byId = doc.ElementDescendants().Where(e => e.GetAttr("id") != null)
+            .ToDictionary(e => e.GetAttr("id")!, e => e.Style!);
+        Check.That(byId["ex"].FontSize == 16f, "ex resolves against font size");
+        Check.That(byId["pc"].FontSize == 24f && byId["in"].FontSize == 24f,
+            "pc and inch units resolve to CSS pixels");
+        Check.That(Math.Abs(byId["cm"].FontSize - 96f * 0.6f / 2.54f) < 0.1f &&
+                   Math.Abs(byId["mm"].FontSize - 96f * 6f / 25.4f) < 0.1f,
+            "centimeter and millimeter units resolve to CSS pixels");
+        Check.That(byId["neg-one"].MarginTop == -1f,
+            "negative one-pixel margin is not confused with an unset value");
+        Check.That(byId["va-top"].VerticalAlign == VerticalAlign.TextTop &&
+                   byId["va-bottom"].VerticalAlign == VerticalAlign.Bottom,
+            "vertical-align keyword values resolve");
+        Check.That(byId["va-pct"].VerticalAlignPercent == -50f,
+            "vertical-align percentage remains signed");
+        Check.That(doc.AllTags("ol")[0].Style!.ListStyleType == ListStyleType.UpperRoman &&
+                   doc.AllTags("ol")[1].Style!.ListStyleType == ListStyleType.LowerAlpha,
+            "ordered list CSS marker types resolve");
+        Check.That(byId["groove"].BorderLeftStyle == BorderStyleValue.Groove &&
+                   byId["groove"].BorderLeftWidth == 10f &&
+                   byId["groove"].BorderLeftColor == Color.FromArgb(0xCC, 0x99, 0x00),
+            "per-side border shorthand keeps groove color and width");
+        Check.That(byId["none"].OwnBorderTopStyle &&
+                   byId["none"].BorderTopStyle == BorderStyleValue.None &&
+                   byId["none"].BorderTopWidth == 0f,
+            "explicit border-style none computes a zero border width");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ImportParsesQuotedAndUnquotedUrls()
+    {
+        var (_, imports) = CssParser.Parse(
+            "@import url(\"quoted.css\"); @import url(bare.css);");
+        Check.That(imports.Count == 2, "both CSS import declarations are collected", imports.Count.ToString());
+        Check.That(imports[0].Url == "quoted.css", "quoted url() import is unwrapped", imports[0].Url);
+        Check.That(imports[1].Url == "bare.css", "unquoted url() import is unwrapped", imports[1].Url);
         Check.Done();
     }
 

@@ -119,6 +119,7 @@ public class Renderer
     public bool IsPrintRendering { get; set; }
     private string? _baseUrl;
     private float _scrollX, _scrollY;
+    private float _viewportWidth, _viewportHeight;
 
     // fontCache/imageCache are accepted for shell API compatibility; the
     // per-call Render(...) arguments are the ones used for painting.
@@ -146,6 +147,8 @@ public class Renderer
         _baseUrl = document?.BaseUrl?.ToAbsolute();
         _scrollX = scrollX;
         _scrollY = scrollY;
+        _viewportWidth = viewportWidth;
+        _viewportHeight = viewportHeight;
 
         float docWidth = Math.Max(rootBox.Width, viewportWidth);
         float docHeight = Math.Max(rootBox.Height, viewportHeight);
@@ -564,17 +567,16 @@ public class Renderer
         float ih = image.Height;
         if (iw <= 0 || ih <= 0) return;
 
+        float positionX = style.BackgroundFixed ? _scrollX : rect.X;
+        float positionY = style.BackgroundFixed ? _scrollY : rect.Y;
+        float positionWidth = style.BackgroundFixed ? _viewportWidth : rect.Width;
+        float positionHeight = style.BackgroundFixed ? _viewportHeight : rect.Height;
         float anchorX = style.BackgroundPositionXLength.HasValue
-            ? rect.X + style.BackgroundPositionXLength.Value
-            : rect.X + (style.BackgroundPosition.X / 100f) * (rect.Width - iw);
+            ? positionX + style.BackgroundPositionXLength.Value
+            : positionX + (style.BackgroundPosition.X / 100f) * (positionWidth - iw);
         float anchorY = style.BackgroundPositionYLength.HasValue
-            ? rect.Y + style.BackgroundPositionYLength.Value
-            : rect.Y + (style.BackgroundPosition.Y / 100f) * (rect.Height - ih);
-        if (style.BackgroundFixed)
-        {
-            anchorX += _scrollX;
-            anchorY += _scrollY;
-        }
+            ? positionY + style.BackgroundPositionYLength.Value
+            : positionY + (style.BackgroundPosition.Y / 100f) * (positionHeight - ih);
 
         var state = g.Save();
         try
@@ -593,45 +595,45 @@ public class Renderer
             try
             {
                 switch (style.BackgroundRepeat)
-            {
-                case BackgroundRepeat.NoRepeat:
-                    g.DrawImage(image, anchorX, anchorY, iw, ih);
-                    break;
+                {
+                    case BackgroundRepeat.NoRepeat:
+                        g.DrawImage(image, anchorX, anchorY, iw, ih);
+                        break;
 
-                case BackgroundRepeat.RepeatX:
-                    {
-                        // Tile in BOTH directions from the anchor, or a
-                        // positioned tile leaves the left of the rect uncovered
-                        float x0 = BackOffToCover(anchorX, rect.Left, iw);
-                        for (float x = x0; x < rect.Right && drawn < MaxBackgroundTiles; x += iw)
+                    case BackgroundRepeat.RepeatX:
                         {
-                            g.DrawImage(image, x, anchorY, iw, ih);
-                            drawn++;
-                        }
-                        break;
-                    }
-                case BackgroundRepeat.RepeatY:
-                    {
-                        float y0 = BackOffToCover(anchorY, rect.Top, ih);
-                        for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
-                        {
-                            g.DrawImage(image, anchorX, y, iw, ih);
-                            drawn++;
-                        }
-                        break;
-                    }
-                default:
-                    {
-                        float x0 = BackOffToCover(anchorX, rect.Left, iw);
-                        float y0 = BackOffToCover(anchorY, rect.Top, ih);
-                        for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
+                            // Tile in BOTH directions from the anchor, or a
+                            // positioned tile leaves the left of the rect uncovered
+                            float x0 = BackOffToCover(anchorX, rect.Left, iw);
                             for (float x = x0; x < rect.Right && drawn < MaxBackgroundTiles; x += iw)
                             {
-                                g.DrawImage(image, x, y, iw, ih);
+                                g.DrawImage(image, x, anchorY, iw, ih);
                                 drawn++;
                             }
-                        break;
-                    }
+                            break;
+                        }
+                    case BackgroundRepeat.RepeatY:
+                        {
+                            float y0 = BackOffToCover(anchorY, rect.Top, ih);
+                            for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
+                            {
+                                g.DrawImage(image, anchorX, y, iw, ih);
+                                drawn++;
+                            }
+                            break;
+                        }
+                    default:
+                        {
+                            float x0 = BackOffToCover(anchorX, rect.Left, iw);
+                            float y0 = BackOffToCover(anchorY, rect.Top, ih);
+                            for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
+                                for (float x = x0; x < rect.Right && drawn < MaxBackgroundTiles; x += iw)
+                                {
+                                    g.DrawImage(image, x, y, iw, ih);
+                                    drawn++;
+                                }
+                            break;
+                        }
                 }
             }
             finally
@@ -692,27 +694,30 @@ public class Renderer
         // border attributes the CSS style may know nothing about.
         PaintBorderSide(g, box.BorderRect, box.BorderTop, style.BorderTopStyle,
                         BorderColorFor(BorderColorOrBlack(style.BorderTopColor), isTableCell, localBackground),
-                        BorderSide.Top, localBackground);
+                        BorderSide.Top, localBackground, box.BorderLeft, box.BorderRight,
+                        style.OwnBorderTopStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderRight, style.BorderRightStyle,
                         BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell, localBackground),
-                        BorderSide.Right, localBackground);
+                        BorderSide.Right, localBackground, box.BorderTop, box.BorderBottom,
+                        style.OwnBorderRightStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderBottom, style.BorderBottomStyle,
                         BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell, localBackground),
-                        BorderSide.Bottom, localBackground);
+                        BorderSide.Bottom, localBackground, box.BorderLeft, box.BorderRight,
+                        style.OwnBorderBottomStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderLeft, style.BorderLeftStyle,
                         BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell, localBackground),
-                        BorderSide.Left, localBackground);
+                        BorderSide.Left, localBackground, box.BorderTop, box.BorderBottom,
+                        style.OwnBorderLeftStyle);
     }
 
     /// <summary>Table cell rules were grey (#808080), not text-black.
-    /// When an authored cell border is itself too close to the cell's local
-    /// background, give the rule enough contrast to remain visible.</summary>
+    /// Keep that default and adapt any authored border that is too close to
+    /// its local background so CSS box edges remain visible.</summary>
     private static Color BorderColorFor(Color cssColor, bool isTableCell, Color background)
     {
         var color = isTableCell && cssColor == Color.Black
             ? Color.FromArgb(0x80, 0x80, 0x80)
             : cssColor;
-        if (!isTableCell) return color;
 
         return LuminanceDistance(color, background) >= 0.14f
             ? color
@@ -831,11 +836,16 @@ public class Renderer
     private enum BorderSide { Top, Right, Bottom, Left }
 
     private static void PaintBorderSide(Graphics g, RectangleF rect, float width,
-        BorderStyleValue bStyle, Color color, BorderSide side, Color background)
+        BorderStyleValue bStyle, Color color, BorderSide side, Color background,
+        float nearCornerWidth, float farCornerWidth, bool authoredStyle)
     {
         if (width <= 0) return;
 
-        if (bStyle is BorderStyleValue.None or BorderStyleValue.Hidden)
+        if (bStyle == BorderStyleValue.Hidden ||
+            (bStyle == BorderStyleValue.None && authoredStyle))
+            return;
+
+        if (bStyle == BorderStyleValue.None)
         {
             // A positive box border with no resolvable style can only have
             // come from an HTML attribute (img/table BORDER), table cell
@@ -857,36 +867,127 @@ public class Renderer
 
         if (bStyle == BorderStyleValue.Double)
         {
-            PaintDoubleBorder(g, rect, w, color, side);
+            PaintDoubleBorder(g, rect, w, color, side, nearCornerWidth, farCornerWidth);
             return;
         }
 
-        using var pen = CreateBorderPen(bStyle, color);
-        PaintSimpleSide(g, rect, w, pen, side);
+        PaintSimpleSide(g, rect, w, bStyle, color, side, nearCornerWidth, farCornerWidth);
     }
 
-    /// <summary>Draws a plain side as `w` one-pixel strokes.</summary>
+    /// <summary>Draws border scanlines with mitered endpoints and CSS-scaled dash spacing.</summary>
     private static void PaintSimpleSide(Graphics g, RectangleF rect, int w,
-                                        Pen pen, BorderSide side)
+        BorderStyleValue style, Color color, BorderSide side,
+        float nearCornerWidth, float farCornerWidth)
     {
-        switch (side)
+        using var clip = new Region(GetBorderPolygon(
+            rect, w, side, nearCornerWidth, farCornerWidth));
+        int state = g.Save();
+        using var brush = new SolidBrush(color);
+        float dashLength = Math.Max(3f, w * 3f);
+        float dashGap = Math.Max(2f, w * 2f);
+        float dotPitch = w * 2f;
+        bool horizontal = side is BorderSide.Top or BorderSide.Bottom;
+        float axisStart = horizontal ? rect.Left : rect.Top;
+        float axisEnd = horizontal ? rect.Right : rect.Bottom;
+        float crossStart = side switch
         {
-            case BorderSide.Top:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(pen, rect.Left, rect.Top + i, rect.Right, rect.Top + i);
-                break;
-            case BorderSide.Right:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(pen, rect.Right - i - 1, rect.Top, rect.Right - i - 1, rect.Bottom);
-                break;
-            case BorderSide.Bottom:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(pen, rect.Left, rect.Bottom - i - 1, rect.Right, rect.Bottom - i - 1);
-                break;
-            case BorderSide.Left:
-                for (int i = 0; i < w; i++)
-                    g.DrawLine(pen, rect.Left + i, rect.Top, rect.Left + i, rect.Bottom);
-                break;
+            BorderSide.Top => rect.Top,
+            BorderSide.Bottom => rect.Bottom - w,
+            BorderSide.Left => rect.Left,
+            _ => rect.Right - w
+        };
+
+        try
+        {
+            g.SetClip(clip, CombineMode.Intersect);
+            if (style == BorderStyleValue.Dotted)
+            {
+                for (float position = axisStart; position < axisEnd; position += dotPitch)
+                {
+                    if (horizontal)
+                        g.FillEllipse(brush, position, crossStart, w, w);
+                    else
+                        g.FillEllipse(brush, crossStart, position, w, w);
+                }
+            }
+            else if (style == BorderStyleValue.Dashed)
+            {
+                for (float position = axisStart; position < axisEnd; position += dashLength + dashGap)
+                {
+                    float length = Math.Min(dashLength, axisEnd - position);
+                    if (horizontal)
+                        g.FillRectangle(brush, position, crossStart, length, w);
+                    else
+                        g.FillRectangle(brush, crossStart, position, w, length);
+                }
+            }
+            else if (horizontal)
+            {
+                g.FillRectangle(brush, axisStart, crossStart, axisEnd - axisStart, w);
+            }
+            else
+            {
+                g.FillRectangle(brush, crossStart, axisStart, w, axisEnd - axisStart);
+            }
+        }
+        finally
+        {
+            g.Restore(state);
+        }
+    }
+
+    private static PointF[] GetBorderPolygon(RectangleF rect, int width, BorderSide side,
+        float nearCornerWidth, float farCornerWidth)
+    {
+        float maxCorner = side is BorderSide.Top or BorderSide.Bottom ? rect.Width : rect.Height;
+        float near = Math.Clamp(nearCornerWidth, 0f, maxCorner);
+        float far = Math.Clamp(farCornerWidth, 0f, maxCorner);
+        return side switch
+        {
+            BorderSide.Top => [
+                new PointF(rect.Left, rect.Top), new PointF(rect.Right, rect.Top),
+                new PointF(rect.Right - far, rect.Top + width),
+                new PointF(rect.Left + near, rect.Top + width)],
+            BorderSide.Right => [
+                new PointF(rect.Right, rect.Top), new PointF(rect.Right, rect.Bottom),
+                new PointF(rect.Right - width, rect.Bottom - far),
+                new PointF(rect.Right - width, rect.Top + near)],
+            BorderSide.Bottom => [
+                new PointF(rect.Right, rect.Bottom), new PointF(rect.Left, rect.Bottom),
+                new PointF(rect.Left + near, rect.Bottom - width),
+                new PointF(rect.Right - far, rect.Bottom - width)],
+            _ => [
+                new PointF(rect.Left, rect.Bottom), new PointF(rect.Left, rect.Top),
+                new PointF(rect.Left + width, rect.Top + near),
+                new PointF(rect.Left + width, rect.Bottom - far)]
+        };
+    }
+
+    private static void GetBorderSpan(RectangleF rect, BorderSide side, int offset,
+        int sideWidth, float nearCornerWidth, float farCornerWidth,
+        out float start, out float end)
+    {
+        float fraction = (offset + 0.5f) / sideWidth;
+        bool horizontal = side is BorderSide.Top or BorderSide.Bottom;
+        float lengthStart = horizontal ? rect.Left : rect.Top;
+        float lengthEnd = horizontal ? rect.Right : rect.Bottom;
+        start = lengthStart + nearCornerWidth * fraction;
+        end = lengthEnd - farCornerWidth * fraction;
+    }
+
+    private static void DrawBorderScanline(Graphics g, Brush brush, RectangleF rect,
+        BorderSide side, int offset, float start, float end)
+    {
+        if (end <= start) return;
+        if (side is BorderSide.Top or BorderSide.Bottom)
+        {
+            float y = side == BorderSide.Top ? rect.Top + offset : rect.Bottom - offset - 1;
+            g.FillRectangle(brush, start, y, end - start, 1f);
+        }
+        else
+        {
+            float x = side == BorderSide.Left ? rect.Left + offset : rect.Right - offset - 1;
+            g.FillRectangle(brush, x, start, 1f, end - start);
         }
     }
 
@@ -907,7 +1008,13 @@ public class Renderer
         {
             Color shade = (raised == topLeft) ? light : darkDark;
             if (NeedsStrongBevelOutline(background))
-                shade = raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
+            {
+                int minChannel = Math.Min(baseColor.R, Math.Min(baseColor.G, baseColor.B));
+                int maxChannel = Math.Max(baseColor.R, Math.Max(baseColor.G, baseColor.B));
+                shade = maxChannel - minChannel > 24
+                    ? raised == topLeft ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f)
+                    : raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
+            }
             using var brush = new SolidBrush(shade);
             switch (side)
             {
@@ -926,8 +1033,18 @@ public class Renderer
         Color inner = outerLight ? midLight : dark;
         if (NeedsStrongBevelOutline(background))
         {
-            outer = outerLight ? BevelHighlightColor(background) : BevelShadowColor(background);
-            inner = outerLight ? BevelShadowColor(background) : BevelHighlightColor(background);
+            int minChannel = Math.Min(baseColor.R, Math.Min(baseColor.G, baseColor.B));
+            int maxChannel = Math.Max(baseColor.R, Math.Max(baseColor.G, baseColor.B));
+            if (maxChannel - minChannel > 24)
+            {
+                outer = outerLight ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f);
+                inner = outerLight ? Tint(baseColor, 0.30f) : Shade(baseColor, 0.70f);
+            }
+            else
+            {
+                outer = outerLight ? BevelHighlightColor(background) : BevelShadowColor(background);
+                inner = outerLight ? BevelShadowColor(background) : BevelHighlightColor(background);
+            }
         }
         int first = Math.Max(1, w / 2);
         int second = Math.Max(1, w - first);
@@ -955,53 +1072,28 @@ public class Renderer
         }
     }
 
-    private static void PaintDoubleBorder(Graphics g, RectangleF rect,
-                                          int w, Color color, BorderSide side)
+    private static void PaintDoubleBorder(Graphics g, RectangleF rect, int w,
+        Color color, BorderSide side, float nearCornerWidth, float farCornerWidth)
     {
         if (w < 3)
         {
-            using var solidPen = new Pen(color, 1);
-            PaintSimpleSide(g, rect, w, solidPen, side);
+            PaintSimpleSide(g, rect, w, BorderStyleValue.Solid, color, side,
+                nearCornerWidth, farCornerWidth);
             return;
         }
 
         int line = Math.Max(1, w / 3);
-        int gap = Math.Max(1, w - line * 2);
+        int secondLineStart = w - line;
         using var brush = new SolidBrush(color);
-
-        switch (side)
+        for (int offset = 0; offset < w; offset++)
         {
-            case BorderSide.Top:
-                g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, line);
-                g.FillRectangle(brush, rect.Left, rect.Top + line + gap, rect.Width, line);
-                break;
-            case BorderSide.Bottom:
-                g.FillRectangle(brush, rect.Left, rect.Bottom - line - gap - line, rect.Width, line);
-                g.FillRectangle(brush, rect.Left, rect.Bottom - line, rect.Width, line);
-                break;
-            case BorderSide.Left:
-                g.FillRectangle(brush, rect.Left, rect.Top, line, rect.Height);
-                g.FillRectangle(brush, rect.Left + line + gap, rect.Top, line, rect.Height);
-                break;
-            case BorderSide.Right:
-                g.FillRectangle(brush, rect.Right - line - gap - line, rect.Top, line, rect.Height);
-                g.FillRectangle(brush, rect.Right - line, rect.Top, line, rect.Height);
-                break;
+            if (offset < line || offset >= secondLineStart)
+            {
+                GetBorderSpan(rect, side, offset, w, nearCornerWidth, farCornerWidth,
+                    out float start, out float end);
+                DrawBorderScanline(g, brush, rect, side, offset, start, end);
+            }
         }
-    }
-
-    /// <summary>Pen is always 1 px wide — the caller loops it for thickness.</summary>
-    private static Pen CreateBorderPen(BorderStyleValue style, Color color)
-    {
-        var pen = new Pen(color, 1);
-        switch (style)
-        {
-            case BorderStyleValue.Dashed:
-                pen.DashStyle = DashStyle.Dash; break;
-            case BorderStyleValue.Dotted:
-                pen.DashStyle = DashStyle.Dot; break;
-        }
-        return pen;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1141,6 +1233,10 @@ public class Renderer
             !float.IsFinite(box.Width) || !float.IsFinite(box.Height))
             return;
 
+        float textY = contentRect.Y;
+        if (style.LineHeightMode != LineHeightMode.Normal)
+            textY += Math.Max(0f, (contentRect.Height - font.GetHeight(g)) / 2f);
+
         // FIX: shared format + shared brush — a text-heavy page used to
         // allocate one StringFormat and one SolidBrush per WORD BOX on
         // every repaint (the caret blink repaints twice a second).
@@ -1162,11 +1258,11 @@ public class Renderer
                 $"style.TextAlign={style.TextAlign}");
 
         if (style.FontVariant == FontVariantValue.SmallCaps)
-            PaintSmallCapsText(g, contentRect.X, contentRect.Y, text, style, fonts, textColor, sf);
+            PaintSmallCapsText(g, contentRect.X, textY, text, style, fonts, textColor, sf);
         else if (Math.Abs(style.LetterSpacing) > 0.001f || Math.Abs(style.WordSpacing) > 0.001f)
-            PaintSpacedText(g, contentRect.X, contentRect.Y, text, font, brush, style, sf);
+            PaintSpacedText(g, contentRect.X, textY, text, font, brush, style, sf);
         else
-            g.DrawString(text, font, brush, contentRect.X, contentRect.Y, sf);
+            g.DrawString(text, font, brush, contentRect.X, textY, sf);
 
         // Text decoration.  HTML links carry their UA underline through
         // descendant inline elements such as <font>, even though
@@ -1195,18 +1291,18 @@ public class Renderer
 
             if (deco.HasFlag(TextDecoration.Underline))
             {
-                float uy = contentRect.Y + font.GetHeight(g) - 1;
+                float uy = textY + font.GetHeight(g) - 1;
                 g.DrawLine(decoP, contentRect.X, uy, lineRight, uy);
             }
             if (deco.HasFlag(TextDecoration.LineThrough))
             {
-                float sy = contentRect.Y + font.GetHeight(g) / 2f;
+                float sy = textY + font.GetHeight(g) / 2f;
                 g.DrawLine(decoP, contentRect.X, sy, lineRight, sy);
             }
             if (deco.HasFlag(TextDecoration.Overline))
             {
-                g.DrawLine(decoP, contentRect.X, contentRect.Y,
-                    lineRight, contentRect.Y);
+                g.DrawLine(decoP, contentRect.X, textY,
+                    lineRight, textY);
             }
         }
     }
@@ -1266,12 +1362,12 @@ public class Renderer
             float baselineOffset = lower ? Math.Max(0f, fullFont.AscentPx - smallFont.AscentPx) : 0f;
             g.DrawString(draw, runFont, runBrush, drawX, y + baselineOffset, sf);
 
-            // Small-cap glyphs are visually reduced, but their advance stays
-            // on the normal/full-size metric grid. Using the reduced glyph
-            // width here made strings such as "The Quick Brown Fox" look
-            // unnaturally cramped after the lowercase letters were promoted
-            // to capitals.
-            drawX += g.MeasureString(draw, fullFont, int.MaxValue, sf).Width;
+            // Advance with the same font used to draw this run. Tracking is
+            // applied per character so measured and painted advances agree.
+            drawX += g.MeasureString(draw, runFont, int.MaxValue, sf).Width;
+            drawX += (i < text.Length ? run.Length : Math.Max(0, run.Length - 1)) * style.LetterSpacing;
+            foreach (char character in run)
+                if (char.IsWhiteSpace(character)) drawX += style.WordSpacing;
         }
     }
 
@@ -1406,11 +1502,11 @@ public class Renderer
         try
         {
             var task = images.GetAsync(absoluteUrl, _resourceLoader, default);
-        if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
-        {
-            frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
-            return true;
-        }
+            if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
+            {
+                frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
+                return true;
+            }
         }
         catch { }
         frame = null;
@@ -2178,6 +2274,8 @@ public class Renderer
             listStyle.ListStyleType = parent.Style.ListStyleType;
         if (!style.OwnListStyleImage && parent.Style != null)
             listStyle.ListStyleImage = parent.Style.ListStyleImage;
+        if (listStyle.ListStyleType == ListStyleType.None)
+            return;
 
         var font = ResolveFont(fonts, style);
         Color markerColor = EffectiveTextColor(style);
@@ -2226,7 +2324,14 @@ public class Renderer
                 "A" => MarkerLetters(index, 'A'),
                 "i" => MarkerRoman(index, lowercase: true),
                 "I" => MarkerRoman(index, lowercase: false),
-                _ => index.ToString(),
+                _ => listStyle.ListStyleType switch
+                {
+                    ListStyleType.LowerAlpha => MarkerLetters(index, 'a'),
+                    ListStyleType.UpperAlpha => MarkerLetters(index, 'A'),
+                    ListStyleType.LowerRoman => MarkerRoman(index, lowercase: true),
+                    ListStyleType.UpperRoman => MarkerRoman(index, lowercase: false),
+                    _ => index.ToString()
+                }
             };
 
             string label = marker + ".";
@@ -2239,14 +2344,11 @@ public class Renderer
 
         // Unordered: disc / circle / square, with nesting-depth default
         // (disc → circle → square, per the era's nesting behaviour)
-        if (parentTag is "ul" or "menu" or "dir")
+        if (parentTag is "ul" or "menu" or "dir" || style.Display == DisplayValue.ListItem)
         {
             // CSS list-style-* is inherited by the <li>; use the computed
             // style rather than looking only at the old HTML TYPE attribute.
             // `none` means there is no marker at all.
-            if (listStyle.ListStyleType == ListStyleType.None)
-                return;
-
             // HTML TYPE and CSS list-style-type are explicit choices.  When
             // neither is present, use the historical nested-list convention
             // (disc -> circle -> square).  The old code could never reach its
@@ -2265,6 +2367,8 @@ public class Renderer
                     ListStyleType.Circle => "circle",
                     ListStyleType.Square => "square",
                     ListStyleType.Disc => "disc",
+                    ListStyleType.LowerAlpha or ListStyleType.UpperAlpha or
+                    ListStyleType.LowerRoman or ListStyleType.UpperRoman or ListStyleType.Decimal => "number",
                     _ => (type ?? "").ToLowerInvariant()
                 };
             }
@@ -2285,6 +2389,32 @@ public class Renderer
             float cx = box.X - 10f;
             float cy = markerY + (style.FontSize > 0f ? style.FontSize : 16f) * 0.42f;
             float half = markerSize * 0.5f;
+
+            if (shape == "number")
+            {
+                int index = 1;
+                foreach (var sibling in parent.Children)
+                {
+                    if (ReferenceEquals(sibling, elem)) break;
+                    if (sibling is DomElement siblingElement &&
+                        siblingElement.Style?.Display == DisplayValue.ListItem)
+                        index++;
+                }
+                string marker = listStyle.ListStyleType switch
+                {
+                    ListStyleType.LowerAlpha => MarkerLetters(index, 'a'),
+                    ListStyleType.UpperAlpha => MarkerLetters(index, 'A'),
+                    ListStyleType.LowerRoman => MarkerRoman(index, lowercase: true),
+                    ListStyleType.UpperRoman => MarkerRoman(index, lowercase: false),
+                    _ => index.ToString()
+                };
+                string label = marker + ".";
+                var size = g.MeasureString(label, font, int.MaxValue,
+                    new StringFormat(StringFormat.GenericTypographic));
+                g.DrawString(label, font, brush, box.X - size.Width - 4f, markerY,
+                    new StringFormat(StringFormat.GenericTypographic));
+                return;
+            }
 
             switch (shape)
             {

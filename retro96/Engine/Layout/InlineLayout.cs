@@ -265,11 +265,20 @@ public static class InlineLayout
             return MeasureSmallCapsWidth(text, style);
 
         var font = ResolveRunFont(style);
-        var sz = _measureG.MeasureString(text, font, int.MaxValue, _sf);
-        float width = (float)sz.Width;
-        if (text.Length > 1) width += Math.Max(0f, text.Length - 1) * style.LetterSpacing;
-        int spaces = text.Count(c => char.IsWhiteSpace(c));
-        if (spaces > 0) width += spaces * style.WordSpacing;
+        if (Math.Abs(style.LetterSpacing) <= 0.001f &&
+            Math.Abs(style.WordSpacing) <= 0.001f)
+        {
+            var measured = _measureG.MeasureString(text, font, int.MaxValue, _sf);
+            return Math.Max(0f, (float)Math.Ceiling(measured.Width));
+        }
+
+        float width = 0f;
+        for (int i = 0; i < text.Length; i++)
+        {
+            width += _measureG.MeasureString(text[i].ToString(), font, int.MaxValue, _sf).Width;
+            if (i + 1 < text.Length) width += style.LetterSpacing;
+            if (char.IsWhiteSpace(text[i])) width += style.WordSpacing;
+        }
         return Math.Max(0f, (float)Math.Ceiling(width));
     }
 
@@ -297,12 +306,8 @@ public static class InlineLayout
 
             string run = text[start..i];
             string draw = lower ? run.ToUpperInvariant() : run;
-            // Synthetic small-caps use the reduced-size glyphs only for
-            // their outlines. Keep the nominal/full-size advance so the
-            // letters do not bunch together just because the fallback
-            // small-cap font is smaller. This also keeps word spacing
-            // consistent with the normal text metrics.
-            width += _measureG.MeasureString(draw, fullFont, int.MaxValue, _sf).Width;
+            var runFont = lower ? smallFont : fullFont;
+            width += _measureG.MeasureString(draw, runFont, int.MaxValue, _sf).Width;
         }
 
         if (text.Length > 1) width += Math.Max(0f, text.Length - 1) * style.LetterSpacing;
@@ -431,11 +436,25 @@ public static class InlineLayout
     private enum VAlignMode { Baseline, Top, Middle, Bottom }
 
     private readonly record struct MeasuredItem(
-        LayoutBox Box, float W, float H, float Asc, VAlignMode VA,
+        LayoutBox Box, float W, float H, float Asc, float ContentHeight, float LeadingTop, VAlignMode VA,
         bool Atomic, float MarginL, float MarginR);
 
     private static VAlignMode GetVAlignMode(LayoutBox box)
     {
+        var style = box.Element?.Style;
+        if (style?.OwnVerticalAlign == true)
+        {
+            if (style.VerticalAlignPercent.HasValue)
+                return VAlignMode.Baseline;
+            return style.VerticalAlign switch
+            {
+                VerticalAlign.Top or VerticalAlign.TextTop => VAlignMode.Top,
+                VerticalAlign.Middle => VAlignMode.Middle,
+                VerticalAlign.Bottom or VerticalAlign.TextBottom => VAlignMode.Bottom,
+                _ => VAlignMode.Baseline
+            };
+        }
+
         var align = box.Element?.GetAttr("align")?.Trim().ToLowerInvariant();
         return align switch
         {
@@ -486,11 +505,13 @@ public static class InlineLayout
                     bool isSpace = frag.TextRun == " ";
                     if (isSpace && lastWasSpace)
                         continue;
-                    MeasureBox(frag, out float w, out float h, out float asc);
+                    MeasureBox(frag, out float w, out float h, out float asc,
+                        out float contentHeight, out float leadingTop);
                     bool atomic = frag.Element?.TagName == "spacer"
                                   || frag.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame
                                   || frag.ReplacedImage != null;
-                    items.Add(new MeasuredItem(frag, w, h, asc, GetVAlignMode(frag), atomic,
+                    items.Add(new MeasuredItem(frag, w, h, asc, contentHeight, leadingTop,
+                        GetVAlignMode(frag), atomic,
                         atomic ? frag.MarginLeft : 0f,
                         atomic ? frag.MarginRight : 0f));
                     lastWasSpace = isSpace;
@@ -536,6 +557,16 @@ public static class InlineLayout
         for (int i = 0; i < items.Count; i++)
         {
             var it = items[i];
+            ComputedStyle? firstLineStyle = null;
+            if (firstLine && it.Box.StyleOverride == null &&
+                !string.IsNullOrEmpty(it.Box.TextRun) &&
+                it.Box.Element?.Style is { } elementStyle &&
+                ReferenceEquals(elementStyle, containerStyle))
+            {
+                firstLineStyle = elementStyle.FirstLineStyle;
+                if (firstLineStyle != null)
+                    it = Remeasure(it, firstLineStyle);
+            }
 
             // Leading spaces are dropped ONLY while the line is still empty.
             // The old flag-based version left skipLeadingSpaces=true after a
@@ -644,6 +675,11 @@ public static class InlineLayout
                 lineItems.Clear();
                 lineW = 0f;
                 RecomputeAvailableWidth();
+                if (firstLineStyle != null)
+                {
+                    it = Remeasure(it, null);
+                    outerW = it.MarginL + it.W + it.MarginR;
+                }
                 LayoutTrace.Log($"  new availW at y={currentY:F1} => {availW:F1}");
                 if (it.Box.TextRun == " ")
                 {
@@ -705,11 +741,23 @@ public static class InlineLayout
         var measured = new List<MeasuredItem>(pieces.Count);
         foreach (var piece in pieces)
         {
-            MeasureBox(piece, out float width, out float height, out float ascent);
-            measured.Add(new MeasuredItem(piece, width, height, ascent,
+            MeasureBox(piece, out float width, out float height, out float ascent,
+                out float contentHeight, out float leadingTop);
+            measured.Add(new MeasuredItem(piece, width, height, ascent, contentHeight, leadingTop,
                 GetVAlignMode(piece), false, 0f, 0f));
         }
         return measured;
+    }
+
+    private static MeasuredItem Remeasure(MeasuredItem item, ComputedStyle? styleOverride)
+    {
+        MeasureBox(item.Box, out float width, out float height, out float ascent,
+            out float contentHeight, out float leadingTop, styleOverride);
+        return item with
+        {
+            W = width, H = height, Asc = ascent,
+            ContentHeight = contentHeight, LeadingTop = leadingTop
+        };
     }
 
     private static bool RunIsUnbreakable(DomElement? elem)
@@ -800,10 +848,12 @@ public static class InlineLayout
         if (items.Count == 0) return 0f;
 
         float maxAscent = 0f, maxDescent = 0f;
+        float minLeadingTop = float.MaxValue;
         foreach (var it in items)
         {
             maxAscent = Math.Max(maxAscent, it.Asc);
             maxDescent = Math.Max(maxDescent, it.H - it.Asc);
+            minLeadingTop = Math.Min(minLeadingTop, it.LeadingTop);
         }
         float lineH = Math.Max(maxAscent + maxDescent, 1f);
 
@@ -868,13 +918,13 @@ public static class InlineLayout
             switch (it.VA)
             {
                 case VAlignMode.Top:
-                    box.Y = y;
+                    box.Y = y + minLeadingTop - it.LeadingTop;
                     break;
                 case VAlignMode.Middle:
-                    box.Y = y + (lineH - it.H) / 2f;
+                    box.Y = y + (lineH - it.ContentHeight) / 2f - it.LeadingTop;
                     break;
                 case VAlignMode.Bottom:
-                    box.Y = y + lineH - it.H;
+                    box.Y = y + lineH - minLeadingTop - it.ContentHeight - it.LeadingTop;
                     break;
                 default:
                     box.Y = y + (maxAscent - it.Asc);
@@ -883,6 +933,8 @@ public static class InlineLayout
                     var tag = elem?.TagName;
                     if (cssVa == VerticalAlign.Super || tag == "sup") box.Y -= it.H * 0.35f;
                     else if (cssVa == VerticalAlign.Sub || tag == "sub") box.Y += it.H * 0.25f;
+                    if (elem?.Style?.VerticalAlignPercent is { } percent)
+                        box.Y -= lineH * percent / 100f;
                     break;
             }
 
@@ -923,7 +975,9 @@ public static class InlineLayout
     // ─────────────────────────────────────────────────────────────────────
 
     private static void MeasureBox(LayoutBox box,
-        out float width, out float height, out float ascent)
+        out float width, out float height, out float ascent,
+        out float contentHeight, out float leadingTop,
+        ComputedStyle? styleOverride = null)
     {
         // Atomic inline boxes (images, form controls, inline-blocks, frames)
         // and Netscape <spacer type=horizontal>.  SPACER is an empty element,
@@ -941,6 +995,7 @@ public static class InlineLayout
                 el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant() == "hidden")
             {
                 width = 0f; height = 0f; ascent = 0f;
+                contentHeight = 0f; leadingTop = 0f;
                 return;
             }
 
@@ -959,6 +1014,8 @@ public static class InlineLayout
 
             width = cw + box.BorderLeft + box.BorderRight + box.PaddingLeft + box.PaddingRight;
             height = ch + box.BorderTop + box.BorderBottom + box.PaddingTop + box.PaddingBottom;
+            contentHeight = height;
+            leadingTop = 0f;
 
             // Baseline placement.  Images sit bottom-on-baseline (the
             // standard inline convention).  FORM CONTROLS straddle it —
@@ -974,22 +1031,22 @@ public static class InlineLayout
         // draws with, spaces glued to its word.
         if (!string.IsNullOrEmpty(box.TextRun))
         {
-            var style = box.StyleOverride
-                     ?? box.Element?.Style?.FirstLineStyle
-                     ?? box.Element?.Style;
+            var style = styleOverride ?? box.StyleOverride ?? box.Element?.Style;
             if (_fontCache != null && style != null)
             {
                 var font = ResolveRunFont(style);
 
                 var measuredText = TransformText(box.TextRun, style.TextTransform);
                 width = MeasureTextWidth(measuredText, style);
+                contentHeight = font.GetHeight(_measureG);
 
                 height = style.LineHeightMode switch
                 {
                     LineHeightMode.Number => (float)Math.Ceiling(Math.Max(0f, style.LineHeight) * style.FontSize),
                     LineHeightMode.Absolute => (float)Math.Ceiling(Math.Max(0f, style.LineHeightPixels)),
-                    _ => (float)Math.Ceiling(font.GetHeight(_measureG))
+                    _ => (float)Math.Ceiling(contentHeight)
                 };
+                leadingTop = Math.Max(0f, (height - contentHeight) / 2f);
 
 
                 // FIX: guard the em-unit ratio — GetLineSpacing can return 0
@@ -997,22 +1054,31 @@ public static class InlineLayout
                 // box on the line lands at NaN Y.
                 float cellH = font.FontFamily.GetLineSpacing(font.Style);
                 float ascentU = font.FontFamily.GetCellAscent(font.Style);
-                ascent = cellH > 0f
+                float naturalAscent = cellH > 0f
                     ? font.GetHeight(_measureG) * (ascentU / cellH)
                     : font.GetHeight(_measureG) * 0.8f;
+                ascent = naturalAscent + leadingTop;
                 return;
             }
 
             float fSize = style?.FontSize > 0f ? style.FontSize : 16f;
             width = TransformText(box.TextRun!, style?.TextTransform ?? TextTransform.None).Length
                 * fSize * 0.55f;
-            height = fSize * 1.2f;
-            ascent = fSize * 0.85f;
+            contentHeight = fSize * 1.2f;
+            height = style?.LineHeightMode switch
+            {
+                LineHeightMode.Number => Math.Max(0f, style.LineHeight * style.FontSize),
+                LineHeightMode.Absolute => Math.Max(0f, style.LineHeightPixels),
+                _ => contentHeight
+            };
+            leadingTop = Math.Max(0f, (height - contentHeight) / 2f);
+            ascent = fSize * 0.85f + leadingTop;
             return;
         }
 
         // Empty / unknown (<br>, <wbr>)
         width = 0f; height = 0f; ascent = 0f;
+        contentHeight = 0f; leadingTop = 0f;
     }
 
     private static DomElement? containerStyleElement(LayoutBox box, ComputedStyle style)
@@ -1026,8 +1092,28 @@ public static class InlineLayout
         {
             TextTransform.Uppercase => text.ToUpperInvariant(),
             TextTransform.Lowercase => text.ToLowerInvariant(),
+            TextTransform.Capitalize => CapitalizeWords(text),
             _ => text
         };
+
+    private static string CapitalizeWords(string text)
+    {
+        var chars = text.ToCharArray();
+        bool start = true;
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (char.IsLetterOrDigit(chars[i]))
+            {
+                if (start) chars[i] = char.ToUpperInvariant(chars[i]);
+                start = false;
+            }
+            else
+            {
+                start = true;
+            }
+        }
+        return new string(chars);
+    }
 
     private static IEnumerable<LayoutBox> ApplyFirstLetter(LayoutBox box)
     {

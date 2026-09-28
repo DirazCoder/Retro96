@@ -349,12 +349,15 @@ public class HttpClient
         return (headerText, wire);
     }
 
-    internal async Task<HttpResult> SendRawAsync(
-        ParsedUrl url, byte[] wire, CancellationToken ct, System.Net.IPAddress? connectAddress = null) =>
-        await SendOverSocketAsync(url, wire, ct, connectAddress).ConfigureAwait(false);
+    internal Task<HttpResult> SendRawAsync(
+        ParsedUrl url, byte[] wire, CancellationToken ct,
+        System.Net.IPAddress? connectAddress = null, int maxResponseBytes = MaxBodySize) =>
+        SendOverSocketAsync(url, wire, ct, connectAddress,
+            Math.Clamp(maxResponseBytes, 1, MaxBodySize));
 
     private async Task<HttpResult> SendOverSocketAsync(
-        ParsedUrl url, byte[] wire, CancellationToken ct, System.Net.IPAddress? connectAddress = null)
+        ParsedUrl url, byte[] wire, CancellationToken ct,
+        System.Net.IPAddress? connectAddress = null, int maxResponseBytes = MaxBodySize)
     {
         TcpClient? tcpClient = null;
         try
@@ -405,7 +408,7 @@ public class HttpClient
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             readCts.CancelAfter(ReadTimeoutMs);
 
-            return await ReadResponseAsync(stream, url, readCts.Token);
+            return await ReadResponseAsync(stream, url, readCts.Token, maxResponseBytes);
         }
         catch (OperationCanceledException)
         {
@@ -456,7 +459,7 @@ public class HttpClient
     }
 
     private async Task<HttpResult> ReadResponseAsync(Stream stream, ParsedUrl url,
-                                                     CancellationToken ct)
+                                                     CancellationToken ct, int maxBodySize)
     {
         string? statusLine = await ReadRawLineAsync(stream, ct);
         if (string.IsNullOrEmpty(statusLine))
@@ -517,7 +520,7 @@ public class HttpClient
         {
             if (contentLength < 0)
                 return new HttpError("Invalid Content-Length");
-            if (contentLength > MaxBodySize)
+            if (contentLength > maxBodySize)
                 return new HttpError($"Response body too large: {contentLength} bytes");
 
             try
@@ -532,11 +535,11 @@ public class HttpClient
         else if (headers.TryGetValue("transfer-encoding", out var transferEncoding) &&
                  transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
         {
-            body = await ReadChunkedAsync(stream, ct);
+            body = await ReadChunkedAsync(stream, ct, maxBodySize);
         }
         else
         {
-            body = await ReadUntilCloseAsync(stream, ct);
+            body = await ReadUntilCloseAsync(stream, ct, maxBodySize);
         }
 
         // Content-Encoding: gzip (defensive — the request never asks)
@@ -559,7 +562,7 @@ public class HttpClient
                 {
                     int n = await gzip.ReadAsync(buf, ct);
                     if (n <= 0) break;
-                    if (output.Length + n > MaxBodySize)
+                    if (output.Length + n > maxBodySize)
                         return new HttpError("Decompressed response body too large");
                     await output.WriteAsync(buf.AsMemory(0, n), ct);
                 }
@@ -594,7 +597,8 @@ public class HttpClient
     /// a buffered StreamReader here swallows chunk data into its internal
     /// buffer and corrupts the body.
     /// </summary>
-    private static async Task<byte[]> ReadChunkedAsync(Stream stream, CancellationToken ct)
+    private static async Task<byte[]> ReadChunkedAsync(
+        Stream stream, CancellationToken ct, int maxBodySize)
     {
         using var ms = new MemoryStream();
         while (true)
@@ -617,7 +621,7 @@ public class HttpClient
                 }
             }
 
-            if (ms.Length + chunkSize > MaxBodySize)
+            if (ms.Length + chunkSize > maxBodySize)
                 throw new InvalidDataException("Chunked response body too large.");
 
             byte[] chunk = await ReadExactAsync(stream, chunkSize, ct);
@@ -628,18 +632,19 @@ public class HttpClient
         }
     }
 
-    private async Task<byte[]> ReadUntilCloseAsync(Stream stream, CancellationToken ct)
+    private async Task<byte[]> ReadUntilCloseAsync(
+        Stream stream, CancellationToken ct, int maxBodySize)
     {
         using var ms = new MemoryStream();
         byte[] buffer = new byte[8192];
         while (true)
         {
-            int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+            int readSize = (int)Math.Min(buffer.Length, maxBodySize - ms.Length + 1);
+            int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, readSize), ct);
             if (bytesRead == 0) break;
-            await ms.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-
-            if (ms.Length > MaxBodySize)
+            if (ms.Length + bytesRead > maxBodySize)
                 throw new InvalidDataException("Response body too large before connection close.");
+            await ms.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
         }
         return ms.ToArray();
     }
