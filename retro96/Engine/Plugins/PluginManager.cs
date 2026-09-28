@@ -708,7 +708,7 @@ public sealed class PluginManager : IDisposable
         {
             Id = p.Manifest.Id,
             Enabled = p.Enabled,
-            GrantedPermissions = (long)p.GrantedPermissions
+            GrantedPermissions = p.GrantedPermissions
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
     }
@@ -764,7 +764,7 @@ public sealed class PluginManager : IDisposable
     {
         public string Id { get; set; } = "";
         public bool Enabled { get; set; }
-        public long GrantedPermissions { get; set; }
+        public ulong GrantedPermissions { get; set; }
     }
 
     public sealed class PluginRecord

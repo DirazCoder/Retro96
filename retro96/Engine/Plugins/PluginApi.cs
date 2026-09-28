@@ -10,32 +10,32 @@ public static class Retro96PluginApi
 }
 
 [Flags]
-public enum PluginPermission
+public enum PluginPermission : ulong
 {
     None = 0,
-    BrowserRead = 1 << 0,
-    BrowserNavigation = 1 << 1,
-    BrowserWindows = 1 << 2,
-    BrowserEvents = 1 << 3,
-    UserInterface = 1 << 4,
-    Storage = 1 << 5,
-    Network = 1 << 6,
-    FileSystem = 1 << 7,
-    Clipboard = 1 << 8,
-    BrowserZoom = 1 << 9,
-    BrowserCookies = 1 << 10,
-    BrowserFind = 1 << 11,
-    BrowserScreenshot = 1 << 12,
-    UiPanel = 1 << 13,
-    AudioPlayback = 1 << 14,
-    Notifications = 1 << 15,
-    Dialogs = 1 << 16,
-    EmbedRenderer = 1 << 17,
-    EmbedNetwork = 1 << 18,
-    EmbedNavigate = 1 << 19,
-    EmbedStatus = 1 << 20,
-    EmbedPrint = 1 << 21,
-    EmbedScript = 1 << 22
+    BrowserRead = 1UL << 0,
+    BrowserNavigation = 1UL << 1,
+    BrowserWindows = 1UL << 2,
+    BrowserEvents = 1UL << 3,
+    UserInterface = 1UL << 4,
+    Storage = 1UL << 5,
+    Network = 1UL << 6,
+    FileSystem = 1UL << 7,
+    Clipboard = 1UL << 8,
+    BrowserZoom = 1UL << 9,
+    BrowserCookies = 1UL << 10,
+    BrowserFind = 1UL << 11,
+    BrowserScreenshot = 1UL << 12,
+    UiPanel = 1UL << 13,
+    AudioPlayback = 1UL << 14,
+    Notifications = 1UL << 15,
+    Dialogs = 1UL << 16,
+    EmbedRenderer = 1UL << 17,
+    EmbedNetwork = 1UL << 18,
+    EmbedNavigate = 1UL << 19,
+    EmbedStatus = 1UL << 20,
+    EmbedPrint = 1UL << 21,
+    EmbedScript = 1UL << 22
 }
 
 public static class PluginPermissionNames

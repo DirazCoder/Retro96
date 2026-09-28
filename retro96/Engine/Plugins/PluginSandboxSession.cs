@@ -272,7 +272,7 @@ internal sealed class PluginSandboxSession : IDisposable
                         string.Equals(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HelloPayload>(envelope)?.PluginId,
                             _record.Manifest.Id, StringComparison.OrdinalIgnoreCase),
                         JsonSerializer.Serialize(_record.Manifest, PluginManifestJsonContext.Default.PluginManifest),
-                        (long)_record.GrantedPermissions,
+                        (ulong)_record.GrantedPermissions,
                         string.Equals(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HelloPayload>(envelope)?.PluginId,
                             _record.Manifest.Id, StringComparison.OrdinalIgnoreCase) ? "" : "Plugin id mismatch."));
                     break;
