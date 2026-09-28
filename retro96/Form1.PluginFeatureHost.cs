@@ -129,6 +129,33 @@ public partial class Form1
     internal void PluginFindClear() => _canvas.FindClear();
     internal byte[] PluginCaptureViewport() => _canvas.CaptureViewportPng();
 
+    internal string PluginGetPageText() => _canvas.PageDocument?.InnerText ?? string.Empty;
+
+    internal IReadOnlyList<PluginPageLink> PluginGetPageLinks()
+    {
+        var document = _canvas.PageDocument;
+        if (document == null) return Array.Empty<PluginPageLink>();
+        var list = new List<PluginPageLink>();
+        foreach (var element in document.Links.Take(2000))
+        {
+            string href = element.GetAttr("href") ?? string.Empty;
+            if (href.Length == 0) continue;
+            string absolute = href;
+            try { if (document.BaseUrl != null) absolute = document.BaseUrl.Resolve(href).ToAbsolute(); } catch { }
+            list.Add(new PluginPageLink(absolute, TruncatePluginText(element.InnerText.Trim(), 512), TruncatePluginText(element.GetAttr("title") ?? string.Empty, 512)));
+        }
+        return list;
+    }
+
+    internal string? PluginGetSelection()
+    {
+        string value = _canvas.GetPluginSelectedText();
+        return string.IsNullOrWhiteSpace(value) ? null : TruncatePluginText(value, 64 * 1024);
+    }
+
+    private static string TruncatePluginText(string value, int max) =>
+        value.Length <= max ? value : value[..max];
+
     internal async Task<string> PluginNetworkGetStringAsync(string url, CancellationToken ct) => await PluginNetworkSendAsync(new HttpPluginRequest("GET", url), ct).ConfigureAwait(false);
 
     internal async Task<byte[]> PluginNetworkGetBytesAsync(string url, CancellationToken ct) => Convert.FromBase64String(await PluginNetworkSendAsync(new HttpPluginRequest("GET", url), ct, binary: true).ConfigureAwait(false));

@@ -4710,6 +4710,8 @@ public class BrowserCanvas : Control
             yield return textBoxes[i];
     }
 
+    internal string GetPluginSelectedText() => GetSelectedText();
+
     private string GetSelectedText()
     {
         var textBoxes = OrderedSelectionBoxes();

@@ -47,6 +47,8 @@ internal static class PluginSandboxWorker
         private readonly Dictionary<string, Action> _invokeCallbacks = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Func<ContextMenuContext, bool>> _contextQueries = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Action<ContextMenuContext>> _contextActions = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>>> _protocolCallbacks = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Func<PluginContentTransformRequest, CancellationToken, Task<string>>> _contentTransformCallbacks = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Action<string?, bool?, int?>> _panelCallbacks = new(StringComparer.Ordinal);
         private readonly PluginEventsProxy _events = new();
         private WorkerEmbeddedContentService? _embeds;
@@ -77,10 +79,23 @@ internal static class PluginSandboxWorker
         public IPluginEmbeddedContentService Embeds => _embeds!;
         public IPluginLogger Log { get; private set; } = null!;
         public IPluginHostInfo Info { get; private set; } = null!;
+        public IPluginPageRead Page { get; private set; } = null!;
+        public IPluginNetworkRules NetworkRules { get; private set; } = null!;
+        public IPluginProtocols Protocols { get; private set; } = null!;
+        public IPluginContentTransform ContentTransform { get; private set; } = null!;
+        public IPluginPageStyle PageStyle { get; private set; } = null!;
+        public IPluginTabs Tabs { get; private set; } = null!;
+        public IPluginHistory History { get; private set; } = null!;
+        public IPluginBookmarks Bookmarks { get; private set; } = null!;
         public bool HasPermission(PluginPermission permission) => (_grantedPermissions & permission) == permission;
         public Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default) =>
             SendRequestAsync<PluginSandboxProtocol.PermissionRequestReply>("permission.request", new PluginSandboxProtocol.PermissionRequestPayload(name), cancellationToken)
                 .ContinueWith(t => t.Result.Granted, cancellationToken, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+        internal void RegisterProtocol(string token, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>> callback) => _protocolCallbacks[token] = callback;
+        internal void RemoveProtocol(string token) => _protocolCallbacks.Remove(token);
+        internal void RegisterContentTransform(string token, Func<PluginContentTransformRequest, CancellationToken, Task<string>> callback) => _contentTransformCallbacks[token] = callback;
+        internal void RemoveContentTransform(string token) => _contentTransformCallbacks.Remove(token);
 
         public async Task RunAsync()
         {
@@ -105,6 +120,14 @@ internal static class PluginSandboxWorker
             Dialogs = new WorkerDialogs(this);
             _embeds = new WorkerEmbeddedContentService(this);
             Log = new WorkerLogger(this);
+            Page = new WorkerPageRead(this);
+            NetworkRules = new WorkerNetworkRules(this);
+            Protocols = new WorkerProtocols(this);
+            ContentTransform = new WorkerContentTransform(this);
+            PageStyle = new WorkerPageStyle(this);
+            Tabs = new WorkerTabs(this);
+            History = new WorkerHistory(this);
+            Bookmarks = new WorkerBookmarks(this);
             try
             {
                 _plugin!.Initialize(this);
@@ -261,7 +284,7 @@ internal static class PluginSandboxWorker
                             }
                             break;
 
-                        case "event.navigated": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigatedPayload>(envelope) is { } nav) _ = Task.Run(() => InvokePluginCallback("Navigated", () => _events.RaiseNavigated(new PluginNavigationEventArgs(nav.Url)))); break;
+                case "event.navigated": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigatedPayload>(envelope) is { } nav) _ = Task.Run(() => InvokePluginCallback("Navigated", () => _events.RaiseNavigated(new PluginNavigationEventArgs(nav.Url)))); break;
                         case "event.pageLoaded": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPageLoadedPayload>(envelope) is { } page) _ = Task.Run(() => InvokePluginCallback("PageLoaded", () => _events.RaisePageLoaded(new PluginPageEventArgs(page.Url, page.Title)))); break;
                         case "event.hostShuttingDown": _ = Task.Run(() => InvokePluginCallback("HostShuttingDown", _events.RaiseHostShuttingDown)); break;
                         case "event.focus": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventFocusPayload>(envelope) is { } focus) _ = Task.Run(() => InvokePluginCallback("WindowFocusChanged", () => _events.RaiseFocus(focus.HasFocus))); break;
@@ -339,29 +362,10 @@ internal static class PluginSandboxWorker
 
         private async Task HandleBinaryAsync(PluginSandboxProtocol.BinaryEnvelope binary)
         {
-            if (binary.Op == "embed.stream.chunk")
-            {
-                var chunk = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStreamChunkPayload>(binary) ?? throw new InvalidDataException();
-                lock (_streams)
-                {
-                    if (_streams.TryGetValue(chunk.StreamToken, out var stream))
-                        stream.AcceptChunk(chunk, binary.Data);
-                }
+            if (binary.Op == "protocol.response" || binary.Op == "content.transform.response")
+                throw new InvalidOperationException($"Unexpected plugin response '{binary.Op}'.");
+            if (binary.Op == "embed.frame")
                 return;
-            }
-            if (binary.Op == "embed.input")
-            {
-                var input = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedInputPayload>(binary) ?? throw new InvalidDataException();
-                WorkerEmbeddedInstance? instance;
-                lock (_embeddedInstances) _embeddedInstances.TryGetValue(input.InstanceToken, out instance);
-                if (instance != null) await instance.HandleInputAsync(input.Event, _lifetime.Token).ConfigureAwait(false);
-                return;
-            }
-            if (binary.Op == "embed.frame" && _pendingBinary.TryGetValue(binary.Id, out var completion))
-            {
-                completion.TrySetResult(binary);
-                return;
-            }
             throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{binary.Op}'.");
         }
 
@@ -780,6 +784,118 @@ internal static class PluginSandboxWorker
             public async Task<string?> OpenFilePickerAsync(string title, string filter) { Demand(PluginPermission.Dialogs); return (await Host.SendRequestAsync<PluginSandboxProtocol.DialogOpenReply>("dialogs.open", new PluginSandboxProtocol.DialogOpenPayload(title, filter), CancellationToken.None).ConfigureAwait(false)).RelativePath; }
             public async Task<bool> SaveFilePickerAsync(string sandboxRelativePath, string suggestedFilename, string filter) { Demand(PluginPermission.Dialogs); return (await Host.SendRequestAsync<PluginSandboxProtocol.DialogSaveReply>("dialogs.save", new PluginSandboxProtocol.DialogSavePayload(sandboxRelativePath, suggestedFilename, filter), CancellationToken.None).ConfigureAwait(false)).Success; }
         }
+
+        private sealed class WorkerPageRead : RpcService, IPluginPageRead
+        {
+            public WorkerPageRead(PluginWorkerHost host) : base(host) { }
+            public async Task<string> GetPageTextAsync(CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.PageRead); return (await Host.SendRequestAsync<PluginSandboxProtocol.PageReadReply>("page.read.text", null, cancellationToken).ConfigureAwait(false)).Text; }
+            public async Task<IReadOnlyList<PluginPageLink>> GetLinksAsync(CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.PageRead); return (await Host.SendRequestAsync<PluginSandboxProtocol.PageLinksReply>("page.read.links", null, cancellationToken).ConfigureAwait(false)).Links; }
+            public async Task<string?> GetSelectionAsync(CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.PageRead); return (await Host.SendRequestAsync<PluginSandboxProtocol.PageSelectionReply>("page.read.selection", null, cancellationToken).ConfigureAwait(false)).Text; }
+        }
+
+        private sealed class WorkerNetworkRules : RpcService, IPluginNetworkRules
+        {
+            public WorkerNetworkRules(PluginWorkerHost host) : base(host) { }
+            public void SetRules(IEnumerable<PluginNetworkRule> rules)
+            {
+                Demand(PluginPermission.NetworkRules);
+                var list = (rules ?? Array.Empty<PluginNetworkRule>()).Take(100).ToArray();
+                Host.SendRequestAsync<object>("network.rules.set", new PluginSandboxProtocol.NetworkRulesPayload(list), CancellationToken.None).GetAwaiter().GetResult();
+            }
+            public void Clear()
+            { Demand(PluginPermission.NetworkRules); Host.SendRequestAsync<object>("network.rules.clear", null, CancellationToken.None).GetAwaiter().GetResult(); }
+        }
+
+        private sealed class WorkerProtocols : RpcService, IPluginProtocols
+        {
+            public WorkerProtocols(PluginWorkerHost host) : base(host) { }
+            public IDisposable Register(string scheme, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>> handler)
+            {
+                Demand(PluginPermission.Protocol);
+                if (string.IsNullOrWhiteSpace(scheme) || handler == null) throw new ArgumentException("A protocol scheme and handler are required.");
+                scheme = scheme.Trim().ToLowerInvariant();
+                if (scheme.Length > 32 || !scheme.All(c => char.IsLetterOrDigit(c) || c is '+' or '-' or '.')) throw new ArgumentException("Invalid protocol scheme.");
+                string token = Guid.NewGuid().ToString("N");
+                Host.RegisterProtocol(token, handler);
+                Host.SendRequestAsync<object>("protocol.register", new PluginSandboxProtocol.ProtocolRegisterPayload(scheme, token), CancellationToken.None).GetAwaiter().GetResult();
+                return new ActionLease(() => { Host.RemoveProtocol(token); try { Host.SendRequestAsync<object>("protocol.unregister", new PluginSandboxProtocol.ProtocolRegisterPayload(scheme, token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } });
+            }
+        }
+
+        private sealed class WorkerContentTransform : RpcService, IPluginContentTransform
+        {
+            public WorkerContentTransform(PluginWorkerHost host) : base(host) { }
+            public IDisposable Register(string contentType, Func<PluginContentTransformRequest, CancellationToken, Task<string>> handler)
+            {
+                Demand(PluginPermission.ContentTransform);
+                if (string.IsNullOrWhiteSpace(contentType) || handler == null) throw new ArgumentException("A content type and handler are required.");
+                contentType = contentType.Trim().ToLowerInvariant();
+                string token = Guid.NewGuid().ToString("N");
+                Host.RegisterContentTransform(token, handler);
+                Host.SendRequestAsync<object>("content.transform.register", new PluginSandboxProtocol.ContentTransformRegisterPayload(contentType, token), CancellationToken.None).GetAwaiter().GetResult();
+                return new ActionLease(() => { Host.RemoveContentTransform(token); try { Host.SendRequestAsync<object>("content.transform.unregister", new PluginSandboxProtocol.ContentTransformRegisterPayload(contentType, token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } });
+            }
+        }
+
+        private sealed class WorkerPageStyle : RpcService, IPluginPageStyle
+        {
+            public WorkerPageStyle(PluginWorkerHost host) : base(host) { }
+            public IDisposable SetCss(string css)
+            {
+                Demand(PluginPermission.PageStyle);
+                if (css == null || css.Length > 64 * 1024) throw new ArgumentOutOfRangeException(nameof(css));
+                string token = Guid.NewGuid().ToString("N");
+                Host.SendRequestAsync<object>("page.style.set", new PluginSandboxProtocol.PageStylePayload(token, css), CancellationToken.None).GetAwaiter().GetResult();
+                return new ActionLease(() => { try { Host.SendRequestAsync<object>("page.style.remove", new PluginSandboxProtocol.PageStyleRemovePayload(token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } });
+            }
+        }
+
+        private sealed class WorkerTabs : RpcService, IPluginTabs
+        {
+            public WorkerTabs(PluginWorkerHost host) : base(host) { }
+            public event Func<PluginBeforeNavigateEventArgs, Task<PluginBeforeNavigateDecision>>? BeforeNavigate;
+            public async Task<IReadOnlyList<PluginTabInfo>> ListAsync(CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.Tabs); return (await Host.SendRequestAsync<PluginSandboxProtocol.TabsListReply>("tabs.list", null, cancellationToken).ConfigureAwait(false)).Tabs; }
+            internal async Task<PluginBeforeNavigateDecision> RaiseBeforeNavigateAsync(PluginBeforeNavigateEventArgs args)
+            {
+                var handlers = BeforeNavigate?.GetInvocationList();
+                if (handlers == null || handlers.Length == 0) return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow);
+                foreach (var callback in handlers)
+                {
+                    try
+                    {
+                        var result = await ((Func<PluginBeforeNavigateEventArgs, Task<PluginBeforeNavigateDecision>>)callback)(args).ConfigureAwait(false);
+                        if (result.Action != PluginBeforeNavigateAction.Allow) return result;
+                    }
+                    catch { return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow); }
+                }
+                return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow);
+            }
+        }
+
+        private sealed class WorkerHistory : RpcService, IPluginHistory
+        {
+            public WorkerHistory(PluginWorkerHost host) : base(host) { }
+            public async Task<IReadOnlyList<PluginHistoryEntry>> SearchAsync(string? query = null, int maxResults = 100, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.History); maxResults = Math.Clamp(maxResults, 1, 100); return (await Host.SendRequestAsync<PluginSandboxProtocol.HistoryReply>("history.search", new PluginSandboxProtocol.HistorySearchPayload(query, maxResults), cancellationToken).ConfigureAwait(false)).Entries; }
+        }
+
+        private sealed class WorkerBookmarks : RpcService, IPluginBookmarks
+        {
+            public WorkerBookmarks(PluginWorkerHost host) : base(host) { }
+            public async Task<IReadOnlyList<PluginBookmarkEntry>> ListAsync(int maxResults = 500, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.Bookmarks); maxResults = Math.Clamp(maxResults, 1, 500); return (await Host.SendRequestAsync<PluginSandboxProtocol.BookmarksReply>("bookmarks.list", new PluginSandboxProtocol.BookmarksListPayload(maxResults), cancellationToken).ConfigureAwait(false)).Entries; }
+            public Task AddAsync(string title, string url, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.Bookmarks); return Host.SendRequestAsync<object>("bookmarks.add", new PluginSandboxProtocol.BookmarkMutationPayload(title ?? "", url ?? ""), cancellationToken); }
+            public Task RemoveAsync(string url, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.Bookmarks); return Host.SendRequestAsync<object>("bookmarks.remove", new PluginSandboxProtocol.BookmarkRemovePayload(url ?? ""), cancellationToken); }
+        }
+
+        private sealed class ActionLease : IDisposable
+        { private Action? _dispose; public ActionLease(Action dispose) => _dispose = dispose; public void Dispose() => Interlocked.Exchange(ref _dispose, null)?.Invoke(); }
 
         private sealed class WorkerLogger : IPluginLogger
         {

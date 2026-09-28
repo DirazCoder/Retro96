@@ -34,6 +34,9 @@ internal sealed class PluginSandboxSession : IDisposable
     private readonly Dictionary<string, HostEmbeddedRegistration> _embeddedRegistrations = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HostEmbeddedInstance> _embeddedInstances = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HostStreamState> _streams = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _protocols = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _contentTransforms = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _pageStyles = new();
     private NamedPipeServerStream? _pipe;
     private WindowsSecurity.WorkerProcess? _worker;
     private string? _profileName;
@@ -244,7 +247,7 @@ internal sealed class PluginSandboxSession : IDisposable
                         await HandleAsync(envelope).ConfigureAwait(false);
                         break;
                     case PluginSandboxProtocol.BinaryMessage binary:
-                        if (binary.Envelope.Op == "embed.frame" && _pendingBinary.TryGetValue(binary.Envelope.Id, out var binaryCompletion))
+                        if ((binary.Envelope.Op == "embed.frame" || binary.Envelope.Op == "protocol.response" || binary.Envelope.Op == "content.transform.response") && _pendingBinary.TryGetValue(binary.Envelope.Id, out var binaryCompletion))
                             binaryCompletion.TrySetResult(binary.Envelope);
                         else
                             await HandleBinaryAsync(binary.Envelope).ConfigureAwait(false);
@@ -303,6 +306,18 @@ internal sealed class PluginSandboxSession : IDisposable
                         await ReplyAsync(envelope.Id, "response", info).ConfigureAwait(false);
                         break;
                     }
+                case "page.read.text":
+                    var pageText = await GetPageTextAsync(_lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageReadReply(pageText));
+                    break;
+                case "page.read.links":
+                    var pageLinks = await GetPageLinksAsync(_lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageLinksReply(pageLinks.ToArray()));
+                    break;
+                case "page.read.selection":
+                    var selection = await GetSelectionAsync(_lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageSelectionReply(selection));
+                    break;
                 case "browser.state":
                     Demand(PluginPermission.BrowserRead);
                     var viewport = RunOnUi(() => _browser.PluginViewportSize);
@@ -605,6 +620,68 @@ internal sealed class PluginSandboxSession : IDisposable
         }
         throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{envelope.Op}'.");
     }
+
+    internal void RegisterProtocol(string scheme, string token)
+    {
+        Demand(PluginPermission.Protocol);
+        if (string.IsNullOrWhiteSpace(scheme) || scheme.Length > 32) throw new InvalidDataException("Invalid protocol scheme.");
+        lock (_protocols) _protocols[scheme] = token;
+    }
+
+    internal void UnregisterProtocol(string scheme, string token)
+    {
+        lock (_protocols) if (_protocols.TryGetValue(scheme, out var current) && current == token) _protocols.Remove(scheme);
+    }
+
+    internal bool HasProtocol(string scheme) { lock (_protocols) return _protocols.ContainsKey(scheme); }
+
+    internal void RegisterContentTransform(string contentType, string token)
+    {
+        Demand(PluginPermission.ContentTransform);
+        if (string.IsNullOrWhiteSpace(contentType) || contentType.Length > 256) throw new InvalidDataException("Invalid content type.");
+        lock (_contentTransforms) _contentTransforms[contentType] = token;
+    }
+
+    internal void UnregisterContentTransform(string contentType, string token)
+    {
+        lock (_contentTransforms) if (_contentTransforms.TryGetValue(contentType, out var current) && current == token) _contentTransforms.Remove(contentType);
+    }
+
+    internal string[] GetContentTransformTypes() { lock (_contentTransforms) return _contentTransforms.Keys.ToArray(); }
+
+    internal async Task<PluginProtocolResponse?> HandleProtocolAsync(string scheme, string url, string method, CancellationToken ct)
+    {
+        Demand(PluginPermission.Protocol);
+        string token;
+        lock (_protocols) if (!_protocols.TryGetValue(scheme, out token!)) return null;
+        var binary = await SendBinaryRequestAsync("protocol.request", new PluginSandboxProtocol.ProtocolRequestPayload(token, scheme, url, method), ct).ConfigureAwait(true);
+        var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolResponsePayload>(binary) ?? throw new InvalidDataException("Protocol response metadata is missing.");
+        if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
+        if (binary.Data.Length > 32 * 1024 * 1024) throw new InvalidDataException("Protocol response exceeds its size cap.");
+        return new PluginProtocolResponse(binary.Data.ToArray(), meta.ContentType, meta.StatusCode, meta.Charset);
+    }
+
+    internal async Task<string?> TransformContentAsync(string contentType, string url, string charset, byte[] body, CancellationToken ct)
+    {
+        Demand(PluginPermission.ContentTransform);
+        string token;
+        lock (_contentTransforms)
+        {
+            var pair = _contentTransforms.FirstOrDefault(x => contentType.Equals(x.Key, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrEmpty(pair.Key)) return null;
+            token = pair.Value;
+        }
+        if (body.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform input exceeds its size cap.");
+        var binary = await SendBinaryRequestAsync("content.transform.request", new PluginSandboxProtocol.ContentTransformRequestPayload(token, url, contentType, charset), ct).ConfigureAwait(true);
+        var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ContentTransformResponsePayload>(binary) ?? throw new InvalidDataException("Transform response metadata is missing.");
+        if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
+        if (binary.Data.Length > 8 * 1024 * 1024) throw new InvalidDataException("Transform output exceeds its size cap.");
+        return Encoding.UTF8.GetString(binary.Data);
+    }
+
+    internal IReadOnlyList<string> PageStyles { get { lock (_pageStyles) return _pageStyles.ToArray(); } }
+    internal void SetPageStyle(string token, string css) { Demand(PluginPermission.PageStyle); lock (_pageStyles) { _pageStyles.RemoveAll(x => x.StartsWith(token + "\n", StringComparison.Ordinal)); _pageStyles.Add(token + "\n" + css); } }
+    internal void RemovePageStyle(string token) { lock (_pageStyles) _pageStyles.RemoveAll(x => x.StartsWith(token + "\n", StringComparison.Ordinal)); }
 
     internal sealed class EmbeddedHostInstance : IEmbeddedContentInstance
     {
