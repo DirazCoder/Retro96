@@ -303,7 +303,7 @@ public partial class Form1
         if (!string.Equals(pluginId, _pluginManager?.Plugins.FirstOrDefault(x => x.Manifest.Id.Equals(pluginId, StringComparison.OrdinalIgnoreCase))?.Manifest.Id, StringComparison.OrdinalIgnoreCase)) throw new SecurityException("Plugin identity is invalid.");
         string fileName = Path.GetFileName(suggestedFileName ?? string.Empty);
         if (string.IsNullOrWhiteSpace(fileName) || fileName is "." or "..") fileName = "download";
-        fileName = string.Concat(fileName.Where(c => !char.IsControl(c) && c != '\' && c != '/')).Trim();
+        fileName = string.Concat(fileName.Where(c => !char.IsControl(c) && c != '\\' && c != '/')).Trim();
         if (fileName.Length > 128) fileName = fileName[..128];
         if (string.IsNullOrWhiteSpace(fileName)) fileName = "download";
         if (MessageBox.Show(this, $"Plugin '{pluginId}' requested a download from:

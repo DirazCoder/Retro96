@@ -367,9 +367,91 @@ public sealed class PluginManager : IDisposable
     public void Reload(string id)
     {
         if (!_plugins.TryGetValue(id, out var record)) return;
+        if (record.IsDev && !string.IsNullOrWhiteSpace(record.DevSourceDirectory))
+        {
+            try
+            {
+                ReloadUnpackedSource(record);
+                return;
+            }
+            catch (Exception ex)
+            {
+                record.Error = ex.Message;
+                record.Status = "Unpacked reload failed";
+                SaveState();
+                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+        }
         DisableRecord(record);
         if (record.Enabled) TryLoad(record);
         PluginsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ReloadUnpackedSource(PluginRecord record)
+    {
+        string source = Path.GetFullPath(record.DevSourceDirectory!);
+        string manifestPath = Path.Combine(source, "plugin.json");
+        string libPath = Path.Combine(source, "lib");
+        if (!Directory.Exists(source) || !File.Exists(manifestPath) || !Directory.Exists(libPath))
+            throw new InvalidDataException("Load Unpacked source must contain plugin.json and lib/.");
+        PluginManifest manifest = LoadManifest(manifestPath);
+        ValidateManifest(manifest);
+        if (!manifest.Id.Equals(record.Manifest.Id, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The unpacked source changed plugin id.");
+        ValidateEntryAssembly(source, manifest);
+
+        bool wasEnabled = record.Enabled;
+        PluginPermission oldGranted = record.GrantedPermissions;
+        PluginPermission oldRequested = record.RequestedPermissions;
+        string destination = record.Directory;
+        string temp = destination + ".reload-" + Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(temp);
+        try
+        {
+            CopyDirectory(source, temp, skipGit: true);
+            PluginManifest copied = LoadManifest(Path.Combine(temp, "plugin.json"));
+            ValidateManifest(copied);
+            ValidateEntryAssembly(temp, copied);
+            string newHash = ComputeDllSha256(temp, copied);
+            DisableRecord(record);
+            string backup = destination + ".reload-backup-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                Directory.Move(destination, backup);
+                Directory.Move(temp, destination);
+                temp = string.Empty;
+                string oldData = Path.Combine(backup, "data");
+                string newData = Path.Combine(destination, "data");
+                if (Directory.Exists(oldData))
+                {
+                    TryDeleteDirectory(newData);
+                    Directory.Move(oldData, newData);
+                }
+                TryDeleteDirectory(backup);
+            }
+            catch
+            {
+                TryDeleteDirectory(destination);
+                if (Directory.Exists(backup)) Directory.Move(backup, destination);
+                throw;
+            }
+            record.Manifest = copied;
+            record.Directory = destination;
+            record.DllSha256 = newHash;
+            record.GrantedPermissions = oldGranted & copied.AvailablePermissions;
+            record.PendingNewPermissions = copied.RequestedPermissions & ~oldRequested;
+            record.Error = null;
+            record.Status = wasEnabled ? "Reloading (unpacked)" : "Disabled";
+            SaveState();
+            if (wasEnabled) TryLoad(record);
+            PluginsChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch
+        {
+            if (!string.IsNullOrEmpty(temp)) TryDeleteDirectory(temp);
+            throw;
+        }
     }
 
     public IReadOnlyList<PluginActivitySummary> GetActivitySummary(string id)
@@ -1374,6 +1456,8 @@ public sealed class PluginManager : IDisposable
         public string? LastCrashReason { get; internal set; }
         public DateTimeOffset? LastCrashUtc { get; internal set; }
         public PluginPermission PendingNewPermissions { get; internal set; }
+        public bool IsDev { get; internal set; }
+        public string? DevSourceDirectory { get; internal set; }
         internal List<PluginActivityEntry> Activity { get; set; } = new();
         internal readonly object ActivitySync = new();
         internal Action? ActivityPersistence { get; set; }
