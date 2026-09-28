@@ -1,3 +1,4 @@
+using System.Security;
 using Retro96.Plugins;
 
 namespace RetroTests;
@@ -95,5 +96,31 @@ public sealed class PluginSandboxProtocolTests
         Assert.True(PluginSandboxProtocol.MaxStreamChunkBytes > 0);
         Assert.True(PluginSandboxProtocol.MaxJsonBytes >= PluginSandboxProtocol.MaxStreamChunkBytes);
         Assert.True(PluginSandboxProtocol.MaxBinaryFrameBytes >= PluginSandboxProtocol.MaxJsonBytes);
+    }
+}
+
+
+public sealed class PluginPermissionSecurityTests
+{
+    [Fact]
+    public void EveryPermissionDeniesWhenItIsNotGranted()
+    {
+        foreach (var permission in Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None))
+            Assert.Throws<SecurityException>(() => PluginPermissionSecurity.Require(PluginPermission.None, permission));
+    }
+
+    [Fact]
+    public void EveryPermissionAllowsItsOwnGrant()
+    {
+        foreach (var permission in Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None))
+            PluginPermissionSecurity.Require(permission, permission);
+    }
+
+    [Fact]
+    public void WideFlagsRoundTripBeyondIntRange()
+    {
+        var permissions = PluginPermission.Omnibox | PluginPermission.Settings | PluginPermission.UiExtras | PluginPermission.EmbedAudio | PluginPermission.EmbedExtras;
+        Assert.Equal(permissions, PluginPermissionNames.Parse(PluginPermissionNames.ToNames(permissions)));
+        Assert.True((ulong)permissions > uint.MaxValue);
     }
 }

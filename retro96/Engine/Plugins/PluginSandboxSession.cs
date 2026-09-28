@@ -1272,8 +1272,8 @@ internal sealed class PluginSandboxSession : IDisposable
 
     private void Demand(PluginPermission permission, string? networkHost = null)
     {
-        if (!_record.HasPermission(permission))
-            throw new SecurityException($"Plugin '{_record.Manifest.Name}' lacks permission '{string.Join(", ", PluginPermissionNames.ToNames(permission))}'.");
+        try { PluginPermissionSecurity.Require(_record.GrantedPermissions, permission); }
+        catch (SecurityException ex) { throw new SecurityException($"Plugin '{_record.Manifest.Name}' is not allowed to perform this operation.", ex); }
         _record.RecordActivity(permission, networkHost);
     }
 

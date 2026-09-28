@@ -1380,8 +1380,6 @@ public sealed class PluginManager : IDisposable
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
-        public bool IsDev { get; internal set; }
-        public string? DevSourceDirectory { get; internal set; }
         public int CrashCountInWindow => CrashTimes.Count(t => DateTimeOffset.UtcNow - t <= PluginCrashWindow);
 
         internal void RecordActivity(PluginPermission permission, string? host)
