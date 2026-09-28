@@ -87,7 +87,7 @@ internal sealed class PluginPcmMixer : IDisposable
     private void EnsureOutput()
     {
         if (_waveOut != IntPtr.Zero || _format is null) return;
-        var f = _format.Value;
+        var f = _format ?? throw new InvalidOperationException("PCM format is unavailable.");
         int bytesPerSample = f.SampleFormat == PluginPcmSampleFormat.PcmS16Le ? 2 : 4;
         int blockAlign = checked(f.Channels * bytesPerSample);
         var wave = new WAVEFORMATEX
@@ -125,14 +125,15 @@ internal sealed class PluginPcmMixer : IDisposable
     {
         Array.Clear(output);
         if (_format is null) return;
-        int bytesPerSample = _format.Value.SampleFormat == PluginPcmSampleFormat.PcmS16Le ? 2 : 4;
-        int frames = output.Length / (_format.Value.Channels * bytesPerSample);
+        var format = _format ?? throw new InvalidOperationException("PCM format is unavailable.");
+        int bytesPerSample = format.SampleFormat == PluginPcmSampleFormat.PcmS16Le ? 2 : 4;
+        int frames = output.Length / (format.Channels * bytesPerSample);
         lock (_sync)
         {
             foreach (var source in _sources.Values)
             {
                 if (source.Muted) continue;
-                source.MixInto(output, _format.Value, frames);
+                source.MixInto(output, format, frames);
             }
         }
     }

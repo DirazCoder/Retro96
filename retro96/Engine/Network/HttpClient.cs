@@ -56,7 +56,7 @@ public class HttpClient
     /// <summary>Current page URL used as the Referer header when enabled.</summary>
     public string? ReferrerOverride { get; set; }
 
-    public Func<string, IReadOnlyDictionary<string, string>, PluginNetworkRuleDecision>? PluginRuleEvaluator { get; set; }
+    internal Func<string, IReadOnlyDictionary<string, string>, PluginNetworkRuleDecision>? PluginRuleEvaluator { get; set; }
 
     private const int MaxRedirects = 5;
     private const int MaxBodySize = 8 * 1024 * 1024;    // 8 MB is generous for 1996 pages

@@ -8,6 +8,7 @@ using System.Collections.Concurrent;
 using System.Windows.Forms;
 using Retro96;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Network;
 
 namespace Retro96.Plugins;
 
@@ -627,8 +628,8 @@ internal sealed class PluginSandboxSession : IDisposable
                     Demand(PluginPermission.UiExtras);
                     var utea = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasToolbarPayload>(envelope) ?? throw new InvalidDataException();
                     if (utea.Label.Length > 64 || utea.Tooltip.Length > 256) throw new InvalidDataException("Plugin toolbar text is too long.");
-                    byte[]? png = string.IsNullOrWhiteSpace(utea.PngBase64) ? null : DecodeCappedBase64(utea.PngBase64, 64 * 1024);
-                    var toolbarLease = RunOnUi(() => _browser.AddPluginUiExtrasToolbarButton(_record.Manifest.Id, utea.Label, utea.Tooltip, png,
+                    byte[]? extraPng = string.IsNullOrWhiteSpace(utea.PngBase64) ? null : DecodeCappedBase64(utea.PngBase64, 64 * 1024);
+                    var toolbarLease = RunOnUi(() => _browser.AddPluginUiExtrasToolbarButton(_record.Manifest.Id, utea.Label, utea.Tooltip, extraPng,
                         () => SendEvent("event.ui.invoke", new PluginSandboxProtocol.UiInvokePayload(utea.Token)), utea.Menu));
                     lock (_extraUiItems) _extraUiItems[utea.Token] = toolbarLease;
                     await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
@@ -661,7 +662,7 @@ internal sealed class PluginSandboxSession : IDisposable
                 case "ui.extras.shortcut.remove":
                     Demand(PluginPermission.UiExtras);
                     var usr = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasTokenPayload>(envelope) ?? throw new InvalidDataException();
-                    lock (_shortcuts) { if (_shortcuts.Remove(usr.Token, out var shortcut)) _browser.UnregisterPluginShortcut(_record.Manifest.Id, shortcut); }
+                    lock (_shortcuts) { if (_shortcuts.Remove(usr.Token, out var existingShortcut)) _browser.UnregisterPluginShortcut(_record.Manifest.Id, existingShortcut); }
                     await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
                     break;
 
@@ -903,6 +904,9 @@ internal sealed class PluginSandboxSession : IDisposable
         var reply = await SendRequestAsync<PluginSandboxProtocol.OmniboxSuggestionsReply>("omnibox.suggest", new PluginSandboxProtocol.OmniboxSuggestPayload(token, text), ct).ConfigureAwait(true);
         return (reply.Suggestions ?? Array.Empty<PluginSandboxProtocol.OmniboxSuggestionWire>()).Take(8).Select(x => new PluginOmniboxSuggestion(TruncatePluginText(x.Text ?? string.Empty, 256), string.IsNullOrWhiteSpace(x.Url) ? null : TruncatePluginText(x.Url!, 8192), TruncatePluginText(x.Description ?? string.Empty, 512))).ToArray();
     }
+
+    private static string TruncatePluginText(string value, int max) =>
+        value.Length <= max ? value : value[..max];
 
     internal void RegisterProtocol(string scheme, string token)
     {

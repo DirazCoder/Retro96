@@ -2215,10 +2215,11 @@ public partial class Form1 : Form
     {
         string css = _pluginManager?.BuildPageStyleCss() ?? string.Empty;
         if (css.Length == 0) return;
-        var head = document.ElementDescendants().FirstOrDefault(x => x.TagName == "head") ?? document;
         var style = new DomElement("style");
         style.AppendChild(new DomText(css));
-        head.AppendChild(style);
+        var head = document.ElementDescendants().FirstOrDefault(x => x.TagName == "head");
+        if (head != null) head.AppendChild(style);
+        else document.AppendChild(style);
     }
 
     private async Task RenderPluginProtocolResponseAsync(string url, PluginProtocolResponse response, bool replaceHistory, long generation)

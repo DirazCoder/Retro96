@@ -7,6 +7,7 @@ using System.Security;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Forms;
+using Retro96.Engine.Network;
 using Retro96.Drawing;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Layout;
@@ -1366,7 +1367,7 @@ public sealed class PluginManager : IDisposable
         {
             Id = p.Manifest.Id,
             Enabled = p.Enabled,
-            GrantedPermissions = p.GrantedPermissions,
+            GrantedPermissions = (ulong)p.GrantedPermissions,
             InstalledUtc = p.InstalledUtc,
             DllSha256 = p.DllSha256,
             PermissionChanges = p.PermissionChanges,
@@ -1478,6 +1479,10 @@ public sealed class PluginManager : IDisposable
         internal Action? ActivityPersistence { get; set; }
         internal PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
+        public PluginPermission AvailablePermissions => Manifest.AvailablePermissions;
+        public List<DateTimeOffset> CrashTimes { get; internal set; } = new();
+        public int RestartAttempt { get; internal set; }
+        public List<string> RejectedShortcuts { get; internal set; } = new();
         public bool HasPermission(PluginPermission permission) => (GrantedPermissions & permission) == permission;
         public int CrashCountInWindow => CrashTimes.Count(t => DateTimeOffset.UtcNow - t <= PluginCrashWindow);
 

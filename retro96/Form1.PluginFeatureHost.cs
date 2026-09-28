@@ -251,7 +251,7 @@ public partial class Form1
     internal void PluginFindClear() => _canvas.FindClear();
     internal byte[] PluginCaptureViewport() => _canvas.CaptureViewportPng();
 
-    internal string PluginGetPageText() => _canvas.PageDocument?.InnerText ?? string.Empty;
+    internal string PluginGetPageText() => _canvas.PageDocument?.ElementDescendants().FirstOrDefault(x => x.TagName == "body")?.InnerText ?? string.Empty;
 
     internal IReadOnlyList<PluginPageLink> PluginGetPageLinks()
     {
@@ -306,11 +306,7 @@ public partial class Form1
         fileName = string.Concat(fileName.Where(c => !char.IsControl(c) && c != '\\' && c != '/')).Trim();
         if (fileName.Length > 128) fileName = fileName[..128];
         if (string.IsNullOrWhiteSpace(fileName)) fileName = "download";
-        if (MessageBox.Show(this, $"Plugin '{pluginId}' requested a download from:
-
-{url}
-
-The download is capped at 8 MiB and will be stored in the plugin sandbox.", "Allow plugin download?", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) return null;
+        if (MessageBox.Show(this, $"Plugin '{pluginId}' requested a download from:\r\n\r\n{url}\r\n\r\nThe download is capped at 8 MiB and will be stored in the plugin sandbox.", "Allow plugin download?", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) return null;
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromSeconds(30));
         HttpResult result = await _httpClient.GetAsync(parsed, _cookieStore, cts.Token, ResourceKind.Document).ConfigureAwait(true);
@@ -375,6 +371,8 @@ The download is capped at 8 MiB and will be stored in the plugin sandbox.", "All
     internal void ActivatePluginEmbeddedAudio(string sourceKey) => _pluginPcmMixer.Unmute(sourceKey);
     internal void RemovePluginEmbeddedAudio(string sourceKey) => _pluginPcmMixer.Remove(sourceKey);
 
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    [System.ComponentModel.Browsable(false)]
     internal float PluginAudioVolume { get => _midiPlayer.Volume; set => _midiPlayer.Volume = Math.Clamp(value, 0f, 1f); }
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     [System.ComponentModel.Browsable(false)]
