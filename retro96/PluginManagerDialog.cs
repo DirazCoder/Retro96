@@ -28,9 +28,9 @@ public sealed class PluginManagerDialog : Form
 
         Text = "Retro96 Plugin Addons";
         StartPosition = FormStartPosition.CenterParent;
-        MinimumSize = new Size(900, 560);
+        MinimumSize = new Size(900, 600);
         ClientSize = new Size(980, 620);
-        AutoScaleMode = AutoScaleMode.Font;
+        AutoScaleMode = AutoScaleMode.Dpi;
         AutoScroll = false;
 
         var header = new TableLayoutPanel
@@ -383,33 +383,73 @@ internal sealed class PluginPermissionsDialog : Form
         GrantedPermissions = record.GrantedPermissions;
         Text = "Plugin Permissions — " + record.Manifest.Name;
         StartPosition = FormStartPosition.CenterParent;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        FormBorderStyle = FormBorderStyle.Sizable;
         MinimizeBox = false;
         MaximizeBox = false;
-        ClientSize = new Size(420, 390);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        MinimumSize = new Size(520, 520);
+        ClientSize = new Size(640, 640);
 
-        var info = new Label { Dock = DockStyle.Top, Height = 48, Padding = new Padding(10), Text = "Grant only the capabilities this plugin actually needs." };
-        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(10), WrapContents = false, AutoScroll = true };
+        var intro = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            MaximumSize = new Size(0, 0),
+            Text = "Grant only the capabilities this plugin actually needs. The host checks the user's granted set before every privileged broker call.",
+            Padding = new Padding(12, 10, 12, 10)
+        };
+
+        var introWrap = new TableLayoutPanel
+        { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
+        introWrap.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        introWrap.Controls.Add(intro, 0, 0);
+
+        var panel = new FlowLayoutPanel
+        { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(12, 4, 12, 12), WrapContents = false, AutoScroll = true, Margin = Padding.Empty };
 
         foreach (var permission in Enum.GetValues<PluginPermission>().Where(p => p != PluginPermission.None))
         {
             if (!record.RequestedPermissions.HasFlag(permission)) continue;
-            var check = new CheckBox { AutoSize = true, Text = PluginPermissionNames.ToNames(permission).FirstOrDefault() ?? permission.ToString(), Checked = record.GrantedPermissions.HasFlag(permission) };
-            _checks[permission] = check;
-            panel.Controls.Add(check);
+            AddPermissionRow(panel, permission);
         }
 
-        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 45, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(6) };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 80 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 80 };
-        bottom.Controls.Add(ok); bottom.Controls.Add(cancel);
-        ok.Click += (s, e) =>
+        var bottom = new FlowLayoutPanel
+        { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, AutoSize = true, Padding = new Padding(10, 8, 10, 8), Margin = Padding.Empty };
+        var ok = new Button { Text = "OK", Width = 92, Height = 34, Margin = new Padding(8, 0, 0, 0) };
+        var cancel = new Button { Text = "Cancel", Width = 92, Height = 34, Margin = new Padding(8, 0, 0, 0) };
+        ok.Click += (_, _) =>
         {
             PluginPermission value = PluginPermission.None;
             foreach (var pair in _checks) if (pair.Value.Checked) value |= pair.Key;
             GrantedPermissions = value;
+            DialogResult = DialogResult.OK;
+            Close();
         };
+        cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+        bottom.Controls.Add(ok);
+        bottom.Controls.Add(cancel);
         AcceptButton = ok; CancelButton = cancel;
-        Controls.Add(panel); Controls.Add(bottom); Controls.Add(info);
+
+        var layout = new TableLayoutPanel
+        { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = Padding.Empty, Margin = Padding.Empty };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54f));
+        layout.Controls.Add(introWrap, 0, 0);
+        layout.Controls.Add(panel, 0, 1);
+        layout.Controls.Add(bottom, 0, 2);
+        Controls.Add(layout);
+    }
+
+    private void AddPermissionRow(FlowLayoutPanel panel, PluginPermission permission)
+    {
+        string name = PluginPermissionNames.ToNames(permission).FirstOrDefault() ?? permission.ToString();
+        var row = new Panel
+        { Width = 580, Height = 34, Margin = new Padding(0, 0, 0, 4), Padding = Padding.Empty };
+        var check = new CheckBox
+        { Text = name, AutoSize = true, Dock = DockStyle.Fill, Checked = _record.GrantedPermissions.HasFlag(permission), Margin = new Padding(0, 5, 0, 0) };
+        _checks[permission] = check;
+        row.Controls.Add(check);
+        panel.Controls.Add(row);
     }
 }
