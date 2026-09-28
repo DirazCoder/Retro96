@@ -69,7 +69,7 @@ public sealed class PluginManager : IDisposable
         return name switch
         {
             "host.info" or "browser" or "ui" or "storage" or "network" or "filesystem" or
-            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" => true,
+            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" or "permissions" => true,
             _ => false
         };
     }
@@ -237,13 +237,39 @@ public sealed class PluginManager : IDisposable
     {
         if (!_plugins.TryGetValue(id, out var record)) return;
         PluginPermission old = record.GrantedPermissions;
-        PluginPermission sanitized = permissions & record.Manifest.RequestedPermissions;
+        PluginPermission sanitized = permissions & record.Manifest.AvailablePermissions;
         record.GrantedPermissions = sanitized;
         record.PendingNewPermissions = PluginPermission.None;
         if (old != sanitized)
             record.Sandbox?.PushGrantedPermissions(sanitized);
         SaveState();
         PluginsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    internal async Task<bool> RequestPermissionAsync(PluginRecord record, string name, CancellationToken cancellationToken)
+    {
+        PluginPermission permission = PluginPermissionNames.Parse(new[] { name });
+        if (permission == PluginPermission.None)
+            throw new ArgumentException("Unknown plugin permission.", nameof(name));
+        var info = PluginPermissionCatalog.Get(permission);
+        if (!record.Manifest.OptionalPermissionSet.HasFlag(permission))
+            throw new SecurityException($"Permission '{info.Name}' is not declared in optional_permissions.");
+        if (record.HasPermission(permission)) return true;
+
+        bool granted = await RunPermissionPromptAsync(info, record, cancellationToken).ConfigureAwait(true);
+        if (!granted) return false;
+        record.GrantedPermissions |= permission;
+        record.Sandbox?.PushGrantedPermissions(record.GrantedPermissions);
+        SaveState();
+        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    private Task<bool> RunPermissionPromptAsync(PluginPermissionInfo info, PluginRecord record, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested) return Task.FromCanceled<bool>(cancellationToken);
+        return Task.FromResult(PermissionConfirmationDialog.Confirm(_browser, info,
+            record.HasPermission(PluginPermission.Network) && info.IsDataReading));
     }
 
     public void Reload(string id)
@@ -667,7 +693,7 @@ public sealed class PluginManager : IDisposable
 
     private async Task LoadSandboxAsync(PluginRecord record)
     {
-        var sandbox = new PluginSandboxSession(_browser, record);
+        var sandbox = new PluginSandboxSession(_browser, this, record);
         record.Sandbox = sandbox;
         try
         {
@@ -791,6 +817,11 @@ public sealed class PluginManager : IDisposable
         if (!manifest.Id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_'))
             throw new InvalidDataException("Plugin id may contain only letters, digits, '.', '-' and '_'.");
         ValidatePermissions(manifest.Permissions);
+        ValidatePermissions(manifest.OptionalPermissions);
+        var overlap = new HashSet<string>(manifest.Permissions ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+        if (manifest.OptionalPermissions != null && manifest.OptionalPermissions.Any(overlap.Contains))
+            throw new InvalidDataException("A permission cannot be listed in both permissions and optional_permissions.");
+        manifest.OptionalPermissions ??= new List<string>();
         manifest.EmbedTypes ??= new List<string>();
         bool renderer = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedRenderer);
         bool script = manifest.RequestedPermissions.HasFlag(PluginPermission.EmbedScript);
@@ -854,7 +885,7 @@ public sealed class PluginManager : IDisposable
                         Manifest = manifest,
                         Directory = dir,
                         Enabled = state.Enabled,
-                        GrantedPermissions = requested & (PluginPermission)state.GrantedPermissions,
+                        GrantedPermissions = manifest.AvailablePermissions & (PluginPermission)state.GrantedPermissions,
                         InstalledUtc = state.InstalledUtc == default ? new DateTimeOffset(File.GetCreationTimeUtc(manifestPath), TimeSpan.Zero) : state.InstalledUtc,
                         DllSha256 = string.IsNullOrWhiteSpace(state.DllSha256) ? SafeComputeDllSha256(dir, manifest) : state.DllSha256,
                         PermissionChanges = state.PermissionChanges ?? new List<PluginPermissionVersionChange>(),

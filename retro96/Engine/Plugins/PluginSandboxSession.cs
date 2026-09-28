@@ -19,6 +19,7 @@ namespace Retro96.Plugins;
 internal sealed class PluginSandboxSession : IDisposable
 {
     private readonly Form1 _browser;
+    private readonly PluginManager _manager;
     private readonly PluginManager.PluginRecord _record;
     private readonly string _rootDirectory;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -38,9 +39,10 @@ internal sealed class PluginSandboxSession : IDisposable
     private string? _profileName;
     private int _disposed;
 
-    public PluginSandboxSession(Form1 browser, PluginManager.PluginRecord record)
+    public PluginSandboxSession(Form1 browser, PluginManager manager, PluginManager.PluginRecord record)
     {
         _browser = browser;
+        _manager = manager;
         _record = record;
         _rootDirectory = record.Directory;
     }
@@ -285,6 +287,13 @@ internal sealed class PluginSandboxSession : IDisposable
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.ReadyPayload(ready?.Ready == true, ready?.Error ?? ""));
                     break;
 
+                case "permission.request":
+                    {
+                        var request = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PermissionRequestPayload>(envelope) ?? throw new InvalidDataException();
+                        bool granted = await _manager.RequestPermissionAsync(_record, request.Name, _lifetime.Token).ConfigureAwait(true);
+                        await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PermissionRequestReply(granted)).ConfigureAwait(false);
+                        break;
+                    }
                 case "host.info":
                     {
                         string[] supported = new[] { "host.info", "browser", "ui", "storage", "network", "filesystem", "clipboard", "events", "audio", "notifications", "dialogs", "embeds", "logger" };

@@ -123,6 +123,8 @@ public sealed class PluginManifest
     public string Assembly { get; set; } = "plugin.dll";
     public string EntryPoint { get; set; } = "";
     public List<string> Permissions { get; set; } = new();
+    [JsonPropertyName("optional_permissions")]
+    public List<string> OptionalPermissions { get; set; } = new();
     [JsonPropertyName("embed_types")]
     public List<string> EmbedTypes { get; set; } = new();
 
@@ -132,6 +134,8 @@ public sealed class PluginManifest
     [JsonPropertyName("min_host_version")]
     public string MinHostVersion { get; set; } = "";
     public PluginPermission RequestedPermissions => PluginPermissionNames.Parse(Permissions);
+    public PluginPermission OptionalPermissionSet => PluginPermissionNames.Parse(OptionalPermissions);
+    public PluginPermission AvailablePermissions => RequestedPermissions | OptionalPermissionSet;
 }
 
 public interface IRetro96Plugin : IDisposable { void Initialize(IRetro96PluginHost host); }
@@ -154,6 +158,7 @@ public interface IRetro96PluginHost
     IPluginLogger Log { get; }
     IPluginHostInfo Info { get; }
     bool HasPermission(PluginPermission permission);
+    Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default);
 
     IBrowserService BrowserService => Browser;
     IUiService UiService => Ui;

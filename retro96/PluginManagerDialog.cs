@@ -376,7 +376,7 @@ internal sealed class PluginPermissionsDialog : Form
     {
         _record = record;
         _onlyNewPermissions = visiblePermissions.HasValue;
-        _visiblePermissions = visiblePermissions ?? record.RequestedPermissions;
+        _visiblePermissions = visiblePermissions ?? record.AvailablePermissions;
         GrantedPermissions = _onlyNewPermissions ? PluginPermission.None : record.GrantedPermissions;
         Text = "Plugin Permissions — " + record.Manifest.Name;
         StartPosition = FormStartPosition.CenterParent;

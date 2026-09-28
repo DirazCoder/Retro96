@@ -78,6 +78,9 @@ internal static class PluginSandboxWorker
         public IPluginLogger Log { get; private set; } = null!;
         public IPluginHostInfo Info { get; private set; } = null!;
         public bool HasPermission(PluginPermission permission) => (_grantedPermissions & permission) == permission;
+        public Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default) =>
+            SendRequestAsync<PluginSandboxProtocol.PermissionRequestReply>("permission.request", new PluginSandboxProtocol.PermissionRequestPayload(name), cancellationToken)
+                .ContinueWith(t => t.Result.Granted, cancellationToken, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         public async Task RunAsync()
         {
