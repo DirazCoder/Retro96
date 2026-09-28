@@ -180,7 +180,7 @@ public sealed class PluginManager : IDisposable
 
             existing.Manifest = installedManifest;
             existing.DllSha256 = newHash;
-            existing.GrantedPermissions = oldGranted & installedManifest.RequestedPermissions;
+            existing.GrantedPermissions = oldGranted & installedManifest.AvailablePermissions;
             existing.PendingNewPermissions = installedManifest.RequestedPermissions & ~oldRequested;
             existing.PermissionChanges.Insert(0, new PluginPermissionVersionChange
             {
