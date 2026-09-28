@@ -49,11 +49,13 @@ internal static class PluginSandboxWorker
         private readonly Dictionary<string, Action<ContextMenuContext>> _contextActions = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>>> _protocolCallbacks = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Func<PluginContentTransformRequest, CancellationToken, Task<string>>> _contentTransformCallbacks = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, (string Keyword, Func<string, CancellationToken, Task<IReadOnlyList<PluginOmniboxSuggestion>>> Handler)> _omniboxCallbacks = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Action<string?, bool?, int?>> _panelCallbacks = new(StringComparer.Ordinal);
         private readonly PluginEventsProxy _events = new();
         private WorkerEmbeddedContentService? _embeds;
         private PluginClipboard? _clipboard;
         private PluginAudio? _audio;
+        private WorkerDownloads? _downloads;
         private PluginAssemblyLoadContext? _loadContext;
         private IRetro96Plugin? _plugin;
         private PluginManifest _manifest = new();
@@ -87,6 +89,9 @@ internal static class PluginSandboxWorker
         public IPluginTabs Tabs { get; private set; } = null!;
         public IPluginHistory History { get; private set; } = null!;
         public IPluginBookmarks Bookmarks { get; private set; } = null!;
+        public IPluginDownloads Downloads { get; private set; } = null!;
+        public IPluginOmnibox Omnibox { get; private set; } = null!;
+        public IPluginUiExtras UiExtras { get; private set; } = null!;
         public bool HasPermission(PluginPermission permission) => (_grantedPermissions & permission) == permission;
         public Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default) =>
             SendRequestAsync<PluginSandboxProtocol.PermissionRequestReply>("permission.request", new PluginSandboxProtocol.PermissionRequestPayload(name), cancellationToken)
@@ -96,6 +101,8 @@ internal static class PluginSandboxWorker
         internal void RemoveProtocol(string token) => _protocolCallbacks.Remove(token);
         internal void RegisterContentTransform(string token, Func<PluginContentTransformRequest, CancellationToken, Task<string>> callback) => _contentTransformCallbacks[token] = callback;
         internal void RemoveContentTransform(string token) => _contentTransformCallbacks.Remove(token);
+        internal void RegisterOmnibox(string token, string keyword, Func<string, CancellationToken, Task<IReadOnlyList<PluginOmniboxSuggestion>>> handler) => _omniboxCallbacks[token] = (keyword, handler);
+        internal void RemoveOmnibox(string token) => _omniboxCallbacks.Remove(token);
 
         public async Task RunAsync()
         {
@@ -128,6 +135,10 @@ internal static class PluginSandboxWorker
             Tabs = new WorkerTabs(this);
             History = new WorkerHistory(this);
             Bookmarks = new WorkerBookmarks(this);
+            _downloads = new WorkerDownloads(this);
+            Downloads = _downloads;
+            Omnibox = new WorkerOmnibox(this);
+            UiExtras = new WorkerUiExtras(this);
             try
             {
                 _plugin!.Initialize(this);
@@ -204,6 +215,9 @@ internal static class PluginSandboxWorker
                     if (envelope.Op is "response" or "error") { if (_pending.TryGetValue(envelope.Id, out var completion)) completion.TrySetResult(envelope); continue; }
                     switch (envelope.Op)
                     {
+                        case "omnibox.suggest":
+                            { var os = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.OmniboxSuggestPayload>(envelope) ?? throw new InvalidDataException(); if (!_omniboxCallbacks.TryGetValue(os.Token, out var ocb)) throw new InvalidOperationException("Omnibox handler is unavailable."); var suggestions = (await ocb.Handler(os.Text ?? "", _lifetime.Token).ConfigureAwait(false)).Take(8).Select(x => new PluginSandboxProtocol.OmniboxSuggestionWire(x.Text, x.Url, x.Description)).ToArray(); await ReplyAsync(envelope.Id, new PluginSandboxProtocol.OmniboxSuggestionsReply(suggestions)); }
+                            break;
                         case "ui.context.query":
                             if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextQueryPayload>(envelope) is { } query)
                             {
@@ -286,6 +300,10 @@ internal static class PluginSandboxWorker
 
                 case "event.navigated": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigatedPayload>(envelope) is { } nav) _ = Task.Run(() => InvokePluginCallback("Navigated", () => _events.RaiseNavigated(new PluginNavigationEventArgs(nav.Url)))); break;
                         case "event.pageLoaded": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPageLoadedPayload>(envelope) is { } page) _ = Task.Run(() => InvokePluginCallback("PageLoaded", () => _events.RaisePageLoaded(new PluginPageEventArgs(page.Url, page.Title)))); break;
+                        case "event.navigationFailed": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigationFailedPayload>(envelope) is { } nf) _ = Task.Run(() => InvokePluginCallback("NavigationFailed", () => _events.RaiseNavigationFailed(new PluginNavigationFailedEventArgs(nf.Url, nf.Message)))); break;
+                        case "event.titleChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventTitleChangedPayload>(envelope) is { } tc) _ = Task.Run(() => InvokePluginCallback("TitleChanged", () => _events.RaiseTitleChanged(new PluginTitleChangedEventArgs(tc.Url, tc.Title)))); break;
+                        case "event.loadProgress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventLoadProgressPayload>(envelope) is { } lp) _ = Task.Run(() => InvokePluginCallback("LoadProgress", () => _events.RaiseLoadProgress(new PluginLoadProgressEventArgs(lp.Url, lp.Fraction)))); break;
+                        case "event.zoomChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventZoomChangedPayload>(envelope) is { } zc) _ = Task.Run(() => InvokePluginCallback("ZoomChanged", () => _events.RaiseZoomChanged(new PluginZoomChangedEventArgs(zc.Zoom)))); break;
                         case "event.hostShuttingDown": _ = Task.Run(() => InvokePluginCallback("HostShuttingDown", _events.RaiseHostShuttingDown)); break;
                         case "event.focus": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventFocusPayload>(envelope) is { } focus) _ = Task.Run(() => InvokePluginCallback("WindowFocusChanged", () => _events.RaiseFocus(focus.HasFocus))); break;
                         case "event.ui.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiInvokePayload>(envelope) is { } invoke && _invokeCallbacks.TryGetValue(invoke.Token, out var callback)) _ = Task.Run(() => InvokePluginCallback("UiInvoke", callback)); break;
@@ -296,6 +314,7 @@ internal static class PluginSandboxWorker
                         case "event.embed.visibility": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedVisibilityPayload>(envelope) is { } ev) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ev.InstanceToken, out var ei)) ei.Host.RaiseVisibility(ev.Visible); } break;
                         case "event.embed.pause": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedPausePayload>(envelope) is { } ep) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ep.InstanceToken, out var ei)) ei.Host.RaisePause(ep.Paused); } break;
                         case "event.embed.resize": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedResizePayload>(envelope) is { } er) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(er.InstanceToken, out var ei)) ei.Host.RaiseResize(er.Width, er.Height); } break;
+                        case "event.download.progress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventDownloadProgressPayload>(envelope) is { } dp) _downloads?.Raise(dp.Progress); break;
                         case "event.permissions.changed":
                             if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPermissionsPayload>(envelope) is { } permissions)
                                 _grantedPermissions = (PluginPermission)permissions.GrantedPermissions;
@@ -947,6 +966,31 @@ internal static class PluginSandboxWorker
             }
         }
 
+        private sealed class WorkerDownloads : RpcService, IPluginDownloads
+        {
+            public WorkerDownloads(PluginWorkerHost host) : base(host) { }
+            public event EventHandler<PluginDownloadProgress>? Progress;
+            internal void Raise(PluginDownloadProgress value) => Progress?.Invoke(this, value);
+            public async Task<string?> DownloadAsync(string url, string suggestedFileName, CancellationToken cancellationToken = default)
+            { Demand(PluginPermission.Downloads); var reply = await Host.SendRequestAsync<PluginSandboxProtocol.DownloadReply>("downloads.start", new PluginSandboxProtocol.DownloadStartPayload(url ?? "", suggestedFileName ?? "download"), cancellationToken).ConfigureAwait(false); return reply.RelativePath; }
+        }
+
+        private sealed class WorkerOmnibox : RpcService, IPluginOmnibox
+        {
+            public WorkerOmnibox(PluginWorkerHost host) : base(host) { }
+            public IDisposable RegisterKeyword(string keyword, Func<string, CancellationToken, Task<IReadOnlyList<PluginOmniboxSuggestion>>> handler)
+            { Demand(PluginPermission.Omnibox); if (string.IsNullOrWhiteSpace(keyword) || handler == null) throw new ArgumentException("Keyword and handler are required."); keyword=keyword.Trim().ToLowerInvariant(); if (keyword.Length > 32 || !keyword.All(c => char.IsLetterOrDigit(c) || c is '-' or '_')) throw new ArgumentException("Invalid omnibox keyword."); string token=Guid.NewGuid().ToString("N"); Host.RegisterOmnibox(token, keyword, handler); Host.SendRequestAsync<object>("omnibox.register", new PluginSandboxProtocol.OmniboxRegisterPayload(keyword, token), CancellationToken.None).GetAwaiter().GetResult(); return new Lease(Host, token, "omnibox.remove"); }
+        }
+
+        private sealed class WorkerUiExtras : RpcService, IPluginUiExtras
+        {
+            public WorkerUiExtras(PluginWorkerHost host) : base(host) { }
+            public IDisposable AddToolbarButton(string label, string tooltip, byte[]? pngIcon, Action onClick, PluginMenuChoice menu = PluginMenuChoice.File)
+            { Demand(PluginPermission.UiExtras); if (pngIcon?.Length > 64 * 1024) throw new ArgumentOutOfRangeException(nameof(pngIcon)); string token=Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token,onClick); Host.SendRequestAsync<object>("ui.extras.toolbar.add", new PluginSandboxProtocol.UiExtrasToolbarPayload(label ?? "", tooltip ?? "", pngIcon == null ? null : Convert.ToBase64String(pngIcon), menu, token), CancellationToken.None).GetAwaiter().GetResult(); return new Lease(Host, token, "ui.extras.toolbar.remove"); }
+            public void SetBadge(string text) { Demand(PluginPermission.UiExtras); Host.SendRequestAsync<object>("ui.extras.badge", new PluginSandboxProtocol.UiExtrasBadgePayload(text ?? ""), CancellationToken.None).GetAwaiter().GetResult(); }
+            public IDisposable RegisterShortcut(string shortcut, string description, Action callback) { Demand(PluginPermission.UiExtras); string token=Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token,callback); Host.SendRequestAsync<object>("ui.extras.shortcut.add", new PluginSandboxProtocol.UiExtrasShortcutPayload(shortcut ?? "", description ?? "", token), CancellationToken.None).GetAwaiter().GetResult(); return new Lease(Host, token, "ui.extras.shortcut.remove"); }
+        }
+
         private sealed class WorkerHistory : RpcService, IPluginHistory
         {
             public WorkerHistory(PluginWorkerHost host) : base(host) { }
@@ -978,7 +1022,9 @@ internal static class PluginSandboxWorker
         private sealed class PluginEventsProxy : IPluginEvents
         {
             public event EventHandler<PluginNavigationEventArgs>? Navigated; public event EventHandler<PluginPageEventArgs>? PageLoaded; public event EventHandler? HostShuttingDown; public event EventHandler<FocusEventArgs>? WindowFocusChanged;
+            public event EventHandler<PluginNavigationFailedEventArgs>? NavigationFailed; public event EventHandler<PluginTitleChangedEventArgs>? TitleChanged; public event EventHandler<PluginLoadProgressEventArgs>? LoadProgress; public event EventHandler<PluginZoomChangedEventArgs>? ZoomChanged;
             public void RaiseNavigated(PluginNavigationEventArgs args) => Navigated?.Invoke(this, args); public void RaisePageLoaded(PluginPageEventArgs args) => PageLoaded?.Invoke(this, args); public void RaiseHostShuttingDown() => HostShuttingDown?.Invoke(this, EventArgs.Empty); public void RaiseFocus(bool hasFocus) => WindowFocusChanged?.Invoke(this, new FocusEventArgs(hasFocus));
+            public void RaiseNavigationFailed(PluginNavigationFailedEventArgs args) => NavigationFailed?.Invoke(this, args); public void RaiseTitleChanged(PluginTitleChangedEventArgs args) => TitleChanged?.Invoke(this, args); public void RaiseLoadProgress(PluginLoadProgressEventArgs args) => LoadProgress?.Invoke(this, args); public void RaiseZoomChanged(PluginZoomChangedEventArgs args) => ZoomChanged?.Invoke(this, args);
             public IDisposable CreateTimer(TimeSpan interval, Action callback) { var timer = new System.Threading.Timer(_ => { try { callback(); } catch { } }, null, interval, interval); return new TimerLease(timer); }
             private sealed class TimerLease : IDisposable { private System.Threading.Timer? _timer; public TimerLease(System.Threading.Timer timer) => _timer = timer; public void Dispose() => Interlocked.Exchange(ref _timer, null)?.Dispose(); }
         }

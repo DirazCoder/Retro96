@@ -25,6 +25,8 @@ internal sealed class PreferencesDialog : Form
     private readonly TextBox _trustDetails = new();
     private readonly CheckBox _hostImageCheck = new();
     private readonly CheckBox _discardState = new();
+    private readonly PluginManager? _pluginManager;
+    private readonly Dictionary<string, Control> _pluginSettingControls = new(StringComparer.OrdinalIgnoreCase);
 
     // Advanced engine feature switches. Kept in one long, scrollable list
     // so the Advanced tab acts as the low-level control panel.
@@ -41,9 +43,10 @@ internal sealed class PreferencesDialog : Form
     private readonly CheckBox _blink = new();
     private readonly CheckBox _marquee = new();
 
-    public PreferencesDialog(UserSettings source)
+    public PreferencesDialog(UserSettings source, PluginManager? pluginManager = null)
     {
         _settings = source.Clone();
+        _pluginManager = pluginManager;
 
         Text = "Retro96 — Preferences";
         StartPosition = FormStartPosition.CenterParent;
@@ -59,6 +62,8 @@ internal sealed class PreferencesDialog : Form
         tabs.TabPages.Add(BuildAppearanceTab());
         tabs.TabPages.Add(BuildSecurityTab());
         tabs.TabPages.Add(BuildAdvancedTab());
+        if (_pluginManager != null)
+            tabs.TabPages.Add(BuildPluginSettingsTab());
 
         var buttons = new Panel { Dock = DockStyle.Bottom, Height = 58, Padding = new Padding(10, 8, 10, 8) };
         var defaults = new Button { Text = "Restore Defaults", Width = 140, Height = 34, Dock = DockStyle.Left };
@@ -423,6 +428,62 @@ internal sealed class PreferencesDialog : Form
         return wrapper;
     }
 
+    private TabPage BuildPluginSettingsTab()
+    {
+        var page = NewTab("Plugins");
+        var panel = StackPanel();
+        bool any = false;
+        foreach (var record in _pluginManager!.Plugins)
+        {
+            if (record.Manifest.Settings.Count == 0) continue;
+            var controls = new List<Control>();
+            if (!record.HasPermission(PluginPermission.Settings))
+            {
+                controls.Add(new Label
+                {
+                    Text = "This plugin has declared settings, but the settings permission is not granted. Grant it in Addons → Permissions to edit these values.",
+                    AutoSize = true, MaximumSize = new Size(680, 0), ForeColor = SystemColors.GrayText
+                });
+            }
+            else
+            {
+                var values = _pluginManager.GetPluginSettings(record);
+                foreach (var definition in record.Manifest.Settings)
+                {
+                    Control control = CreatePluginSettingControl(definition, values.TryGetValue(definition.Name, out var value) ? value : definition.DefaultValue ?? "");
+                    _pluginSettingControls[SettingKey(record, definition)] = control;
+                    controls.Add(new Label { Text = definition.Description ?? "", AutoSize = true, MaximumSize = new Size(650, 0), ForeColor = SystemColors.GrayText, Visible = !string.IsNullOrWhiteSpace(definition.Description) });
+                    controls.Add(new Label { Text = string.IsNullOrWhiteSpace(definition.Label) ? definition.Name : definition.Label, AutoSize = true });
+                    controls.Add(control);
+                }
+            }
+            panel.Controls.Add(Group(record.Manifest.Name, controls.ToArray()));
+            any = true;
+        }
+        if (!any)
+            panel.Controls.Add(new Label { Text = "No installed plugins declare host-rendered settings.", AutoSize = true, ForeColor = SystemColors.GrayText });
+        page.Controls.Add(panel);
+        return page;
+    }
+
+    private static string SettingKey(PluginManager.PluginRecord record, PluginSettingDefinition definition) => record.Manifest.Id + "\n" + definition.Name;
+
+    private static Control CreatePluginSettingControl(PluginSettingDefinition definition, string value)
+    {
+        string type = definition.Type.Trim().ToLowerInvariant();
+        if (type == "toggle")
+            return new CheckBox { Text = "Enabled", AutoSize = true, Checked = bool.TryParse(value, out var b) && b, MinimumSize = new Size(0, 24), Tag = definition };
+        if (type == "select")
+        {
+            var combo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 420, Tag = definition };
+            foreach (string option in definition.Options ?? Array.Empty<string>()) combo.Items.Add(option);
+            int selected = combo.Items.IndexOf(value);
+            combo.SelectedIndex = selected >= 0 ? selected : (combo.Items.Count > 0 ? 0 : -1);
+            return combo;
+        }
+        return new TextBox { Width = 620, Text = value, Tag = definition };
+    }
+
     private void BindFromSettings()
     {
         _home.Text = _settings.HomePageUrl;
@@ -482,6 +543,23 @@ internal sealed class PreferencesDialog : Form
         target.AnimateImages = _animateImages.Checked;
         target.BlinkText = _blink.Checked;
         target.MarqueeText = _marquee.Checked;
+
+        if (_pluginManager != null)
+        {
+            foreach (var record in _pluginManager.Plugins.Where(r => r.HasPermission(PluginPermission.Settings) && r.Manifest.Settings.Count > 0))
+            foreach (var definition in record.Manifest.Settings)
+            {
+                if (!_pluginSettingControls.TryGetValue(SettingKey(record, definition), out var control)) continue;
+                string value = control switch
+                {
+                    CheckBox check => check.Checked ? "true" : "false",
+                    ComboBox combo => combo.SelectedItem?.ToString() ?? "",
+                    TextBox text => text.Text,
+                    _ => ""
+                };
+                _pluginManager.SetPluginSetting(record, definition, value);
+            }
+        }
 
         if (!string.IsNullOrWhiteSpace(_home.Text)) target.HomePageUrl = _home.Text.Trim();
         if (!string.IsNullOrWhiteSpace(_search.Text))

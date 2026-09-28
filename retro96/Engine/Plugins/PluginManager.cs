@@ -36,6 +36,7 @@ public sealed class PluginManager : IDisposable
     private readonly object _embedLock = new();
     private readonly System.Windows.Forms.Timer _embedRenderTimer;
     private readonly Dictionary<string, (PluginRecord Record, string Token)> _pluginProtocols = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (PluginRecord Record, string Token)> _pluginOmnibox = new(StringComparer.OrdinalIgnoreCase);
 
     public PluginManager(Form1 browser)
     {
@@ -73,7 +74,7 @@ public sealed class PluginManager : IDisposable
         return name switch
         {
             "host.info" or "browser" or "ui" or "storage" or "network" or "filesystem" or
-            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" or "permissions" => true,
+            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" or "permissions" or "page.read" or "network.rules" or "protocol" or "content.transform" or "page.style" or "tabs" or "history" or "bookmarks" or "downloads" or "omnibox" or "settings" or "ui.extras" or "embed.audio" or "embed.extras" or "browser" => true,
             _ => false
         };
     }
@@ -319,7 +320,15 @@ public sealed class PluginManager : IDisposable
     {
         EmbeddedRuntime[] old;
         lock (_embedLock) { old = _embedded.Values.ToArray(); _embedded.Clear(); }
-        foreach (var item in old) item.Dispose();
+        foreach (var item in old)
+        {
+            if (item.Instance != null)
+            {
+                try { item.Instance.Session?.RaiseEmbeddedVisibility(item.Instance.InstanceToken, false); } catch { }
+                try { item.Instance.Session?.RaiseEmbeddedPause(item.Instance.InstanceToken, true); } catch { }
+            }
+            item.Dispose();
+        }
     }
 
     private Bitmap? ResolveEmbeddedFrame(DomElement element, LayoutBox box, bool isPrint)
@@ -336,6 +345,13 @@ public sealed class PluginManager : IDisposable
                 _embedded[element] = runtime;
             }
             EnsureEmbeddedStart(runtime, element, width, height);
+            if (runtime.Instance != null)
+            {
+                if (!runtime.VisibleNotified)
+                { runtime.Instance.Session?.RaiseEmbeddedVisibility(runtime.Instance.InstanceToken, true); runtime.VisibleNotified = true; }
+                if (runtime.LastNotifiedWidth != width || runtime.LastNotifiedHeight != height)
+                { runtime.Instance.Session?.RaiseEmbeddedResize(runtime.Instance.InstanceToken, width, height); runtime.LastNotifiedWidth = width; runtime.LastNotifiedHeight = height; }
+            }
         }
 
         if (isPrint)
@@ -593,6 +609,9 @@ public sealed class PluginManager : IDisposable
         public int LastHeight { get; set; }
         public int LastPrintWidth { get; set; }
         public int LastPrintHeight { get; set; }
+        public int LastNotifiedWidth { get; set; }
+        public int LastNotifiedHeight { get; set; }
+        public bool VisibleNotified { get; set; }
         public Task? StartTask { get; set; }
         public int Rendering;
         public string? Error { get; set; }
@@ -646,6 +665,34 @@ public sealed class PluginManager : IDisposable
         }
     }
 
+    internal void RaiseNavigationFailed(string url, string message)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+            if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
+                record.Sandbox.RaiseNavigationFailed(url, message);
+    }
+
+    internal void RaiseTitleChanged(string url, string title)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+            if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
+                record.Sandbox.RaiseTitleChanged(url, title);
+    }
+
+    internal void RaiseLoadProgress(string url, double fraction)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+            if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
+                record.Sandbox.RaiseLoadProgress(url, fraction);
+    }
+
+    internal void RaiseZoomChanged(float zoom)
+    {
+        foreach (var record in _plugins.Values.ToArray())
+            if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
+                record.Sandbox.RaiseZoomChanged(zoom);
+    }
+
     internal void RaiseHostShuttingDown()
     {
         foreach (var record in _plugins.Values.ToArray())
@@ -672,6 +719,57 @@ public sealed class PluginManager : IDisposable
         foreach (var record in _plugins.Values.ToArray())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.AudioPlayback))
                 record.Sandbox.RaiseAudioComplete();
+    }
+
+    internal void RegisterPluginOmnibox(PluginRecord record, string keyword, string token)
+    {
+        lock (_pluginOmnibox)
+        {
+            if (_pluginOmnibox.TryGetValue(keyword, out var existing) && !ReferenceEquals(existing.Record, record)) throw new InvalidOperationException($"Omnibox keyword '{keyword}' is already registered by another plugin.");
+            _pluginOmnibox[keyword] = (record, token);
+        }
+    }
+
+    internal void UnregisterPluginOmnibox(PluginRecord record, string keyword, string token)
+    {
+        lock (_pluginOmnibox) if (_pluginOmnibox.TryGetValue(keyword, out var existing) && ReferenceEquals(existing.Record, record) && existing.Token == token) _pluginOmnibox.Remove(keyword);
+    }
+
+    internal IReadOnlyDictionary<string, string> GetPluginSettings(PluginRecord record)
+    {
+        if (!record.Manifest.Settings.Any() || !record.HasPermission(PluginPermission.Settings)) return new Dictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            string path = Path.Combine(record.Directory, "data", "storage.json");
+            if (!File.Exists(path)) return new Dictionary<string, string>(StringComparer.Ordinal);
+            var values = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new();
+            return values.Where(p => p.Key.StartsWith("settings.", StringComparison.Ordinal)).ToDictionary(p => p.Key[9..], p => p.Value ?? "", StringComparer.Ordinal);
+        }
+        catch { return new Dictionary<string, string>(StringComparer.Ordinal); }
+    }
+
+    internal void SetPluginSetting(PluginRecord record, PluginSettingDefinition definition, string value)
+    {
+        if (!record.HasPermission(PluginPermission.Settings)) throw new SecurityException("Plugin settings permission has not been granted.");
+        string key = "settings." + definition.Name;
+        string path = Path.Combine(record.Directory, "data", "storage.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        Dictionary<string, string> values;
+        try { values = File.Exists(path) ? JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new() : new(); } catch { values = new(); }
+        values[key] = value ?? "";
+        File.WriteAllText(path, JsonSerializer.Serialize(values));
+        record.Sandbox?.PushSettingChanged(definition.Name, values[key]);
+    }
+
+    internal async Task<IReadOnlyList<PluginOmniboxSuggestion>> GetOmniboxSuggestionsAsync(string text, CancellationToken ct)
+    {
+        string[] parts = (text ?? string.Empty).TrimStart().Split(' ', 2, StringSplitOptions.None);
+        if (parts.Length == 0 || string.IsNullOrWhiteSpace(parts[0])) return Array.Empty<PluginOmniboxSuggestion>();
+        (PluginRecord Record, string Token) entry;
+        lock (_pluginOmnibox) if (!_pluginOmnibox.TryGetValue(parts[0], out entry)) return Array.Empty<PluginOmniboxSuggestion>();
+        if (!entry.Record.Enabled || entry.Record.Sandbox == null || !entry.Record.HasPermission(PluginPermission.Omnibox)) return Array.Empty<PluginOmniboxSuggestion>();
+        string query = parts.Length > 1 ? parts[1] : string.Empty;
+        return await entry.Record.Sandbox.GetOmniboxSuggestionsAsync(parts[0], query, ct).ConfigureAwait(true);
     }
 
     internal void RegisterPluginProtocol(PluginRecord record, string scheme, string token)
@@ -952,6 +1050,27 @@ public sealed class PluginManager : IDisposable
         }
     }
 
+    private static void ValidateSettings(IEnumerable<PluginSettingDefinition>? settings)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int count = 0;
+        foreach (var setting in settings ?? Array.Empty<PluginSettingDefinition>())
+        {
+            if (++count > 32) throw new InvalidDataException("A plugin may declare at most 32 settings.");
+            string name = (setting.Name ?? "").Trim();
+            string type = (setting.Type ?? "").Trim().ToLowerInvariant();
+            if (name.Length == 0 || name.Length > 64 || !name.All(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.'))
+                throw new InvalidDataException($"Invalid plugin setting name '{setting.Name}'.");
+            if (!seen.Add(name)) throw new InvalidDataException($"Duplicate plugin setting '{name}'.");
+            if (type is not ("toggle" or "text" or "select"))
+                throw new InvalidDataException($"Plugin setting '{name}' has unsupported type '{setting.Type}'. Use toggle, text, or select.");
+            if ((setting.Label ?? "").Length > 128 || (setting.Description ?? "").Length > 512 || (setting.DefaultValue ?? "").Length > 2048)
+                throw new InvalidDataException($"Plugin setting '{name}' contains text that is too long.");
+            if (type == "select" && (setting.Options == null || setting.Options.Length == 0 || setting.Options.Length > 32 || setting.Options.Any(o => string.IsNullOrWhiteSpace(o) || o.Length > 128)))
+                throw new InvalidDataException($"Plugin select setting '{name}' must contain 1-32 options of at most 128 characters.");
+        }
+    }
+
     private static void ValidateManifest(PluginManifest manifest)
     {
         if (string.IsNullOrWhiteSpace(manifest.Id) || string.IsNullOrWhiteSpace(manifest.Name))
@@ -967,6 +1086,7 @@ public sealed class PluginManager : IDisposable
             throw new InvalidDataException("Plugin id may contain only letters, digits, '.', '-' and '_'.");
         ValidatePermissions(manifest.Permissions);
         ValidatePermissions(manifest.OptionalPermissions);
+        ValidateSettings(manifest.Settings);
         var overlap = new HashSet<string>(manifest.Permissions ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
         if (manifest.OptionalPermissions != null && manifest.OptionalPermissions.Any(overlap.Contains))
             throw new InvalidDataException("A permission cannot be listed in both permissions and optional_permissions.");
@@ -1042,7 +1162,8 @@ public sealed class PluginManager : IDisposable
                         LastCrashUtc = state.LastCrashUtc,
                         Activity = state.Activity ?? new List<PluginActivityEntry>(),
                         CrashTimes = state.CrashTimes ?? new List<DateTimeOffset>(),
-                        RestartAttempt = state.RestartAttempt
+                        RestartAttempt = state.RestartAttempt,
+                        RejectedShortcuts = state.RejectedShortcuts ?? new List<string>()
                     };
                     _plugins[state.Id].ActivityPersistence = SaveState;
                 }
@@ -1067,7 +1188,8 @@ public sealed class PluginManager : IDisposable
             LastCrashUtc = p.LastCrashUtc,
             Activity = p.SnapshotActivity(),
             CrashTimes = p.CrashTimes.ToList(),
-            RestartAttempt = p.RestartAttempt
+            RestartAttempt = p.RestartAttempt,
+            RejectedShortcuts = p.RejectedShortcuts.ToList()
         }).ToList();
         File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
     }
@@ -1093,6 +1215,8 @@ public sealed class PluginManager : IDisposable
     {
         lock (_pluginProtocols)
             foreach (var key in _pluginProtocols.Where(x => ReferenceEquals(x.Value.Record, record)).Select(x => x.Key).ToArray()) _pluginProtocols.Remove(key);
+        lock (_pluginOmnibox)
+            foreach (var key in _pluginOmnibox.Where(x => ReferenceEquals(x.Value.Record, record)).Select(x => x.Key).ToArray()) _pluginOmnibox.Remove(key);
         DisableRuntimeOnly(record);
         _browser.RemovePluginFileMenuItems(record.Manifest.Id);
         record.Status = "Disabled";
@@ -1139,6 +1263,7 @@ public sealed class PluginManager : IDisposable
         public List<PluginActivityEntry>? Activity { get; set; }
         public List<DateTimeOffset>? CrashTimes { get; set; }
         public int RestartAttempt { get; set; }
+        public List<string>? RejectedShortcuts { get; set; }
     }
 
     public sealed class PluginRecord

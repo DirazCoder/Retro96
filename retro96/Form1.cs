@@ -308,6 +308,7 @@ public partial class Form1 : Form
     private void InitializeComponent()
     {
         AutoScaleMode = AutoScaleMode.None;
+        KeyPreview = true;
 
         Text = "Retro96";
         Size = new Size(1024, 760);
@@ -442,6 +443,11 @@ public partial class Form1 : Form
         _btnPrint.Click += (s, e) => PrintPage();
 
         _btnGo.Click += (s, e) => NavigateOrSearch(_txtUrl.Text);
+        KeyDown += (_, e) =>
+        {
+            if (_pluginShortcuts.TryGetValue(e.KeyData, out var shortcut)) { try { shortcut.Callback(); } catch (Exception ex) { DebugLog.WriteException($"Plugin shortcut '{shortcut.PluginId}'", ex); } e.Handled = true; e.SuppressKeyPress = true; }
+        };
+
         _txtUrl.KeyDown += (s, e) =>
         {
             if (e.KeyCode == Keys.Enter)
@@ -578,7 +584,7 @@ public partial class Form1 : Form
 
     private void ShowPreferencesDialog()
     {
-        using var dialog = new PreferencesDialog(_settings);
+        using var dialog = new PreferencesDialog(_settings, _pluginManager);
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         var updated = dialog.Settings;
@@ -886,19 +892,23 @@ public partial class Form1 : Form
                 switch (result)
                 {
                     case HttpSuccess s:
+                        _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.75);
                         await ProcessSuccessAsync(s, url, ct, postData, replaceHistory, isMetaRefreshNav, myGeneration);
                         break;
                     case CertError ce:
+                        _pluginManager?.RaiseNavigationFailed(url.ToAbsolute(), ce.Message);
                         _pendingCertRetryUrl = url.ToAbsolute();
                         _certRetryCount++;
                         await RenderErrorAsync(ErrorPage.CertificateError(url.ToAbsolute(), ce.Message), myGeneration);
                         break;
                     case HttpError he:
+                        _pluginManager?.RaiseNavigationFailed(url.ToAbsolute(), he.Message);
                         await RenderErrorAsync(he.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
                             ? ErrorPage.Timeout(url.ToAbsolute())
                             : ErrorPage.NetworkError(url.ToAbsolute(), he.Message), myGeneration);
                         break;
                     case TooManyRedirects:
+                        _pluginManager?.RaiseNavigationFailed(url.ToAbsolute(), "Too many redirects.");
                         await RenderErrorAsync(ErrorPage.TooManyRedirects(url.ToAbsolute()), myGeneration);
                         break;
                 }
@@ -913,6 +923,7 @@ public partial class Form1 : Form
             }
             catch (Exception ex)
             {
+                _pluginManager?.RaiseNavigationFailed(url.ToAbsolute(), ex.Message);
                 BeginInvoke(async () =>
                     await RenderErrorAsync(ErrorPage.NetworkError(url.ToAbsolute(), ex.Message), myGeneration));
             }
@@ -1071,6 +1082,7 @@ public partial class Form1 : Form
 
         BeginInvoke(() => _statusLabel.Text = "Parsing…");
 
+        _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.8);
         var (document, interpreter, state) = PrepareScripting(url, html);
 
         // document.lastModified / document.referrer (checklist)
@@ -1088,6 +1100,7 @@ public partial class Form1 : Form
         document.VisitedUrls.UnionWith(_visitedUrls);
         Size canvasSize = GetCanvasSize();
         StyleResolver.Resolve(document, canvasSize.Width);
+        _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.9);
 
         var rootBox = LayoutEngineApi.BuildLayoutTree(
             document, canvasSize.Width, canvasSize.Height);
@@ -2131,6 +2144,7 @@ public partial class Form1 : Form
         _canvas.ReRenderPage(_fontCache, _imageCache, _resourceLoader!);
 
         Text = (document.Title.Length > 0 ? document.Title : "Untitled") + " — Retro96";
+        _pluginManager?.RaiseTitleChanged(url, document.Title);
         _txtUrl.Text = url;
         _statusLabel.Text = "Done";
         Cursor = Cursors.Default;

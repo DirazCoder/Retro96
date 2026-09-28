@@ -12,6 +12,11 @@ namespace Retro96;
 public partial class Form1
 {
     private readonly ToolStrip _pluginToolbar = new() { GripStyle = ToolStripGripStyle.Hidden, Visible = false };
+    private readonly Dictionary<string, ToolStripLabel> _pluginBadges = new(StringComparer.Ordinal);
+    private readonly Dictionary<Keys, (string PluginId, Action Callback)> _pluginShortcuts = new();
+    private readonly ContextMenuStrip _pluginOmniboxMenu = new();
+    private ToolStripDropDownButton? _pluginToolsMenu;
+    private ToolStripDropDownButton? _pluginHelpMenu;
     private readonly Panel _pluginPanelContainer = new() { Dock = DockStyle.Right, Width = 300, Visible = false, BorderStyle = BorderStyle.FixedSingle };
     private readonly TabControl _pluginPanelTabs = new() { Dock = DockStyle.Fill };
     private readonly NotifyIcon _pluginNotifyIcon = new() { Icon = SystemIcons.Application, Visible = false, Text = "Retro96" };
@@ -29,11 +34,17 @@ public partial class Form1
         _pluginPanelContainer.Controls.Add(_pluginPanelTabs);
         Controls.Add(_pluginToolbar);
         _pluginToolbar.Dock = DockStyle.Top;
+        _pluginToolsMenu ??= new ToolStripDropDownButton("Tools");
+        _pluginHelpMenu ??= new ToolStripDropDownButton("Help");
+        _toolbar.Items.Add(_pluginToolsMenu);
+        _toolbar.Items.Add(_pluginHelpMenu);
         _pluginPanelContainer.BringToFront();
         _pluginNotifyIcon.BalloonTipClicked += PluginNotificationBalloonClicked;
         _clipboardPollTimer.Tick += (_, _) => PollClipboardChanged();
         try { _clipboardFingerprint = ClipboardFingerprint(); } catch { }
         _clipboardPollTimer.Start();
+        _txtUrl.TextChanged += async (_, _) => await RefreshPluginOmniboxAsync();
+        _pluginOmniboxMenu.Closing += (_, _) => _pluginOmniboxMenu.Items.Clear();
     }
 
     internal IDisposable AddPluginToolbarButton(string pluginId, string label, string tooltip, Action callback)
@@ -47,6 +58,108 @@ public partial class Form1
             try { _pluginToolbar.Items.Remove(button); button.Dispose(); } catch { }
             if (_pluginToolbar.Items.Count == 0) _pluginToolbar.Visible = false;
         });
+    }
+
+    internal IDisposable AddPluginUiExtrasToolbarButton(string pluginId, string label, string tooltip, byte[]? png, Action callback, PluginMenuChoice menu)
+    {
+        if (InvokeRequired) return (IDisposable)Invoke(() => AddPluginUiExtrasToolbarButton(pluginId, label, tooltip, png, callback, menu));
+        Image? image = null;
+        if (png is { Length: > 0 })
+        {
+            using var ms = new MemoryStream(png); using var source = Image.FromStream(ms); image = new Bitmap(source, new Size(Math.Min(24, source.Width), Math.Min(24, source.Height)));
+        }
+        var item = new ToolStripButton(label) { ToolTipText = tooltip, Tag = pluginId, DisplayStyle = image == null ? ToolStripItemDisplayStyle.Text : ToolStripItemDisplayStyle.ImageAndText, Image = image, ImageScaling = ToolStripItemImageScaling.SizeToFit };
+        item.Click += (_, _) => { try { callback(); } catch (Exception ex) { DebugLog.WriteException($"Plugin toolbar '{pluginId}'", ex); } };
+        ToolStripDropDown target = menu switch
+        {
+            PluginMenuChoice.View => EnsurePluginMenu(_viewMenu, "View"),
+            PluginMenuChoice.Tools => EnsurePluginMenu(_pluginToolsMenu ??= new ToolStripDropDownButton("Tools"), "Tools"),
+            PluginMenuChoice.Help => EnsurePluginMenu(_pluginHelpMenu ??= new ToolStripDropDownButton("Help"), "Help"),
+            _ => _btnFile.DropDown
+        };
+        target.Items.Add(item);
+        return new DelegateDisposable(() => { try { target.Items.Remove(item); item.Image?.Dispose(); item.Dispose(); } catch { } });
+    }
+
+    private static ToolStripDropDown EnsurePluginMenu(ToolStripDropDownButton button, string title) => button.DropDown;
+
+    internal void SetPluginBadge(string pluginId, string text)
+    {
+        if (InvokeRequired) { BeginInvoke(() => SetPluginBadge(pluginId, text)); return; }
+        if (!_pluginBadges.TryGetValue(pluginId, out var label))
+        {
+            label = new ToolStripLabel { Tag = pluginId, Margin = new Padding(4, 0, 4, 0) }; _pluginBadges[pluginId] = label; _pluginToolbar.Items.Add(label); _pluginToolbar.Visible = true;
+        }
+        label.Text = string.IsNullOrWhiteSpace(text) ? string.Empty : $"[{text.Trim()[..Math.Min(32, text.Trim().Length)]}]"; label.Visible = !string.IsNullOrEmpty(label.Text);
+    }
+
+    internal bool TryRegisterPluginShortcut(string pluginId, PluginKeyboardShortcut shortcut, Action callback)
+    {
+        if (!TryParseShortcut(shortcut.Shortcut, out var keys) || IsBuiltInShortcut(keys) || _pluginShortcuts.ContainsKey(keys)) return false;
+        _pluginShortcuts[keys] = (pluginId, callback);
+        return true;
+    }
+
+    internal void UnregisterPluginShortcut(string pluginId, PluginKeyboardShortcut shortcut)
+    {
+        if (TryParseShortcut(shortcut.Shortcut, out var keys) && _pluginShortcuts.TryGetValue(keys, out var value) && value.PluginId.Equals(pluginId, StringComparison.OrdinalIgnoreCase)) _pluginShortcuts.Remove(keys);
+    }
+
+    private static bool TryParseShortcut(string value, out Keys keys)
+    {
+        keys = Keys.None;
+        foreach (string partRaw in (value ?? string.Empty).Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            string part = partRaw.ToLowerInvariant();
+            keys |= part switch
+            { "ctrl" or "control" => Keys.Control, "shift" => Keys.Shift, "alt" => Keys.Alt, "win" or "meta" => Keys.LWin,
+              _ when Enum.TryParse<Keys>(partRaw, true, out var key) => key, _ => Keys.None };
+        }
+        return keys != Keys.None && (keys & Keys.KeyCode) != Keys.None;
+    }
+
+    private static bool IsBuiltInShortcut(Keys keys)
+    {
+        Keys k = keys & Keys.KeyCode;
+        if (k == Keys.F5 || k == Keys.F6 || k == Keys.F11 || k == Keys.Enter) return true;
+        return keys == (Keys.Control | Keys.L) || keys == (Keys.Control | Keys.R) || keys == (Keys.Control | Keys.F) || keys == (Keys.Control | Keys.O) || keys == (Keys.Control | Keys.P) || keys == (Keys.Alt | Keys.Left) || keys == (Keys.Alt | Keys.Right);
+    }
+
+
+    internal void SetPluginEmbeddedCursor(Retro96.Engine.Dom.DomElement? element, EmbeddedCursor cursor)
+    {
+        if (InvokeRequired) { BeginInvoke(() => SetPluginEmbeddedCursor(element, cursor)); return; }
+        _canvas.Cursor = cursor switch
+        {
+            EmbeddedCursor.Arrow => Cursors.Arrow,
+            EmbeddedCursor.Hand => Cursors.Hand,
+            EmbeddedCursor.IBeam => Cursors.IBeam,
+            EmbeddedCursor.Cross => Cursors.Cross,
+            EmbeddedCursor.SizeAll => Cursors.SizeAll,
+            EmbeddedCursor.SizeNS => Cursors.SizeNS,
+            EmbeddedCursor.SizeWE => Cursors.SizeWE,
+            _ => Cursors.Default
+        };
+    }
+
+    internal async Task RefreshPluginOmniboxAsync()
+    {
+        var manager = _pluginManager; if (manager == null || IsDisposed) return;
+        string text = _txtUrl.Text.TrimStart();
+        string keyword = text.Split(' ', 2, StringSplitOptions.None).FirstOrDefault() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(keyword)) { _pluginOmniboxMenu.Close(); return; }
+        using var cts = new CancellationTokenSource(350);
+        IReadOnlyList<PluginOmniboxSuggestion> suggestions;
+        try { suggestions = await manager.GetOmniboxSuggestionsAsync(text, cts.Token).ConfigureAwait(true); } catch { return; }
+        if (suggestions.Count == 0 || !_txtUrl.Text.StartsWith(keyword, StringComparison.OrdinalIgnoreCase)) { _pluginOmniboxMenu.Close(); return; }
+        _pluginOmniboxMenu.Items.Clear();
+        foreach (var suggestion in suggestions)
+        {
+            var item = new ToolStripMenuItem(string.IsNullOrWhiteSpace(suggestion.Description) ? suggestion.Text : $"{suggestion.Text} — {suggestion.Description}") { Tag = suggestion };
+            item.Click += (_, _) => { if (!string.IsNullOrWhiteSpace(suggestion.Url)) _ = NavigateAsync(suggestion.Url!); else _txtUrl.Text = suggestion.Text; };
+            _pluginOmniboxMenu.Items.Add(item);
+        }
+        if (_pluginOmniboxMenu.Items.Count > 0) _pluginOmniboxMenu.Show(_txtUrl.TextBox, new Point(0, _txtUrl.TextBox.Height));
     }
 
     internal IDisposable AddPluginContextMenuItem(string pluginId, string label,
@@ -123,7 +236,15 @@ public partial class Form1
 
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     [System.ComponentModel.Browsable(false)]
-    internal float PluginZoom { get => _canvas.ZoomFactor; set => _canvas.ZoomFactor = value; }
+    internal float PluginZoom
+    {
+        get => _canvas.ZoomFactor;
+        set
+        {
+            _canvas.ZoomFactor = Math.Clamp(value, 0.25f, 4f);
+            _pluginManager?.RaiseZoomChanged(_canvas.ZoomFactor);
+        }
+    }
     internal Size PluginViewportSize => _canvas.GetViewportSize();
     internal void PluginFind(string text, bool caseSensitive, bool wrapAround) => _canvas.FindInPage(text, caseSensitive, wrapAround);
     internal void PluginFindNext() => _canvas.FindNext();
@@ -173,6 +294,43 @@ public partial class Form1
 
     private static string TruncatePluginText(string value, int max) =>
         value.Length <= max ? value : value[..max];
+
+    internal async Task<string?> PluginDownloadAsync(string pluginId, string url, string suggestedFileName, string pluginDataRoot, Action<PluginDownloadProgress> progress, CancellationToken cancellationToken)
+    {
+        if (InvokeRequired) return await (Task<string?>)Invoke(() => PluginDownloadAsync(pluginId, url, suggestedFileName, pluginDataRoot, progress, cancellationToken));
+        var parsed = ParsedUrl.Parse(url);
+        if (!parsed.IsHttp) throw new SecurityException("Plugin downloads are limited to http/https URLs.");
+        if (!string.Equals(pluginId, _pluginManager?.Plugins.FirstOrDefault(x => x.Manifest.Id.Equals(pluginId, StringComparison.OrdinalIgnoreCase))?.Manifest.Id, StringComparison.OrdinalIgnoreCase)) throw new SecurityException("Plugin identity is invalid.");
+        string fileName = Path.GetFileName(suggestedFileName ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(fileName) || fileName is "." or "..") fileName = "download";
+        fileName = string.Concat(fileName.Where(c => !char.IsControl(c) && c != '\' && c != '/')).Trim();
+        if (fileName.Length > 128) fileName = fileName[..128];
+        if (string.IsNullOrWhiteSpace(fileName)) fileName = "download";
+        if (MessageBox.Show(this, $"Plugin '{pluginId}' requested a download from:
+
+{url}
+
+The download is capped at 8 MiB and will be stored in the plugin sandbox.", "Allow plugin download?", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) return null;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(30));
+        HttpResult result = await _httpClient.GetAsync(parsed, _cookieStore, cts.Token, ResourceKind.Document).ConfigureAwait(true);
+        if (result is not HttpSuccess success) throw new InvalidOperationException(result is HttpError he ? he.Message : "Plugin download failed.");
+        if (success.Body.Length > 8 * 1024 * 1024) throw new InvalidDataException("Plugin download exceeds the 8 MiB size cap.");
+        string relative = Path.Combine("downloads", Guid.NewGuid().ToString("N") + "_" + fileName).Replace(Path.DirectorySeparatorChar, '/');
+        string path = SafePluginDataPath(pluginDataRoot, relative);
+        var item = _downloadManager.Start(url, success.Body, fileName, path);
+        EventHandler handler = (_, _) => {
+            progress(new PluginDownloadProgress(url, relative, item.BytesDownloaded, item.TotalBytes, item.Status == DownloadStatus.Complete, item.Error));
+        };
+        _downloadManager.Changed += handler;
+        try
+        {
+            while (item.Status == DownloadStatus.Downloading) { cts.Token.ThrowIfCancellationRequested(); await Task.Delay(100, cts.Token).ConfigureAwait(true); }
+            progress(new PluginDownloadProgress(url, relative, item.BytesDownloaded, item.TotalBytes, item.Status == DownloadStatus.Complete, item.Error));
+            return item.Status == DownloadStatus.Complete ? relative : null;
+        }
+        finally { _downloadManager.Changed -= handler; }
+    }
 
     internal async Task<string> PluginNetworkGetStringAsync(string url, CancellationToken ct) => await PluginNetworkSendAsync(new HttpPluginRequest("GET", url), ct).ConfigureAwait(false);
 

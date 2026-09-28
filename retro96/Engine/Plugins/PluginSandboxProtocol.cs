@@ -140,10 +140,12 @@ internal static class PluginSandboxProtocol
     public sealed record EventClipboardPayload();
     public sealed record EventPlaybackPayload();
     public sealed record EventPermissionsPayload(ulong GrantedPermissions);
+    public sealed record EventPluginSettingChangedPayload(string Name, string Value);
     public sealed record EventNavigationFailedPayload(string Url, string Message);
     public sealed record EventTitleChangedPayload(string Url, string Title);
     public sealed record EventLoadProgressPayload(string Url, double Fraction);
     public sealed record EventZoomChangedPayload(double Zoom);
+    public sealed record EventDownloadProgressPayload(PluginDownloadProgress Progress);
     public sealed record ScreenshotReply(string PngBase64);
     public sealed record PanelInvokePayload(string Token, string? Text = null, bool? Checked = null, int? Index = null);
 
@@ -183,6 +185,16 @@ internal static class PluginSandboxProtocol
     public sealed record EmbedAudioPayload(string InstanceToken, PluginPcmFormat Format, string PcmBase64);
     public sealed record EmbedMutePayload(string InstanceToken, bool Muted);
     public sealed record EmbedCursorPayload(string InstanceToken, EmbeddedCursor Cursor);
+    public sealed record DownloadStartPayload(string Url, string SuggestedFileName);
+    public sealed record DownloadReply(string? RelativePath);
+    public sealed record OmniboxRegisterPayload(string Keyword, string Token);
+    public sealed record OmniboxSuggestionWire(string Text, string? Url, string? Description);
+    public sealed record OmniboxSuggestPayload(string Token, string Text);
+    public sealed record OmniboxSuggestionsReply(OmniboxSuggestionWire[] Suggestions);
+    public sealed record UiExtrasToolbarPayload(string Label, string Tooltip, string? PngBase64, PluginMenuChoice Menu, string Token);
+    public sealed record UiExtrasBadgePayload(string Text);
+    public sealed record UiExtrasShortcutPayload(string Shortcut, string Description, string Token);
+    public sealed record UiExtrasTokenPayload(string Token);
     public sealed record EventEmbedVisibilityPayload(string InstanceToken, bool Visible);
     public sealed record EventEmbedPausePayload(string InstanceToken, bool Paused);
     public sealed record EventEmbedResizePayload(string InstanceToken, int Width, int Height);

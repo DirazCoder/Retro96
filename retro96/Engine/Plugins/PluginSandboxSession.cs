@@ -37,6 +37,9 @@ internal sealed class PluginSandboxSession : IDisposable
     private readonly Dictionary<string, string> _protocols = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _contentTransforms = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _pageStyles = new();
+    private readonly Dictionary<string, string> _omniboxKeywords = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IDisposable> _extraUiItems = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PluginKeyboardShortcut> _shortcuts = new(StringComparer.Ordinal);
     private readonly List<PluginNetworkRule> _networkRules = new();
     private NamedPipeServerStream? _pipe;
     private WindowsSecurity.WorkerProcess? _worker;
@@ -209,11 +212,28 @@ internal sealed class PluginSandboxSession : IDisposable
 
     public void RaiseNavigated(string url) => SendEvent("event.navigated", new PluginSandboxProtocol.EventNavigatedPayload(url));
     public void RaisePageLoaded(string url, string title) => SendEvent("event.pageLoaded", new PluginSandboxProtocol.EventPageLoadedPayload(url, title));
+    public void RaiseNavigationFailed(string url, string message) => SendEvent("event.navigationFailed", new PluginSandboxProtocol.EventNavigationFailedPayload(url, message));
+    public void RaiseTitleChanged(string url, string title) => SendEvent("event.titleChanged", new PluginSandboxProtocol.EventTitleChangedPayload(url, title));
+    public void RaiseLoadProgress(string url, double fraction) => SendEvent("event.loadProgress", new PluginSandboxProtocol.EventLoadProgressPayload(url, fraction));
+    public void RaiseZoomChanged(float zoom) => SendEvent("event.zoomChanged", new PluginSandboxProtocol.EventZoomChangedPayload(zoom));
+    internal void RaiseEmbeddedVisibility(string instanceToken, bool visible)
+    {
+        if (_record.HasPermission(PluginPermission.EmbedExtras)) SendEvent("event.embed.visibility", new PluginSandboxProtocol.EventEmbedVisibilityPayload(instanceToken, visible));
+    }
+    internal void RaiseEmbeddedPause(string instanceToken, bool paused)
+    {
+        if (_record.HasPermission(PluginPermission.EmbedExtras)) SendEvent("event.embed.pause", new PluginSandboxProtocol.EventEmbedPausePayload(instanceToken, paused));
+    }
+    internal void RaiseEmbeddedResize(string instanceToken, int width, int height)
+    {
+        if (_record.HasPermission(PluginPermission.EmbedExtras)) SendEvent("event.embed.resize", new PluginSandboxProtocol.EventEmbedResizePayload(instanceToken, Math.Clamp(width, 1, 4096), Math.Clamp(height, 1, 4096)));
+    }
     public void RaiseHostShuttingDown() => SendEvent("event.hostShuttingDown", new { });
     public void RaiseWindowFocusChanged(bool hasFocus) => SendEvent("event.focus", new PluginSandboxProtocol.EventFocusPayload(hasFocus));
     public void RaiseClipboardChanged() => SendEvent("event.clipboard.changed", new PluginSandboxProtocol.EventClipboardPayload());
     public void RaiseAudioComplete() => SendEvent("event.audio.complete", new PluginSandboxProtocol.EventPlaybackPayload());
     public void PushGrantedPermissions(PluginPermission permissions) => SendEvent("event.permissions.changed", new PluginSandboxProtocol.EventPermissionsPayload((ulong)permissions));
+    public void PushSettingChanged(string name, string value) => SendEvent("event.setting.changed", new PluginSandboxProtocol.EventPluginSettingChangedPayload(name, value));
 
     private void SendEvent(string op, object payload)
     {
@@ -583,6 +603,71 @@ internal sealed class PluginSandboxSession : IDisposable
                     byte[] audioPcm = DecodeCappedBase64(audioBytes.PcmBase64, 1024 * 1024);
                     await _browser.PlayPluginPcmAsync("plugin:" + _record.Manifest.Id, audioPcm, audioBytes.Format, _lifetime.Token).ConfigureAwait(true);
                     await ReplyOkAsync(envelope); break;
+                case "omnibox.register":
+                    Demand(PluginPermission.Omnibox);
+                    var orp = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.OmniboxRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    ValidateOmniboxKeyword(orp.Keyword);
+                    _manager.RegisterPluginOmnibox(_record, orp.Keyword, orp.Token);
+                    lock (_omniboxKeywords) _omniboxKeywords[orp.Token] = orp.Keyword;
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "omnibox.remove":
+                    Demand(PluginPermission.Omnibox);
+                    var orm = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.OmniboxRegisterPayload>(envelope) ?? throw new InvalidDataException();
+                    _manager.UnregisterPluginOmnibox(_record, orm.Keyword, orm.Token);
+                    lock (_omniboxKeywords) _omniboxKeywords.Remove(orm.Token);
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "ui.extras.toolbar.add":
+                    Demand(PluginPermission.UiExtras);
+                    var utea = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasToolbarPayload>(envelope) ?? throw new InvalidDataException();
+                    if (utea.Label.Length > 64 || utea.Tooltip.Length > 256) throw new InvalidDataException("Plugin toolbar text is too long.");
+                    byte[]? png = string.IsNullOrWhiteSpace(utea.PngBase64) ? null : DecodeCappedBase64(utea.PngBase64, 64 * 1024);
+                    var toolbarLease = RunOnUi(() => _browser.AddPluginUiExtrasToolbarButton(_record.Manifest.Id, utea.Label, utea.Tooltip, png,
+                        () => SendEvent("event.ui.invoke", new PluginSandboxProtocol.UiInvokePayload(utea.Token)), utea.Menu));
+                    lock (_extraUiItems) _extraUiItems[utea.Token] = toolbarLease;
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "ui.extras.toolbar.remove":
+                    Demand(PluginPermission.UiExtras);
+                    var uter = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasTokenPayload>(envelope) ?? throw new InvalidDataException();
+                    lock (_extraUiItems) { if (_extraUiItems.Remove(uter.Token, out var lease)) lease.Dispose(); }
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "ui.extras.badge":
+                    Demand(PluginPermission.UiExtras);
+                    var ub = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasBadgePayload>(envelope) ?? throw new InvalidDataException();
+                    if (ub.Text.Length > 32) throw new InvalidDataException("Plugin badge text is too long.");
+                    RunOnUi(() => _browser.SetPluginBadge(_record.Manifest.Id, ub.Text));
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "ui.extras.shortcut.add":
+                    Demand(PluginPermission.UiExtras);
+                    var usa = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasShortcutPayload>(envelope) ?? throw new InvalidDataException();
+                    var shortcut = new PluginKeyboardShortcut(usa.Shortcut.Trim(), usa.Description.Trim());
+                    if (!_browser.TryRegisterPluginShortcut(_record.Manifest.Id, shortcut, () => SendEvent("event.ui.invoke", new PluginSandboxProtocol.UiInvokePayload(usa.Token))))
+                    {
+                        _record.RejectedShortcuts.Add(shortcut.Shortcut);
+                        throw new InvalidOperationException($"Shortcut '{shortcut.Shortcut}' conflicts with a built-in shortcut or another plugin.");
+                    }
+                    lock (_shortcuts) _shortcuts[usa.Token] = shortcut;
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+                case "ui.extras.shortcut.remove":
+                    Demand(PluginPermission.UiExtras);
+                    var usr = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiExtrasTokenPayload>(envelope) ?? throw new InvalidDataException();
+                    lock (_shortcuts) { if (_shortcuts.Remove(usr.Token, out var shortcut)) _browser.UnregisterPluginShortcut(_record.Manifest.Id, shortcut); }
+                    await ReplyOkAsync(envelope.Id).ConfigureAwait(false);
+                    break;
+
+                case "downloads.start":
+                    Demand(PluginPermission.Downloads, GetNetworkHost(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DownloadStartPayload>(envelope)?.Url));
+                    var dl = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DownloadStartPayload>(envelope) ?? throw new InvalidDataException();
+                    string? downloaded = await _browser.PluginDownloadAsync(_record.Manifest.Id, dl.Url, dl.SuggestedFileName, Path.Combine(_rootDirectory, "data"),
+                        progress => SendEvent("event.download.progress", new PluginSandboxProtocol.EventDownloadProgressPayload(progress)), _lifetime.Token).ConfigureAwait(true);
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DownloadReply(downloaded)).ConfigureAwait(false);
+                    break;
+
                 case "dialogs.open":
                     Demand(PluginPermission.Dialogs); string? importPath = await _browser.PluginOpenFilePickerAsync(_record.Manifest.Id, PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Title ?? "Open File", PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Filter ?? "All files (*.*)|*.*", Path.Combine(_rootDirectory, "data")).ConfigureAwait(false); await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DialogOpenReply(importPath)); break;
                 case "dialogs.save":
@@ -749,6 +834,12 @@ internal sealed class PluginSandboxSession : IDisposable
         if (value is "http" or "https" or "file" or "about" or "data" or "javascript" or "mailto" or "retro96") throw new SecurityException("That URL scheme is reserved by Retro96.");
     }
 
+    private static void ValidateOmniboxKeyword(string keyword)
+    {
+        string value = (keyword ?? string.Empty).Trim().ToLowerInvariant();
+        if (value.Length is < 1 or > 32 || !value.All(c => char.IsLetterOrDigit(c) || c is '-' or '_')) throw new InvalidDataException("Invalid omnibox keyword.");
+    }
+
     private static void ValidateContentType(string contentType)
     {
         string value = (contentType ?? string.Empty).Trim().ToLowerInvariant();
@@ -796,6 +887,16 @@ internal sealed class PluginSandboxSession : IDisposable
     {
         Demand(PluginPermission.Tabs);
         return await RunBeforeNavigateAsync(tabId, url, ct).ConfigureAwait(true);
+    }
+
+    internal async Task<IReadOnlyList<PluginOmniboxSuggestion>> GetOmniboxSuggestionsAsync(string keyword, string text, CancellationToken ct)
+    {
+        Demand(PluginPermission.Omnibox);
+        string token;
+        lock (_omniboxKeywords) token = _omniboxKeywords.FirstOrDefault(x => x.Value.Equals(keyword, StringComparison.OrdinalIgnoreCase)).Key;
+        if (string.IsNullOrWhiteSpace(token)) return Array.Empty<PluginOmniboxSuggestion>();
+        var reply = await SendRequestAsync<PluginSandboxProtocol.OmniboxSuggestionsReply>("omnibox.suggest", new PluginSandboxProtocol.OmniboxSuggestPayload(token, text), ct).ConfigureAwait(true);
+        return (reply.Suggestions ?? Array.Empty<PluginSandboxProtocol.OmniboxSuggestionWire>()).Take(8).Select(x => new PluginOmniboxSuggestion(TruncatePluginText(x.Text ?? string.Empty, 256), string.IsNullOrWhiteSpace(x.Url) ? null : TruncatePluginText(x.Url!, 8192), TruncatePluginText(x.Description ?? string.Empty, 512))).ToArray();
     }
 
     internal void RegisterProtocol(string scheme, string token)
@@ -888,6 +989,7 @@ internal sealed class PluginSandboxSession : IDisposable
         { _session = session; InstanceToken=instanceToken; StreamToken=streamToken; ScriptName=scriptName; ScriptMethods=scriptMethods; }
         internal string InstanceToken { get; }
         internal string StreamToken { get; }
+        internal PluginSandboxSession? Session => _session;
         public string ScriptName { get; }
         public IReadOnlyList<string> ScriptMethods { get; }
         internal DomElement? Element { get; set; }
