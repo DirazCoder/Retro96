@@ -670,6 +670,35 @@ public sealed class PluginManager : IDisposable
                 record.Sandbox.RaiseAudioComplete();
     }
 
+    internal PluginNetworkRuleDecision EvaluateNetworkRules(string url, IReadOnlyDictionary<string, string> headers)
+    {
+        var strip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in _plugins.Values.ToArray())
+        {
+            if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.NetworkRules)) continue;
+            foreach (var rule in record.Sandbox.SnapshotNetworkRules())
+            {
+                if (!NetworkRuleMatches(rule.Match, url)) continue;
+                if (rule.Kind == PluginNetworkRuleKind.Block) return new PluginNetworkRuleDecision(true, null, strip);
+                if (rule.Kind == PluginNetworkRuleKind.Redirect && !string.IsNullOrWhiteSpace(rule.Replacement)) return new PluginNetworkRuleDecision(false, rule.Replacement, strip);
+                if (rule.Kind == PluginNetworkRuleKind.StripHeader && !string.IsNullOrWhiteSpace(rule.Replacement)) strip.Add(rule.Replacement);
+            }
+        }
+        return new PluginNetworkRuleDecision(false, null, strip);
+    }
+
+    private static bool NetworkRuleMatches(string match, string url)
+    {
+        string value = match.Trim();
+        if (value == "*") return true;
+        if (value.StartsWith("host:", StringComparison.OrdinalIgnoreCase))
+        {
+            string host = value[5..].Trim();
+            return Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Host.Equals(host, StringComparison.OrdinalIgnoreCase);
+        }
+        return url.Contains(value, StringComparison.OrdinalIgnoreCase);
+    }
+
     internal void PopulateContextMenu(ContextMenuStrip menu, ContextMenuContext context)
     {
         _browser.PopulatePluginContextMenu(menu, context);

@@ -297,6 +297,7 @@ public partial class Form1 : Form
         InitializeBrowser();
         InitializeBuiltInFeatures();
         _pluginManager = new PluginManager(this);
+        _httpClient.PluginRuleEvaluator = _pluginManager.EvaluateNetworkRules;
     }
 
     // ─────────────────────────────────────────────────────────────────────

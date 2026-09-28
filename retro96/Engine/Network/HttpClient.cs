@@ -32,6 +32,8 @@ public record CertError(string Message) : HttpResult;
 
 public record TooManyRedirects() : HttpResult;
 
+internal sealed record PluginNetworkRuleDecision(bool Blocked, string? RedirectUrl, IReadOnlySet<string> StripHeaders);
+
 /// <summary>
 /// Minimal HTTP/1.0 client over raw sockets — one connection per request,
 /// "Connection: close", no keep-alive, exactly like the era.  Supports
@@ -53,6 +55,8 @@ public class HttpClient
 
     /// <summary>Current page URL used as the Referer header when enabled.</summary>
     public string? ReferrerOverride { get; set; }
+
+    public Func<string, IReadOnlyDictionary<string, string>, PluginNetworkRuleDecision>? PluginRuleEvaluator { get; set; }
 
     private const int MaxRedirects = 5;
     private const int MaxBodySize = 8 * 1024 * 1024;    // 8 MB is generous for 1996 pages
@@ -132,7 +136,7 @@ public class HttpClient
     private async Task<HttpResult> SendRequestAsync(
         string method, ParsedUrl url, byte[]? body, CookieStore cookies,
         CancellationToken ct, int redirectCount = 0, string? contentType = null, ResourceKind resourceKind = ResourceKind.Document,
-        IReadOnlyDictionary<string, string>? extraHeaders = null)
+        IReadOnlyDictionary<string, string>? extraHeaders = null, int ruleRedirectCount = 0)
     {
         if (redirectCount > MaxRedirects)
             return new TooManyRedirects();
@@ -142,6 +146,19 @@ public class HttpClient
 
         ct.ThrowIfCancellationRequested();
 
+        var ruleDecision = PluginRuleEvaluator?.Invoke(url.ToAbsolute(), extraHeaders ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        if (ruleDecision?.Blocked == true)
+            return new HttpError("Blocked by an active plugin network rule.");
+        if (!string.IsNullOrWhiteSpace(ruleDecision?.RedirectUrl))
+        {
+            if (ruleRedirectCount >= 5) return new TooManyRedirects();
+            ParsedUrl redirected;
+            try { redirected = ParsedUrl.Parse(ruleDecision.RedirectUrl); }
+            catch (Exception ex) { return new HttpError($"Plugin network rule returned an invalid redirect: {ex.Message}"); }
+            if (!redirected.IsHttp) return new HttpError("Plugin network rules may only redirect to http/https URLs.");
+            return await SendRequestAsync(method, redirected, body, cookies, ct, redirectCount, contentType, resourceKind, extraHeaders, ruleRedirectCount + 1).ConfigureAwait(false);
+        }
+
         // Bare "name=value; …" values — the "Cookie: " prefix is added when
         // the header block is built.
         string cookieValues = BrowserRuntime.CookiesEnabled ? cookies.Get(url) : string.Empty;
@@ -149,8 +166,9 @@ public class HttpClient
             ? url.Path
             : url.Path + "?" + url.Query;
 
+        var requestHeaders = extraHeaders == null ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) : new Dictionary<string, string>(extraHeaders, StringComparer.OrdinalIgnoreCase);
         var (headerBlock, headerBytes) = BuildRequestHeaders(
-            method, url, requestPath, cookieValues, body, contentType);
+            method, url, requestPath, cookieValues, body, contentType, requestHeaders, ruleDecision?.StripHeaders);
 
         HttpResult result;
         if (SandboxContext.BrokerAllNetwork ||
@@ -217,7 +235,7 @@ public class HttpClient
                 useGet ? "GET" : method,
                 newUrl,
                 useGet ? null : body,
-                cookies, ct, redirectCount + 1, contentType, resourceKind, extraHeaders);
+                cookies, ct, redirectCount + 1, contentType, resourceKind, extraHeaders, ruleRedirectCount);
         }
 
         return success;
@@ -270,7 +288,7 @@ public class HttpClient
     private (string Text, byte[] Wire) BuildRequestHeaders(
         string method, ParsedUrl url, string path,
         string cookieValues, byte[]? body, string? contentType,
-        IReadOnlyDictionary<string, string>? extraHeaders = null)
+        IReadOnlyDictionary<string, string>? extraHeaders = null, IReadOnlySet<string>? stripHeaders = null)
     {
         var sb = new StringBuilder(256);
 
@@ -331,6 +349,15 @@ public class HttpClient
         sb.Append("\r\n");
 
         string headerText = sb.ToString();
+        if (stripHeaders != null && stripHeaders.Count != 0)
+        {
+            var lines = headerText.Split("\r\n", StringSplitOptions.None);
+            headerText = string.Join("\r\n", lines.Where(line =>
+            {
+                int colon = line.IndexOf(':');
+                return colon <= 0 || !stripHeaders.Contains(line[..colon].Trim());
+            }));
+        }
 
         // Headers are ASCII; body bytes go out verbatim (binary-safe)
         byte[] wire;

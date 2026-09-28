@@ -37,6 +37,7 @@ internal sealed class PluginSandboxSession : IDisposable
     private readonly Dictionary<string, string> _protocols = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _contentTransforms = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _pageStyles = new();
+    private readonly List<PluginNetworkRule> _networkRules = new();
     private NamedPipeServerStream? _pipe;
     private WindowsSecurity.WorkerProcess? _worker;
     private string? _profileName;
@@ -306,6 +307,17 @@ internal sealed class PluginSandboxSession : IDisposable
                         await ReplyAsync(envelope.Id, "response", info).ConfigureAwait(false);
                         break;
                     }
+                case "network.rules.set":
+                    Demand(PluginPermission.NetworkRules);
+                    var networkRules = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NetworkRulesPayload>(envelope) ?? throw new InvalidDataException();
+                    SetNetworkRules(networkRules.Rules);
+                    await ReplyOkAsync(envelope);
+                    break;
+                case "network.rules.clear":
+                    Demand(PluginPermission.NetworkRules);
+                    ClearNetworkRules();
+                    await ReplyOkAsync(envelope);
+                    break;
                 case "page.read.text":
                     var pageText = await GetPageTextAsync(_lifetime.Token).ConfigureAwait(true);
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.PageReadReply(pageText));
@@ -680,6 +692,26 @@ internal sealed class PluginSandboxSession : IDisposable
     }
 
     internal IReadOnlyList<string> PageStyles { get { lock (_pageStyles) return _pageStyles.ToArray(); } }
+    internal void SetNetworkRules(IEnumerable<PluginNetworkRule> rules)
+    {
+        Demand(PluginPermission.NetworkRules);
+        var normalized = new List<PluginNetworkRule>();
+        foreach (var rule in (rules ?? Array.Empty<PluginNetworkRule>()).Take(100))
+        {
+            string match = (rule.Match ?? string.Empty).Trim();
+            if (match.Length == 0 || match.Length > 1024) throw new InvalidDataException("Network rule match is invalid.");
+            string? replacement = rule.Replacement?.Trim();
+            if (rule.Kind == PluginNetworkRuleKind.Redirect && (string.IsNullOrWhiteSpace(replacement) || replacement.Length > 8192)) throw new InvalidDataException("Network redirect target is invalid.");
+            if (rule.Kind == PluginNetworkRuleKind.StripHeader && (string.IsNullOrWhiteSpace(replacement) || replacement.Length > 128)) throw new InvalidDataException("Header name is invalid.");
+            if (rule.Kind is not (PluginNetworkRuleKind.Block or PluginNetworkRuleKind.Redirect or PluginNetworkRuleKind.StripHeader)) throw new InvalidDataException("Unknown network rule kind.");
+            normalized.Add(new PluginNetworkRule(rule.Kind, match, replacement));
+        }
+        lock (_networkRules) { _networkRules.Clear(); _networkRules.AddRange(normalized); }
+    }
+
+    internal void ClearNetworkRules() { Demand(PluginPermission.NetworkRules); lock (_networkRules) _networkRules.Clear(); }
+    internal PluginNetworkRule[] SnapshotNetworkRules() { lock (_networkRules) return _networkRules.ToArray(); }
+
     internal void SetPageStyle(string token, string css) { Demand(PluginPermission.PageStyle); lock (_pageStyles) { _pageStyles.RemoveAll(x => x.StartsWith(token + "\n", StringComparison.Ordinal)); _pageStyles.Add(token + "\n" + css); } }
     internal void RemovePageStyle(string token) { lock (_pageStyles) _pageStyles.RemoveAll(x => x.StartsWith(token + "\n", StringComparison.Ordinal)); }
 
