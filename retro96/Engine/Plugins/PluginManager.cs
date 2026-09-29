@@ -181,7 +181,6 @@ public sealed class PluginManager : IDisposable
             int versionComparison = ComparePluginVersions(installedManifest.Version, existing.Manifest.Version);
             bool authorChanged = !string.Equals(existing.Manifest.Author?.Trim(), installedManifest.Author?.Trim(), StringComparison.Ordinal);
             string oldVersion = existing.Manifest.Version;
-            string oldAuthor = existing.Manifest.Author;
             string updateMessage =
                 $"Retro96 will replace the installed files for '{existing.Manifest.Name}'.\r\n\r\n" +
                 $"Version: {existing.Manifest.Version} -> {installedManifest.Version}\r\n" +
