@@ -1,5 +1,6 @@
 using System.Text;
 using System.Collections.Concurrent;
+using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
 using System.Security;
@@ -16,21 +17,24 @@ internal static class PluginSandboxWorker
     {
         if (!IsInvocation(args)) return;
         string pipeName = args[1];
+        if (string.IsNullOrWhiteSpace(pipeName) || string.IsNullOrWhiteSpace(args[2]))
+            throw new ArgumentException("Plugin worker requires a pipe name and a payload directory.");
+
+        // The payload directory arrives from the broker's command line; keep it
+        // anchored inside this worker's runtime shadow.
+        string baseDirectory = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
         string pluginDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, args[2]));
+        if (!pluginDirectory.StartsWith(baseDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Plugin payload directory must stay inside the worker runtime.");
+
         await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(15_000).ConfigureAwait(false);
         using var lifetime = new CancellationTokenSource();
         using var writeLock = new SemaphoreSlim(1, 1);
         var host = new PluginWorkerHost(pluginDirectory, pipe, writeLock, lifetime);
-        try
-        {
-            await host.RunAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            await host.ReportFatalAsync(ex).ConfigureAwait(false);
-            throw;
-        }
+        // PluginWorkerHost.RunAsync reports its own fatal errors (before it
+        // disposes itself) and always runs its Dispose.
+        await host.RunAsync().ConfigureAwait(false);
     }
 
     private sealed class PluginWorkerHost : IRetro96PluginHost, IDisposable
@@ -40,8 +44,6 @@ internal static class PluginSandboxWorker
         private readonly SemaphoreSlim _writeLock;
         private readonly CancellationTokenSource _lifetime;
         private readonly ConcurrentDictionary<string, TaskCompletionSource<PluginSandboxProtocol.Envelope>> _pending = new();
-        private readonly ConcurrentDictionary<string, TaskCompletionSource<PluginSandboxProtocol.BinaryEnvelope>> _pendingBinary = new();
-        private readonly ConcurrentDictionary<string, EmbeddedContentRegistration> _pendingEmbedRegistrations = new();
         private readonly Dictionary<string, WorkerByteStream> _streams = new(StringComparer.Ordinal);
         private readonly Dictionary<string, WorkerEmbeddedInstance> _embeddedInstances = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Action> _invokeCallbacks = new(StringComparer.Ordinal);
@@ -56,6 +58,7 @@ internal static class PluginSandboxWorker
         private PluginClipboard? _clipboard;
         private PluginAudio? _audio;
         private WorkerDownloads? _downloads;
+        private WorkerTabs? _tabs;
         private PluginAssemblyLoadContext? _loadContext;
         private IRetro96Plugin? _plugin;
         private PluginManifest _manifest = new();
@@ -93,9 +96,13 @@ internal static class PluginSandboxWorker
         public IPluginOmnibox Omnibox { get; private set; } = null!;
         public IPluginUiExtras UiExtras { get; private set; } = null!;
         public bool HasPermission(PluginPermission permission) => (_grantedPermissions & permission) == permission;
-        public Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default) =>
-            SendRequestAsync<PluginSandboxProtocol.PermissionRequestReply>("permission.request", new PluginSandboxProtocol.PermissionRequestPayload(name), cancellationToken)
-                .ContinueWith(t => t.Result.Granted, cancellationToken, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+        public async Task<bool> RequestPermissionAsync(string name, CancellationToken cancellationToken = default)
+        {
+            var reply = await SendRequestAsync<PluginSandboxProtocol.PermissionRequestReply>(
+                "permission.request", new PluginSandboxProtocol.PermissionRequestPayload(name), cancellationToken).ConfigureAwait(false);
+            return reply.Granted;
+        }
 
         internal void RegisterProtocol(string token, Func<PluginProtocolRequest, CancellationToken, Task<PluginProtocolResponse>> callback) => _protocolCallbacks[token] = callback;
         internal void RemoveProtocol(string token) => _protocolCallbacks.Remove(token);
@@ -106,50 +113,65 @@ internal static class PluginSandboxWorker
 
         public async Task RunAsync()
         {
-            _readerLoop = Task.Run(ReadLoopAsync);
-            string pluginId = ReadPluginId();
-            var hello = await SendRequestAsync<PluginSandboxProtocol.HelloReply>("hello", new PluginSandboxProtocol.HelloPayload(pluginId, Environment.ProcessId), _lifetime.Token).ConfigureAwait(false);
-            if (!hello.Accepted) throw new SecurityException(string.IsNullOrWhiteSpace(hello.Error) ? "Plugin sandbox handshake rejected." : hello.Error);
-            var brokerManifest = JsonSerializer.Deserialize(hello.ManifestJson, PluginManifestJsonContext.Default.PluginManifest) ?? throw new InvalidDataException("Plugin manifest was invalid.");
-            if (!string.Equals(brokerManifest.Id, _manifest.Id, StringComparison.OrdinalIgnoreCase)) throw new SecurityException("Plugin manifest identity mismatch.");
-            _grantedPermissions = (PluginPermission)hello.GrantedPermissions;
-            var hostInfo = await SendRequestAsync<PluginSandboxProtocol.HostInfoReply>("host.info", null, _lifetime.Token).ConfigureAwait(false);
-            Info = new WorkerHostInfo(hostInfo);
-            LoadPlugin();
-            Browser = new WorkerBrowser(this);
-            Ui = new WorkerUi(this);
-            Storage = new WorkerStorage(this);
-            Network = new WorkerNetwork(this);
-            FileSystem = new WorkerFileSystem(this);
-            _clipboard = new PluginClipboard(this);
-            _audio = new PluginAudio(this);
-            Notifications = new WorkerNotifications(this);
-            Dialogs = new WorkerDialogs(this);
-            _embeds = new WorkerEmbeddedContentService(this);
-            Log = new WorkerLogger(this);
-            Page = new WorkerPageRead(this);
-            NetworkRules = new WorkerNetworkRules(this);
-            Protocols = new WorkerProtocols(this);
-            ContentTransform = new WorkerContentTransform(this);
-            PageStyle = new WorkerPageStyle(this);
-            Tabs = new WorkerTabs(this);
-            History = new WorkerHistory(this);
-            Bookmarks = new WorkerBookmarks(this);
-            _downloads = new WorkerDownloads(this);
-            Downloads = _downloads;
-            Omnibox = new WorkerOmnibox(this);
-            UiExtras = new WorkerUiExtras(this);
             try
             {
-                _plugin!.Initialize(this);
-                await SendRequestAsync<PluginSandboxProtocol.ReadyPayload>("ready", new PluginSandboxProtocol.ReadyPayload(true), _lifetime.Token).ConfigureAwait(false);
+                _readerLoop = Task.Run(ReadLoopAsync);
+                string pluginId = ReadPluginId();
+                var hello = await SendRequestAsync<PluginSandboxProtocol.HelloReply>("hello", new PluginSandboxProtocol.HelloPayload(pluginId, Environment.ProcessId), _lifetime.Token).ConfigureAwait(false);
+                if (!hello.Accepted) throw new SecurityException(string.IsNullOrWhiteSpace(hello.Error) ? "Plugin sandbox handshake rejected." : hello.Error);
+                var brokerManifest = JsonSerializer.Deserialize(hello.ManifestJson, PluginManifestJsonContext.Default.PluginManifest) ?? throw new InvalidDataException("Plugin manifest was invalid.");
+                if (!string.Equals(brokerManifest.Id, _manifest.Id, StringComparison.OrdinalIgnoreCase)) throw new SecurityException("Plugin manifest identity mismatch.");
+                _grantedPermissions = (PluginPermission)hello.GrantedPermissions;
+                var hostInfo = await SendRequestAsync<PluginSandboxProtocol.HostInfoReply>("host.info", null, _lifetime.Token).ConfigureAwait(false);
+                Info = new WorkerHostInfo(hostInfo);
+                LoadPlugin();
+                Browser = new WorkerBrowser(this);
+                Ui = new WorkerUi(this);
+                Storage = new WorkerStorage(this);
+                Network = new WorkerNetwork(this);
+                FileSystem = new WorkerFileSystem(this);
+                _clipboard = new PluginClipboard(this);
+                _audio = new PluginAudio(this);
+                Notifications = new WorkerNotifications(this);
+                Dialogs = new WorkerDialogs(this);
+                _embeds = new WorkerEmbeddedContentService(this);
+                Log = new WorkerLogger(this);
+                Page = new WorkerPageRead(this);
+                NetworkRules = new WorkerNetworkRules(this);
+                Protocols = new WorkerProtocols(this);
+                ContentTransform = new WorkerContentTransform(this);
+                PageStyle = new WorkerPageStyle(this);
+                _tabs = new WorkerTabs(this);
+                Tabs = _tabs;
+                History = new WorkerHistory(this);
+                Bookmarks = new WorkerBookmarks(this);
+                _downloads = new WorkerDownloads(this);
+                Downloads = _downloads;
+                Omnibox = new WorkerOmnibox(this);
+                UiExtras = new WorkerUiExtras(this);
+                try
+                {
+                    _plugin!.Initialize(this);
+                    await SendRequestAsync<PluginSandboxProtocol.ReadyPayload>("ready", new PluginSandboxProtocol.ReadyPayload(true), _lifetime.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    try { await SendRequestAsync<PluginSandboxProtocol.ReadyPayload>("ready", new PluginSandboxProtocol.ReadyPayload(false, ex.ToString()), CancellationToken.None).ConfigureAwait(false); } catch { }
+                    throw;
+                }
+                await _readerLoop.ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                try { await SendRequestAsync<PluginSandboxProtocol.ReadyPayload>("ready", new PluginSandboxProtocol.ReadyPayload(false, ex.ToString()), CancellationToken.None).ConfigureAwait(false); } catch { }
+                // Report BEFORE Dispose: after disposal the write lock is gone
+                // and the fatal report would be silently dropped.
+                await ReportFatalAsync(ex).ConfigureAwait(false);
                 throw;
             }
-            try { await _readerLoop.ConfigureAwait(false); } finally { Dispose(); }
+            finally
+            {
+                Dispose();
+            }
         }
 
         private string ReadPluginId()
@@ -170,7 +192,7 @@ internal static class PluginSandboxWorker
             Assembly assembly = _loadContext.LoadFromAssemblyPath(assemblyPath);
             string typeName = _manifest.EntryPoint; int comma = typeName.IndexOf(','); if (comma >= 0) typeName = typeName[..comma].Trim();
             Type? entryType = assembly.GetType(typeName, false, false);
-            if (entryType == null || !typeof(IRetro96Plugin).IsAssignableFrom(entryType)) throw new InvalidDataException("Plugin entry point does not implement IRetro96Plugin.");
+            if (entryType == null || !typeof(IRetro96Plugin).IsAssignableFrom(entryType)) throw new InvalidDataException($"Plugin entry point '{typeName}' does not exist or does not implement IRetro96Plugin.");
             _plugin = Activator.CreateInstance(entryType) as IRetro96Plugin ?? throw new InvalidOperationException("Plugin entry point could not be created.");
         }
 
@@ -204,128 +226,202 @@ internal static class PluginSandboxWorker
             {
                 while (!_lifetime.IsCancellationRequested)
                 {
-                    var message = await PluginSandboxProtocol.ReadAsync(_pipe, _lifetime.Token).ConfigureAwait(false);
-                    if (message == null) break;
-                    if (message is PluginSandboxProtocol.BinaryMessage binary)
+                    PluginSandboxProtocol.Message? message;
+                    try
                     {
-                        await HandleBinaryAsync(binary.Envelope).ConfigureAwait(false);
-                        continue;
+                        message = await PluginSandboxProtocol.ReadAsync(_pipe, _lifetime.Token).ConfigureAwait(false);
                     }
-                    var envelope = ((PluginSandboxProtocol.JsonMessage)message).Envelope;
-                    if (envelope.Op is "response" or "error") { if (_pending.TryGetValue(envelope.Id, out var completion)) completion.TrySetResult(envelope); continue; }
-                    switch (envelope.Op)
+                    catch (OperationCanceledException)
                     {
-                        case "omnibox.suggest":
-                            { var os = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.OmniboxSuggestPayload>(envelope) ?? throw new InvalidDataException(); if (!_omniboxCallbacks.TryGetValue(os.Token, out var ocb)) throw new InvalidOperationException("Omnibox handler is unavailable."); var suggestions = (await ocb.Handler(os.Text ?? "", _lifetime.Token).ConfigureAwait(false)).Take(8).Select(x => new PluginSandboxProtocol.OmniboxSuggestionWire(x.Text, x.Url, x.Description)).ToArray(); await ReplyAsync(envelope.Id, new PluginSandboxProtocol.OmniboxSuggestionsReply(suggestions)); }
-                            break;
-                        case "ui.context.query":
-                            if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextQueryPayload>(envelope) is { } query)
-                            {
-                                bool visible = QueryContext(query.Token, query.Context);
-                                _ = PluginSandboxProtocol.WriteAsync(_pipe, "response", envelope.Id, new PluginSandboxProtocol.UiContextResult(visible), _writeLock, _lifetime.Token);
-                            }
-                            break;
-                        case "embed.register":
-                            {
-                                if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
-                                if (_embeds == null) throw new InvalidOperationException("Embedded content service is unavailable.");
-                                var requested = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedRegisterPayload>(envelope) ?? throw new InvalidDataException();
-                                if (!_pendingEmbedRegistrations.TryRemove(envelope.Id, out var registration)) throw new InvalidOperationException("Embedded registration callback was not found.");
-                                var types = requested.MimeTypes.Select(t => t.Trim().ToLowerInvariant()).Where(t => t.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-                                if (types.Length == 0 || types.Any(t => !registration.MimeTypes.Any(r => r.Equals(t, StringComparison.OrdinalIgnoreCase)))) throw new SecurityException("Embedded MIME registration mismatch.");
-                                string brokerToken = Guid.NewGuid().ToString("N");
-                                _embeds.RegisterBrokerToken(brokerToken, registration with { MimeTypes = types });
-                                await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedRegisterReply(brokerToken)).ConfigureAwait(false);
-                            }
-                            break;
-                        case "embed.unregister":
-                            if (_embeds == null) throw new InvalidOperationException("Embedded content service is unavailable.");
-                            var unreg = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedUnregisterPayload>(envelope) ?? throw new InvalidDataException();
-                            _embeds.Remove(unreg.Token);
-                            await ReplyAsync(envelope.Id, new { success = true }).ConfigureAwait(false);
-                            break;
-                        case "embed.create":
-                            {
-                                if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
-                                if (_embeds == null) throw new InvalidOperationException("Embedded content service is unavailable.");
-                                var create = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedCreatePayload>(envelope) ?? throw new InvalidDataException();
-                                if (!_embeds.TryGet(create.RegistrationToken, out var registration) || !registration.MimeTypes.Any(t => t.Equals(create.MimeType, StringComparison.OrdinalIgnoreCase))) throw new SecurityException("Unknown embedded content registration.");
-                                var stream = new WorkerByteStream(this, create.StreamToken, create.StreamCanSeek, create.StreamLength);
-                                lock (_streams) _streams[create.StreamToken] = stream;
-                                var context = new EmbeddedContentContext(create.MimeType, create.SourceUrl, create.CurrentUrl, create.UserAgent, new Dictionary<string,string>(create.Parameters), create.Width, create.Height);
-                                var hostBridge = new WorkerEmbeddedHost(this, create.InstanceToken, create.CurrentUrl, create.UserAgent);
-                                var methods = new Dictionary<string, Func<IReadOnlyList<JsValue>, Task<JsValue>>>(StringComparer.Ordinal);
-                                var scriptBridge = new WorkerScriptBridge(this, create.InstanceToken, methods);
-                                var pluginInstance = registration.Factory(context, stream, hostBridge, scriptBridge);
-                                foreach (string methodName in methods.Keys)
-                                    ValidateScriptName(methodName);
-                                var publishedMethods = methods.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
-                                lock (_embeddedInstances) _embeddedInstances[create.InstanceToken] = new WorkerEmbeddedInstance(create.InstanceToken, pluginInstance, stream, scriptBridge, hostBridge);
-                                await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedCreateReply(create.InstanceToken, _manifest.ScriptName, publishedMethods)).ConfigureAwait(false);
-                            }
-                            break;
-                        case "embed.dispose":
-                            {
-                                var dispose = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedDisposePayload>(envelope) ?? throw new InvalidDataException();
-                                WorkerEmbeddedInstance? instance;
-                                lock (_embeddedInstances) _embeddedInstances.Remove(dispose.InstanceToken, out instance);
-                                instance?.Dispose();
-                                await ReplyAsync(envelope.Id, new { success = true }).ConfigureAwait(false);
-                            }
-                            break;
-                        case "embed.render":
-                            {
-                                if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
-                                var render = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedRenderPayload>(envelope) ?? throw new InvalidDataException();
-                                WorkerEmbeddedInstance? instance;
-                                lock (_embeddedInstances) _embeddedInstances.TryGetValue(render.InstanceToken, out instance);
-                                if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
-                                var buffer = (await instance.Instance.RenderAsync(new EmbeddedRenderRequest(render.Width, render.Height, render.Stride, render.DpiX, render.DpiY, render.IsPrint), _lifetime.Token).ConfigureAwait(false)).Validate();
-                                if (buffer.Width != render.Width || buffer.Height != render.Height) throw new InvalidDataException("Embedded renderer returned unexpected frame dimensions.");
-                                await SendBinaryAsync("embed.frame", envelope.Id, new PluginSandboxProtocol.EmbedFramePayload(render.InstanceToken, buffer.Width, buffer.Height, buffer.Stride, render.DpiX, render.DpiY, render.IsPrint), buffer.Pixels, _lifetime.Token).ConfigureAwait(false);
-                            }
-                            break;
-                        case "embed.script.call":
-                            {
-                                if (!HasPermission(PluginPermission.EmbedScript)) throw new SecurityException("Permission 'embed.script' has not been granted.");
-                                var call = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedScriptCallPayload>(envelope) ?? throw new InvalidDataException();
-                                WorkerEmbeddedInstance? instance;
-                                lock (_embeddedInstances) _embeddedInstances.TryGetValue(call.InstanceToken, out instance);
-                                if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
-                                if (!instance.Script.Methods.TryGetValue(call.Name, out var method)) throw new MissingMethodException($"Embedded script method '{call.Name}' is not registered.");
-                                JsValue value = await method(call.Args.Select(PluginJsValueCodec.FromWire).ToArray()).ConfigureAwait(false);
-                                await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedScriptCallReply(PluginJsValueCodec.ToWire(value))).ConfigureAwait(false);
-                            }
-                            break;
+                        break;
+                    }
+                    if (message == null) break; // broker closed the pipe
 
-                case "event.navigated": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigatedPayload>(envelope) is { } nav) _ = Task.Run(() => InvokePluginCallback("Navigated", () => _events.RaiseNavigated(new PluginNavigationEventArgs(nav.Url)))); break;
-                        case "event.pageLoaded": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPageLoadedPayload>(envelope) is { } page) _ = Task.Run(() => InvokePluginCallback("PageLoaded", () => _events.RaisePageLoaded(new PluginPageEventArgs(page.Url, page.Title)))); break;
-                        case "event.navigationFailed": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigationFailedPayload>(envelope) is { } nf) _ = Task.Run(() => InvokePluginCallback("NavigationFailed", () => _events.RaiseNavigationFailed(new PluginNavigationFailedEventArgs(nf.Url, nf.Message)))); break;
-                        case "event.titleChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventTitleChangedPayload>(envelope) is { } tc) _ = Task.Run(() => InvokePluginCallback("TitleChanged", () => _events.RaiseTitleChanged(new PluginTitleChangedEventArgs(tc.Url, tc.Title)))); break;
-                        case "event.loadProgress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventLoadProgressPayload>(envelope) is { } lp) _ = Task.Run(() => InvokePluginCallback("LoadProgress", () => _events.RaiseLoadProgress(new PluginLoadProgressEventArgs(lp.Url, lp.Fraction)))); break;
-                        case "event.zoomChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventZoomChangedPayload>(envelope) is { } zc) _ = Task.Run(() => InvokePluginCallback("ZoomChanged", () => _events.RaiseZoomChanged(new PluginZoomChangedEventArgs(zc.Zoom)))); break;
-                        case "event.hostShuttingDown": _ = Task.Run(() => InvokePluginCallback("HostShuttingDown", _events.RaiseHostShuttingDown)); break;
-                        case "event.focus": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventFocusPayload>(envelope) is { } focus) _ = Task.Run(() => InvokePluginCallback("WindowFocusChanged", () => _events.RaiseFocus(focus.HasFocus))); break;
-                        case "event.ui.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiInvokePayload>(envelope) is { } invoke && _invokeCallbacks.TryGetValue(invoke.Token, out var callback)) _ = Task.Run(() => InvokePluginCallback("UiInvoke", callback)); break;
-                        case "event.ui.context.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextInvokePayload>(envelope) is { } cInvoke && _contextActions.TryGetValue(cInvoke.Token, out var cAction)) _ = Task.Run(() => InvokePluginCallback("ContextMenu", () => cAction(cInvoke.Context))); break;
-                        case "event.ui.panel.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PanelInvokePayload>(envelope) is { } pInvoke && _panelCallbacks.TryGetValue(pInvoke.Token, out var pAction)) _ = Task.Run(() => InvokePluginCallback("Panel", () => pAction(pInvoke.Text, pInvoke.Checked, pInvoke.Index))); break;
-                        case "event.clipboard.changed": _clipboard?.RaiseChanged(); break;
-                        case "event.audio.complete": _audio?.RaisePlaybackComplete(); break;
-                        case "event.embed.visibility": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedVisibilityPayload>(envelope) is { } ev) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ev.InstanceToken, out var ei)) ei.Host.RaiseVisibility(ev.Visible); } break;
-                        case "event.embed.pause": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedPausePayload>(envelope) is { } ep) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ep.InstanceToken, out var ei)) ei.Host.RaisePause(ep.Paused); } break;
-                        case "event.embed.resize": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedResizePayload>(envelope) is { } er) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(er.InstanceToken, out var ei)) ei.Host.RaiseResize(er.Width, er.Height); } break;
-                        case "event.download.progress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventDownloadProgressPayload>(envelope) is { } dp) _downloads?.Raise(dp.Progress); break;
-                        case "event.permissions.changed":
-                            if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPermissionsPayload>(envelope) is { } permissions)
-                                _grantedPermissions = (PluginPermission)permissions.GrantedPermissions;
-                            break;
-                        case "event.notification.click": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NotificationPayload>(envelope) is { Token: { } token } && _invokeCallbacks.TryGetValue(token, out var ncb)) _ = Task.Run(() => InvokePluginCallback("NotificationClick", ncb)); break;
+                    // Fault isolation: one malformed or failing message must not
+                    // kill the whole worker. Previously ANY dispatch exception
+                    // tore down this loop (and with it the process).
+                    try
+                    {
+                        if (message is PluginSandboxProtocol.BinaryMessage binary)
+                            await HandleBinaryAsync(binary.Envelope).ConfigureAwait(false);
+                        else
+                            await HandleJsonAsync(((PluginSandboxProtocol.JsonMessage)message).Envelope).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        await HandleDispatchFailureAsync(message, ex).ConfigureAwait(false);
                     }
                 }
             }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) { foreach (var completion in _pending.Values) completion.TrySetException(ex); }
-            finally { foreach (var completion in _pending.Values) completion.TrySetException(new IOException("Plugin sandbox connection closed.")); _lifetime.Cancel(); }
+            catch (Exception ex)
+            {
+                foreach (var completion in _pending.Values) completion.TrySetException(ex);
+                throw;
+            }
+            finally
+            {
+                foreach (var completion in _pending.Values) completion.TrySetException(new IOException("Plugin sandbox connection closed."));
+                _lifetime.Cancel();
+            }
+        }
+
+        private async Task HandleDispatchFailureAsync(PluginSandboxProtocol.Message message, Exception ex)
+        {
+            string op = message is PluginSandboxProtocol.JsonMessage json ? json.Envelope.Op
+                      : ((PluginSandboxProtocol.BinaryMessage)message).Envelope.Op;
+            // Fire-and-forget: the log request's reply must be read by this
+            // very loop, so it cannot be awaited here.
+            _ = ReportCallbackErrorAsync(op, ex);
+
+            // JSON request ops are answered with an error envelope so the
+            // broker fails fast instead of stalling until its call timeout.
+            // Events and binary ops have no error-reply channel (the broker
+            // times those out on its own), so they are only logged.
+            if (message is PluginSandboxProtocol.JsonMessage jsonMessage &&
+                jsonMessage.Envelope.Op is not ("response" or "error") &&
+                !jsonMessage.Envelope.Op.StartsWith("event.", StringComparison.Ordinal))
+            {
+                try
+                {
+                    await PluginSandboxProtocol.WriteAsync(_pipe, "error", jsonMessage.Envelope.Id,
+                        new PluginSandboxProtocol.ErrorPayload(ex.Message), _writeLock, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch { }
+            }
+        }
+
+        private async Task HandleJsonAsync(PluginSandboxProtocol.Envelope envelope)
+        {
+            if (envelope.Op is "response" or "error")
+            {
+                if (_pending.TryGetValue(envelope.Id, out var completion))
+                    completion.TrySetResult(envelope);
+                return;
+            }
+
+            switch (envelope.Op)
+            {
+                case "tabs.beforeNavigate":
+                    {
+                        // Previously never dispatched: the broker sends this on
+                        // every navigation when a tabs plugin is installed, so
+                        // every navigation timed out (750 ms) and failed.
+                        if (!HasPermission(PluginPermission.Tabs)) throw new SecurityException("Permission 'tabs' has not been granted.");
+                        var before = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.BeforeNavigatePayload>(envelope) ?? throw new InvalidDataException();
+                        var decision = _tabs != null
+                            ? await _tabs.RaiseBeforeNavigateAsync(new PluginBeforeNavigateEventArgs(before.TabId, before.Url)).ConfigureAwait(false)
+                            : new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow);
+                        await ReplyAsync(envelope.Id, new PluginSandboxProtocol.BeforeNavigateReply(decision.Action, decision.RedirectUrl)).ConfigureAwait(false);
+                        break;
+                    }
+                case "omnibox.suggest":
+                    {
+                        var os = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.OmniboxSuggestPayload>(envelope) ?? throw new InvalidDataException();
+                        if (!_omniboxCallbacks.TryGetValue(os.Token, out var ocb)) throw new InvalidOperationException("Omnibox handler is unavailable.");
+                        var suggestions = (await ocb.Handler(os.Text ?? "", _lifetime.Token).ConfigureAwait(false)).Take(8).Select(x => new PluginSandboxProtocol.OmniboxSuggestionWire(x.Text, x.Url, x.Description)).ToArray();
+                        await ReplyAsync(envelope.Id, new PluginSandboxProtocol.OmniboxSuggestionsReply(suggestions)).ConfigureAwait(false);
+                        break;
+                    }
+                case "ui.context.query":
+                    if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextQueryPayload>(envelope) is { } query)
+                    {
+                        bool visible = QueryContext(query.Token, query.Context);
+                        await ReplyAsync(envelope.Id, new PluginSandboxProtocol.UiContextResult(visible)).ConfigureAwait(false);
+                    }
+                    break;
+                case "embed.unregister":
+                    if (_embeds == null) throw new InvalidOperationException("Embedded content service is unavailable.");
+                    var unreg = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedUnregisterPayload>(envelope) ?? throw new InvalidDataException();
+                    _embeds.Remove(unreg.Token);
+                    await ReplyAsync(envelope.Id, new { success = true }).ConfigureAwait(false);
+                    break;
+                case "embed.create":
+                    {
+                        if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
+                        if (_embeds == null) throw new InvalidOperationException("Embedded content service is unavailable.");
+                        var create = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedCreatePayload>(envelope) ?? throw new InvalidDataException();
+                        if (!_embeds.TryGet(create.RegistrationToken, out var registration) || !registration.MimeTypes.Any(t => t.Equals(create.MimeType, StringComparison.OrdinalIgnoreCase))) throw new SecurityException("Unknown embedded content registration.");
+                        var stream = new WorkerByteStream(this, create.StreamToken, create.StreamCanSeek, create.StreamLength);
+                        lock (_streams) _streams[create.StreamToken] = stream;
+                        try
+                        {
+                            var context = new EmbeddedContentContext(create.MimeType, create.SourceUrl, create.CurrentUrl, create.UserAgent, new Dictionary<string, string>(create.Parameters), create.Width, create.Height);
+                            var hostBridge = new WorkerEmbeddedHost(this, create.InstanceToken, create.CurrentUrl, create.UserAgent);
+                            var methods = new Dictionary<string, Func<IReadOnlyList<JsValue>, Task<JsValue>>>(StringComparer.Ordinal);
+                            var scriptBridge = new WorkerScriptBridge(this, create.InstanceToken, methods);
+                            // Run the plugin factory off the reader loop: a
+                            // factory that makes broker requests during
+                            // construction would otherwise deadlock this loop
+                            // (its replies can only be read by this loop).
+                            var pluginInstance = await Task.Run(() => registration.Factory(context, stream, hostBridge, scriptBridge)).ConfigureAwait(false);
+                            foreach (string methodName in methods.Keys)
+                                ValidateScriptName(methodName);
+                            var publishedMethods = methods.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+                            lock (_embeddedInstances) _embeddedInstances[create.InstanceToken] = new WorkerEmbeddedInstance(create.InstanceToken, pluginInstance, stream, scriptBridge, hostBridge);
+                            await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedCreateReply(create.InstanceToken, _manifest.ScriptName, publishedMethods)).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            // A throwing plugin factory must not leak the stream
+                            // registration (or, previously, kill the worker).
+                            lock (_streams) _streams.Remove(create.StreamToken);
+                            try { stream.Dispose(); } catch { }
+                            throw;
+                        }
+                        break;
+                    }
+                case "embed.dispose":
+                    {
+                        var dispose = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedDisposePayload>(envelope) ?? throw new InvalidDataException();
+                        WorkerEmbeddedInstance? instance;
+                        lock (_embeddedInstances) _embeddedInstances.Remove(dispose.InstanceToken, out instance);
+                        // Run the plugin's Dispose off the reader loop: plugin
+                        // teardown may itself make broker requests, which need
+                        // this loop alive to complete. The broker has already
+                        // removed its own instance/stream state.
+                        if (instance != null) _ = Task.Run(() => { try { instance.Dispose(); } catch { } });
+                        await ReplyAsync(envelope.Id, new { success = true }).ConfigureAwait(false);
+                        break;
+                    }
+                case "embed.script.call":
+                    {
+                        if (!HasPermission(PluginPermission.EmbedScript)) throw new SecurityException("Permission 'embed.script' has not been granted.");
+                        var call = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedScriptCallPayload>(envelope) ?? throw new InvalidDataException();
+                        WorkerEmbeddedInstance? instance;
+                        lock (_embeddedInstances) _embeddedInstances.TryGetValue(call.InstanceToken, out instance);
+                        if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
+                        if (!instance.Script.Methods.TryGetValue(call.Name, out var method)) throw new MissingMethodException($"Embedded script method '{call.Name}' is not registered.");
+                        JsValue value = await method(call.Args.Select(PluginJsValueCodec.FromWire).ToArray()).ConfigureAwait(false);
+                        await ReplyAsync(envelope.Id, new PluginSandboxProtocol.EmbedScriptCallReply(PluginJsValueCodec.ToWire(value))).ConfigureAwait(false);
+                        break;
+                    }
+
+                case "event.navigated": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigatedPayload>(envelope) is { } nav) _ = Task.Run(() => InvokePluginCallback("Navigated", () => _events.RaiseNavigated(new PluginNavigationEventArgs(nav.Url)))); break;
+                case "event.pageLoaded": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPageLoadedPayload>(envelope) is { } page) _ = Task.Run(() => InvokePluginCallback("PageLoaded", () => _events.RaisePageLoaded(new PluginPageEventArgs(page.Url, page.Title)))); break;
+                case "event.navigationFailed": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventNavigationFailedPayload>(envelope) is { } nf) _ = Task.Run(() => InvokePluginCallback("NavigationFailed", () => _events.RaiseNavigationFailed(new PluginNavigationFailedEventArgs(nf.Url, nf.Message)))); break;
+                case "event.titleChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventTitleChangedPayload>(envelope) is { } tc) _ = Task.Run(() => InvokePluginCallback("TitleChanged", () => _events.RaiseTitleChanged(new PluginTitleChangedEventArgs(tc.Url, tc.Title)))); break;
+                case "event.loadProgress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventLoadProgressPayload>(envelope) is { } lp) _ = Task.Run(() => InvokePluginCallback("LoadProgress", () => _events.RaiseLoadProgress(new PluginLoadProgressEventArgs(lp.Url, lp.Fraction)))); break;
+                case "event.zoomChanged": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventZoomChangedPayload>(envelope) is { } zc) _ = Task.Run(() => InvokePluginCallback("ZoomChanged", () => _events.RaiseZoomChanged(new PluginZoomChangedEventArgs(zc.Zoom)))); break;
+                case "event.hostShuttingDown": _ = Task.Run(() => InvokePluginCallback("HostShuttingDown", _events.RaiseHostShuttingDown)); break;
+                case "event.focus": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventFocusPayload>(envelope) is { } focus) _ = Task.Run(() => InvokePluginCallback("WindowFocusChanged", () => _events.RaiseFocus(focus.HasFocus))); break;
+                case "event.ui.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiInvokePayload>(envelope) is { } invoke && _invokeCallbacks.TryGetValue(invoke.Token, out var callback)) _ = Task.Run(() => InvokePluginCallback("UiInvoke", callback)); break;
+                case "event.ui.context.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextInvokePayload>(envelope) is { } cInvoke && _contextActions.TryGetValue(cInvoke.Token, out var cAction)) _ = Task.Run(() => InvokePluginCallback("ContextMenu", () => cAction(cInvoke.Context))); break;
+                case "event.ui.panel.invoke": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.PanelInvokePayload>(envelope) is { } pInvoke && _panelCallbacks.TryGetValue(pInvoke.Token, out var pAction)) _ = Task.Run(() => InvokePluginCallback("Panel", () => pAction(pInvoke.Text, pInvoke.Checked, pInvoke.Index))); break;
+                case "event.clipboard.changed": _clipboard?.RaiseChanged(); break;
+                case "event.audio.complete": _audio?.RaisePlaybackComplete(); break;
+                case "event.embed.visibility": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedVisibilityPayload>(envelope) is { } ev) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ev.InstanceToken, out var ei)) ei.Host.RaiseVisibility(ev.Visible); } break;
+                case "event.embed.pause": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedPausePayload>(envelope) is { } ep) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(ep.InstanceToken, out var ei)) ei.Host.RaisePause(ep.Paused); } break;
+                case "event.embed.resize": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventEmbedResizePayload>(envelope) is { } er) { lock (_embeddedInstances) if (_embeddedInstances.TryGetValue(er.InstanceToken, out var ei)) ei.Host.RaiseResize(er.Width, er.Height); } break;
+                case "event.download.progress": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventDownloadProgressPayload>(envelope) is { } dp) _downloads?.Raise(dp.Progress); break;
+                case "event.permissions.changed":
+                    if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EventPermissionsPayload>(envelope) is { } permissions)
+                        _grantedPermissions = (PluginPermission)permissions.GrantedPermissions;
+                    break;
+                case "event.notification.click": if (PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.NotificationPayload>(envelope) is { Token: { } token } && _invokeCallbacks.TryGetValue(token, out var ncb)) _ = Task.Run(() => InvokePluginCallback("NotificationClick", ncb)); break;
+
+                default:
+                    throw new InvalidOperationException($"Unknown plugin sandbox operation '{envelope.Op}'.");
+            }
         }
 
         private static TimeSpan GetCallTimeout(string op)
@@ -337,10 +433,10 @@ internal static class PluginSandboxWorker
             return TimeSpan.FromMilliseconds(PluginSandboxProtocol.DefaultCallTimeoutMs);
         }
 
-        internal async Task<T> SendRequestAsync<T>(string op, object? payload, CancellationToken cancellationToken, string? requestId = null)
+        internal async Task<T> SendRequestAsync<T>(string op, object? payload, CancellationToken cancellationToken)
         {
             if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(PluginWorkerHost));
-            string id = requestId ?? Guid.NewGuid().ToString("N");
+            string id = Guid.NewGuid().ToString("N");
             var completion = new TaskCompletionSource<PluginSandboxProtocol.Envelope>(TaskCreationOptions.RunContinuationsAsynchronously);
             _pending[id] = completion;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
@@ -359,26 +455,6 @@ internal static class PluginSandboxWorker
             finally { _pending.TryRemove(id, out _); }
         }
 
-        internal async Task<PluginSandboxProtocol.BinaryEnvelope> SendBinaryRequestAsync(string op, object? payload, CancellationToken cancellationToken)
-        {
-            if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(PluginWorkerHost));
-            string id = Guid.NewGuid().ToString("N");
-            var completion = new TaskCompletionSource<PluginSandboxProtocol.BinaryEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingBinary[id] = completion;
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
-            timeout.CancelAfter(GetCallTimeout(op));
-            try
-            {
-                await PluginSandboxProtocol.WriteAsync(_pipe, op, id, payload, _writeLock, timeout.Token).ConfigureAwait(false);
-                return await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
-            {
-                throw new TimeoutException($"Plugin call '{op}' timed out after {GetCallTimeout(op).TotalMilliseconds:0} ms.");
-            }
-            finally { _pendingBinary.TryRemove(id, out _); }
-        }
-
         internal Task SendBinaryAsync(string op, string id, object payload, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
             PluginSandboxProtocol.WriteBinaryAsync(_pipe, op, id, payload, data, _writeLock, cancellationToken);
 
@@ -392,6 +468,29 @@ internal static class PluginSandboxWorker
                 lock (_embeddedInstances) _embeddedInstances.TryGetValue(input.InstanceToken, out instance);
                 if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
                 await instance.HandleInputAsync(input.Event, _lifetime.Token).ConfigureAwait(false);
+                return;
+            }
+            if (binary.Op == "embed.stream.chunk")
+            {
+                // Previously missing entirely: the broker pumps all embedded
+                // stream data as binary embed.stream.chunk frames, and the
+                // fall-through "unknown operation" throw killed the reader
+                // loop on the very first chunk.
+                var chunk = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedStreamChunkPayload>(binary)
+                    ?? throw new InvalidDataException("Embedded stream chunk metadata is missing.");
+                WorkerByteStream? stream;
+                lock (_streams) _streams.TryGetValue(chunk.StreamToken, out stream);
+                stream?.AcceptChunk(chunk, binary.Data);
+                return;
+            }
+            if (binary.Op == "embed.render")
+            {
+                // Previously only handled on the JSON path, but the broker
+                // sends render requests as binary frames — every render killed
+                // the worker via the fall-through throw.
+                var render = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedRenderPayload>(binary)
+                    ?? throw new InvalidDataException("Embedded render metadata is missing.");
+                await HandleEmbedRenderAsync(render.InstanceToken, render.Width, render.Height, render.Stride, render.DpiX, render.DpiY, render.IsPrint, binary.Id).ConfigureAwait(false);
                 return;
             }
             if (binary.Op == "protocol.response" || binary.Op == "content.transform.response")
@@ -439,6 +538,17 @@ internal static class PluginSandboxWorker
             throw new InvalidOperationException($"Unknown plugin sandbox binary operation '{binary.Op}'.");
         }
 
+        private async Task HandleEmbedRenderAsync(string instanceToken, int width, int height, int stride, int dpiX, int dpiY, bool isPrint, string replyId)
+        {
+            if (!HasPermission(PluginPermission.EmbedRenderer)) throw new SecurityException("Permission 'embed.renderer' has not been granted.");
+            WorkerEmbeddedInstance? instance;
+            lock (_embeddedInstances) _embeddedInstances.TryGetValue(instanceToken, out instance);
+            if (instance == null) throw new InvalidOperationException("Embedded content instance does not exist.");
+            var buffer = (await instance.Instance.RenderAsync(new EmbeddedRenderRequest(width, height, stride, dpiX, dpiY, isPrint), _lifetime.Token).ConfigureAwait(false)).Validate();
+            if (buffer.Width != width || buffer.Height != height) throw new InvalidDataException("Embedded renderer returned unexpected frame dimensions.");
+            await SendBinaryAsync("embed.frame", replyId, new PluginSandboxProtocol.EmbedFramePayload(instanceToken, buffer.Width, buffer.Height, buffer.Stride, dpiX, dpiY, isPrint), buffer.Pixels, _lifetime.Token).ConfigureAwait(false);
+        }
+
         private Task ReplyAsync(string id, object payload) => PluginSandboxProtocol.WriteAsync(_pipe, "response", id, payload, _writeLock, _lifetime.Token);
 
         internal void RegisterInvoke(string token, Action callback) => _invokeCallbacks[token] = callback;
@@ -472,8 +582,6 @@ internal static class PluginSandboxWorker
             try { _loadContext?.Unload(); } catch { }
             foreach (var completion in _pending.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginWorkerHost)));
             _pending.Clear();
-            foreach (var completion in _pendingBinary.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginWorkerHost)));
-            _pendingBinary.Clear();
             WorkerEmbeddedInstance[] instances;
             lock (_embeddedInstances) { instances = _embeddedInstances.Values.ToArray(); _embeddedInstances.Clear(); }
             foreach (var instance in instances) { try { instance.Dispose(); } catch { } }
@@ -535,15 +643,26 @@ internal static class PluginSandboxWorker
         private sealed class WorkerUi : RpcService, IPluginUi
         {
             public WorkerUi(PluginWorkerHost host) : base(host) { }
-            public IDisposable AddFileMenuItem(string text, Action callback) => AddInvoke<PluginSandboxProtocol.UiMenuAddReply>("ui.menu.add", new PluginSandboxProtocol.UiMenuAddPayload(text), callback, token => new Lease(Host, token, "ui.menu.remove"));
-            public IDisposable AddToolbarButton(string label, string tooltip, Action onClick) => AddInvoke<PluginSandboxProtocol.UiToolbarAddReply>("ui.toolbar.add", new PluginSandboxProtocol.UiToolbarAddPayload(label, tooltip), onClick, token => new Lease(Host, token, "ui.toolbar.remove"));
-            private IDisposable AddInvoke<TReply>(string op, object payload, Action callback, Func<string, IDisposable> lease)
+            public IDisposable AddFileMenuItem(string text, Action callback)
             {
-                Demand(PluginPermission.UserInterface); object? replyObj = Host.SendRequestAsync<TReply>(op, payload, CancellationToken.None).GetAwaiter().GetResult(); string token = replyObj switch { PluginSandboxProtocol.UiMenuAddReply m => m.Token, PluginSandboxProtocol.UiToolbarAddReply t => t.Token, _ => throw new InvalidOperationException() }; Host.RegisterInvoke(token, callback); return lease(token);
+                Demand(PluginPermission.UserInterface);
+                var reply = Host.SendRequestAsync<PluginSandboxProtocol.UiMenuAddReply>("ui.menu.add", new PluginSandboxProtocol.UiMenuAddPayload(text), CancellationToken.None).GetAwaiter().GetResult();
+                Host.RegisterInvoke(reply.Token, callback);
+                return new Lease(Host, reply.Token, "ui.menu.remove");
+            }
+            public IDisposable AddToolbarButton(string label, string tooltip, Action onClick)
+            {
+                Demand(PluginPermission.UserInterface);
+                var reply = Host.SendRequestAsync<PluginSandboxProtocol.UiToolbarAddReply>("ui.toolbar.add", new PluginSandboxProtocol.UiToolbarAddPayload(label, tooltip), CancellationToken.None).GetAwaiter().GetResult();
+                Host.RegisterInvoke(reply.Token, onClick);
+                return new Lease(Host, reply.Token, "ui.toolbar.remove");
             }
             public IDisposable AddContextMenuItem(string label, Func<ContextMenuContext, bool> shouldShow, Action<ContextMenuContext> onClick)
             {
-                Demand(PluginPermission.UserInterface); var reply = Host.SendRequestAsync<PluginSandboxProtocol.UiContextAddReply>("ui.context.add", new PluginSandboxProtocol.UiContextAddPayload(label), CancellationToken.None).GetAwaiter().GetResult(); Host.RegisterContext(reply.Token, shouldShow, onClick); return new ContextLease(Host, reply.Token);
+                Demand(PluginPermission.UserInterface);
+                var reply = Host.SendRequestAsync<PluginSandboxProtocol.UiContextAddReply>("ui.context.add", new PluginSandboxProtocol.UiContextAddPayload(label), CancellationToken.None).GetAwaiter().GetResult();
+                Host.RegisterContext(reply.Token, shouldShow, onClick);
+                return new ContextLease(Host, reply.Token);
             }
             public void SetStatus(string text) { Demand(PluginPermission.UserInterface); Host.SendRequestAsync<object>("ui.status", new PluginSandboxProtocol.UiStatusPayload(text), CancellationToken.None).GetAwaiter().GetResult(); }
             public void SetProgress(double? fraction) { Demand(PluginPermission.UserInterface); Host.SendRequestAsync<object>("ui.progress", new PluginSandboxProtocol.UiProgressPayload(fraction), CancellationToken.None).GetAwaiter().GetResult(); }
@@ -603,12 +722,12 @@ internal static class PluginSandboxWorker
             public async Task<string> PostStringAsync(string url, string body, string contentType, CancellationToken cancellationToken = default) => await SendString("POST", url, Encoding.UTF8.GetBytes(body ?? string.Empty), contentType, cancellationToken).ConfigureAwait(false);
             public async Task<byte[]> PostBytesAsync(string url, byte[] body, string contentType, CancellationToken cancellationToken = default) => await SendBytes("POST", url, body, contentType, cancellationToken).ConfigureAwait(false);
             public async Task<string> SendAsync(HttpPluginRequest request, CancellationToken cancellationToken = default) => await SendString(request.Method, request.Url, request.Body, request.ContentType, cancellationToken, request.Headers).ConfigureAwait(false);
-            private async Task<string> SendString(string method, string url, byte[]? body, string? contentType, CancellationToken ct, IReadOnlyDictionary<string,string>? headers = null) { Demand(PluginPermission.Network); var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkReply>("network.get", new PluginSandboxProtocol.NetworkRequestPayload(method, url, headers == null ? null : new Dictionary<string,string>(headers), body == null ? null : Convert.ToBase64String(body), contentType), ct).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); return reply.Text ?? string.Empty; }
-            private async Task<byte[]> SendBytes(string method, string url, byte[]? body, string? contentType, CancellationToken ct, IReadOnlyDictionary<string,string>? headers = null) { Demand(PluginPermission.Network); var merged = headers == null ? new Dictionary<string,string>() : new Dictionary<string,string>(headers); if (contentType != null) merged["Content-Type"] = contentType; var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkReply>("network.bytes", new PluginSandboxProtocol.NetworkRequestPayload(method, url, merged, body == null ? null : Convert.ToBase64String(body), contentType), ct).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); return Convert.FromBase64String(reply.BytesBase64 ?? ""); }
+            private async Task<string> SendString(string method, string url, byte[]? body, string? contentType, CancellationToken ct, IReadOnlyDictionary<string, string>? headers = null) { Demand(PluginPermission.Network); var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkReply>("network.get", new PluginSandboxProtocol.NetworkRequestPayload(method, url, headers == null ? null : new Dictionary<string, string>(headers), body == null ? null : Convert.ToBase64String(body), contentType), ct).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); return reply.Text ?? string.Empty; }
+            private async Task<byte[]> SendBytes(string method, string url, byte[]? body, string? contentType, CancellationToken ct, IReadOnlyDictionary<string, string>? headers = null) { Demand(PluginPermission.Network); var merged = headers == null ? new Dictionary<string, string>() : new Dictionary<string, string>(headers); if (contentType != null) merged["Content-Type"] = contentType; var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkReply>("network.bytes", new PluginSandboxProtocol.NetworkRequestPayload(method, url, merged, body == null ? null : Convert.ToBase64String(body), contentType), ct).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); return Convert.FromBase64String(reply.BytesBase64 ?? ""); }
             public Task<IPluginNetworkResponse> GetStreamAsync(string url, CancellationToken cancellationToken = default) => OpenStreamAsync(new HttpPluginRequest("GET", url), cancellationToken);
             public Task<IPluginNetworkResponse> PostStreamAsync(string url, byte[] body, string contentType, CancellationToken cancellationToken = default) => OpenStreamAsync(new HttpPluginRequest("POST", url, null, body, contentType), cancellationToken);
             public async Task<IPluginNetworkResponse> OpenStreamAsync(HttpPluginRequest request, CancellationToken cancellationToken = default)
-            { Demand(PluginPermission.Network); var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkStreamOpenReply>("network.stream.open", new PluginSandboxProtocol.NetworkStreamOpenPayload(new PluginSandboxProtocol.NetworkRequestPayload(request.Method, request.Url, request.Headers == null ? null : new Dictionary<string,string>(request.Headers), request.Body == null ? null : Convert.ToBase64String(request.Body), request.ContentType)), cancellationToken).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); var stream = new WorkerByteStream(Host, reply.StreamToken, reply.CanSeek, reply.Length); lock (Host._streams) Host._streams[reply.StreamToken] = stream; return new WorkerNetworkResponse(reply.StatusCode, reply.Headers, reply.ContentType, reply.Charset, reply.EffectiveUrl, stream); }
+            { Demand(PluginPermission.Network); var reply = await Host.SendRequestAsync<PluginSandboxProtocol.NetworkStreamOpenReply>("network.stream.open", new PluginSandboxProtocol.NetworkStreamOpenPayload(new PluginSandboxProtocol.NetworkRequestPayload(request.Method, request.Url, request.Headers == null ? null : new Dictionary<string, string>(request.Headers), request.Body == null ? null : Convert.ToBase64String(request.Body), request.ContentType)), cancellationToken).ConfigureAwait(false); if (!reply.Success) throw new InvalidOperationException(reply.Error); var stream = new WorkerByteStream(Host, reply.StreamToken, reply.CanSeek, reply.Length); lock (Host._streams) Host._streams[reply.StreamToken] = stream; return new WorkerNetworkResponse(reply.StatusCode, reply.Headers, reply.ContentType, reply.Charset, reply.EffectiveUrl, stream); }
         }
 
         private sealed class WorkerEmbeddedContentService : RpcService, IPluginEmbeddedContentService
@@ -631,20 +750,13 @@ internal static class PluginSandboxWorker
                 foreach (var type in types)
                     if (!_host._manifest.EmbedTypes.Any(t => type.Equals(t, StringComparison.OrdinalIgnoreCase)))
                         throw new SecurityException($"Manifest does not declare embedded MIME type '{type}'.");
-                string requestId = Guid.NewGuid().ToString("N");
-                _host._pendingEmbedRegistrations[requestId] = registration with { MimeTypes = types };
-                try
-                {
-                    var reply = _host.SendRequestAsync<PluginSandboxProtocol.EmbedRegisterReply>(
-                        "embed.register", new PluginSandboxProtocol.EmbedRegisterPayload(types), CancellationToken.None, requestId)
-                        .GetAwaiter().GetResult();
-                    _registrations[reply.Token] = registration with { MimeTypes = types };
-                    return new Lease(this, reply.Token);
-                }
-                finally { _host._pendingEmbedRegistrations.TryRemove(requestId, out _); }
+                var reply = _host.SendRequestAsync<PluginSandboxProtocol.EmbedRegisterReply>(
+                    "embed.register", new PluginSandboxProtocol.EmbedRegisterPayload(types), CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                _registrations[reply.Token] = registration with { MimeTypes = types };
+                return new Lease(this, reply.Token);
             }
 
-            internal void RegisterBrokerToken(string token, EmbeddedContentRegistration registration) => _registrations[token] = registration;
             internal bool TryGet(string token, out EmbeddedContentRegistration registration) => _registrations.TryGetValue(token, out registration!);
             internal void Remove(string token) => _registrations.Remove(token);
 
@@ -711,8 +823,21 @@ internal static class PluginSandboxWorker
             public void Dispose()
             {
                 if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-                try { _host.SendRequestAsync<object>("embed.stream.close", new PluginSandboxProtocol.EmbedStreamClosePayload(_token), CancellationToken.None).GetAwaiter().GetResult(); } catch { }
+                // Fire-and-forget: Dispose may run on the reader loop (broker
+                // initiated embed.dispose), where a blocking close request
+                // could never be answered — it would stall the loop for the
+                // full call timeout instead.
+                _ = CloseAsync();
                 ChunkReceived = null;
+            }
+
+            private async Task CloseAsync()
+            {
+                try
+                {
+                    await _host.SendRequestAsync<object>("embed.stream.close", new PluginSandboxProtocol.EmbedStreamClosePayload(_token), CancellationToken.None).ConfigureAwait(false);
+                }
+                catch { }
             }
         }
 
@@ -772,10 +897,10 @@ internal static class PluginSandboxWorker
 
         private sealed class WorkerNetworkResponse : IPluginNetworkResponse
         {
-            public WorkerNetworkResponse(int statusCode, IReadOnlyDictionary<string,string> headers, string? contentType, string? charset, string effectiveUrl, IPluginByteStream body)
-            { StatusCode=statusCode; Headers=headers; ContentType=contentType; Charset=charset; EffectiveUrl=effectiveUrl; Body=body; }
+            public WorkerNetworkResponse(int statusCode, IReadOnlyDictionary<string, string> headers, string? contentType, string? charset, string effectiveUrl, IPluginByteStream body)
+            { StatusCode = statusCode; Headers = headers; ContentType = contentType; Charset = charset; EffectiveUrl = effectiveUrl; Body = body; }
             public int StatusCode { get; }
-            public IReadOnlyDictionary<string,string> Headers { get; }
+            public IReadOnlyDictionary<string, string> Headers { get; }
             public string? ContentType { get; }
             public string? Charset { get; }
             public string EffectiveUrl { get; }
@@ -811,7 +936,7 @@ internal static class PluginSandboxWorker
         private sealed class WorkerEmbeddedInstance : IDisposable
         {
             public WorkerEmbeddedInstance(string token, IEmbeddedContentInstance instance, WorkerByteStream stream, WorkerScriptBridge script, WorkerEmbeddedHost host)
-            { Token=token; Instance=instance; Stream=stream; Script=script; Host=host; }
+            { Token = token; Instance = instance; Stream = stream; Script = script; Host = host; }
             public string Token { get; }
             public IEmbeddedContentInstance Instance { get; }
             public WorkerByteStream Stream { get; }
@@ -979,16 +1104,16 @@ internal static class PluginSandboxWorker
         {
             public WorkerOmnibox(PluginWorkerHost host) : base(host) { }
             public IDisposable RegisterKeyword(string keyword, Func<string, CancellationToken, Task<IReadOnlyList<PluginOmniboxSuggestion>>> handler)
-            { Demand(PluginPermission.Omnibox); if (string.IsNullOrWhiteSpace(keyword) || handler == null) throw new ArgumentException("Keyword and handler are required."); keyword=keyword.Trim().ToLowerInvariant(); if (keyword.Length > 32 || !keyword.All(c => char.IsLetterOrDigit(c) || c is '-' or '_')) throw new ArgumentException("Invalid omnibox keyword."); string token=Guid.NewGuid().ToString("N"); Host.RegisterOmnibox(token, keyword, handler); Host.SendRequestAsync<object>("omnibox.register", new PluginSandboxProtocol.OmniboxRegisterPayload(keyword, token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveOmnibox(token); try { Host.SendRequestAsync<object>("omnibox.remove", new PluginSandboxProtocol.OmniboxRegisterPayload(keyword, token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
+            { Demand(PluginPermission.Omnibox); if (string.IsNullOrWhiteSpace(keyword) || handler == null) throw new ArgumentException("Keyword and handler are required."); keyword = keyword.Trim().ToLowerInvariant(); if (keyword.Length > 32 || !keyword.All(c => char.IsLetterOrDigit(c) || c is '-' or '_')) throw new ArgumentException("Invalid omnibox keyword."); string token = Guid.NewGuid().ToString("N"); Host.RegisterOmnibox(token, keyword, handler); Host.SendRequestAsync<object>("omnibox.register", new PluginSandboxProtocol.OmniboxRegisterPayload(keyword, token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveOmnibox(token); try { Host.SendRequestAsync<object>("omnibox.remove", new PluginSandboxProtocol.OmniboxRegisterPayload(keyword, token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
         }
 
         private sealed class WorkerUiExtras : RpcService, IPluginUiExtras
         {
             public WorkerUiExtras(PluginWorkerHost host) : base(host) { }
             public IDisposable AddToolbarButton(string label, string tooltip, byte[]? pngIcon, Action onClick, PluginMenuChoice menu = PluginMenuChoice.File)
-            { Demand(PluginPermission.UiExtras); if (pngIcon?.Length > 64 * 1024) throw new ArgumentOutOfRangeException(nameof(pngIcon)); string token=Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token,onClick); Host.SendRequestAsync<object>("ui.extras.toolbar.add", new PluginSandboxProtocol.UiExtrasToolbarPayload(label ?? "", tooltip ?? "", pngIcon == null ? null : Convert.ToBase64String(pngIcon), menu, token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveInvoke(token); try { Host.SendRequestAsync<object>("ui.extras.toolbar.remove", new PluginSandboxProtocol.UiExtrasTokenPayload(token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
+            { Demand(PluginPermission.UiExtras); if (pngIcon?.Length > 64 * 1024) throw new ArgumentOutOfRangeException(nameof(pngIcon)); string token = Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token, onClick); Host.SendRequestAsync<object>("ui.extras.toolbar.add", new PluginSandboxProtocol.UiExtrasToolbarPayload(label ?? "", tooltip ?? "", pngIcon == null ? null : Convert.ToBase64String(pngIcon), menu, token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveInvoke(token); try { Host.SendRequestAsync<object>("ui.extras.toolbar.remove", new PluginSandboxProtocol.UiExtrasTokenPayload(token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
             public void SetBadge(string text) { Demand(PluginPermission.UiExtras); Host.SendRequestAsync<object>("ui.extras.badge", new PluginSandboxProtocol.UiExtrasBadgePayload(text ?? ""), CancellationToken.None).GetAwaiter().GetResult(); }
-            public IDisposable RegisterShortcut(string shortcut, string description, Action callback) { Demand(PluginPermission.UiExtras); string token=Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token,callback); Host.SendRequestAsync<object>("ui.extras.shortcut.add", new PluginSandboxProtocol.UiExtrasShortcutPayload(shortcut ?? "", description ?? "", token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveInvoke(token); try { Host.SendRequestAsync<object>("ui.extras.shortcut.remove", new PluginSandboxProtocol.UiExtrasTokenPayload(token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
+            public IDisposable RegisterShortcut(string shortcut, string description, Action callback) { Demand(PluginPermission.UiExtras); string token = Guid.NewGuid().ToString("N"); Host.RegisterInvoke(token, callback); Host.SendRequestAsync<object>("ui.extras.shortcut.add", new PluginSandboxProtocol.UiExtrasShortcutPayload(shortcut ?? "", description ?? "", token), CancellationToken.None).GetAwaiter().GetResult(); return new ActionLease(() => { Host.RemoveInvoke(token); try { Host.SendRequestAsync<object>("ui.extras.shortcut.remove", new PluginSandboxProtocol.UiExtrasTokenPayload(token), CancellationToken.None).GetAwaiter().GetResult(); } catch { } }); }
         }
 
         private sealed class WorkerHistory : RpcService, IPluginHistory

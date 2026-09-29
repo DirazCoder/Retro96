@@ -27,12 +27,20 @@ public sealed class PluginManager : IDisposable
     private const int MaxPluginCrashesInWindow = 3;
     private static readonly TimeSpan PluginCrashWindow = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan[] PluginRestartBackoff = { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30) };
+
+    // Package extraction limits: a hostile .r96p must not be able to fill the
+    // disk or hang the installer with a zip bomb.
+    private const int MaxPackageEntries = 4096;
+    private const long MaxPackageEntryBytes = 256L * 1024 * 1024;
+    private const long MaxPackageTotalBytes = 1024L * 1024 * 1024;
+    private const long MaxManifestBytes = 1024 * 1024;
+
     private readonly Form1 _browser;
     private readonly string _rootDirectory;
     private readonly string _stateFile;
     private readonly Dictionary<string, PluginRecord> _plugins = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
-    private bool _disposed;
+    private int _disposed;
     private readonly Dictionary<DomElement, EmbeddedRuntime> _embedded = new();
     private readonly object _embedLock = new();
     private readonly System.Windows.Forms.Timer _embedRenderTimer;
@@ -65,18 +73,55 @@ public sealed class PluginManager : IDisposable
         _embedRenderTimer.Start();
     }
 
-    public IReadOnlyList<PluginRecord> Plugins => _plugins.Values.OrderBy(p => p.Manifest.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    public IReadOnlyList<PluginRecord> Plugins
+    {
+        get { lock (_plugins) return _plugins.Values.OrderBy(p => p.Manifest.Name, StringComparer.OrdinalIgnoreCase).ToArray(); }
+    }
+
     internal string HostVersion => Application.ProductVersion;
     internal bool IsDeveloperModeEnabled => _browser.PluginDevMode;
 
     public event EventHandler? PluginsChanged;
+
+    private PluginRecord[] SnapshotPlugins()
+    {
+        lock (_plugins) return _plugins.Values.ToArray();
+    }
+
+    private void RaisePluginsChanged()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        // PluginsChanged is raised from background paths (crash/restart) but
+        // subscribers update UI; marshal to the UI thread when needed.
+        if (!_browser.IsHandleCreated || _browser.IsDisposed || !_browser.InvokeRequired)
+        {
+            PluginsChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        try
+        {
+            _browser.BeginInvoke((Action)(() => PluginsChanged?.Invoke(this, EventArgs.Empty)));
+        }
+        catch { }
+    }
+
+    private T RunOnUi<T>(Func<T> func)
+    {
+        if (!_browser.IsHandleCreated || _browser.IsDisposed)
+            throw new InvalidOperationException("Browser window is unavailable.");
+        return _browser.InvokeRequired ? (T)_browser.Invoke(func)! : func();
+    }
 
     internal bool IsSupportedCapability(string name)
     {
         return name switch
         {
             "host.info" or "browser" or "ui" or "storage" or "network" or "filesystem" or
-            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or "logger" or "permissions" or "page.read" or "network.rules" or "protocol" or "content.transform" or "page.style" or "tabs" or "history" or "bookmarks" or "downloads" or "omnibox" or "settings" or "ui.extras" or "embed.audio" or "embed.extras" or "browser" => true,
+            "clipboard" or "events" or "audio" or "notifications" or "dialogs" or "embeds" or
+            "logger" or "permissions" or "page.read" or "network.rules" or "protocol" or
+            "content.transform" or "page.style" or "tabs" or "history" or "bookmarks" or
+            "downloads" or "omnibox" or "settings" or "ui.extras" or "embed.audio" or
+            "embed.extras" => true,
             _ => false
         };
     }
@@ -90,7 +135,8 @@ public sealed class PluginManager : IDisposable
         PluginManifest manifest = ReadManifestFromPackage(packagePath);
         ValidateManifest(manifest);
 
-        _plugins.TryGetValue(manifest.Id, out var existing);
+        PluginRecord? existing;
+        lock (_plugins) _plugins.TryGetValue(manifest.Id, out existing);
         string destination = GetPluginDirectory(manifest.Id);
         string temp = destination + ".installing-" + Guid.NewGuid().ToString("N");
         Directory.CreateDirectory(temp);
@@ -118,10 +164,10 @@ public sealed class PluginManager : IDisposable
                     DllSha256 = newHash,
                     ActivityPersistence = SaveState
                 };
-                _plugins.Add(record.Manifest.Id, record);
+                lock (_plugins) _plugins.Add(record.Manifest.Id, record);
                 SaveState();
                 if (record.Enabled) TryLoad(record);
-                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                RaisePluginsChanged();
                 return record;
             }
 
@@ -209,7 +255,7 @@ public sealed class PluginManager : IDisposable
             existing.Status = wasEnabled ? "Loading (sandboxed)" : "Disabled";
             SaveState();
             if (wasEnabled) TryLoad(existing);
-            PluginsChanged?.Invoke(this, EventArgs.Empty);
+            RaisePluginsChanged();
             return existing;
         }
         catch
@@ -242,15 +288,16 @@ public sealed class PluginManager : IDisposable
             ValidateManifest(copied);
             ValidateEntryAssembly(temp, copied);
             string hash = ComputeDllSha256(temp, copied);
-            _plugins.TryGetValue(copied.Id, out var existing);
+            PluginRecord? existing;
+            lock (_plugins) _plugins.TryGetValue(copied.Id, out existing);
             if (existing == null)
             {
                 Directory.Move(temp, destination);
                 var record = new PluginRecord { Manifest = copied, Directory = destination, Enabled = enableImmediately, GrantedPermissions = PluginPermission.None, InstalledUtc = DateTimeOffset.UtcNow, DllSha256 = hash, IsDev = true, DevSourceDirectory = source, ActivityPersistence = SaveState };
-                _plugins.Add(record.Manifest.Id, record);
+                lock (_plugins) _plugins.Add(record.Manifest.Id, record);
                 SaveState();
                 if (record.Enabled) TryLoad(record);
-                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                RaisePluginsChanged();
                 return record;
             }
 
@@ -270,7 +317,8 @@ public sealed class PluginManager : IDisposable
             catch
             {
                 TryDeleteDirectory(destination);
-                if (Directory.Exists(backup)) Directory.Move(backup, destination);
+                if (Directory.Exists(backup))
+                    Directory.Move(backup, destination);
                 throw;
             }
             existing.Manifest = copied;
@@ -284,7 +332,7 @@ public sealed class PluginManager : IDisposable
             existing.Status = wasEnabled ? "Loading (unpacked)" : "Disabled";
             SaveState();
             if (wasEnabled || enableImmediately) { existing.Enabled = true; TryLoad(existing); }
-            PluginsChanged?.Invoke(this, EventArgs.Empty);
+            RaisePluginsChanged();
             return existing;
         }
         catch { if (!string.IsNullOrEmpty(temp)) TryDeleteDirectory(temp); throw; }
@@ -307,28 +355,34 @@ public sealed class PluginManager : IDisposable
 
     public void Remove(string id)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return;
         DisableRecord(record);
-        _plugins.Remove(id);
+        lock (_plugins) _plugins.Remove(id);
         SaveState();
         TryDeleteDirectory(record.Directory);
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
     }
 
     public void SetEnabled(string id, bool enabled)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return;
         if (record.Enabled == enabled) return;
         record.Enabled = enabled;
         if (enabled) TryLoad(record);
         else DisableRecord(record);
         SaveState();
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
     }
 
     public void SetGrantedPermissions(string id, PluginPermission permissions)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return;
         PluginPermission old = record.GrantedPermissions;
         PluginPermission sanitized = permissions & record.Manifest.AvailablePermissions;
         record.GrantedPermissions = sanitized;
@@ -336,7 +390,7 @@ public sealed class PluginManager : IDisposable
         if (old != sanitized)
             record.Sandbox?.PushGrantedPermissions(sanitized);
         SaveState();
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
     }
 
     internal async Task<bool> RequestPermissionAsync(PluginRecord record, string name, CancellationToken cancellationToken)
@@ -349,25 +403,31 @@ public sealed class PluginManager : IDisposable
             throw new SecurityException($"Permission '{info.Name}' is not declared in optional_permissions.");
         if (record.HasPermission(permission)) return true;
 
-        bool granted = await RunPermissionPromptAsync(info, record, cancellationToken).ConfigureAwait(true);
+        bool granted = await RunPermissionPromptAsync(info, record, cancellationToken).ConfigureAwait(false);
         if (!granted) return false;
         record.GrantedPermissions |= permission;
         record.Sandbox?.PushGrantedPermissions(record.GrantedPermissions);
         SaveState();
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
         return true;
     }
 
     private Task<bool> RunPermissionPromptAsync(PluginPermissionInfo info, PluginRecord record, CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested) return Task.FromCanceled<bool>(cancellationToken);
-        return Task.FromResult(PermissionConfirmationDialog.Confirm(_browser, info,
-            record.HasPermission(PluginPermission.Network) && info.IsDataReading));
+        bool dataReading = record.HasPermission(PluginPermission.Network) && info.IsDataReading;
+        // The prompt is a modal WinForms dialog owned by the browser window;
+        // this method is normally invoked from the sandbox session's
+        // background reader loop, so the dialog must be marshalled to the UI
+        // thread before ShowDialog.
+        return Task.Run(() => RunOnUi(() => PermissionConfirmationDialog.Confirm(_browser, info, dataReading)));
     }
 
     public void Reload(string id)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return;
         if (record.IsDev && !string.IsNullOrWhiteSpace(record.DevSourceDirectory))
         {
             try
@@ -380,13 +440,13 @@ public sealed class PluginManager : IDisposable
                 record.Error = ex.Message;
                 record.Status = "Unpacked reload failed";
                 SaveState();
-                PluginsChanged?.Invoke(this, EventArgs.Empty);
+                RaisePluginsChanged();
                 return;
             }
         }
         DisableRecord(record);
         if (record.Enabled) TryLoad(record);
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
     }
 
     private void ReloadUnpackedSource(PluginRecord record)
@@ -434,7 +494,8 @@ public sealed class PluginManager : IDisposable
             catch
             {
                 TryDeleteDirectory(destination);
-                if (Directory.Exists(backup)) Directory.Move(backup, destination);
+                if (Directory.Exists(backup))
+                    Directory.Move(backup, destination);
                 throw;
             }
             record.Manifest = copied;
@@ -446,7 +507,7 @@ public sealed class PluginManager : IDisposable
             record.Status = wasEnabled ? "Reloading (unpacked)" : "Disabled";
             SaveState();
             if (wasEnabled) TryLoad(record);
-            PluginsChanged?.Invoke(this, EventArgs.Empty);
+            RaisePluginsChanged();
         }
         catch
         {
@@ -457,13 +518,16 @@ public sealed class PluginManager : IDisposable
 
     public IReadOnlyList<PluginActivitySummary> GetActivitySummary(string id)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return Array.Empty<PluginActivitySummary>();
-        return record.BuildActivitySummary();
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        return record?.BuildActivitySummary() ?? Array.Empty<PluginActivitySummary>();
     }
 
     public PluginPermission ConsumePendingNewPermissions(string id)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return PluginPermission.None;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return PluginPermission.None;
         PluginPermission value = record.PendingNewPermissions;
         record.PendingNewPermissions = PluginPermission.None;
         return value;
@@ -471,7 +535,9 @@ public sealed class PluginManager : IDisposable
 
     public void OpenFolder(string id)
     {
-        if (!_plugins.TryGetValue(id, out var record)) return;
+        PluginRecord? record;
+        lock (_plugins) _plugins.TryGetValue(id, out record);
+        if (record == null) return;
         Directory.CreateDirectory(record.Directory);
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
@@ -503,7 +569,7 @@ public sealed class PluginManager : IDisposable
 
     private Bitmap? ResolveEmbeddedFrame(DomElement element, LayoutBox box, bool isPrint)
     {
-        if (_disposed || element.TagName != "embed" || box.Width <= 0 || box.Height <= 0) return null;
+        if (Volatile.Read(ref _disposed) != 0 || element.TagName != "embed" || box.Width <= 0 || box.Height <= 0) return null;
         int width = Math.Max(1, (int)Math.Ceiling(box.Width));
         int height = Math.Max(1, (int)Math.Ceiling(box.Height));
         EmbeddedRuntime runtime;
@@ -637,14 +703,11 @@ public sealed class PluginManager : IDisposable
             if (mime.Length == 0) return;
             PluginRecord? record = null;
             string registrationToken = "";
-            lock (_plugins)
+            foreach (var candidate in SnapshotPlugins())
             {
-                foreach (var candidate in _plugins.Values)
-                {
-                    if (!candidate.Enabled || candidate.Sandbox == null || !candidate.HasPermission(PluginPermission.EmbedRenderer)) continue;
-                    if (!candidate.Manifest.EmbedTypes.Any(t => t.Equals(mime, StringComparison.OrdinalIgnoreCase))) continue;
-                    if (candidate.Sandbox.TryGetEmbedRegistrationToken(mime, out registrationToken)) { record = candidate; break; }
-                }
+                if (!candidate.Enabled || candidate.Sandbox == null || !candidate.HasPermission(PluginPermission.EmbedRenderer)) continue;
+                if (!candidate.Manifest.EmbedTypes.Any(t => t.Equals(mime, StringComparison.OrdinalIgnoreCase))) continue;
+                if (candidate.Sandbox.TryGetEmbedRegistrationToken(mime, out registrationToken)) { record = candidate; break; }
             }
             if (record?.Sandbox == null || registrationToken.Length == 0) return;
             string source = element.GetAttr("src") ?? "";
@@ -710,7 +773,7 @@ public sealed class PluginManager : IDisposable
                 return (runtime.ScriptName, runtime.ScriptMethods);
 
             string mime = (element.GetAttr("type") ?? InferMimeFromSource(element.GetAttr("src"))).Trim().ToLowerInvariant();
-            foreach (var candidate in _plugins.Values)
+            foreach (var candidate in SnapshotPlugins())
             {
                 if (!candidate.Enabled || candidate.Sandbox == null || !candidate.HasPermission(PluginPermission.EmbedRenderer) || !candidate.HasPermission(PluginPermission.EmbedScript)) continue;
                 if (string.IsNullOrWhiteSpace(candidate.Manifest.ScriptName)) continue;
@@ -819,7 +882,7 @@ public sealed class PluginManager : IDisposable
 
     internal void RaiseNavigation(string url)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.BrowserEvents)) continue;
             record.Sandbox.RaiseNavigated(url);
@@ -828,7 +891,7 @@ public sealed class PluginManager : IDisposable
 
     internal void RaisePageLoaded(string url, string title)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.BrowserEvents)) continue;
             record.Sandbox.RaisePageLoaded(url, title);
@@ -837,56 +900,56 @@ public sealed class PluginManager : IDisposable
 
     internal void RaiseNavigationFailed(string url, string message)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseNavigationFailed(url, message);
     }
 
     internal void RaiseTitleChanged(string url, string title)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseTitleChanged(url, title);
     }
 
     internal void RaiseLoadProgress(string url, double fraction)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseLoadProgress(url, fraction);
     }
 
     internal void RaiseZoomChanged(float zoom)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseZoomChanged(zoom);
     }
 
     internal void RaiseHostShuttingDown()
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseHostShuttingDown();
     }
 
     internal void RaiseWindowFocusChanged(bool hasFocus)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.BrowserEvents))
                 record.Sandbox.RaiseWindowFocusChanged(hasFocus);
     }
 
     internal void RaiseClipboardChanged()
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.Clipboard))
                 record.Sandbox.RaiseClipboardChanged();
     }
 
     internal void RaiseAudioComplete()
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
             if (record.Enabled && record.Sandbox != null && record.HasPermission(PluginPermission.AudioPlayback))
                 record.Sandbox.RaiseAudioComplete();
     }
@@ -912,7 +975,9 @@ public sealed class PluginManager : IDisposable
         {
             string path = Path.Combine(record.Directory, "data", "storage.json");
             if (!File.Exists(path)) return new Dictionary<string, string>(StringComparer.Ordinal);
-            var values = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new();
+            Dictionary<string, string> values;
+            lock (record.StorageSync)
+                values = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new();
             return values.Where(p => p.Key.StartsWith("settings.", StringComparison.Ordinal)).ToDictionary(p => p.Key[9..], p => p.Value ?? "", StringComparer.Ordinal);
         }
         catch { return new Dictionary<string, string>(StringComparer.Ordinal); }
@@ -924,11 +989,16 @@ public sealed class PluginManager : IDisposable
         string key = "settings." + definition.Name;
         string path = Path.Combine(record.Directory, "data", "storage.json");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        Dictionary<string, string> values;
-        try { values = File.Exists(path) ? JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new() : new(); } catch { values = new(); }
-        values[key] = value ?? "";
-        File.WriteAllText(path, JsonSerializer.Serialize(values));
-        record.Sandbox?.PushSettingChanged(definition.Name, values[key]);
+        // storage.json is also read/written by the sandbox session broker; the
+        // per-record lock keeps the read-modify-write from losing updates.
+        lock (record.StorageSync)
+        {
+            Dictionary<string, string> values;
+            try { values = File.Exists(path) ? JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path)) ?? new() : new(); } catch { values = new(); }
+            values[key] = value ?? "";
+            File.WriteAllText(path, JsonSerializer.Serialize(values));
+        }
+        record.Sandbox?.PushSettingChanged(definition.Name, value ?? "");
     }
 
     internal async Task<IReadOnlyList<PluginOmniboxSuggestion>> GetOmniboxSuggestionsAsync(string text, CancellationToken ct)
@@ -974,12 +1044,21 @@ public sealed class PluginManager : IDisposable
 
     internal async Task<string?> TransformContentAsync(string contentType, string url, string charset, byte[] body, CancellationToken ct)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.ContentTransform)) continue;
             if (!record.Sandbox.GetContentTransformTypes().Any(t => contentType.Equals(t, StringComparison.OrdinalIgnoreCase))) continue;
             if (!record.Manifest.ContentTransformScopes.Any(scope => PluginContentTransformPolicy.ScopeMatches(scope, url, contentType))) continue;
-            return await record.Sandbox.TransformContentAsync(contentType, url, charset, body, ct).ConfigureAwait(true);
+            try
+            {
+                return await record.Sandbox.TransformContentAsync(contentType, url, charset, body, ct).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                // One broken plugin must not break the page load; skip it and
+                // let the next matching plugin (or no transform) apply.
+                DebugLog.Write($"PLUGIN[{record.Manifest.Id}] content transform failed: {ex.Message}");
+            }
         }
         return null;
     }
@@ -987,7 +1066,7 @@ public sealed class PluginManager : IDisposable
     internal string BuildPageStyleCss()
     {
         var styles = new List<string>();
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.PageStyle)) continue;
             styles.AddRange(record.Sandbox.PageStyles);
@@ -997,10 +1076,20 @@ public sealed class PluginManager : IDisposable
 
     internal async Task<PluginBeforeNavigateDecision> BeforeNavigateAsync(string url, CancellationToken ct)
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.Tabs)) continue;
-            var decision = await record.Sandbox.BeforeNavigateAsync("active", url, ct).ConfigureAwait(true);
+            PluginBeforeNavigateDecision decision;
+            try
+            {
+                decision = await record.Sandbox.BeforeNavigateAsync("active", url, ct).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                // A hung or crashed plugin must not break navigation.
+                DebugLog.Write($"PLUGIN[{record.Manifest.Id}] beforeNavigate failed: {ex.Message}");
+                continue;
+            }
             if (decision.Action != PluginBeforeNavigateAction.Allow) return decision;
         }
         return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Allow);
@@ -1009,7 +1098,7 @@ public sealed class PluginManager : IDisposable
     internal PluginNetworkRuleDecision EvaluateNetworkRules(string url, IReadOnlyDictionary<string, string> headers)
     {
         var strip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (!record.Enabled || record.Sandbox == null || !record.HasPermission(PluginPermission.NetworkRules)) continue;
             foreach (var rule in record.Sandbox.SnapshotNetworkRules())
@@ -1063,7 +1152,7 @@ public sealed class PluginManager : IDisposable
 
     internal void RecordSandboxCrash(PluginRecord record, string reason)
     {
-        if (_disposed || !record.Enabled) return;
+        if (Volatile.Read(ref _disposed) != 0 || !record.Enabled) return;
         DateTimeOffset now = DateTimeOffset.UtcNow;
         record.LastCrashUtc = now; record.LastCrashReason = string.IsNullOrWhiteSpace(reason) ? "Plugin worker disconnected." : reason;
         record.CrashTimes.RemoveAll(t => now - t > PluginCrashWindow);
@@ -1081,20 +1170,20 @@ public sealed class PluginManager : IDisposable
             TimeSpan delay = PluginRestartBackoff[Math.Max(0, record.RestartAttempt - 1)];
             _ = RestartAfterCrashAsync(record, delay);
         }
-        SaveState(); PluginsChanged?.Invoke(this, EventArgs.Empty);
+        SaveState(); RaisePluginsChanged();
     }
 
     private async Task RestartAfterCrashAsync(PluginRecord record, TimeSpan delay)
     {
         try { await Task.Delay(delay).ConfigureAwait(false); } catch { return; }
-        if (_disposed || !record.Enabled || record.Sandbox != null) return;
+        if (Volatile.Read(ref _disposed) != 0 || !record.Enabled || record.Sandbox != null) return;
         if (_browser.IsHandleCreated && !_browser.IsDisposed) _browser.BeginInvoke((Action)(() => TryLoad(record)));
         else TryLoad(record);
     }
 
     private void LoadEnabledPlugins()
     {
-        foreach (var record in _plugins.Values.ToArray())
+        foreach (var record in SnapshotPlugins())
         {
             if (record.Enabled) TryLoad(record);
         }
@@ -1102,9 +1191,23 @@ public sealed class PluginManager : IDisposable
 
     private void TryLoad(PluginRecord record)
     {
-        ValidateEntryAssembly(record.Directory, record.Manifest);
+        try
+        {
+            ValidateEntryAssembly(record.Directory, record.Manifest);
+        }
+        catch (Exception ex)
+        {
+            // TryLoad runs during window startup (HandleCreated) and from
+            // crash-restart paths; a broken installed plugin must be recorded,
+            // never propagated into the host.
+            record.Status = "Error";
+            record.Error = ex.Message;
+            SaveState();
+            RaisePluginsChanged();
+            return;
+        }
         record.Status = "Loading (sandboxed)";
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
         _ = LoadSandboxAsync(record);
     }
 
@@ -1137,7 +1240,7 @@ public sealed class PluginManager : IDisposable
                 RecordSandboxCrash(record, ex.ToString());
             }
         }
-        PluginsChanged?.Invoke(this, EventArgs.Empty);
+        RaisePluginsChanged();
     }
 
     private static string ComputeDllSha256(string root, PluginManifest manifest)
@@ -1149,12 +1252,14 @@ public sealed class PluginManager : IDisposable
 
     private static int ComparePluginVersions(string left, string right)
     {
-        static (int number, string[] prerelease) Parse(string value)
+        // The numeric component packs up to four 0-999 fields; 999.999.999.999
+        // exceeds int.MaxValue, so the accumulator must be a long.
+        static (long number, string[] prerelease) Parse(string value)
         {
             string main = value?.Trim() ?? "0";
             string[] parts = main.Split('-', 2, StringSplitOptions.TrimEntries);
             string[] nums = parts[0].Split('.', StringSplitOptions.RemoveEmptyEntries);
-            int number = 0;
+            long number = 0;
             foreach (string part in nums.Take(4))
             {
                 number = checked(number * 1000 + (int.TryParse(part, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? Math.Clamp(n, 0, 999) : 0));
@@ -1197,14 +1302,19 @@ public sealed class PluginManager : IDisposable
         using var archive = ZipFile.OpenRead(packagePath);
         var entry = archive.GetEntry("plugin.json") ?? archive.Entries.FirstOrDefault(e => e.FullName.Equals("plugin.json", StringComparison.OrdinalIgnoreCase));
         if (entry == null) throw new InvalidDataException("Package is missing plugin.json.");
+        if (entry.Length > MaxManifestBytes) throw new InvalidDataException("plugin.json exceeds its size limit.");
         using var stream = entry.Open();
         return JsonSerializer.Deserialize(stream, PluginManifestJsonContext.Default.PluginManifest)
                ?? throw new InvalidDataException("plugin.json is empty or invalid.");
     }
 
-    private PluginManifest LoadManifest(string path) =>
-        JsonSerializer.Deserialize(File.ReadAllText(path), PluginManifestJsonContext.Default.PluginManifest)
-        ?? throw new InvalidDataException("plugin.json is empty or invalid.");
+    private PluginManifest LoadManifest(string path)
+    {
+        var info = new FileInfo(path);
+        if (info.Length > MaxManifestBytes) throw new InvalidDataException("plugin.json exceeds its size limit.");
+        return JsonSerializer.Deserialize(File.ReadAllText(path), PluginManifestJsonContext.Default.PluginManifest)
+               ?? throw new InvalidDataException("plugin.json is empty or invalid.");
+    }
 
     private static void ValidatePermissions(IEnumerable<string>? permissions)
     {
@@ -1238,7 +1348,7 @@ public sealed class PluginManager : IDisposable
             if ((setting.Label ?? "").Length > 128 || (setting.Description ?? "").Length > 512 || (setting.DefaultValue ?? "").Length > 2048)
                 throw new InvalidDataException($"Plugin setting '{name}' contains text that is too long.");
             if (type == "select" && (setting.Options == null || setting.Options.Length == 0 || setting.Options.Length > 32 || setting.Options.Any(o => string.IsNullOrWhiteSpace(o) || o.Length > 128)))
-                throw new InvalidDataException($"Plugin select setting '{name}' must contain 1-32 options of at most 128 characters.");
+                throw new InvalidDataException($"Plugin setting '{name}' must contain 1-32 options of at most 128 characters.");
         }
     }
 
@@ -1255,6 +1365,18 @@ public sealed class PluginManager : IDisposable
             throw new InvalidDataException("plugin.json requires assembly and entryPoint.");
         if (!manifest.Id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_'))
             throw new InvalidDataException("Plugin id may contain only letters, digits, '.', '-' and '_'.");
+        // The id reaches the filesystem, the worker command line and the
+        // runtime payload path; everything else is displayed or passed to the
+        // engine, so all of it is length-capped.
+        if (manifest.Id.Length > 64) throw new InvalidDataException("Plugin id must be at most 64 characters.");
+        if (manifest.Name.Length > 128) throw new InvalidDataException("Plugin name must be at most 128 characters.");
+        if ((manifest.Author ?? "").Length > 128) throw new InvalidDataException("Plugin author must be at most 128 characters.");
+        if ((manifest.Description ?? "").Length > 1024) throw new InvalidDataException("Plugin description is too long.");
+        if ((manifest.Website ?? "").Length > 2048) throw new InvalidDataException("Plugin website URL is too long.");
+        if ((manifest.Version ?? "").Length > 32) throw new InvalidDataException("Plugin version string is too long.");
+        if ((manifest.MinHostVersion ?? "").Length > 32) throw new InvalidDataException("Plugin min_host_version is too long.");
+        if ((manifest.Assembly ?? "").Length > 256) throw new InvalidDataException("Plugin assembly path is too long.");
+        if ((manifest.EntryPoint ?? "").Length > 512) throw new InvalidDataException("Plugin entry point is too long.");
         ValidatePermissions(manifest.Permissions);
         ValidatePermissions(manifest.OptionalPermissions);
         ValidateSettings(manifest.Settings);
@@ -1298,11 +1420,16 @@ public sealed class PluginManager : IDisposable
     private static void ExtractPackageSafely(string packagePath, string destination)
     {
         using var archive = ZipFile.OpenRead(packagePath);
+        if (archive.Entries.Count > MaxPackageEntries)
+            throw new InvalidDataException("Plugin package contains too many entries.");
+
+        string root = Path.GetFullPath(destination.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
+        long total = 0;
+
         foreach (var entry in archive.Entries)
         {
             if (string.IsNullOrWhiteSpace(entry.FullName)) continue;
             string full = Path.GetFullPath(Path.Combine(destination, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
-            string root = Path.GetFullPath(destination.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
             if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Plugin package contains a path traversal entry.");
 
@@ -1312,8 +1439,29 @@ public sealed class PluginManager : IDisposable
                 continue;
             }
 
+            // entry.Length is the declared uncompressed size; the copy loop
+            // below enforces the same cap in case the header lies.
+            if (entry.Length > MaxPackageEntryBytes)
+                throw new InvalidDataException("Plugin package contains an oversized entry.");
+            total += entry.Length;
+            if (total > MaxPackageTotalBytes)
+                throw new InvalidDataException("Plugin package exceeds the total size limit.");
+
             Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-            entry.ExtractToFile(full, overwrite: true);
+            using (var source = entry.Open())
+            using (var target = File.Create(full))
+            {
+                byte[] buffer = new byte[81920];
+                long written = 0;
+                int read;
+                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    written += read;
+                    if (written > MaxPackageEntryBytes)
+                        throw new InvalidDataException("Plugin package contains an oversized entry.");
+                    target.Write(buffer, 0, read);
+                }
+            }
         }
     }
 
@@ -1327,13 +1475,18 @@ public sealed class PluginManager : IDisposable
             var saved = JsonSerializer.Deserialize<List<PluginState>>(File.ReadAllText(_stateFile), _jsonOptions) ?? new();
             foreach (var state in saved)
             {
+                // The state file is on disk and therefore untrusted: the id
+                // reaches the filesystem (Remove deletes record.Directory) and
+                // the sandbox worker command line.
+                if (state == null || string.IsNullOrWhiteSpace(state.Id)) continue;
+                if (state.Id.Length > 64 || !state.Id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_')) continue;
                 string dir = GetPluginDirectory(state.Id);
                 string manifestPath = Path.Combine(dir, "plugin.json");
                 if (!File.Exists(manifestPath)) continue;
                 try
                 {
                     var manifest = LoadManifest(manifestPath);
-                    var requested = manifest.RequestedPermissions;
+                    ValidateManifest(manifest);
                     _plugins[state.Id] = new PluginRecord
                     {
                         Manifest = manifest,
@@ -1362,25 +1515,38 @@ public sealed class PluginManager : IDisposable
 
     private void SaveState()
     {
-        Directory.CreateDirectory(_rootDirectory);
-        var state = _plugins.Values.Select(p => new PluginState
+        // Atomic (temp + move) so a crash mid-write cannot corrupt the state
+        // file, and never throws: this runs from background crash paths.
+        try
         {
-            Id = p.Manifest.Id,
-            Enabled = p.Enabled,
-            GrantedPermissions = (ulong)p.GrantedPermissions,
-            InstalledUtc = p.InstalledUtc,
-            DllSha256 = p.DllSha256,
-            PermissionChanges = p.PermissionChanges,
-            LastCrashReason = p.LastCrashReason,
-            LastCrashUtc = p.LastCrashUtc,
-            Activity = p.SnapshotActivity(),
-            CrashTimes = p.CrashTimes.ToList(),
-            RestartAttempt = p.RestartAttempt,
-            RejectedShortcuts = p.RejectedShortcuts.ToList(),
-            IsDev = p.IsDev,
-            DevSourceDirectory = p.DevSourceDirectory
-        }).ToList();
-        File.WriteAllText(_stateFile, JsonSerializer.Serialize(state, _jsonOptions));
+            Directory.CreateDirectory(_rootDirectory);
+            PluginRecord[] records;
+            lock (_plugins) records = _plugins.Values.ToArray();
+            var state = records.Select(p => new PluginState
+            {
+                Id = p.Manifest.Id,
+                Enabled = p.Enabled,
+                GrantedPermissions = (ulong)p.GrantedPermissions,
+                InstalledUtc = p.InstalledUtc,
+                DllSha256 = p.DllSha256,
+                PermissionChanges = p.PermissionChanges,
+                LastCrashReason = p.LastCrashReason,
+                LastCrashUtc = p.LastCrashUtc,
+                Activity = p.SnapshotActivity(),
+                CrashTimes = p.CrashTimes.ToList(),
+                RestartAttempt = p.RestartAttempt,
+                RejectedShortcuts = p.RejectedShortcuts.ToList(),
+                IsDev = p.IsDev,
+                DevSourceDirectory = p.DevSourceDirectory
+            }).ToList();
+            string temp = _stateFile + ".tmp-" + Guid.NewGuid().ToString("N");
+            File.WriteAllText(temp, JsonSerializer.Serialize(state, _jsonOptions));
+            File.Move(temp, _stateFile, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("PluginManager state save failed: " + ex.Message);
+        }
     }
 
     private static string SafeComputeDllSha256(string root, PluginManifest manifest)
@@ -1413,7 +1579,7 @@ public sealed class PluginManager : IDisposable
 
     private void OnEmbedRenderTick(object? sender, EventArgs e)
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
         EmbeddedRuntime[] runtimes;
         lock (_embedLock) { runtimes = _embedded.Values.ToArray(); }
         foreach (var runtime in runtimes)
@@ -1425,8 +1591,7 @@ public sealed class PluginManager : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _embedRenderTimer.Stop();
         _embedRenderTimer.Dispose();
         _browser.PluginCanvas.PageChanged -= OnPageChanged;
@@ -1435,8 +1600,8 @@ public sealed class PluginManager : IDisposable
         _browser.PluginCanvas.EmbeddedScriptInfoResolver = null;
         _browser.PluginCanvas.EmbeddedScriptCall = null;
         OnPageChanged();
-        foreach (var record in _plugins.Values.ToArray()) DisableRecord(record);
-        _plugins.Clear();
+        foreach (var record in SnapshotPlugins()) DisableRecord(record);
+        lock (_plugins) _plugins.Clear();
     }
 
     private sealed class PluginState
@@ -1476,8 +1641,13 @@ public sealed class PluginManager : IDisposable
         public string? DevSourceDirectory { get; internal set; }
         internal List<PluginActivityEntry> Activity { get; set; } = new();
         internal readonly object ActivitySync = new();
+        // Guards data/storage.json, which is read and written by both this
+        // manager (UI thread) and the sandbox session broker (reader loop).
+        internal readonly object StorageSync = new();
         internal Action? ActivityPersistence { get; set; }
-        internal PluginSandboxSession? Sandbox;
+        // Volatile: written by crash/restart paths on background threads and
+        // read from the UI thread and embed pipeline.
+        internal volatile PluginSandboxSession? Sandbox;
         public PluginPermission RequestedPermissions => Manifest.RequestedPermissions;
         public PluginPermission AvailablePermissions => Manifest.AvailablePermissions;
         public List<DateTimeOffset> CrashTimes { get; internal set; } = new();

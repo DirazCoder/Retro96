@@ -77,6 +77,8 @@ internal static class PluginContentTransformPolicy
 
             if (StartsWithTag(html, lt, "script"))
             {
+                // Fail closed: a script element with no closing tag causes the
+                // rest of the document to be dropped rather than emitted.
                 int end = FindTagEnd(html, lt);
                 if (end < 0) break;
                 int close = html.IndexOf("</script", end + 1, StringComparison.OrdinalIgnoreCase);
@@ -97,6 +99,8 @@ internal static class PluginContentTransformPolicy
             if (TrySanitizeStartTag(fragment, out string sanitized))
                 output.Append(sanitized);
             else
+                // Comments, doctypes and end tags have no event handlers and
+                // browsers ignore attributes on end tags; verbatim is safe.
                 output.Append(fragment);
             index = gt + 1;
         }
@@ -111,18 +115,28 @@ internal static class PluginContentTransformPolicy
             if (token is not StartTag start)
                 return false;
 
+            // A tag name that cannot be re-emitted safely drops the entire tag
+            // (fail closed) rather than echoing the fragment verbatim.
+            if (!IsSafeHtmlName(start.Name))
+            {
+                sanitized = string.Empty;
+                return true;
+            }
+
             var attrs = new StringBuilder();
             foreach (var pair in start.Attrs)
             {
                 string name = pair.Key ?? string.Empty;
                 string value = pair.Value ?? string.Empty;
+                if (!IsSafeHtmlName(name))
+                    continue;
                 if (name.StartsWith("on", StringComparison.OrdinalIgnoreCase))
                     continue;
-                if (IsJavascriptUrl(value))
+                if (IsScriptUrl(value))
                     continue;
                 attrs.Append(' ').Append(name);
                 if (pair.Value != null && value.Length > 0)
-                    attrs.Append("=\"").Append(EscapeAttribute(value)).Append('\"');
+                    attrs.Append("=\"").Append(EscapeAttribute(value)).Append('"');
             }
 
             sanitized = "<" + start.Name + attrs + (start.SelfClosing ? "/>" : ">");
@@ -131,7 +145,19 @@ internal static class PluginContentTransformPolicy
         return false;
     }
 
-    private static bool IsJavascriptUrl(string value)
+    private static bool IsSafeHtmlName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        foreach (char c in name)
+        {
+            if (char.IsControl(c) || char.IsWhiteSpace(c) ||
+                c is '"' or '\'' or '<' or '>' or '/' or '=')
+                return false;
+        }
+        return true;
+    }
+
+    private static bool IsScriptUrl(string value)
     {
         string normalized = HtmlEntities.Decode(value ?? string.Empty);
         var sb = new StringBuilder(normalized.Length);
@@ -140,7 +166,13 @@ internal static class PluginContentTransformPolicy
             if (c <= 0x20 || c == '\u007f') continue;
             sb.Append(c);
         }
-        return sb.ToString().StartsWith("javascript:", StringComparison.OrdinalIgnoreCase);
+        string cleaned = sb.ToString();
+        // javascript: plus the era-relevant script schemes (vbscript in IE,
+        // livescript/mocha in early Netscape builds).
+        return cleaned.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
+               cleaned.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase) ||
+               cleaned.StartsWith("livescript:", StringComparison.OrdinalIgnoreCase) ||
+               cleaned.StartsWith("mocha:", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string EscapeAttribute(string value) =>

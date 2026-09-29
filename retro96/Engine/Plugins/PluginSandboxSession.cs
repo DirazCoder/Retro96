@@ -1,5 +1,6 @@
 using System.Text;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -19,6 +20,32 @@ namespace Retro96.Plugins;
 /// </summary>
 internal sealed class PluginSandboxSession : IDisposable
 {
+    private const int ConnectTimeoutSeconds = 20;
+    private const int ReadyTimeoutSeconds = 20;
+    private const int CpuRatePercent = 25;
+    private const int EmbedDisposeTimeoutMs = 3000;
+    private const int ContextQueryTimeoutMs = 250;
+    private const long MaxPluginFileBytes = 64L * 1024 * 1024;
+
+    // Job Object CPU rate control (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).
+    private const int JobObjectCpuRateControlInformation = 15;
+    private const uint JobObjectCpuRateControlEnable = 0x1;
+    private const uint JobObjectCpuRateControlHardCap = 0x4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+    {
+        public uint ControlFlags;
+        public uint Value; // union: CpuRate (percent * 100), Weight, MinRate/MaxRate
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr job,
+        int jobObjectInformationClass,
+        ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION info,
+        int infoLength);
+
     private readonly Form1 _browser;
     private readonly PluginManager _manager;
     private readonly PluginManager.PluginRecord _record;
@@ -59,6 +86,11 @@ internal sealed class PluginSandboxSession : IDisposable
     public async Task StartAsync()
     {
         if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(PluginSandboxSession));
+
+        // The id is embedded in a quoted worker argument and in a path below
+        // the runtime shadow; reject anything that could break out of either.
+        ValidatePluginIdForWorker(_record.Manifest.Id);
+
         string pipeName = "Retro96.Plugin." + Guid.NewGuid().ToString("N");
         var profile = WindowsSecurity.CreateAppContainer(TrustMode.High);
         _profileName = profile.ProfileName;
@@ -86,18 +118,61 @@ internal sealed class PluginSandboxSession : IDisposable
                 runtimeDir,
                 useLpac: false,
                 ownsRuntimeDirectory: true,
-                cpuRatePercent: 25,
                 workerArguments: $"--plugin-worker \"{pipeName}\" \"PluginPayload\\{_record.Manifest.Id}\"");
+            ApplyCpuRateLimit(_worker, CpuRatePercent);
 
-            await _pipe.WaitForConnectionAsync(_lifetime.Token).ConfigureAwait(false);
+            // Wait for the pipe connection with a timeout, watching for an
+            // early worker death so the failure surfaces with the real exit
+            // code instead of a bare timeout.
+            using (var connectCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token))
+            {
+                connectCts.CancelAfter(TimeSpan.FromSeconds(ConnectTimeoutSeconds));
+                Task connectTask = _pipe.WaitForConnectionAsync(connectCts.Token);
+                while (!connectTask.IsCompleted)
+                {
+                    if (_worker.HasExited(out uint exitCode))
+                    {
+                        connectCts.Cancel();
+                        try { await connectTask.ConfigureAwait(false); }
+                        catch { /* observe the abandoned wait */ }
+                        throw new InvalidOperationException(
+                            $"Plugin worker exited before connecting to the sandbox pipe. Exit code: 0x{exitCode:X8} ({exitCode}).");
+                    }
+                    await Task.WhenAny(connectTask, Task.Delay(25, connectCts.Token)).ConfigureAwait(false);
+                }
+                await connectTask.ConfigureAwait(false);
+            }
 
             _ = Task.Run(RunLoopAsync);
-            await _ready.Task.WaitAsync(TimeSpan.FromSeconds(20), _lifetime.Token).ConfigureAwait(false);
+            await _ready.Task.WaitAsync(TimeSpan.FromSeconds(ReadyTimeoutSeconds), _lifetime.Token).ConfigureAwait(false);
         }
         catch
         {
             Dispose();
             throw;
+        }
+    }
+
+    private static void ValidatePluginIdForWorker(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || id.Length > 64 ||
+            !id.All(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_'))
+            throw new SecurityException("Plugin id is not safe to pass to the sandbox worker.");
+    }
+
+    private static void ApplyCpuRateLimit(WindowsSecurity.WorkerProcess worker, int percent)
+    {
+        if (percent is < 1 or > 100) return;
+        var info = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+        {
+            ControlFlags = JobObjectCpuRateControlEnable | JobObjectCpuRateControlHardCap,
+            Value = checked((uint)(percent * 100))
+        };
+        // Soft-fail: older Windows builds without HARD_CAP just skip the cap.
+        if (!SetInformationJobObject(worker.JobHandle, JobObjectCpuRateControlInformation,
+                ref info, Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()))
+        {
+            StartupDiagnostics.Win32Error("HOST", "PluginJobCpuRate", Marshal.GetLastWin32Error());
         }
     }
 
@@ -174,7 +249,9 @@ internal sealed class PluginSandboxSession : IDisposable
             cancellationToken).ConfigureAwait(false);
         var payload = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.EmbedFramePayload>(reply)
             ?? throw new InvalidDataException("Embedded plugin frame metadata is missing.");
-        if (payload.InstanceToken != instance.InstanceToken || payload.Width != request.Width || payload.Height != request.Height || payload.Stride != request.Stride)
+        // The plugin may legitimately return its own (validated) stride, e.g.
+        // a tightly packed buffer; only the identity and dimensions must match.
+        if (payload.InstanceToken != instance.InstanceToken || payload.Width != request.Width || payload.Height != request.Height)
             throw new InvalidDataException("Embedded plugin frame metadata does not match the render request.");
         return new EmbeddedFrameBuffer(payload.Width, payload.Height, payload.Stride, reply.Data).Validate();
     }
@@ -289,7 +366,20 @@ internal sealed class PluginSandboxSession : IDisposable
         finally
         {
             _ready.TrySetException(new InvalidOperationException("Plugin sandbox disconnected."));
-            if (!ExpectedShutdown) _manager.RecordSandboxCrash(_record, _record.Error ?? "Plugin worker disconnected.");
+            // Record the crash (when this session is still the active one and
+            // the shutdown was not requested by the host), THEN dispose. Before
+            // this, a worker death leaked the pipe, the Job/process handles,
+            // the AppContainer profile and the entire runtime shadow per crash.
+            bool expected = ExpectedShutdown || !ReferenceEquals(_record.Sandbox, this);
+            try
+            {
+                if (!expected)
+                    _manager.RecordSandboxCrash(_record, _record.Error ?? "Plugin worker disconnected.");
+            }
+            finally
+            {
+                Dispose();
+            }
         }
     }
 
@@ -300,14 +390,16 @@ internal sealed class PluginSandboxSession : IDisposable
             switch (envelope.Op)
             {
                 case "hello":
-                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.HelloReply(
-                        string.Equals(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HelloPayload>(envelope)?.PluginId,
-                            _record.Manifest.Id, StringComparison.OrdinalIgnoreCase),
-                        JsonSerializer.Serialize(_record.Manifest, PluginManifestJsonContext.Default.PluginManifest),
-                        (ulong)_record.GrantedPermissions,
-                        string.Equals(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HelloPayload>(envelope)?.PluginId,
-                            _record.Manifest.Id, StringComparison.OrdinalIgnoreCase) ? "" : "Plugin id mismatch."));
-                    break;
+                    {
+                        var helloPayload = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.HelloPayload>(envelope);
+                        bool idMatches = string.Equals(helloPayload?.PluginId, _record.Manifest.Id, StringComparison.OrdinalIgnoreCase);
+                        await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.HelloReply(
+                            idMatches,
+                            JsonSerializer.Serialize(_record.Manifest, PluginManifestJsonContext.Default.PluginManifest),
+                            (ulong)_record.GrantedPermissions,
+                            idMatches ? "" : "Plugin id mismatch.")).ConfigureAwait(false);
+                        break;
+                    }
 
                 case "ready":
                     var ready = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ReadyPayload>(envelope);
@@ -501,12 +593,12 @@ internal sealed class PluginSandboxSession : IDisposable
                     Demand(PluginPermission.UserInterface); var tb = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiToolbarAddPayload>(envelope) ?? throw new InvalidDataException(); string tbToken = Guid.NewGuid().ToString("N");
                     IDisposable tbItem = RunOnUi(() => _browser.AddPluginToolbarButton(_record.Manifest.Id, tb.Label, tb.Tooltip, () => SendEvent("event.ui.invoke", new PluginSandboxProtocol.UiInvokePayload(tbToken)))); lock (_toolbarItems) _toolbarItems[tbToken] = tbItem; await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.UiToolbarAddReply(tbToken)); break;
                 case "ui.toolbar.remove":
-                    Demand(PluginPermission.UserInterface); var tr = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiMenuRemovePayload>(envelope) ?? throw new InvalidDataException(); IDisposable? trd = null; lock (_toolbarItems) { if (_toolbarItems.Remove(tr.Token, out var f)) trd = f; } trd?.Dispose(); await ReplyOkAsync(envelope); break;
+                    Demand(PluginPermission.UserInterface); var tr = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiMenuRemovePayload>(envelope) ?? throw new InvalidDataException(); IDisposable? trd = null; lock (_toolbarItems) { if (_toolbarItems.Remove(tr.Token, out var f)) trd = f; } try { trd?.Dispose(); } catch { } await ReplyOkAsync(envelope); break;
                 case "ui.context.add":
                     Demand(PluginPermission.UserInterface); var ca = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiContextAddPayload>(envelope) ?? throw new InvalidDataException(); string ctoken = Guid.NewGuid().ToString("N");
                     IDisposable ci = RunOnUi(() => _browser.AddPluginContextMenuItem(_record.Manifest.Id, ca.Label, context => QueryWorkerContextVisible(ctoken, context), context => SendEvent("event.ui.context.invoke", new PluginSandboxProtocol.UiContextInvokePayload(ctoken, context)))); lock (_contextItems) _contextItems[ctoken] = ci; await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.UiContextAddReply(ctoken)); break;
                 case "ui.context.remove":
-                    Demand(PluginPermission.UserInterface); var crm = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiMenuRemovePayload>(envelope) ?? throw new InvalidDataException(); IDisposable? crd = null; lock (_contextItems) { if (_contextItems.Remove(crm.Token, out var foundContext)) crd = foundContext; } crd?.Dispose(); await ReplyOkAsync(envelope); break;
+                    Demand(PluginPermission.UserInterface); var crm = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiMenuRemovePayload>(envelope) ?? throw new InvalidDataException(); IDisposable? crd = null; lock (_contextItems) { if (_contextItems.Remove(crm.Token, out var foundContext)) crd = foundContext; } try { crd?.Dispose(); } catch { } await ReplyOkAsync(envelope); break;
                 case "ui.status":
                     Demand(PluginPermission.UserInterface); var status2 = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.UiStatusPayload>(envelope) ?? throw new InvalidDataException(); RunOnUi(() => _browser.SetPluginStatus(_record.Manifest.Id, status2.Text)); await ReplyOkAsync(envelope); break;
                 case "ui.progress":
@@ -555,13 +647,15 @@ internal sealed class PluginSandboxSession : IDisposable
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.FilePayload(frt.RelativePath, ReadDataText(frt.RelativePath))); break;
                 case "filesystem.read.bytes":
                     Demand(PluginPermission.FileSystem); var frb = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.FilePayload>(envelope) ?? throw new InvalidDataException();
-                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.FilePayload(frb.RelativePath, BytesBase64: Convert.ToBase64String(File.ReadAllBytes(GetDataPath(frb.RelativePath))))); break;
+                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.FilePayload(frb.RelativePath, BytesBase64: Convert.ToBase64String(ReadDataBytes(frb.RelativePath)))); break;
                 case "filesystem.write.text":
                     Demand(PluginPermission.FileSystem); var fwt = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.FilePayload>(envelope) ?? throw new InvalidDataException();
                     File.WriteAllText(GetDataPath(fwt.RelativePath), fwt.Text ?? "", Encoding.UTF8); await ReplyOkAsync(envelope); break;
                 case "filesystem.write.bytes":
                     Demand(PluginPermission.FileSystem); var fwb = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.FilePayload>(envelope) ?? throw new InvalidDataException();
-                    File.WriteAllBytes(GetDataPath(fwb.RelativePath), Convert.FromBase64String(fwb.BytesBase64 ?? "")); await ReplyOkAsync(envelope); break;
+                    byte[] written = Convert.FromBase64String(fwb.BytesBase64 ?? "");
+                    if (written.Length > MaxPluginFileBytes) throw new InvalidDataException("Plugin file write exceeds its size cap.");
+                    File.WriteAllBytes(GetDataPath(fwb.RelativePath), written); await ReplyOkAsync(envelope); break;
                 case "filesystem.delete":
                     Demand(PluginPermission.FileSystem); var fd = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.FilePayload>(envelope) ?? throw new InvalidDataException();
                     string deletePath = GetDataPath(fd.RelativePath); if (File.Exists(deletePath)) File.Delete(deletePath); await ReplyOkAsync(envelope); break;
@@ -667,15 +761,23 @@ internal sealed class PluginSandboxSession : IDisposable
                     break;
 
                 case "downloads.start":
-                    Demand(PluginPermission.Downloads, GetNetworkHost(PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DownloadStartPayload>(envelope)?.Url));
-                    var dl = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DownloadStartPayload>(envelope) ?? throw new InvalidDataException();
-                    string? downloaded = await _browser.PluginDownloadAsync(_record.Manifest.Id, dl.Url, dl.SuggestedFileName, Path.Combine(_rootDirectory, "data"),
-                        progress => SendEvent("event.download.progress", new PluginSandboxProtocol.EventDownloadProgressPayload(progress)), _lifetime.Token).ConfigureAwait(true);
-                    await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DownloadReply(downloaded)).ConfigureAwait(false);
-                    break;
+                    {
+                        var dl = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DownloadStartPayload>(envelope) ?? throw new InvalidDataException();
+                        Demand(PluginPermission.Downloads, GetNetworkHost(dl.Url));
+                        string suggested = SanitizeSuggestedFileName(dl.SuggestedFileName);
+                        string? downloaded = await _browser.PluginDownloadAsync(_record.Manifest.Id, dl.Url, suggested, Path.Combine(_rootDirectory, "data"),
+                            progress => SendEvent("event.download.progress", new PluginSandboxProtocol.EventDownloadProgressPayload(progress)), _lifetime.Token).ConfigureAwait(true);
+                        await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DownloadReply(downloaded)).ConfigureAwait(false);
+                        break;
+                    }
 
                 case "dialogs.open":
-                    Demand(PluginPermission.Dialogs); string? importPath = await _browser.PluginOpenFilePickerAsync(_record.Manifest.Id, PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Title ?? "Open File", PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope)?.Filter ?? "All files (*.*)|*.*", Path.Combine(_rootDirectory, "data")).ConfigureAwait(false); await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DialogOpenReply(importPath)); break;
+                    {
+                        Demand(PluginPermission.Dialogs);
+                        var dOpen = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogOpenPayload>(envelope) ?? throw new InvalidDataException();
+                        string? importPath = await _browser.PluginOpenFilePickerAsync(_record.Manifest.Id, dOpen.Title ?? "Open File", dOpen.Filter ?? "All files (*.*)|*.*", Path.Combine(_rootDirectory, "data")).ConfigureAwait(false);
+                        await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DialogOpenReply(importPath)); break;
+                    }
                 case "dialogs.save":
                     Demand(PluginPermission.Dialogs); var dsp = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.DialogSavePayload>(envelope) ?? throw new InvalidDataException(); bool saved = await _browser.PluginSaveFilePickerAsync(Path.Combine(_rootDirectory, "data"), dsp.RelativePath, dsp.SuggestedFilename, dsp.Filter).ConfigureAwait(false); await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.DialogSaveReply(saved)); break;
                 case "notifications.show":
@@ -742,7 +844,7 @@ internal sealed class PluginSandboxSession : IDisposable
                     var networkState = new HostStreamState(this, networkStreamToken, net.Body, net.CanSeek, net.Length, PluginPermission.Network);
                     lock (_streams) _streams[networkStreamToken] = networkState;
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkStreamOpenReply(
-                        true, net.StatusCode, new Dictionary<string,string>(net.Headers, StringComparer.OrdinalIgnoreCase), net.ContentType, net.Charset,
+                        true, net.StatusCode, new Dictionary<string, string>(net.Headers, StringComparer.OrdinalIgnoreCase), net.ContentType, net.Charset,
                         net.EffectiveUrl, networkStreamToken, net.CanSeek, net.Length)).ConfigureAwait(false);
                     break;
                 case "embed.network.stream.open":
@@ -754,7 +856,7 @@ internal sealed class PluginSandboxSession : IDisposable
                     var embedNetworkState = new HostStreamState(this, embedNetworkStreamToken, embedNet.Body, embedNet.CanSeek, embedNet.Length, PluginPermission.EmbedNetwork);
                     lock (_streams) _streams[embedNetworkStreamToken] = embedNetworkState;
                     await ReplyAsync(envelope.Id, "response", new PluginSandboxProtocol.NetworkStreamOpenReply(
-                        true, embedNet.StatusCode, new Dictionary<string,string>(embedNet.Headers, StringComparer.OrdinalIgnoreCase), embedNet.ContentType, embedNet.Charset,
+                        true, embedNet.StatusCode, new Dictionary<string, string>(embedNet.Headers, StringComparer.OrdinalIgnoreCase), embedNet.ContentType, embedNet.Charset,
                         embedNet.EffectiveUrl, embedNetworkStreamToken, embedNet.CanSeek, embedNet.Length)).ConfigureAwait(false);
                     break;
                 case "embed.script.pageCall":
@@ -818,8 +920,12 @@ internal sealed class PluginSandboxSession : IDisposable
         }
         catch (Exception ex)
         {
-            await ReplyAsync(envelope.Id, "error", new PluginSandboxProtocol.ErrorPayload(ex.Message)).ConfigureAwait(false);
             _record.Error = ex.Message;
+            try
+            {
+                await ReplyAsync(envelope.Id, "error", new PluginSandboxProtocol.ErrorPayload(ex.Message)).ConfigureAwait(false);
+            }
+            catch { /* the pipe is already gone; the run loop will notice */ }
         }
     }
 
@@ -866,6 +972,15 @@ internal sealed class PluginSandboxSession : IDisposable
         if (format.SampleRate is < 8000 or > 48000 || format.Channels is < 1 or > 2 || format.SampleFormat is not (PluginPcmSampleFormat.PcmS16Le or PluginPcmSampleFormat.Float32Le)) throw new InvalidDataException("Unsupported PCM format.");
     }
 
+    private static string SanitizeSuggestedFileName(string? name)
+    {
+        // Strip any directory component so a plugin cannot steer the download
+        // target outside its data directory through the suggested filename.
+        string fileName = Path.GetFileName((name ?? "").Trim());
+        if (fileName.Length == 0) return "download";
+        return fileName.Length > 128 ? fileName[..128] : fileName;
+    }
+
     private static string SanitizePluginCss(string css)
     {
         if (css == null || css.Length > 64 * 1024) throw new InvalidDataException("Plugin CSS exceeds its size cap.");
@@ -883,7 +998,7 @@ internal sealed class PluginSandboxSession : IDisposable
         if (action == PluginBeforeNavigateAction.Redirect)
         {
             if (string.IsNullOrWhiteSpace(reply.RedirectUrl) || reply.RedirectUrl.Length > 8192) return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Cancel);
-            try { _ = ParsedUrl.Parse(reply.RedirectUrl); } catch { return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Cancel); }
+            try { ParsedUrl.Parse(reply.RedirectUrl); } catch { return new PluginBeforeNavigateDecision(PluginBeforeNavigateAction.Cancel); }
             return new PluginBeforeNavigateDecision(action, reply.RedirectUrl);
         }
         return new PluginBeforeNavigateDecision(action);
@@ -946,7 +1061,7 @@ internal sealed class PluginSandboxSession : IDisposable
         var meta = PluginSandboxProtocol.GetPayload<PluginSandboxProtocol.ProtocolResponsePayload>(binary) ?? throw new InvalidDataException("Protocol response metadata is missing.");
         if (!string.IsNullOrEmpty(meta.Error)) throw new InvalidOperationException(meta.Error);
         if (binary.Data.Length > 32 * 1024 * 1024) throw new InvalidDataException("Protocol response exceeds its size cap.");
-        return new PluginProtocolResponse(binary.Data.ToArray(), meta.ContentType, meta.StatusCode, meta.Charset);
+        return new PluginProtocolResponse(binary.Data, meta.ContentType, meta.StatusCode, meta.Charset);
     }
 
     internal async Task<string?> TransformContentAsync(string contentType, string url, string charset, byte[] body, CancellationToken ct)
@@ -995,7 +1110,7 @@ internal sealed class PluginSandboxSession : IDisposable
     {
         private PluginSandboxSession? _session;
         internal EmbeddedHostInstance(PluginSandboxSession session, string instanceToken, string streamToken, string scriptName, IReadOnlyList<string> scriptMethods)
-        { _session = session; InstanceToken=instanceToken; StreamToken=streamToken; ScriptName=scriptName; ScriptMethods=scriptMethods; }
+        { _session = session; InstanceToken = instanceToken; StreamToken = streamToken; ScriptName = scriptName; ScriptMethods = scriptMethods; }
         internal string InstanceToken { get; }
         internal string StreamToken { get; }
         internal PluginSandboxSession? Session => _session;
@@ -1012,7 +1127,15 @@ internal sealed class PluginSandboxSession : IDisposable
         {
             var s = Interlocked.Exchange(ref _session, null);
             if (s == null) return;
-            try { s.SendRequestAsync<object>("embed.dispose", new PluginSandboxProtocol.EmbedDisposePayload(InstanceToken, StreamToken), CancellationToken.None).GetAwaiter().GetResult(); } catch { }
+            // Bounded: this dispose is reached from the UI thread (page change,
+            // embed teardown); a stuck worker must not freeze the UI for the
+            // full 30 s default call timeout.
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(EmbedDisposeTimeoutMs));
+                s.SendRequestAsync<object>("embed.dispose", new PluginSandboxProtocol.EmbedDisposePayload(InstanceToken, StreamToken), cts.Token).GetAwaiter().GetResult();
+            }
+            catch { }
             lock (s._embeddedInstances) s._embeddedInstances.Remove(InstanceToken);
             s.RemoveStream(StreamToken);
         }
@@ -1022,7 +1145,7 @@ internal sealed class PluginSandboxSession : IDisposable
 
     private sealed class HostEmbeddedInstance
     {
-        public HostEmbeddedInstance(string token, string streamToken, string sourceUrl) { Token=token; StreamToken=streamToken; SourceUrl=sourceUrl; }
+        public HostEmbeddedInstance(string token, string streamToken, string sourceUrl) { Token = token; StreamToken = streamToken; SourceUrl = sourceUrl; }
         public string Token { get; }
         public string StreamToken { get; }
         public string SourceUrl { get; }
@@ -1030,7 +1153,7 @@ internal sealed class PluginSandboxSession : IDisposable
         public DomElement? Element { get; set; }
     }
 
-    internal sealed record PluginNetworkStream(Stream Body, int StatusCode, IReadOnlyDictionary<string,string> Headers, string? ContentType, string? Charset, string EffectiveUrl, bool CanSeek, long? Length) : IDisposable
+    internal sealed record PluginNetworkStream(Stream Body, int StatusCode, IReadOnlyDictionary<string, string> Headers, string? ContentType, string? Charset, string EffectiveUrl, bool CanSeek, long? Length) : IDisposable
     {
         public void Dispose() { Body.Dispose(); }
     }
@@ -1045,6 +1168,7 @@ internal sealed class PluginSandboxSession : IDisposable
         private readonly PluginPermission _requiredPermission;
         private readonly CancellationTokenSource _lifetime = new();
         private readonly SemaphoreSlim _ioLock = new(1, 1);
+        private readonly object _gate = new();
         private long _credit;
         private long _position;
         private long _generation;
@@ -1053,14 +1177,14 @@ internal sealed class PluginSandboxSession : IDisposable
         private int _disposed;
 
         public HostStreamState(PluginSandboxSession session, string token, Stream stream, bool canSeek, long? length, PluginPermission permission)
-        { _session=session; _token=token; _stream=stream; _canSeek=canSeek; _length=length; _requiredPermission=permission; _position=stream.CanSeek ? stream.Position : 0; }
+        { _session = session; _token = token; _stream = stream; _canSeek = canSeek; _length = length; _requiredPermission = permission; _position = stream.CanSeek ? stream.Position : 0; }
         internal PluginPermission RequiredPermission => _requiredPermission;
 
         public async Task AddCreditAsync(int maxBytes, string requestId, CancellationToken cancellationToken)
         {
             if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(HostStreamState));
             if (maxBytes <= 0 || maxBytes > PluginSandboxProtocol.MaxStreamChunkBytes) throw new ArgumentOutOfRangeException(nameof(maxBytes));
-            lock (this)
+            lock (_gate)
             {
                 if (_eof) { _ = _session.ReplyAsync(requestId, "response", new { success = true }); return; }
                 _credit = Math.Min(_credit + maxBytes, 8L * PluginSandboxProtocol.MaxStreamChunkBytes);
@@ -1078,30 +1202,30 @@ internal sealed class PluginSandboxSession : IDisposable
                 while (Volatile.Read(ref _disposed) == 0)
                 {
                     int readSize; long offset; long generation;
-                    lock (this)
+                    lock (_gate)
                     {
-                        if (_eof || _credit <= 0) { _pumping=false; return; }
-                        readSize=(int)Math.Min(_credit, PluginSandboxProtocol.MaxStreamChunkBytes);
-                        offset=_position;
-                        generation=_generation;
+                        if (_eof || _credit <= 0) { _pumping = false; return; }
+                        readSize = (int)Math.Min(_credit, PluginSandboxProtocol.MaxStreamChunkBytes);
+                        offset = _position;
+                        generation = _generation;
                     }
                     byte[] buffer = new byte[readSize];
                     int count;
                     try
                     {
                         await _ioLock.WaitAsync(_lifetime.Token).ConfigureAwait(false);
-                        try { count=await _stream.ReadAsync(buffer.AsMemory(0, readSize), _lifetime.Token).ConfigureAwait(false); }
+                        try { count = await _stream.ReadAsync(buffer.AsMemory(0, readSize), _lifetime.Token).ConfigureAwait(false); }
                         finally { _ioLock.Release(); }
                     }
                     catch (Exception ex)
                     {
-                        lock (this) { _eof=true; _pumping=false; }
+                        lock (_gate) { _eof = true; _pumping = false; }
                         await _session.SendBinaryAsync("embed.stream.chunk", Guid.NewGuid().ToString("N"),
                             new PluginSandboxProtocol.EmbedStreamChunkPayload(_token, offset, true, ex.Message), Array.Empty<byte>(), CancellationToken.None).ConfigureAwait(false);
                         return;
                     }
                     bool end = count == 0;
-                    lock (this)
+                    lock (_gate)
                     {
                         if (generation != _generation)
                             continue;
@@ -1112,10 +1236,10 @@ internal sealed class PluginSandboxSession : IDisposable
                     await _session.SendBinaryAsync("embed.stream.chunk", Guid.NewGuid().ToString("N"),
                         new PluginSandboxProtocol.EmbedStreamChunkPayload(_token, offset, end),
                         count == buffer.Length ? buffer : buffer.AsMemory(0, count), _lifetime.Token).ConfigureAwait(false);
-                    if (end) { lock (this) _pumping=false; return; }
+                    if (end) { lock (_gate) _pumping = false; return; }
                 }
             }
-            catch { lock (this) _pumping=false; }
+            catch { lock (_gate) _pumping = false; }
         }
 
         public async Task<EmbeddedSeekResult> SeekAsync(long offset, SeekOrigin origin, CancellationToken cancellationToken)
@@ -1124,8 +1248,8 @@ internal sealed class PluginSandboxSession : IDisposable
             await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                long pos=_stream.Seek(offset, origin);
-                lock (this) { _position=pos; _credit=0; _eof=false; _generation=checked(_generation + 1); }
+                long pos = _stream.Seek(offset, origin);
+                lock (_gate) { _position = pos; _credit = 0; _eof = false; _generation = checked(_generation + 1); }
                 return new EmbeddedSeekResult(pos, _length);
             }
             finally { _ioLock.Release(); }
@@ -1133,7 +1257,7 @@ internal sealed class PluginSandboxSession : IDisposable
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed,1)!=0) return;
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             _lifetime.Cancel();
             try { _stream.Dispose(); } catch { }
             _ioLock.Dispose();
@@ -1173,23 +1297,15 @@ internal sealed class PluginSandboxSession : IDisposable
             throw new SecurityException("Embedded navigation may only use http, https, file, or about URLs.");
     }
 
-    private bool QueryPluginContextCallback(string token, ContextMenuContext context)
-    {
-        try
-        {
-            var result = SendRequestAsync<PluginSandboxProtocol.UiContextResult>("ui.context.check", new PluginSandboxProtocol.UiContextQueryPayload(token, context), CancellationToken.None).GetAwaiter().GetResult();
-            return result.Visible;
-        }
-        catch { return false; }
-    }
-
-
+    // Runs synchronously on the UI thread while a context menu is opening; a
+    // short timeout keeps a stuck plugin from freezing the UI.
     private bool QueryWorkerContextVisible(string token, ContextMenuContext context)
     {
         try
         {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(ContextQueryTimeoutMs));
             return SendRequestAsync<PluginSandboxProtocol.UiContextResult>(
-                "ui.context.query", new PluginSandboxProtocol.UiContextQueryPayload(token, context), CancellationToken.None)
+                "ui.context.query", new PluginSandboxProtocol.UiContextQueryPayload(token, context), cts.Token)
                 .GetAwaiter().GetResult().Visible;
         }
         catch { return false; }
@@ -1268,13 +1384,25 @@ internal sealed class PluginSandboxSession : IDisposable
         return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : null;
     }
 
+    private static bool ContainsHeaderControlCharacter(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return false;
+        foreach (char c in value)
+            if (c == '\r' || c == '\n' || c == '\0') return true;
+        return false;
+    }
+
     private void EnsurePluginHeaders(IReadOnlyDictionary<string, string>? headers)
     {
-        foreach (string name in (headers ?? new Dictionary<string, string>()).Keys)
+        foreach (var pair in headers ?? new Dictionary<string, string>())
         {
-            if (name.Equals("Host", StringComparison.OrdinalIgnoreCase) || name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) || name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                throw new SecurityException($"Plugin HTTP header '{name}' is host-controlled.");
-            if (name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) && !_record.HasPermission(PluginPermission.BrowserCookies))
+            // Header values cross the trust boundary into the host's raw HTTP
+            // request; CR/LF/NUL would allow request splitting/smuggling.
+            if (ContainsHeaderControlCharacter(pair.Key) || ContainsHeaderControlCharacter(pair.Value))
+                throw new SecurityException("Plugin HTTP header contains control characters.");
+            if (pair.Key.Equals("Host", StringComparison.OrdinalIgnoreCase) || pair.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) || pair.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                throw new SecurityException($"Plugin HTTP header '{pair.Key}' is host-controlled.");
+            if (pair.Key.Equals("Cookie", StringComparison.OrdinalIgnoreCase) && !_record.HasPermission(PluginPermission.BrowserCookies))
                 throw new SecurityException("Setting the Cookie header requires 'browser.cookies'.");
         }
     }
@@ -1351,9 +1479,12 @@ internal sealed class PluginSandboxSession : IDisposable
         string path = Path.Combine(_rootDirectory, "data", "storage.json");
         try
         {
-            if (!File.Exists(path)) return new(StringComparer.Ordinal);
-            return JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path), PluginSandboxProtocol.JsonOptions)
-                ?? new(StringComparer.Ordinal);
+            lock (_record.StorageSync)
+            {
+                if (!File.Exists(path)) return new(StringComparer.Ordinal);
+                return JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path), PluginSandboxProtocol.JsonOptions)
+                    ?? new(StringComparer.Ordinal);
+            }
         }
         catch { return new(StringComparer.Ordinal); }
     }
@@ -1362,7 +1493,12 @@ internal sealed class PluginSandboxSession : IDisposable
     {
         string dir = Path.Combine(_rootDirectory, "data");
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "storage.json"), JsonSerializer.Serialize(values, PluginSandboxProtocol.JsonOptions));
+        // PluginManager reads/writes the same file (plugin settings UI); the
+        // per-record lock keeps the read-modify-write cycles from losing data.
+        lock (_record.StorageSync)
+        {
+            File.WriteAllText(Path.Combine(dir, "storage.json"), JsonSerializer.Serialize(values, PluginSandboxProtocol.JsonOptions));
+        }
     }
 
     private string GetDataPath(string relativePath)
@@ -1379,6 +1515,15 @@ internal sealed class PluginSandboxSession : IDisposable
     }
 
     private string ReadDataText(string relativePath) => File.ReadAllText(GetDataPath(relativePath), Encoding.UTF8);
+
+    private byte[] ReadDataBytes(string relativePath)
+    {
+        string path = GetDataPath(relativePath);
+        var info = new FileInfo(path);
+        if (!info.Exists || info.Length > MaxPluginFileBytes)
+            throw new InvalidDataException("File is missing or exceeds the broker size limit.");
+        return File.ReadAllBytes(path);
+    }
 
     private static NamedPipeServerStream CreatePipe(string name, string appContainerSid)
     {
@@ -1398,7 +1543,7 @@ internal sealed class PluginSandboxSession : IDisposable
             PipeDirection.InOut,
             1,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous,
+            PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
             64 * 1024,
             64 * 1024,
             security);
@@ -1426,6 +1571,14 @@ internal sealed class PluginSandboxSession : IDisposable
             foreach (var pair in _protocols.ToArray()) _manager.UnregisterPluginProtocol(_record, pair.Key, pair.Value);
             _protocols.Clear();
         }
+        lock (_omniboxKeywords)
+        {
+            foreach (var pair in _omniboxKeywords.ToArray()) _manager.UnregisterPluginOmnibox(_record, pair.Value, pair.Key);
+            _omniboxKeywords.Clear();
+        }
+        PluginKeyboardShortcut[] shortcuts;
+        lock (_shortcuts) { shortcuts = _shortcuts.Values.ToArray(); _shortcuts.Clear(); }
+        foreach (var shortcut in shortcuts) { try { _browser.UnregisterPluginShortcut(_record.Manifest.Id, shortcut); } catch { } }
         _lifetime.Cancel();
         foreach (var completion in _pending.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginSandboxSession)));
         _pending.Clear();
@@ -1433,12 +1586,16 @@ internal sealed class PluginSandboxSession : IDisposable
         { foreach (var item in _menuItems.Values) { try { item.Dispose(); } catch { } } _menuItems.Clear(); }
         lock (_toolbarItems) { foreach (var item in _toolbarItems.Values) { try { item.Dispose(); } catch { } } _toolbarItems.Clear(); }
         lock (_contextItems) { foreach (var item in _contextItems.Values) { try { item.Dispose(); } catch { } } _contextItems.Clear(); }
+        lock (_extraUiItems) { foreach (var item in _extraUiItems.Values) { try { item.Dispose(); } catch { } } _extraUiItems.Clear(); }
         lock (_panels) { foreach (var item in _panels.Values) { try { item.Dispose(); } catch { } } _panels.Clear(); }
         HostStreamState[] streams;
         lock (_streams) { streams = _streams.Values.ToArray(); _streams.Clear(); }
         foreach (var stream in streams) { try { stream.Dispose(); } catch { } }
         lock (_embeddedInstances) _embeddedInstances.Clear();
         lock (_embeddedRegistrations) _embeddedRegistrations.Clear();
+        lock (_contentTransforms) _contentTransforms.Clear();
+        lock (_pageStyles) _pageStyles.Clear();
+        lock (_networkRules) _networkRules.Clear();
         foreach (var completion in _pendingBinary.Values) completion.TrySetException(new ObjectDisposedException(nameof(PluginSandboxSession)));
         _pendingBinary.Clear();
         try { _pipe?.Dispose(); } catch { }

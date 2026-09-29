@@ -1,9 +1,17 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using Retro96.Engine.Js;
 
 namespace Retro96.Plugins;
 
 internal static class PluginJsValueCodec
 {
+    // Mirrors the engine-side cap in FromEngineObject so both directions of
+    // the script bridge accept the same shapes.
+    private const int MaxWireElements = 4096;
+
     public static PluginSandboxProtocol.JsValueWire ToWire(JsValue value)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -28,10 +36,26 @@ internal static class PluginJsValueCodec
             "string" => JsValue.From(wire.StringValue ?? string.Empty),
             "number" => JsValue.From(wire.NumberValue ?? throw new InvalidDataException("JavaScript number is missing.")),
             "boolean" => JsValue.From(wire.BooleanValue ?? throw new InvalidDataException("JavaScript boolean is missing.")),
-            "array" => JsValue.FromArray((wire.ArrayValue ?? Array.Empty<PluginSandboxProtocol.JsValueWire>()).Select(FromWire).ToArray()),
-            "object" => JsValue.FromObject((wire.ObjectValue ?? new Dictionary<string, PluginSandboxProtocol.JsValueWire>(StringComparer.Ordinal)).ToDictionary(p => p.Key, p => FromWire(p.Value), StringComparer.Ordinal)),
+            "array" => FromWireArray(wire.ArrayValue),
+            "object" => FromWireObject(wire.ObjectValue),
             _ => throw new InvalidDataException($"Unsupported JavaScript value kind '{wire.Kind}'.")
         };
+    }
+
+    private static JsValue FromWireArray(PluginSandboxProtocol.JsValueWire[]? values)
+    {
+        var items = values ?? Array.Empty<PluginSandboxProtocol.JsValueWire>();
+        if (items.Length > MaxWireElements)
+            throw new InvalidDataException("Embedded script array is too large.");
+        return JsValue.FromArray(items.Select(FromWire).ToArray());
+    }
+
+    private static JsValue FromWireObject(Dictionary<string, PluginSandboxProtocol.JsValueWire>? values)
+    {
+        var map = values ?? new Dictionary<string, PluginSandboxProtocol.JsValueWire>(StringComparer.Ordinal);
+        if (map.Count > MaxWireElements)
+            throw new InvalidDataException("Embedded script object is too large.");
+        return JsValue.FromObject(map.ToDictionary(p => p.Key, p => FromWire(p.Value), StringComparer.Ordinal));
     }
 
     public static JsValue FromEngine(Retro96.Engine.Js.JsValue value)
@@ -69,8 +93,12 @@ internal static class PluginJsValueCodec
         {
             int length = 0;
             if (obj.Properties.TryGetValue("length", out var lengthValue) && lengthValue.Type == JsType.Number)
-                length = checked((int)lengthValue.GetNumber());
-            if (length < 0 || length > 4096) throw new InvalidDataException("Embedded script array is too large.");
+            {
+                double raw = lengthValue.GetNumber();
+                if (raw < 0 || raw > MaxWireElements || raw != Math.Floor(raw))
+                    throw new InvalidDataException("Embedded script array is too large or malformed.");
+                length = (int)raw;
+            }
             var values = new JsValue[length];
             for (int i = 0; i < length; i++)
             {
@@ -80,7 +108,7 @@ internal static class PluginJsValueCodec
             return JsValue.FromArray(values);
         }
 
-        if (obj.Properties.Count > 4096) throw new InvalidDataException("Embedded script object is too large.");
+        if (obj.Properties.Count > MaxWireElements) throw new InvalidDataException("Embedded script object is too large.");
         var result = new Dictionary<string, JsValue>(StringComparer.Ordinal);
         foreach (var pair in obj.Properties)
         {

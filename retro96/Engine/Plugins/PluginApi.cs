@@ -1,4 +1,7 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -96,6 +99,12 @@ public static class PluginPermissionNames
             [PluginPermission.EmbedExtras] = "embed.extras"
         };
 
+    // Reverse lookup for parsing; names are unique by construction.
+    private static readonly IReadOnlyDictionary<string, PluginPermission> Lookup =
+        new Dictionary<string, PluginPermission>(
+            Names.Select(p => new KeyValuePair<string, PluginPermission>(p.Value, p.Key)),
+            StringComparer.OrdinalIgnoreCase);
+
     public static IEnumerable<string> ToNames(PluginPermission permissions) =>
         Names.Where(p => permissions.HasFlag(p.Key)).Select(p => p.Value);
 
@@ -104,9 +113,8 @@ public static class PluginPermissionNames
         PluginPermission value = PluginPermission.None;
         foreach (string raw in names ?? Array.Empty<string>())
         {
-            string name = (raw ?? string.Empty).Trim();
-            var pair = Names.FirstOrDefault(p => p.Value.Equals(name, StringComparison.OrdinalIgnoreCase));
-            if (!pair.Equals(default(KeyValuePair<PluginPermission, string>))) value |= pair.Key;
+            if (Lookup.TryGetValue((raw ?? string.Empty).Trim(), out PluginPermission permission))
+                value |= permission;
         }
         return value;
     }

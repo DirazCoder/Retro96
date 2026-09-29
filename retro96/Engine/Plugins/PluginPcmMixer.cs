@@ -138,14 +138,15 @@ internal sealed class PluginPcmMixer : IDisposable
         }
     }
 
-    private void OnWaveOut(IntPtr hwo, uint msg, IntPtr instance, IntPtr header, IntPtr reserved1, IntPtr reserved2)
+    private void OnWaveOut(IntPtr hwo, uint msg, IntPtr dwInstance, IntPtr dwParam1, IntPtr dwParam2)
     {
         if (msg != 0x3fff) return; // WOM_DONE
         lock (_sync)
         {
-            if (_disposed != 0 || !_buffers.TryGetValue(header, out var buffer)) return;
+            if (Volatile.Read(ref _disposed) != 0) return;
+            if (!_buffers.TryGetValue(dwParam1, out var buffer)) return;
             Fill(buffer.Data);
-            waveOutWrite(hwo, header, Marshal.SizeOf<WAVEHDR>());
+            waveOutWrite(hwo, dwParam1, Marshal.SizeOf<WAVEHDR>());
         }
     }
 
@@ -163,22 +164,32 @@ internal sealed class PluginPcmMixer : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        IntPtr waveOut;
+        WaveBuffer[] buffers;
         lock (_sync)
         {
-            if (_waveOut != IntPtr.Zero)
-            {
-                waveOutReset(_waveOut);
-                foreach (var buffer in _buffers.Values)
-                {
-                    try { waveOutUnprepareHeader(_waveOut, buffer.Header, Marshal.SizeOf<WAVEHDR>()); } catch { }
-                    buffer.Dispose();
-                }
-                _buffers.Clear();
-                waveOutClose(_waveOut);
-                _waveOut = IntPtr.Zero;
-            }
+            waveOut = _waveOut;
+            _waveOut = IntPtr.Zero;
+            buffers = _buffers.Values.ToArray();
+            _buffers.Clear();
             _sources.Clear();
         }
+
+        if (waveOut == IntPtr.Zero) return;
+
+        // waveOutReset/unprepare/close MUST run without holding _sync:
+        // reset waits for in-flight buffers to complete, and the WOM_DONE
+        // callback needs _sync to finish. Holding the lock here is a
+        // guaranteed deadlock. After the buffers were claimed above, the
+        // callback finds nothing in _buffers and returns immediately.
+        waveOutReset(waveOut);
+        foreach (var buffer in buffers)
+        {
+            try { waveOutUnprepareHeader(waveOut, buffer.Header, Marshal.SizeOf<WAVEHDR>()); } catch { }
+            buffer.Dispose();
+        }
+        waveOutClose(waveOut);
     }
 
     private sealed class Source
@@ -246,8 +257,24 @@ internal sealed class PluginPcmMixer : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)] private struct WAVEFORMATEX { public ushort wFormatTag, nChannels; public uint nSamplesPerSec, nAvgBytesPerSec; public ushort nBlockAlign, wBitsPerSample, cbSize; }
-    [StructLayout(LayoutKind.Sequential)] private struct WAVEHDR { public IntPtr lpData; public uint dwBufferLength, dwBytesRecorded, dwUser, dwFlags, dwLoops; public IntPtr lpNext, reserved; }
-    private delegate void WaveOutCallback(IntPtr hwo, uint uMsg, IntPtr dwInstance, IntPtr dwParam1, IntPtr dwParam2, IntPtr dwParam3);
+
+    // Native WAVEHDR: dwUser is DWORD_PTR (pointer-sized) — declaring it as
+    // uint shifts every following field's offset on x64.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WAVEHDR
+    {
+        public IntPtr lpData;
+        public uint dwBufferLength;
+        public uint dwBytesRecorded;
+        public UIntPtr dwUser;
+        public uint dwFlags;
+        public uint dwLoops;
+        public IntPtr lpNext;
+        public IntPtr reserved;
+    }
+
+    // Matches waveOutProc(HWAVEOUT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR).
+    private delegate void WaveOutCallback(IntPtr hwo, uint uMsg, IntPtr dwInstance, IntPtr dwParam1, IntPtr dwParam2);
 
     [DllImport("winmm.dll", EntryPoint = "waveOutOpen")] private static extern int waveOutOpen(out IntPtr phwo, uint uDeviceID, ref WAVEFORMATEX pwfx, IntPtr dwCallback, IntPtr dwInstance, uint fdwOpen);
     [DllImport("winmm.dll")] private static extern int waveOutPrepareHeader(IntPtr hwo, IntPtr pwh, int cbwh);

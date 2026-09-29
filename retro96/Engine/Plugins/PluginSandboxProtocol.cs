@@ -10,6 +10,11 @@ namespace Retro96.Plugins;
 /// carry pixel buffers and streamed content without base64 expansion or whole-
 /// payload buffering. The framing is deliberately self-describing so both
 /// endpoints can reject malformed/oversized messages before allocation.
+///
+/// Reply routing invariant: requests made over the JSON path
+/// (PluginSandboxProtocol.WriteAsync) are answered by a JSON "response"/"error"
+/// envelope with the same id; requests made over the binary path
+/// (WriteBinaryRequestAsync) are answered by a binary frame with the same id.
 /// </summary>
 internal static class PluginSandboxProtocol
 {
@@ -225,10 +230,10 @@ internal static class PluginSandboxProtocol
         try
         {
             int frameBytes = checked(1 + jsonBytes.Length);
-            byte[] header = new byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(header, frameBytes);
-            await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
-            await stream.WriteAsync(new[] { (byte)FrameKind.Json }, cancellationToken).ConfigureAwait(false);
+            byte[] prefix = new byte[5];
+            BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(0, 4), frameBytes);
+            prefix[4] = (byte)FrameKind.Json;
+            await stream.WriteAsync(prefix, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(jsonBytes, cancellationToken).ConfigureAwait(false);
             await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
         }
