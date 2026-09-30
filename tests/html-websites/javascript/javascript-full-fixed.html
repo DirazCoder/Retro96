@@ -1,0 +1,52 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Retro96 JavaScript Full Battery</TITLE>
+<SCRIPT LANGUAGE="JavaScript">
+var timerHit=false;
+function writeMarker(){document.write('<P><B>JS-F01 document.write marker</B></P>');}
+function setBg(){document.bgColor='#EEEECC';}
+function env(){document.getElementById('result').innerHTML='location='+location.href+' title='+document.title+' cookie='+document.cookie;}
+function mutate(){var e=document.getElementById('result');e.innerHTML='innerHTML mutated at '+new Date();}
+function attrTest(){var b=document.getElementById('probe');b.setAttribute('data-test','ok');document.getElementById('result').innerHTML='attr='+b.getAttribute('data-test');}
+function propertyTest(){var b=document.getElementById('assigned');b.onclick=function(){document.getElementById('result').innerHTML='assigned onclick fired';};document.getElementById('result').innerHTML='property handler assigned';}
+function replaceDom(){document.getElementById('replace').innerHTML='<B>replacement content</B> <A HREF="#end">fragment link</A>';}
+function timer(){window.setTimeout(function(){timerHit=true;document.getElementById('timer').innerHTML='timeout fired';},50);document.getElementById('timer').innerHTML='timeout scheduled';}
+function formCheck(){document.getElementById('result').innerHTML='submit handler ran and returned false';return false;}
+function showStatus(){window.status='Retro96 mouseover';}
+function clearStatus(){window.status='';}
+function dialogs(){var a=window.confirm('Retro96 confirm test');var p=window.prompt('Retro96 prompt test','default');document.getElementById('result').innerHTML='confirm='+a+' prompt='+p;}
+function nav(){document.getElementById('result').innerHTML='hash before='+location.hash; location.hash='end';}
+function writeButton(){document.write('<html><body><h2>POST-PARSE WRITE RESULT</h2><p>The document was replaced by document.write.</p></body></html>');}
+</SCRIPT></HEAD>
+<BODY ONLOAD="document.getElementById('load').innerHTML='onload fired';" BGCOLOR="#FFFFFF">
+<CENTER><FONT SIZE="+2" COLOR="#000080"><B>JAVASCRIPT FULL BATTERY</B></FONT><BR><FONT SIZE="-1">DOM-0, events, mutation, timers, navigation, dialogs and legacy script behaviour.</FONT></CENTER><HR>
+<H2>JS-F01: document.write during parse</H2><SCRIPT LANGUAGE="JavaScript">writeMarker();</SCRIPT>
+<H2>JS-F02: environment and document properties</H2><P><INPUT TYPE="BUTTON" VALUE="Read environment" ONCLICK="env();"></P>
+<H2>JS-F03: document.bgColor mutation</H2><P><INPUT TYPE="BUTTON" VALUE="Change background" ONCLICK="setBg();"></P>
+<H2>JS-F04: getElementById and innerHTML</H2><P><INPUT TYPE="BUTTON" VALUE="Mutate result" ONCLICK="mutate();"> <INPUT TYPE="BUTTON" VALUE="Replace DOM" ONCLICK="replaceDom();"></P>
+<DIV ID="replace">Original replacement target.</DIV>
+<H2>JS-F05: setAttribute/getAttribute</H2><P><INPUT TYPE="BUTTON" VALUE="Run attribute test" ONCLICK="attrTest();"> <SPAN ID="probe">probe</SPAN></P>
+<H2>JS-F06: property-assigned event handler</H2><P><INPUT TYPE="BUTTON" VALUE="Assign onclick" ONCLICK="propertyTest();"> <INPUT TYPE="BUTTON" ID="assigned" VALUE="Click after assignment"></P>
+<H2>JS-F07: mouse events and status</H2><P><A HREF="#end" ONMOUSEOVER="showStatus();" ONMOUSEOUT="clearStatus();">mouseover link</A></P>
+<H2>JS-F08: timers</H2><P><INPUT TYPE="BUTTON" VALUE="Schedule timeout" ONCLICK="timer();"> <SPAN ID="timer">no timer yet</SPAN></P>
+<H2>JS-F09: dialogs</H2><P><INPUT TYPE="BUTTON" VALUE="Alert/Confirm/Prompt" ONCLICK="alert('Retro96 alert test');dialogs();"></P>
+<H2>JS-F10: form submission cancellation</H2>
+<FORM ACTION="javascript-full-fixed.html" METHOD="GET" ONSUBMIT="return formCheck();"><INPUT TYPE="TEXT" NAME="q" VALUE="test"><INPUT TYPE="SUBMIT" VALUE="Submit (must be blocked)"></FORM>
+<H2>JS-F11: navigation and fragments</H2><P><INPUT TYPE="BUTTON" VALUE="Move to #end" ONCLICK="nav();"></P>
+<H2>JS-F12: checked/selected DOM properties</H2>
+<P><INPUT TYPE="CHECKBOX" ID="jsCheck" ONCLICK="document.getElementById('result').innerHTML='checked='+this.checked;"> check me
+<SELECT ONCHANGE="document.getElementById('result').innerHTML='selected='+this.selectedIndex+' value='+this.value;"><OPTION>one</OPTION><OPTION>two</OPTION><OPTION>three</OPTION></SELECT></P>
+<H2>JS-F13: cookie read/write</H2><P><INPUT TYPE="BUTTON" VALUE="Set cookie" ONCLICK="document.cookie='retro96=full; path=/'; env();"></P>
+<H2>JS-F14: load marker</H2><P ID="load">onload not fired yet</P>
+
+<H2>JS-F15: Query string and fragment reads</H2>
+<P><A HREF="javascript-full-fixed.html?retro96=full#end">Reload with a query string and fragment</A></P>
+<P><INPUT TYPE="BUTTON" VALUE="Read query/hash" ONCLICK="document.getElementById('result').innerHTML='href='+location.href+' hash='+location.hash+' search='+location.search;"></P>
+<H2>JS-F16: History and navigation methods</H2>
+<P><INPUT TYPE="BUTTON" VALUE="Go back" ONCLICK="history.back();"> <INPUT TYPE="BUTTON" VALUE="Go forward" ONCLICK="history.forward();"> <INPUT TYPE="BUTTON" VALUE="Assign self" ONCLICK="location.href='javascript-full-fixed.html#end';"></P>
+<H2>JS-F17: Exception isolation</H2>
+<P><INPUT TYPE="BUTTON" VALUE="Throw and recover" ONCLICK="try{throw new Error('Retro96 expected error');}catch(e){document.getElementById('result').innerHTML='caught='+e.message;}"></P>
+<H2>JS-F18: Legacy arrays, strings and arithmetic</H2>
+<P><INPUT TYPE="BUTTON" VALUE="Run language primitives" ONCLICK="var a=[1,2,3]; var x='retro'.toUpperCase(); document.getElementById('result').innerHTML=x+' sum='+(a[0]+a[1]+a[2]);"></P>
+<H2 ID="end">JS-END</H2><P ID="result">No result yet.</P>
+<HR><P><B>Note:</B> post-parse document.write is available on a separate button in the focused nasty fixture; this full battery stays non-destructive by default.</P>
+</BODY></HTML>

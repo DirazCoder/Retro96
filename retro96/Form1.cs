@@ -318,6 +318,11 @@ public partial class Form1 : Form
         StartPosition = FormStartPosition.CenterScreen;
         FormClosing += (s, e) =>
         {
+            if (IsWelcomeUrl(_currentPageUrl))
+            {
+                _settings.WelcomeDismissed = true;
+                _settings.Save();
+            }
             _loadCts?.Cancel();
             if (_settings.DiscardPageStateOnClose)
             {
@@ -470,7 +475,7 @@ public partial class Form1 : Form
             }
 
             // Land on the configured home page instead of a blank canvas.
-            NavigateTo(_settings.HomePageUrl);
+            NavigateTo(_settings.WelcomeDismissed ? _settings.HomePageUrl : "retro96:welcome");
             SetAppIcon();
         };
 
@@ -647,6 +652,12 @@ public partial class Form1 : Form
             requestedUrl = localUrl;
         rawUrl = requestedUrl;
 
+        if (!_settings.WelcomeDismissed && IsWelcomeUrl(_currentPageUrl) && !IsWelcomeUrl(rawUrl))
+        {
+            _settings.WelcomeDismissed = true;
+            _settings.Save();
+        }
+
         // Keep the address bar/history URL synchronized with the navigation
         // attempt before any error page is rendered.  Local file failures use
         // RenderErrorAsync(), which historically took _txtUrl.Text; leaving
@@ -816,7 +827,11 @@ public partial class Form1 : Form
                     return;
 
                 case "retro96":
-                    if (url.Path.Equals("home", StringComparison.OrdinalIgnoreCase) ||
+                    if (url.Path.Equals("welcome", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await RenderHtmlAsync(Retro96WelcomePageHtml(), rawUrl, replaceHistory, myGeneration);
+                    }
+                    else if (url.Path.Equals("home", StringComparison.OrdinalIgnoreCase) ||
                         string.IsNullOrEmpty(url.Path))
                     {
                         await RenderHtmlAsync(Retro96HomePageHtml(), rawUrl, replaceHistory, myGeneration);
@@ -972,6 +987,18 @@ public partial class Form1 : Form
             NavigateTo("retro96://home");
             return;
         }
+    }
+
+    private static bool IsWelcomeUrl(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        try
+        {
+            var url = ParsedUrl.Parse(value);
+            return url.Scheme.Equals("retro96", StringComparison.OrdinalIgnoreCase) &&
+                   url.Path.Trim('/').Equals("welcome", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     // ── file:// helpers (shared with ImageCache's URL scheme) ────────────
@@ -2890,6 +2917,212 @@ public partial class Form1 : Form
 </BODY>
 </HTML>";
     }
+
+        private static string Retro96WelcomePageHtml() => """
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+<head>
+<title>Welcome to Retro96</title>
+<style type="text/css">
+body {
+    background-color: #c0c0c0;
+    color: #000000;
+    font-family: "Times New Roman", Times, serif;
+    margin: 0;
+    padding: 0;
+}
+
+.page {
+    width: 580px;
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: 32px;
+    margin-bottom: 32px;
+    background-color: #ffffff;
+    border: 2px solid #808080;
+    padding: 32px 40px 40px 40px;
+}
+
+h1 {
+    font-family: "Times New Roman", Times, serif;
+    font-size: 28pt;
+    font-weight: bold;
+    color: #000080;
+    margin-top: 0;
+    margin-bottom: 4px;
+    letter-spacing: -1px;
+}
+
+.subtitle {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 9pt;
+    color: #808080;
+    margin-bottom: 24px;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #808080;
+    margin-top: 0;
+    margin-bottom: 24px;
+}
+
+h2 {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 11pt;
+    font-weight: bold;
+    color: #000000;
+    margin-top: 24px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid #c0c0c0;
+    padding-bottom: 2px;
+}
+
+p {
+    font-family: "Times New Roman", Times, serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    margin-top: 0;
+    margin-bottom: 12px;
+    color: #000000;
+}
+
+.note {
+    background-color: #ffffcc;
+    border: 1px solid #c0c000;
+    padding: 10px 14px;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 9pt;
+    line-height: 1.5;
+    margin-bottom: 20px;
+    color: #333300;
+}
+
+ul {
+    font-family: "Times New Roman", Times, serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    margin-top: 0;
+    margin-bottom: 12px;
+    padding-left: 20px;
+    color: #000000;
+}
+
+li {
+    margin-bottom: 4px;
+}
+
+.footer {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 8pt;
+    color: #808080;
+    text-align: center;
+    margin-top: 28px;
+    border-top: 1px solid #c0c0c0;
+    padding-top: 12px;
+}
+
+a {
+    color: #000080;
+}
+
+a:visited {
+    color: #800080;
+}
+
+code {
+    font-family: "Courier New", Courier, monospace;
+    font-size: 9pt;
+    background-color: #f0f0f0;
+    padding: 1px 3px;
+}
+</style>
+</head>
+<body>
+
+<div class="page">
+
+    <h1>Retro96</h1>
+    <div class="subtitle">Version: I have no idea &mdash; Beta &mdash; Not production software</div>
+
+    <hr>
+
+    <div class="note">
+        <b>Beta notice:</b> It works well right now, but I'm still finding and fixing bugs.
+        Not polished yet. Not ready for production.
+    </div>
+
+    <div class="note" style="border-color: #c00000; background-color: #fff0f0; color: #330000;">
+        <b>Windows only.</b> The security model, sandboxing, plugin isolation, and everything else
+        are built for Windows and staying that way. I can smell you, backporters. Do not.
+    </div>
+
+    <p>
+        Retro96 renders the web the way it looked in 1996. Not "quirks mode close enough" &mdash;
+        actually correctly. The target is 1996, but it covers some 1997&ndash;1998 features on
+        purpose, to handle later retro sites without breaking.
+    </p>
+
+    <p>
+        Almost everything is hand-written C#. The HTML tokenizer and parser, CSS parser,
+        selector engine, style resolver, layout engine, ES3 lexer and interpreter, DOM bindings,
+        a full JDK 1.0/1.1 bytecode interpreter with hand-written java.* natives and AWT,
+        networking, the plugin sandbox &mdash; all of it. The one external dependency is SkiaSharp,
+        and that's only for putting pixels on screen.
+    </p>
+
+    <h2>What it does</h2>
+
+    <ul>
+        <li>HTML tokenizer and parser, written from scratch (HTML 3.2)</li>
+        <li>CSS1 parser, selector engine, and style resolver</li>
+        <li>Block, inline, and table layout &mdash; period-accurate, no silent fixes</li>
+        <li>ES3 JavaScript with DOM-0 scripting (<code>document.formName.fieldName</code>, <code>window.status</code>, live clocks)</li>
+        <li>Frames and nested iframes that actually load and run correctly</li>
+        <li><code>&lt;blink&gt;</code>, <code>text-decoration: blink</code>, and <code>String.prototype.blink()</code></li>
+        <li>Java applets via a from-scratch JDK 1.0/1.1 bytecode interpreter &mdash; no JRE needed</li>
+        <li>Plugin system with sandboxed, permission-gated <code>.r96p</code> packages</li>
+    </ul>
+
+    <h2>What it doesn't do</h2>
+
+    <ul>
+        <li>HTML 4, CSS2, ES5, or anything past the late 1990s</li>
+        <li>Java 1.2+ bytecode, Swing, or the collections framework</li>
+        <li>Applet sound, LiveConnect, or applet-to-applet communication</li>
+        <li>macOS or Linux &mdash; see the Windows notice above</li>
+    </ul>
+
+    <h2>Status</h2>
+
+    <p>
+        There's a real regression suite: 183 xUnit tests, 29 live JS contract checks against
+        real pages, 41 hand-authored QA HTML files, and a pixel-diff harness that runs pages
+        side-by-side against Chromium. It loads actual 1996 sites. It's a side project built
+        for fun, and that's what it'll stay.
+    </p>
+
+    <h2>Building</h2>
+
+    <p>Requires .NET 8 or 11. From the <code>retro96/</code> directory:</p>
+
+    <p><code>dotnet build -p:EnableWindowsTargeting=true</code></p>
+
+    <p>
+        Full instructions, project layout, and the plugin SDK are in the
+        <a href="https://github.com/DirazCoder/Retro96">README on GitHub</a>
+        &mdash; open that in a modern browser.
+    </p>
+
+    <div class="footer">
+        Retro96 &mdash; MIT License &mdash; <a href="https://github.com/DirazCoder/Retro96">github.com/DirazCoder/Retro96</a> (open in a modern browser)
+    </div>
+
+</div>
+
+</body>
+</html>
+""";
 
     private SKBitmap LoadEmbeddedAsset(string resourceName)
     {

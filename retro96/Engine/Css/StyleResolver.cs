@@ -366,17 +366,22 @@ public static class StyleResolver
 
             // Lists
             case "ul":
+                style.Display = DisplayValue.Block;
+                style.ListStyleType = DefaultUnorderedListType(elem);
+                style.MarginTop = style.MarginBottom = IsNestedList(elem) ? 0f : parentFontSize;
+                style.PaddingLeft = 40f;
+                break;
             case "dir":
             case "menu":
                 style.Display = DisplayValue.Block;
                 style.ListStyleType = ListStyleType.Disc;
-                style.MarginTop = style.MarginBottom = parentFontSize;
+                style.MarginTop = style.MarginBottom = IsNestedList(elem) ? 0f : parentFontSize;
                 style.PaddingLeft = 40f;
                 break;
             case "ol":
                 style.Display = DisplayValue.Block;
                 style.ListStyleType = ListStyleType.Decimal;
-                style.MarginTop = style.MarginBottom = parentFontSize;
+                style.MarginTop = style.MarginBottom = IsNestedList(elem) ? 0f : parentFontSize;
                 style.PaddingLeft = 40f;
                 break;
             case "li":
@@ -569,6 +574,28 @@ public static class StyleResolver
         }
     }
 
+    private static bool IsNestedList(DomElement elem)
+    {
+        for (var parent = elem.Parent; parent != null; parent = parent.Parent)
+            if (parent is DomElement ancestor && ancestor.TagName == "li")
+                return true;
+        return false;
+    }
+
+    private static ListStyleType DefaultUnorderedListType(DomElement elem)
+    {
+        int depth = 0;
+        for (var parent = elem.Parent; parent != null; parent = parent.Parent)
+            if (parent is DomElement ancestor && ancestor.TagName is "ul" or "menu" or "dir")
+                depth++;
+        return depth switch
+        {
+            0 => ListStyleType.Disc,
+            1 => ListStyleType.Circle,
+            _ => ListStyleType.Square
+        };
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // HTML presentational attributes (applied per element, pre-recursion)
     // ─────────────────────────────────────────────────────────────────────
@@ -733,6 +760,10 @@ public static class StyleResolver
         if (string.IsNullOrWhiteSpace(raw)) return;
 
         string type = raw.Trim();
+        if (elem.TagName is "ul" or "dir" or "menu" ||
+            elem.TagName == "li" && elem.Parent is DomElement parent &&
+            parent.TagName is "ul" or "dir" or "menu")
+            type = type.ToLowerInvariant();
         ListStyleType mapped = type switch
         {
             // Unordered list shapes.

@@ -1,0 +1,26 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Retro96 Server Full Battery</TITLE></HEAD>
+<BODY BGCOLOR="#FFFFFF" TEXT="#000000" LINK="#0000EE">
+<CENTER><FONT SIZE="+2" COLOR="#000080"><B>SERVER FULL BATTERY</B></FONT><BR><FONT SIZE="-1">Local CGI forms plus ordinary broken-resource requests.</FONT></CENTER><HR>
+<H2>SV-F01: GET form to CGI</H2>
+<FORM METHOD="GET" ACTION="cgi-bin/register.py">
+<TABLE BORDER="1" CELLPADDING="4"><TR><TD>Name</TD><TD><INPUT TYPE="TEXT" NAME="name" VALUE="Retro96"></TD></TR>
+<TR><TD>Mode</TD><TD><SELECT NAME="mode"><OPTION VALUE="get" SELECTED>GET</OPTION><OPTION VALUE="legacy">legacy</OPTION></SELECT></TD></TR>
+<TR><TD>Flag</TD><TD><INPUT TYPE="CHECKBOX" NAME="flag" VALUE="yes" CHECKED></TD></TR>
+<TR><TD>Notes</TD><TD><TEXTAREA NAME="notes" ROWS="4" COLS="42">server full fixture</TEXTAREA></TD></TR>
+</TABLE><INPUT TYPE="SUBMIT" VALUE="Send GET"></FORM>
+<H2>SV-F02: POST form to CGI</H2>
+<FORM METHOD="POST" ACTION="cgi-bin/register.py">
+<INPUT TYPE="TEXT" NAME="postName" VALUE="POST test"><INPUT TYPE="PASSWORD" NAME="postSecret" VALUE="secret"><INPUT TYPE="SUBMIT" VALUE="Send POST"><INPUT TYPE="RESET" VALUE="Reset">
+</FORM>
+<H2>SV-F03: size CGI</H2>
+<P><A HREF="cgi-bin/sizes.py?small=1">Request sizes.py with query string</A></P>
+<H2>SV-F04: alternate CGI scripts</H2>
+<P><A HREF="cgi-bin/register.cgi?name=retro96">register.cgi</A> | <A HREF="cgi-bin/register.py?name=retro96">register.py</A> | <A HREF="cgi-bin/sizes.cgi?x=1">sizes.cgi</A> | <A HREF="cgi-bin/sizes.py?x=1">sizes.py</A></P>
+<H2>SV-F05: Missing-resource and server-error probes</H2>
+<P><IMG SRC="missing-server-image.gif" WIDTH="64" HEIGHT="24" ALT="missing server image"></P>
+<P><A HREF="missing-server-page.html">missing page</A> &nbsp; <A HREF="cgi-bin/not-found.cgi">missing CGI</A></P>
+<H2>SV-F06: Repeated request targets</H2>
+<TABLE BORDER="1"><TR><TH>Resource</TH><TH>Type</TH></TR><TR><TD><A HREF="cgi-bin/sizes.py">sizes.py</A></TD><TD>CGI</TD></TR><TR><TD><A HREF="cgi-bin/register.py">register.py</A></TD><TD>CGI</TD></TR><TR><TD><A HREF="cgi-bin/sizes.cgi">sizes.cgi</A></TD><TD>CGI</TD></TR></TABLE>
+<HR><P><B>SV-END:</B> The server battery references every local CGI implementation and both successful and intentionally missing resources.</P>
+</BODY></HTML>

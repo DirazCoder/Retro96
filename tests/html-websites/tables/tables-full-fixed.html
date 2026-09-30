@@ -1,0 +1,45 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Retro96 Tables Full Battery</TITLE></HEAD>
+<BODY BGCOLOR="#FFFFFF" TEXT="#000000" LINK="#0000EE">
+<CENTER><FONT SIZE="+2" COLOR="#000080"><B>TABLES FULL BATTERY</B></FONT><BR><FONT SIZE="-1">Borders, spacing, spans, captions, nesting, alignment, colours and recovery.</FONT></CENTER>
+<HR>
+<H2>TB-F01: Border, caption, header and normal rows</H2>
+<TABLE BORDER="2" CELLPADDING="5" CELLSPACING="2" WIDTH="100%">
+<CAPTION>Caption above the grid</CAPTION><TR><TH>Item</TH><TH>Quantity</TH><TH>Price</TH></TR>
+<TR><TD>Apples</TD><TD>12</TD><TD>1.20</TD></TR><TR><TD>Oranges</TD><TD>8</TD><TD>1.60</TD></TR></TABLE>
+<H2>TB-F02: Borderless, width and alignment</H2>
+<TABLE BORDER="0" WIDTH="90%"><TR><TD ALIGN="LEFT">left</TD><TD ALIGN="CENTER">center</TD><TD ALIGN="RIGHT">right</TD></TR></TABLE>
+<H2>TB-F03: Colspan and rowspan matrix</H2>
+<TABLE BORDER="1" CELLPADDING="4" CELLSPACING="0">
+<TR><TD COLSPAN="3" ALIGN="CENTER">three-column title</TD></TR>
+<TR><TD ROWSPAN="2" VALIGN="TOP">rowspan two</TD><TD>middle top</TD><TD>right top</TD></TR>
+<TR><TD>middle bottom</TD><TD>right bottom</TD></TR>
+</TABLE>
+<H2>TB-F04: Combined spans and empty cells</H2>
+<TABLE BORDER="1" CELLPADDING="4"><TR><TD ROWSPAN="2">A</TD><TD COLSPAN="2">B+C</TD><TD>&nbsp;</TD></TR><TR><TD></TD><TD>text</TD><TD>&nbsp;</TD></TR></TABLE>
+<H2>TB-F05: Cell and row colour precedence</H2>
+<TABLE BORDER="1" BGCOLOR="#FFFFCC" CELLPADDING="6"><TR BGCOLOR="#CCFFFF"><TD>table then row colour</TD><TD BGCOLOR="#FFCCCC">cell overrides row</TD></TR><TR><TD>another row</TD><TD>default</TD></TR></TABLE>
+<H2>TB-F06: Cellspacing and cellpadding</H2>
+<TABLE BORDER="1" CELLSPACING="10" CELLPADDING="8"><TR><TD>large gaps</TD><TD>large padding</TD></TR><TR><TD>short</TD><TD>longer cell content forces row height</TD></TR></TABLE>
+<H2>TB-F07: Caption below</H2>
+<TABLE BORDER="1"><CAPTION ALIGN="BOTTOM">Caption requested at bottom</CAPTION><TR><TH>A</TH><TH>B</TH></TR><TR><TD>1</TD><TD>2</TD></TR></TABLE>
+<H2>TB-F08: Nested tables three levels</H2>
+<TABLE BORDER="1" WIDTH="100%"><TR><TD>outer
+<TABLE BORDER="1" WIDTH="100%"><TR><TD>middle
+<TABLE BORDER="1" WIDTH="100%"><TR><TD>inner width=100%</TD><TD>second cell</TD></TR></TABLE>
+</TD><TD>middle second</TD></TR></TABLE>
+</TD><TD>outer second</TD></TR></TABLE>
+<H2>TB-F09: Tallest cell and vertical alignment</H2>
+<TABLE BORDER="1" WIDTH="100%"><TR><TD VALIGN="TOP">top<BR>line 2</TD><TD VALIGN="MIDDLE">middle<BR>line 2<BR>line 3</TD><TD VALIGN="BOTTOM">bottom<BR>line 2</TD></TR></TABLE>
+<H2>TB-F10: Width 100% table inside a constrained table</H2>
+<TABLE BORDER="1" WIDTH="480"><TR><TD><TABLE BORDER="1" WIDTH="100%"><TR><TD>inner percentage should resolve against containing cell</TD><TD>second</TD></TR></TABLE></TD></TR></TABLE>
+<H2>TB-F11: THEAD/TBODY/TFOOT</H2>
+<TABLE BORDER="1"><THEAD><TR><TH>Header</TH><TH>Header 2</TH></TR></THEAD><TBODY><TR><TD>Body</TD><TD>Body 2</TD></TR><TR><TD>Body 2</TD><TD>Body 3</TD></TR></TBODY><TFOOT><TR><TD>Footer</TD><TD>Footer 2</TD></TR></TFOOT></TABLE>
+<H2>TB-F12: Malformed recovery cases kept inside the full page</H2>
+<TABLE BORDER="1"><TR><TD>missing end tag starts<td>auto close</tr><tr><td>next row</td><td>two</td></TR></TABLE>
+<TABLE BORDER="1"><TR><TD COLSPAN="5">oversized colspan</TD></TR><TR><TD>one</TD><TD>two</TD></TR></TABLE>
+<TABLE BORDER="1"><TR><TD ROWSPAN="0">rowspan zero</TD><TD>r1</TD></TR><TR><TD>r2</TD></TR><TR><TD>r3</TD></TR></TABLE>
+<H2>TB-F13: Link-heavy four-column layout</H2>
+<TABLE BORDER="1" WIDTH="100%" CELLSPACING="2"><TR><TD WIDTH="25%"><A HREF="#a">Link one</A></TD><TD WIDTH="25%"><A HREF="#b">Link two</A></TD><TD WIDTH="25%"><A HREF="#c">Link three</A></TD><TD WIDTH="25%"><A HREF="#d">Link four</A></TD></TR><TR><TD>Short</TD><TD>Words wrap independently in this cell when the width is constrained.</TD><TD><IMG SRC="data:image/gif;base64,R0lGODdhCQAJAIEAAAAA/wAAAAAAAAAAACwAAAAACQAJAAAIEQABCBxIsKDBgwgTKlzIcGBAADs=" WIDTH="9" HEIGHT="9" ALT="bullet"></TD><TD>Last</TD></TR></TABLE>
+<HR><P><B>TB-END:</B> The full table fixture intentionally contains both valid and recovery-oriented table structures.</P>
+</BODY></HTML>

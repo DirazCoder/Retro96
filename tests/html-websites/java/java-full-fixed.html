@@ -1,0 +1,27 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML><HEAD><TITLE>Retro96 Java Full Battery</TITLE></HEAD>
+<BODY BGCOLOR="#FFFFFF">
+<CENTER><FONT SIZE="+2" COLOR="#000080"><B>JAVA FULL BATTERY</B></FONT><BR><FONT SIZE="-1">Classic APPLET, PARAM, alternate text, alignment and multiple class fixtures.</FONT></CENTER><HR>
+<H2>JV-F01: Basic Applet</H2>
+<APPLET CODE="MyApplet.class" WIDTH="320" HEIGHT="100" ALIGN="MIDDLE" HSPACE="8" VSPACE="5">
+<P>Basic applet fallback text.</P>
+<PARAM NAME="message" VALUE="Retro96 full applet">
+</APPLET>
+<H2>JV-F02: JDK 1.1 style Applet</H2>
+<APPLET CODE="Jdk11Applet.class" WIDTH="400" HEIGHT="180" ALIGN="LEFT" HSPACE="10" VSPACE="6">
+<P>This is alternate content if the applet cannot run.</P>
+<PARAM NAME="label" VALUE="JDK 1.1 fixture">
+</APPLET>
+<P>Text after a floated/left aligned applet must flow and resume after the declared dimensions.</P><BR CLEAR="ALL">
+<H2>JV-F03: Parameter variants</H2>
+<APPLET CODE="MyApplet.class" WIDTH="240" HEIGHT="80">
+<PARAM NAME="message" VALUE="alpha">
+<PARAM NAME="color" VALUE="blue">
+<PARAM NAME="count" VALUE="3">
+Fallback content with three parameters.
+</APPLET>
+<H2>JV-F04: Additional class fixtures</H2>
+<P>These classes are intentionally present in this test directory for engine/linker/class-loading coverage:</P>
+<UL><LI>Adder.class / AdderImpl.class</LI><LI>Caller.class</LI><LI>EdgeOps.class</LI><LI>BadClinit.class</LI></UL>
+<H2>JV-END</H2><P>Applet pages must remain stable even when a class fixture fails to initialize.</P>
+</BODY></HTML>

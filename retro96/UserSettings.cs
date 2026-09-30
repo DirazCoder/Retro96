@@ -38,6 +38,7 @@ public sealed class UserSettings
 
     public string SearchQueryUrl { get; set; } = DefaultSearchUrl;
     public string HomePageUrl { get; set; } = "retro96:home";
+    public bool WelcomeDismissed { get; set; }
 
     public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.Netscape3;
     public string UserAgentOverride { get; set; } = "";
@@ -85,6 +86,7 @@ public sealed class UserSettings
     {
         SearchQueryUrl = SearchQueryUrl,
         HomePageUrl = HomePageUrl,
+        WelcomeDismissed = WelcomeDismissed,
         EngineMode = EngineMode,
         UserAgentOverride = UserAgentOverride,
         BackgroundMode = BackgroundMode,
@@ -157,6 +159,9 @@ public sealed class UserSettings
                         break;
                     case "home.url":
                         if (value.Length > 0) s.HomePageUrl = value;
+                        break;
+                    case "welcome.dismissed":
+                        s.WelcomeDismissed = ParseBool(value, s.WelcomeDismissed);
                         break;
                     case "engine.mode":
                         if (Enum.TryParse<RetroEngineMode>(value, true, out var mode))
@@ -247,6 +252,7 @@ public sealed class UserSettings
         sb.AppendLine("; Retro96 preferences - human editable");
         sb.AppendLine("Search.Url=" + SearchQueryUrl);
         sb.AppendLine("Home.Url=" + HomePageUrl);
+        sb.AppendLine("Welcome.Dismissed=" + BoolText(WelcomeDismissed));
         sb.AppendLine("Engine.Mode=" + EngineMode);
         sb.AppendLine("UserAgent.Override=" + UserAgentOverride);
         sb.AppendLine("Background.Mode=" + BackgroundMode);

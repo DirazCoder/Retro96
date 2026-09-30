@@ -2281,6 +2281,10 @@ public class Renderer
         Color markerColor = EffectiveTextColor(style);
 
         float markerY = box.Y + box.BorderTop + box.PaddingTop;
+        var firstContent = box.Descendants().FirstOrDefault(child =>
+            !string.IsNullOrWhiteSpace(child.TextRun) || child.BoxType == BoxType.Replaced);
+        if (firstContent != null)
+            markerY = firstContent.Y;
         bool inside = box.ListMarkerInside;
         float insideX = box.X + box.BorderLeft + box.PaddingLeft + 2f;
 
@@ -2387,7 +2391,10 @@ public class Renderer
 
             float markerSize = Math.Clamp((style.FontSize > 0f ? style.FontSize : 16f) * 0.45f, 7f, 9f);
             float cx = box.X - 10f;
-            float cy = markerY + (style.FontSize > 0f ? style.FontSize : 16f) * 0.42f;
+            float markerLineHeight = firstContent?.Height > 0f
+                ? firstContent.Height
+                : font.GetHeight();
+            float cy = markerY + markerLineHeight * 0.5f;
             float half = markerSize * 0.5f;
 
             if (shape == "number")
