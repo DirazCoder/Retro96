@@ -21,6 +21,7 @@ public partial class Form1
         InitializePluginHostUi();
         BuildToolsMenu();
         BuildHelpMenu();
+        InitializeFindZoomUi();
         _canvas.PluginContextMenuRequested += (menu, context) => _pluginManager?.PopulateContextMenu(menu, context);
         _canvas.EmbeddedMidiControlRequested += HandleEmbeddedMidiControl;
 

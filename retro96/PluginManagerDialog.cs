@@ -621,8 +621,23 @@ internal sealed class PermissionConfirmationDialog : Form
 
 internal sealed class PluginInstallReviewDialog : Form
 {
+    private sealed class PermissionRow
+    {
+        public required Panel Root { get; init; }
+        public required CheckBox Check { get; init; }
+        public required PermissionInfoButton Details { get; init; }
+        public required Label Description { get; init; }
+    }
+
     private readonly Dictionary<PluginPermission, CheckBox> _checks = new();
+    private readonly List<Control> _contentItems = new();
+    private readonly List<PermissionRow> _rows = new();
+    private readonly Panel _rowsViewport = new();
+    private readonly Panel _rowsContent = new();
+    private readonly Label _intro = new();
+    private readonly Panel _bottom = new() { BackColor = SystemColors.Control };
     private bool _changingCheck;
+    private bool _layoutInProgress;
 
     public PluginPermission GrantedPermissions => _checks
         .Where(p => p.Value.Checked)
@@ -637,18 +652,48 @@ internal sealed class PluginInstallReviewDialog : Form
         FormBorderStyle = FormBorderStyle.Sizable;
         MinimizeBox = false;
         MaximizeBox = false;
-        MinimumSize = new Size(560, 520);
-        ClientSize = new Size(700, 620);
+        MinimumSize = new Size(620, 560);
+        ClientSize = new Size(760, 680);
+        Padding = Padding.Empty;
 
-        var intro = new Label
+        _intro.AutoSize = false;
+        _intro.TextAlign = ContentAlignment.TopLeft;
+        _intro.Padding = new Padding(14, 12, 14, 12);
+        _intro.Text = "Choose the permissions to grant. Sensitive permissions start unchecked and require a separate confirmation. Plugin packages are not signed. Review the capability details before installing.";
+
+        _rowsViewport.AutoScroll = true;
+        _rowsViewport.BackColor = SystemColors.Window;
+        _rowsViewport.Padding = new Padding(12, 12, 12, 12);
+        _rowsViewport.HorizontalScroll.Enabled = false;
+        _rowsViewport.HorizontalScroll.Visible = false;
+
+        _rowsContent.Margin = Padding.Empty;
+        _rowsContent.Padding = Padding.Empty;
+        _rowsContent.BackColor = SystemColors.Window;
+        _rowsContent.Location = new Point(_rowsViewport.Padding.Left, _rowsViewport.Padding.Top);
+        _rowsViewport.Controls.Add(_rowsContent);
+
+        var bottom = _bottom;
+        var install = new Button { Text = "Install", Width = 96, Height = 34, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        var cancel = new Button { Text = "Cancel", Width = 96, Height = 34, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        install.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+        bottom.Controls.Add(install);
+        bottom.Controls.Add(cancel);
+        AcceptButton = install;
+        CancelButton = cancel;
+
+        Controls.Add(_rowsViewport);
+        Controls.Add(bottom);
+        Controls.Add(_intro);
+
+        bottom.Resize += (_, _) =>
         {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            MaximumSize = new Size(640, 0),
-            Padding = new Padding(12),
-            Text = "Choose the permissions to grant. Sensitive permissions start unchecked and require a separate confirmation. Plugin packages are not signed. Review the capability details before installing."
+            const int gap = 10;
+            cancel.Location = new Point(Math.Max(0, bottom.ClientSize.Width - cancel.Width - gap), Math.Max(0, (bottom.ClientSize.Height - cancel.Height) / 2));
+            install.Location = new Point(Math.Max(0, cancel.Left - install.Width - gap), Math.Max(0, (bottom.ClientSize.Height - install.Height) / 2));
         };
-        var rows = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(12), Margin = Padding.Empty };
+
         var permissions = permissionNames
             .Select(name => PluginPermissionNames.Parse(new[] { name }))
             .Where(p => p != PluginPermission.None)
@@ -663,48 +708,213 @@ internal sealed class PluginInstallReviewDialog : Form
         {
             var tierPermissions = permissions.Where(x => x.Tier == tier).ToArray();
             if (tierPermissions.Length == 0) continue;
-            rows.Controls.Add(new Label { Text = tier + " permissions", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(0, 4, 0, 4) });
+
+            AddSectionLabel(tier + " permissions");
             foreach (var info in tierPermissions)
-            {
-                var row = new TableLayoutPanel { Width = 620, Height = 40, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 4), Padding = Padding.Empty };
-                row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-                row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28f));
-                var check = new CheckBox
-                {
-                    Text = info.Name + " — " + info.Description,
-                    AutoSize = false,
-                    Dock = DockStyle.Fill,
-                    Checked = info.Tier != PluginPermissionTier.Sensitive,
-                    Margin = new Padding(0, 5, 0, 0)
-                };
-                check.CheckedChanged += (_, _) => OnPermissionChecked(info, check);
-                _checks[info.Permission] = check;
-                row.Controls.Add(check, 0, 0);
-                row.Controls.Add(new PermissionInfoButton(info.Name, (_, _) => PermissionInfoDialog.Show(this, info.Permission)), 1, 0);
-                rows.Controls.Add(row);
-            }
+                AddPermissionRow(info);
         }
 
-        var bottom = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(10, 8, 10, 8), Margin = Padding.Empty };
-        var install = new Button { Text = "Install", Width = 92, Height = 34 };
-        var cancel = new Button { Text = "Cancel", Width = 92, Height = 34 };
-        install.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
-        cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
-        bottom.Controls.Add(install);
-        bottom.Controls.Add(cancel);
-        AcceptButton = install;
-        CancelButton = cancel;
+        Resize += (_, _) => UpdateResponsiveLayout();
+        Shown += (_, _) =>
+        {
+            UpdateResponsiveLayout();
+            ResetInitialScrollPosition();
+            BeginInvoke((Action)(() =>
+            {
+                UpdateResponsiveLayout();
+                ResetInitialScrollPosition();
+            }));
+        };
 
-        var introWrap = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
-        introWrap.Controls.Add(intro, 0, 0);
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = Padding.Empty, Margin = Padding.Empty };
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54f));
-        layout.Controls.Add(introWrap, 0, 0);
-        layout.Controls.Add(rows, 0, 1);
-        layout.Controls.Add(bottom, 0, 2);
-        Controls.Add(layout);
+        UpdateResponsiveLayout();
+        ResetInitialScrollPosition();
+    }
+
+    private void AddSectionLabel(string text)
+    {
+        var label = new Label
+        {
+            Text = text,
+            AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font(Font, FontStyle.Bold),
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 2, 0, 2)
+        };
+        _contentItems.Add(label);
+        _rowsContent.Controls.Add(label);
+    }
+
+    private void AddPermissionRow(PluginPermissionInfo info)
+    {
+        var row = new Panel
+        {
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            BackColor = SystemColors.Window
+        };
+
+        var check = new CheckBox
+        {
+            Text = info.Name,
+            AutoSize = false,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            CheckAlign = ContentAlignment.MiddleLeft,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Checked = info.Tier != PluginPermissionTier.Sensitive,
+            UseVisualStyleBackColor = true,
+            AccessibleName = "Grant " + info.FriendlyName,
+            AccessibleDescription = info.Description,
+            TabStop = true
+        };
+        check.CheckedChanged += (_, _) => OnPermissionChecked(info, check);
+        _checks[info.Permission] = check;
+
+        var infoButton = new PermissionInfoButton(info.Name, (_, _) => PermissionInfoDialog.Show(this, info.Permission))
+        {
+            Width = 28,
+            Height = 28,
+            Margin = Padding.Empty,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "Details for " + info.FriendlyName
+        };
+
+        var description = new Label
+        {
+            Text = info.Description,
+            AutoSize = false,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            TextAlign = ContentAlignment.TopLeft,
+            ForeColor = SystemColors.GrayText,
+            UseMnemonic = false
+        };
+
+        row.Controls.Add(description);
+        row.Controls.Add(infoButton);
+        row.Controls.Add(check);
+
+        var permissionRow = new PermissionRow
+        {
+            Root = row,
+            Check = check,
+            Details = infoButton,
+            Description = description
+        };
+        _rows.Add(permissionRow);
+        _contentItems.Add(row);
+        _rowsContent.Controls.Add(row);
+    }
+
+    private void UpdateResponsiveLayout()
+    {
+        if (_layoutInProgress || IsDisposed) return;
+        _layoutInProgress = true;
+        try
+        {
+            const int bottomHeight = 58;
+            int clientWidth = Math.Max(1, ClientSize.Width);
+            int clientHeight = Math.Max(1, ClientSize.Height);
+
+            int introTextWidth = Math.Max(100, clientWidth - _intro.Padding.Horizontal);
+            Size introMeasured = TextRenderer.MeasureText(
+                _intro.Text,
+                _intro.Font,
+                new Size(introTextWidth, 0),
+                TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            int introHeight = Math.Max(76, introMeasured.Height + _intro.Padding.Vertical + 2);
+
+            int viewportHeight = Math.Max(120, clientHeight - introHeight - bottomHeight);
+            _intro.Bounds = new Rectangle(0, 0, clientWidth, introHeight);
+            _rowsViewport.Bounds = new Rectangle(0, introHeight, clientWidth, viewportHeight);
+
+            int innerWidth = Math.Max(320, _rowsViewport.ClientSize.Width - _rowsViewport.Padding.Horizontal);
+            int contentHeight = LayoutContent(innerWidth);
+            if (contentHeight + _rowsViewport.Padding.Vertical > _rowsViewport.ClientSize.Height)
+                innerWidth = Math.Max(320, innerWidth - SystemInformation.VerticalScrollBarWidth);
+
+            contentHeight = LayoutContent(innerWidth);
+            _rowsContent.Location = new Point(_rowsViewport.Padding.Left, _rowsViewport.Padding.Top);
+            _rowsContent.Size = new Size(
+                innerWidth,
+                Math.Max(contentHeight, _rowsViewport.ClientSize.Height - _rowsViewport.Padding.Vertical));
+
+            _bottom.Bounds = new Rectangle(0, clientHeight - bottomHeight, clientWidth, bottomHeight);
+
+            _rowsViewport.HorizontalScroll.Enabled = false;
+            _rowsViewport.HorizontalScroll.Visible = false;
+            _rowsViewport.PerformLayout();
+        }
+        finally
+        {
+            _layoutInProgress = false;
+        }
+    }
+
+    private int LayoutContent(int contentWidth)
+    {
+        int y = 0;
+        foreach (Control item in _contentItems)
+        {
+            if (item is Label label)
+            {
+                y += 10;
+                label.Bounds = new Rectangle(0, y, contentWidth, Math.Max(28, label.Font.Height + 8));
+                y += label.Height + 6;
+                continue;
+            }
+
+            var permission = _rows.FirstOrDefault(row => ReferenceEquals(row.Root, item));
+            if (permission == null) continue;
+
+            int detailsWidth = 28;
+            int headerHeight = Math.Max(40, Math.Max(permission.Check.PreferredSize.Height + 12, permission.Details.Height + 10));
+            int checkWidth = Math.Max(140, contentWidth - detailsWidth - 8);
+            permission.Check.Bounds = new Rectangle(0, 0, checkWidth, headerHeight);
+            permission.Details.Bounds = new Rectangle(
+                contentWidth - detailsWidth,
+                Math.Max(0, (headerHeight - permission.Details.Height) / 2),
+                detailsWidth,
+                permission.Details.Height);
+
+            int descriptionLeft = 26;
+            int descriptionWidth = Math.Max(140, contentWidth - descriptionLeft - 2);
+            Size descriptionSize = TextRenderer.MeasureText(
+                permission.Description.Text,
+                permission.Description.Font,
+                new Size(descriptionWidth, 0),
+                TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            int descriptionHeight = Math.Max(permission.Description.Font.Height, descriptionSize.Height);
+            permission.Description.Bounds = new Rectangle(
+                descriptionLeft,
+                headerHeight + 5,
+                descriptionWidth,
+                descriptionHeight);
+
+            int rowHeight = headerHeight + 5 + descriptionHeight + 10;
+            permission.Root.Bounds = new Rectangle(0, y, contentWidth, rowHeight);
+            y += rowHeight + 4;
+        }
+
+        return y;
+    }
+
+    private void ResetInitialScrollPosition()
+    {
+        if (IsDisposed || !_rowsViewport.IsHandleCreated) return;
+        try
+        {
+            _rowsViewport.AutoScrollPosition = new Point(0, 0);
+            _rowsViewport.VerticalScroll.Value = _rowsViewport.VerticalScroll.Minimum;
+            _rowsViewport.PerformLayout();
+            _rowsViewport.AutoScrollPosition = new Point(0, 0);
+            _rowsViewport.VerticalScroll.Value = _rowsViewport.VerticalScroll.Minimum;
+        }
+        catch (ArgumentException)
+        {
+            // The scrollbar range can briefly be incomplete during first display.
+        }
     }
 
     private void OnPermissionChecked(PluginPermissionInfo info, CheckBox check)

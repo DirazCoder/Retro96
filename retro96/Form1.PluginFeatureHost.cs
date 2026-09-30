@@ -121,8 +121,23 @@ public partial class Form1
     private static bool IsBuiltInShortcut(Keys keys)
     {
         Keys k = keys & Keys.KeyCode;
-        if (k == Keys.F5 || k == Keys.F6 || k == Keys.F11 || k == Keys.Enter) return true;
-        return keys == (Keys.Control | Keys.L) || keys == (Keys.Control | Keys.R) || keys == (Keys.Control | Keys.F) || keys == (Keys.Control | Keys.O) || keys == (Keys.Control | Keys.P) || keys == (Keys.Alt | Keys.Left) || keys == (Keys.Alt | Keys.Right);
+        if (k == Keys.F5 || k == Keys.F6 || k == Keys.F11 || k == Keys.F3 ||
+            k == Keys.Enter) return true;
+
+        return keys == (Keys.Shift | Keys.F3) ||
+               keys == (Keys.Control | Keys.L) ||
+               keys == (Keys.Control | Keys.R) ||
+               keys == (Keys.Control | Keys.F) ||
+               keys == (Keys.Control | Keys.O) ||
+               keys == (Keys.Control | Keys.P) ||
+               keys == (Keys.Control | Keys.D0) ||
+               keys == (Keys.Control | Keys.Oemplus) ||
+               keys == (Keys.Control | Keys.Shift | Keys.Oemplus) ||
+               keys == (Keys.Control | Keys.Add) ||
+               keys == (Keys.Control | Keys.OemMinus) ||
+               keys == (Keys.Control | Keys.Subtract) ||
+               keys == (Keys.Alt | Keys.Left) ||
+               keys == (Keys.Alt | Keys.Right);
     }
 
 

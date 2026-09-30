@@ -22,6 +22,7 @@ public class BrowserCanvas
         public int Closes;
         public int Rerenders;
         public int Reflows;
+        public List<bool> FormSubmitDispatchFlags = new();
     }
 
     public Recorded Log { get; } = new();
@@ -35,7 +36,10 @@ public class BrowserCanvas
     public void ScrollTo(int x, int y) { }
     public void ScrollBy(int dx, int dy) { }
     public Size GetViewportSize() => new(800, 600);
-    public void SubmitForm(DomElement? form, object? clickCoords) { }
+    public void SubmitForm(DomElement? form, object? clickCoords, bool dispatchSubmitEvent = true)
+    {
+        FormSubmitDispatchFlags.Add(dispatchSubmitEvent);
+    }
     public void UpdateDocumentTitle(string title) { }
     // WinForms affinity members referenced by DomBindings callbacks; in the
     // headless stub everything runs synchronously on the test thread.

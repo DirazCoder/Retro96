@@ -34,6 +34,8 @@ public sealed class PluginManager : IDisposable
     private const long MaxPackageEntryBytes = 256L * 1024 * 1024;
     private const long MaxPackageTotalBytes = 1024L * 1024 * 1024;
     private const long MaxManifestBytes = 1024 * 1024;
+    private const int PluginDeleteAttempts = 10;
+    private const int PluginDeleteInitialDelayMs = 40;
 
     private readonly Form1 _browser;
     private readonly string _rootDirectory;
@@ -53,6 +55,7 @@ public sealed class PluginManager : IDisposable
         _rootDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Retro96", "Plugins");
         _stateFile = Path.Combine(_rootDirectory, "plugin-state.json");
         Directory.CreateDirectory(_rootDirectory);
+        CleanupPendingPluginDeletes();
         _browser.PluginCanvas.EmbeddedFrameResolver = ResolveEmbeddedFrame;
         _browser.PluginCanvas.EmbeddedInputDispatcher = DispatchEmbeddedInput;
         _browser.PluginCanvas.EmbeddedScriptInfoResolver = GetEmbeddedScriptInfo;
@@ -357,10 +360,23 @@ public sealed class PluginManager : IDisposable
         PluginRecord? record;
         lock (_plugins) _plugins.TryGetValue(id, out record);
         if (record == null) return;
+
+        // Stop the sandbox first. This is important on Windows because the
+        // worker/runtime can still have DLLs or plugin data open while a user
+        // is deleting the plugin. DisableRecord() is synchronous and tears
+        // down the worker before we touch the installed directory.
+        string installedDirectory = record.Directory;
         DisableRecord(record);
+
         lock (_plugins) _plugins.Remove(id);
         SaveState();
-        TryDeleteDirectory(record.Directory);
+
+        // Do not silently swallow an uninstall failure. Move the directory out
+        // of the live plugin namespace first, then retry recursive deletion so
+        // transient Windows file/AV/indexer locks do not leave the installed
+        // plugin sitting at Plugins\<id> forever. Any tombstone left behind is
+        // retried automatically on the next startup.
+        DeleteInstalledPluginDirectory(installedDirectory);
         RaisePluginsChanged();
     }
 
@@ -1551,6 +1567,124 @@ public sealed class PluginManager : IDisposable
     private static string SafeComputeDllSha256(string root, PluginManifest manifest)
     {
         try { return ComputeDllSha256(root, manifest); } catch { return "unavailable"; }
+    }
+
+    private void DeleteInstalledPluginDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+        path = Path.GetFullPath(path);
+
+        // Only installed plugin directories are eligible here. Dev-mode source
+        // directories are deliberately never deleted by the plugin manager.
+        string root = Path.GetFullPath(_rootDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Refusing to delete a plugin directory outside the Retro96 plugin store.");
+        if (!Directory.Exists(path)) return;
+
+        string deletePath = path;
+        string tombstone = path + ".deleting-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            // Renaming first makes the original plugin id disappear from the
+            // store immediately, even if Windows needs a few retries to release
+            // a file handle held by an antivirus/indexer/plugin shutdown path.
+            Directory.Move(path, tombstone);
+            deletePath = tombstone;
+        }
+        catch
+        {
+            // A directory can be momentarily non-movable on Windows. Fall back
+            // to deleting it in place; the same retry logic still applies.
+        }
+
+        Exception? last = null;
+        for (int attempt = 0; attempt < PluginDeleteAttempts; attempt++)
+        {
+            try
+            {
+                ClearReadOnlyAttributes(deletePath);
+                if (Directory.Exists(deletePath))
+                    Directory.Delete(deletePath, recursive: true);
+                if (!Directory.Exists(deletePath)) return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                last = ex;
+            }
+
+            if (attempt + 1 < PluginDeleteAttempts)
+                Thread.Sleep(PluginDeleteInitialDelayMs << Math.Min(attempt, 5));
+        }
+
+        // The live plugin path has already been removed when the rename above
+        // succeeded. Keep the tombstone so startup cleanup can finish it later.
+        // The uninstall itself is already complete from the plugin registry's
+        // point of view; a transient Windows lock must not make the UI report a
+        // false deletion failure or resurrect the plugin on the next launch.
+        if (string.Equals(deletePath, tombstone, StringComparison.OrdinalIgnoreCase) && Directory.Exists(tombstone))
+        {
+            DebugLog.Write($"Plugin directory cleanup deferred: {tombstone}. {last?.Message}");
+            return;
+        }
+
+        DebugLog.Write($"Plugin directory cleanup failed: {path}. {last?.Message}");
+    }
+
+    private void CleanupPendingPluginDeletes()
+    {
+        string root = Path.GetFullPath(_rootDirectory);
+        try
+        {
+            foreach (string dir in Directory.EnumerateDirectories(root, "*.deleting-*", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    ClearReadOnlyAttributes(dir);
+                    Directory.Delete(dir, recursive: true);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        if (!Directory.Exists(path)) return;
+        foreach (string file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                FileAttributes attributes = File.GetAttributes(file);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        foreach (string dir in Directory.EnumerateDirectories(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                FileAttributes attributes = File.GetAttributes(dir);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(dir, attributes & ~FileAttributes.ReadOnly);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        try
+        {
+            FileAttributes rootAttributes = File.GetAttributes(path);
+            if ((rootAttributes & FileAttributes.ReadOnly) != 0)
+                File.SetAttributes(path, rootAttributes & ~FileAttributes.ReadOnly);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private static void TryDeleteDirectory(string path)

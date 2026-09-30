@@ -2152,8 +2152,8 @@ public partial class Form1 : Form
     // ─────────────────────────────────────────────────────────────────────
 
     private Size GetCanvasSize() =>
-        InvokeRequired ? (Size)Invoke(() => _canvas.GetViewportSize())
-                       : _canvas.GetViewportSize();
+        InvokeRequired ? (Size)Invoke(() => _canvas.GetLayoutViewportSize())
+                       : _canvas.GetLayoutViewportSize();
 
     private void UpdatePage(DomDocument document, LayoutBox rootBox, string url,
                             HistoryEntry entry)

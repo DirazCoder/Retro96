@@ -92,8 +92,54 @@ public partial class Form1
             OpenDownloadsWindow();
             return true;
         }
+
+        if (keyData == (Keys.Control | Keys.F))
+        {
+            ShowFindDialog();
+            return true;
+        }
+
+        if (keyData == Keys.F3)
+        {
+            FindNextFromShortcut();
+            return true;
+        }
+
+        if (keyData == (Keys.Shift | Keys.F3))
+        {
+            FindPreviousFromShortcut();
+            return true;
+        }
+
+        if (keyData == (Keys.Control | Keys.D0))
+        {
+            InvokeZoomReset();
+            return true;
+        }
+
+        if (IsZoomInShortcut(keyData))
+        {
+            InvokeZoomShortcut(1);
+            return true;
+        }
+
+        if (IsZoomOutShortcut(keyData))
+        {
+            InvokeZoomShortcut(-1);
+            return true;
+        }
+
         return base.ProcessCmdKey(ref msg, keyData);
     }
+
+    private static bool IsZoomInShortcut(Keys keyData) =>
+        keyData == (Keys.Control | Keys.Oemplus) ||
+        keyData == (Keys.Control | Keys.Shift | Keys.Oemplus) ||
+        keyData == (Keys.Control | Keys.Add);
+
+    private static bool IsZoomOutShortcut(Keys keyData) =>
+        keyData == (Keys.Control | Keys.OemMinus) ||
+        keyData == (Keys.Control | Keys.Subtract);
 
     private void DisposeDownloads()
     {

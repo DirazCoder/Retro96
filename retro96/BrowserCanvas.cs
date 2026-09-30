@@ -119,12 +119,25 @@ public class BrowserCanvas : Control
     private int _fieldClickCount;
 
     private DomElement? _contextElement;
-    private string _findText = "";
+
+    // In-page find state is backed by rendered text runs rather than just
+    // Element.InnerText. This avoids duplicate matches on nested containers
+    // and lets the active occurrence be highlighted precisely even when the
+    // layout engine has split a line into several text boxes.
+    private string _findText = string.Empty;
     private bool _findCaseSensitive;
-    private bool _findWrap;
-    private List<DomElement> _findMatches = new();
+    private bool _findWrap = true;
+    private readonly List<FindMatch> _findMatches = new();
     private int _findIndex = -1;
-    private float _pluginZoom = 1f;
+
+    // Layout zoom (buttons/menu/plugins) changes the CSS viewport and reflows
+    // the document. Gesture zoom (Ctrl+wheel-up) is separate and can only
+    // magnify temporarily and can be unwound back to the layout baseline;
+    // it still re-rasterizes at the requested scale.
+    private float _layoutZoom = 1f;
+    private float _gestureZoom = 1f;
+    private float _renderedBitmapZoom = 1f;
+    private float EffectiveZoom => Math.Clamp(_layoutZoom * _gestureZoom, 0.25f, 4f);
 
     private DomElement? _embeddedMidiElement;
     private string _embeddedMidiLabel = "MIDI";
@@ -199,6 +212,8 @@ public class BrowserCanvas : Control
 
     public event Action<string>? NavigateRequested;
     public event Action<string>? StatusChanged;
+    public event Action<float>? ZoomChanged;
+    public event Action<int, int>? FindChanged;
     public event Action? BackRequested;
     public event Action? ForwardRequested;
     public event Action? ReloadRequested;
@@ -209,10 +224,14 @@ public class BrowserCanvas : Control
 
     public LayoutBox? RootBox => _rootBox;
     public DomDocument? PageDocument => _document;
+    public int FindMatchCount => _findMatches.Count;
+    public int FindCurrentIndex => _findIndex >= 0 && _findIndex < _findMatches.Count ? _findIndex + 1 : 0;
     public bool ShowBoxOutlines => _showBoxOutlines;
     public ResourceLoader? ResourceLoader => _resourceLoader;
 
     public enum FrameScrollMode { Auto, Yes, No }
+
+    private readonly record struct FindMatch(FrameView? Frame, LayoutBox Box, int Start, int Length);
 
     public sealed class FrameView
     {
@@ -301,6 +320,7 @@ public class BrowserCanvas : Control
             _painter.Dispose();
             _renderedBitmap?.Dispose();
             _renderedBitmap = null;
+            _renderedBitmapZoom = 1f;
 
             foreach (var frame in _frames.Values)
                 DisposeFrameView(frame);
@@ -396,6 +416,7 @@ public class BrowserCanvas : Control
         _selectRangeAnchors.Clear();
         _contextElement = null;
 
+        ClearFindState();
         ClearPageSelection();
         _selecting = false;
         _lastTextClickBox = null;
@@ -442,6 +463,7 @@ public class BrowserCanvas : Control
         // Image-load reflow rebuilds the tree — remap the selection onto
         // the new boxes instead of clearing it.
         RemapSelection(newRoot);
+        RefreshFindMatches(preserveCurrent: true);
 
         PageChanged?.Invoke();
         RequestRerender();
@@ -458,7 +480,7 @@ public class BrowserCanvas : Control
     {
         if (_document == null || _rootBox == null) return;
 
-        var vp = GetViewportSize();
+        var vp = GetLayoutViewportSize();
         if (vp.Width <= 0 || vp.Height <= 0) return;
 
         try
@@ -481,7 +503,7 @@ public class BrowserCanvas : Control
         try
         {
             var document = Engine.Html.HtmlParser.Parse(markup ?? "", _document.BaseUrl, _document.Cookies);
-            var viewport = GetViewportSize();
+            var viewport = GetLayoutViewportSize();
             Engine.Css.StyleResolver.Resolve(document, viewport.Width);
             var root = LayoutEngineApi.BuildLayoutTree(document, viewport.Width, viewport.Height);
             SetPage(document, root, _jsInterpreter, _fontCache, _imageCache);
@@ -895,6 +917,18 @@ public class BrowserCanvas : Control
         return new System.Drawing.Size(w, h);
     }
 
+    /// <summary>CSS viewport used by layout zoom.
+    /// This is deliberately different from the physical paint viewport so
+    /// text wrapping/flow changes instead of scaling a screenshot. </summary>
+    public System.Drawing.Size GetLayoutViewportSize()
+    {
+        var physical = GetViewportSize();
+        float zoom = Math.Max(0.25f, _layoutZoom);
+        return new System.Drawing.Size(
+            Math.Max(1, (int)MathF.Floor(Math.Max(1, physical.Width) / zoom)),
+            Math.Max(1, (int)MathF.Floor(Math.Max(1, physical.Height) / zoom)));
+    }
+
     public void SetBoxOutlines(bool show)
     {
         _showBoxOutlines = show;
@@ -927,6 +961,7 @@ public class BrowserCanvas : Control
         _focusedJavaAppletElement = null;
         _pressedJavaAppletElement = null;
         _hoveredJavaAppletElement = null;
+        ClearFindState();
         _javaApplets.StopPage();
         _scrollOffset = PointF.Empty;
         UpdateScrollBars();
@@ -961,8 +996,9 @@ public class BrowserCanvas : Control
             // as soon as the vertical scrollbar appeared, which then forced
             // an unnecessary horizontal scrollbar.
             var viewport = GetViewportSize();
-            int rw = Math.Max(1, viewport.Width);
-            int rh = Math.Max(1, viewport.Height);
+            float effectiveZoom = Math.Max(0.25f, EffectiveZoom);
+            int rw = Math.Max(1, (int)MathF.Floor(Math.Max(1, viewport.Width) / effectiveZoom));
+            int rh = Math.Max(1, (int)MathF.Floor(Math.Max(1, viewport.Height) / effectiveZoom));
 
             var renderer = new Renderer(fontCache, imageCache, resourceLoader)
             {
@@ -972,6 +1008,7 @@ public class BrowserCanvas : Control
                 EmbeddedFrameResolver = ResolveEmbeddedContent
             };
 
+            var renderScale = EffectiveZoom;
             var newBitmap = renderer.Render(
                 _rootBox, _document,
                 fontCache, imageCache,
@@ -980,10 +1017,12 @@ public class BrowserCanvas : Control
                 _lastHoveredElement,
                 _blinkVisible,
                 _showBoxOutlines,
-                _focusedInput);
+                _focusedInput,
+                renderScale);
 
             _renderedBitmap?.Dispose();
             _renderedBitmap = newBitmap;
+            _renderedBitmapZoom = renderScale;
         }
         catch (Exception ex)
         {
@@ -1032,7 +1071,8 @@ public class BrowserCanvas : Control
                 _blinkVisible,
                 focusedElement: _focusedInput != null &&
                     FindBoxForElement(view.RootBox, _focusedInput) != null
-                    ? _focusedInput : null);
+                    ? _focusedInput : null,
+                renderScale: EffectiveZoom);
 
             view.Rendered?.Dispose();
             view.Rendered = bmp;
@@ -1082,14 +1122,16 @@ public class BrowserCanvas : Control
         visibleH = Math.Min(visibleH, r.Height);
         using var g = Graphics.FromImage(parent.Rendered);
         g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        float zoom = Math.Max(0.25f, EffectiveZoom);
         var state = g.Save();
+        g.ScaleTransform(zoom, zoom);
         g.SetClip(new RectangleF(r.X, r.Y, r.Width, r.Height));
-        float sourceX = Math.Max(0f, childView.Scroll.X);
-        float sourceY = Math.Max(0f, childView.Scroll.Y);
-        float sourceW = Math.Min(visibleW, childView.Rendered.Width - sourceX);
-        float sourceH = Math.Min(visibleH, childView.Rendered.Height - sourceY);
+        float sourceX = Math.Max(0f, childView.Scroll.X) * zoom;
+        float sourceY = Math.Max(0f, childView.Scroll.Y) * zoom;
+        float sourceW = Math.Min(visibleW * zoom, childView.Rendered.Width - sourceX);
+        float sourceH = Math.Min(visibleH * zoom, childView.Rendered.Height - sourceY);
         if (sourceW > 0 && sourceH > 0)
-            g.DrawImage(childView.Rendered, new RectangleF(r.X, r.Y, sourceW, sourceH),
+            g.DrawImage(childView.Rendered, new RectangleF(r.X, r.Y, sourceW / zoom, sourceH / zoom),
                 new RectangleF(sourceX, sourceY, sourceW, sourceH), GraphicsUnit.Pixel);
         PaintFrameScrollbars(g, r, childView, childBox);
         if (childView.FrameBorder) PaintFrameBorder(g, r);
@@ -1148,208 +1190,187 @@ public class BrowserCanvas : Control
     {
         base.OnPaint(e);
 
-        int vw = Math.Max(1, ClientSize.Width);
-        int vh = Math.Max(1, ClientSize.Height);
-        float zoom = _pluginZoom;
-        float logicalVw = vw / zoom;
-        float logicalVh = vh / zoom;
-
-        // Compose the whole frame on the Skia screen surface; ShellPaint
-        // hands the finished composite to WinForms through the single
-        // GDI blit.  The surface is REUSED across paints, so it must be
-        // cleared every time — a short page leaves stale pixels at the
-        // right/bottom otherwise.
-        var g = _painter.Begin(vw, vh);
-        g.Clear(Color.FromArgb(0xC0, 0xC0, 0xC0));
-
-        // Whole-document blit at the scrolled position.  Pixel-exact:
-        // nearest sampling + integer offsets, matching the old direct-GDI
-        // blit (it truncated the scroll offset the same way), so a
-        // scroll notch never smears glyphs.
-        // FIX: a failed page render (null bitmap) used to skip frames and
-        // the selection overlay entirely — now only the main blit is skipped.
-        // Compose in logical document coordinates, then scale the whole
-        // composition for browser zoom. Keeping the bitmap at 1x avoids
-        // expensive full-document re-renders when the plugin changes zoom.
-        var zoomState = g.Save();
-        if (Math.Abs(zoom - 1f) > 0.001f)
-            g.ScaleTransform(zoom, zoom);
-
+        int surfaceW = Math.Max(1, ClientSize.Width);
+        int surfaceH = Math.Max(1, ClientSize.Height);
+        var physicalViewport = GetViewportSize();
+        int viewportW = Math.Max(1, physicalViewport.Width);
+        int viewportH = Math.Max(1, physicalViewport.Height);
+        float zoom = Math.Max(0.25f, EffectiveZoom);
+        float logicalVw = viewportW / zoom;
+        float logicalVh = viewportH / zoom;
         float paintScrollX = PaintScrollX;
         float paintScrollY = PaintScrollY;
 
+        // The page bitmap is already rasterized at EffectiveZoom. Blit the
+        // physical pixels 1:1; scaling the bitmap a second time causes the
+        // characteristic blurry/MS-Paint preview.
+        var g = _painter.Begin(surfaceW, surfaceH);
+        g.Clear(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
+
         if (_renderedBitmap != null)
         {
-            g.InterpolationMode = InterpolationMode.NearestNeighbor;
-
-            // IMPORTANT PERF: give Skia only the logical source slice that is
-            // visible. The ScaleTransform expands that slice to the physical
-            // viewport without rescanning the entire document bitmap.
-            int sourceX = Math.Clamp((int)paintScrollX, 0,
-                Math.Max(0, _renderedBitmap.Width - 1));
-            int sourceY = Math.Clamp((int)paintScrollY, 0,
-                Math.Max(0, _renderedBitmap.Height - 1));
-            int sourceW = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVw)), _renderedBitmap.Width - sourceX);
-            int sourceH = Math.Min(Math.Max(1, (int)Math.Ceiling(logicalVh)), _renderedBitmap.Height - sourceY);
+            int sourceX = Math.Clamp((int)MathF.Floor(paintScrollX * zoom), 0, Math.Max(0, _renderedBitmap.Width - 1));
+            int sourceY = Math.Clamp((int)MathF.Floor(paintScrollY * zoom), 0, Math.Max(0, _renderedBitmap.Height - 1));
+            int sourceW = Math.Min(viewportW, _renderedBitmap.Width - sourceX);
+            int sourceH = Math.Min(viewportH, _renderedBitmap.Height - sourceY);
             if (sourceW > 0 && sourceH > 0)
-            {
-                g.DrawImage(_renderedBitmap,
-                    new RectangleF(0, 0, sourceW, sourceH),
-                    new RectangleF(sourceX, sourceY, sourceW, sourceH),
-                    GraphicsUnit.Pixel);
-            }
+                g.DrawImage(_renderedBitmap, new RectangleF(0, 0, sourceW, sourceH),
+                    new RectangleF(sourceX, sourceY, sourceW, sourceH), GraphicsUnit.Pixel);
         }
+
+        var overlayState = g.Save();
+        if (Math.Abs(zoom - 1f) > 0.0005f)
+            g.ScaleTransform(zoom, zoom);
 
         var viewportRect = new RectangleF(0, 0, logicalVw, logicalVh);
         foreach (var (box, view) in _frames)
         {
             if (view.Rendered == null) continue;
 
-            var destRect = new RectangleF(
-                box.X - paintScrollX,
-                box.Y - paintScrollY,
-                box.Width, box.Height);
-
-            // Skip frames that are completely outside the viewport.  This is
-            // especially important on old-school sites with many stacked
-            // frames: their bitmaps can be large even though only a tiny
-            // fraction of the page is visible.
-            // Compute the viewport intersection explicitly.  Using
-            // RectangleF.Intersect here can bind to LINQ/AsyncEnumerable
-            // overloads in this project because of the imported namespaces.
+            var destRect = new RectangleF(box.X - paintScrollX, box.Y - paintScrollY, box.Width, box.Height);
             float visibleLeft = Math.Max(destRect.Left, viewportRect.Left);
             float visibleTop = Math.Max(destRect.Top, viewportRect.Top);
             float visibleRight = Math.Min(destRect.Right, viewportRect.Right);
             float visibleBottom = Math.Min(destRect.Bottom, viewportRect.Bottom);
-            var visible = new RectangleF(
-                visibleLeft,
-                visibleTop,
-                Math.Max(0f, visibleRight - visibleLeft),
-                Math.Max(0f, visibleBottom - visibleTop));
-            float sourceX = view.Scroll.X + (visible.X - destRect.X);
-            float sourceY = view.Scroll.Y + (visible.Y - destRect.Y);
-            float sourceW = Math.Min(visible.Width, view.Rendered.Width - sourceX);
-            float sourceH = Math.Min(visible.Height, view.Rendered.Height - sourceY);
+            var visible = new RectangleF(visibleLeft, visibleTop,
+                Math.Max(0f, visibleRight - visibleLeft), Math.Max(0f, visibleBottom - visibleTop));
 
-            if (visible.Width > 0 && visible.Height > 0 && sourceW > 0 && sourceH > 0)
+            float sourceXPhysical = (Math.Max(0f, view.Scroll.X) + (visible.X - destRect.X)) * zoom;
+            float sourceYPhysical = (Math.Max(0f, view.Scroll.Y) + (visible.Y - destRect.Y)) * zoom;
+            float sourceWPhysical = Math.Min(visible.Width * zoom, view.Rendered.Width - sourceXPhysical);
+            float sourceHPhysical = Math.Min(visible.Height * zoom, view.Rendered.Height - sourceYPhysical);
+
+            if (visible.Width > 0 && visible.Height > 0 && sourceWPhysical > 0 && sourceHPhysical > 0)
             {
                 g.DrawImage(view.Rendered,
-                    new RectangleF(visible.X, visible.Y, sourceW, sourceH),
-                    new RectangleF(sourceX, sourceY, sourceW, sourceH),
+                    new RectangleF(visible.X, visible.Y, sourceWPhysical / zoom, sourceHPhysical / zoom),
+                    new RectangleF(sourceXPhysical, sourceYPhysical, sourceWPhysical, sourceHPhysical),
                     GraphicsUnit.Pixel);
             }
 
             if (visible.Width > 0 && visible.Height > 0)
-            {
                 PaintFrameScrollbars(g, destRect, view, box);
-            }
-
             if (view.FrameBorder && visible.Width > 0 && visible.Height > 0)
-            {
                 PaintFrameBorder(g, destRect);
-            }
 
             if (_focusedFrame == box && visible.Width > 0 && visible.Height > 0)
             {
                 using var focusPen = new Pen(Color.FromArgb(0x00, 0x00, 0x80), 1);
                 g.DrawRectangle(focusPen, destRect.X, destRect.Y,
-                    destRect.Width - 1, destRect.Height - 1);
+                    Math.Max(0, destRect.Width - 1), Math.Max(0, destRect.Height - 1));
             }
 
             if (visible.Width > 0 && visible.Height > 0)
                 PaintFocusedFrameFieldOverlayRecursive(g, destRect, view);
         }
 
-        // Page/frame text selection highlight. Collect selected glyph spans
-        // first, then merge only compatible same-line spans so word + whitespace
-        // + word selections render as one continuous browser-style band without
-        // swallowing genuinely separate layout gaps.
+        PaintFindHighlights(g, paintScrollX, paintScrollY);
+
         if (_selAnchor != null && _selFocus != null)
         {
             using var selBrush = new SolidBrush(Color.FromArgb(110, 0, 0, 170));
-
             var selectionRoot = _selectionFrame?.RootBox ?? _rootBox;
             if (selectionRoot != null)
             {
-                var ordered = selectionRoot.Descendants()
-                    // Keep collapsed single ASCII space runs in the ordered
-                    // selection stream so their measured advance can bridge
-                    // adjacent word runs during the final same-line merge.
-                    .Where(b => !string.IsNullOrEmpty(b.TextRun))
-                    .ToList();
+                var ordered = selectionRoot.Descendants().Where(b => !string.IsNullOrEmpty(b.TextRun)).ToList();
                 int anchorIndex = ordered.IndexOf(_selAnchor);
                 int focusIndex = ordered.IndexOf(_selFocus);
                 if (anchorIndex >= 0 && focusIndex >= 0)
                 {
-                    bool forward = anchorIndex < focusIndex ||
-                        (anchorIndex == focusIndex && _selAnchorOffset <= _selFocusOffset);
+                    bool forward = anchorIndex < focusIndex || (anchorIndex == focusIndex && _selAnchorOffset <= _selFocusOffset);
                     int firstIndex = Math.Min(anchorIndex, focusIndex);
                     int lastIndex = Math.Max(anchorIndex, focusIndex);
-
                     float offsetX = -paintScrollX;
                     float offsetY = -paintScrollY;
                     int selectionState = -1;
-                    if (_selectionFrame != null &&
-                        TryGetFrameDestinationRect(_selectionFrame, out var selectionFrameDestRect))
+                    if (_selectionFrame != null && TryGetFrameDestinationRect(_selectionFrame, out var selectionFrameDestRect))
                     {
                         offsetX = selectionFrameDestRect.X - _selectionFrame.Scroll.X;
                         offsetY = selectionFrameDestRect.Y - _selectionFrame.Scroll.Y;
                         selectionState = g.Save();
                         g.SetClip(selectionFrameDestRect, CombineMode.Intersect);
                     }
-
-                    // Collect ALL selected visual spans first. Merging one box at a
-                    // time can never connect separate inline runs, which is how a
-                    // sentence became a row of disconnected highlight rectangles.
-                    // Space-only runs are kept so their real layout advance bridges
-                    // neighbouring words.
                     var selectedSpans = new List<RectangleF>();
                     for (int i = firstIndex; i <= lastIndex; i++)
                     {
                         var box = ordered[i];
                         int len = box.TextRun?.Length ?? 0;
                         if (len == 0) continue;
-
                         int a = 0, b = len;
-                        if (i == anchorIndex)
-                        {
-                            int off = Math.Clamp(_selAnchorOffset, 0, len);
-                            if (forward) a = off; else b = off;
-                        }
-                        if (i == focusIndex)
-                        {
-                            int off = Math.Clamp(_selFocusOffset, 0, len);
-                            if (forward) b = off; else a = off;
-                        }
+                        if (i == anchorIndex) { int off = Math.Clamp(_selAnchorOffset, 0, len); if (forward) a = off; else b = off; }
+                        if (i == focusIndex) { int off = Math.Clamp(_selFocusOffset, 0, len); if (forward) b = off; else a = off; }
                         if (b < a) (a, b) = (b, a);
                         if (b <= a) continue;
-
                         selectedSpans.AddRange(SelectionVisualSpans(g, box, a, b));
                     }
-
-                    // Only merge after the complete selection has been collected so
-                    // adjacent word/space/inline-element runs on the same visual line
-                    // become one continuous band. Large layout gaps remain distinct.
                     foreach (var span in MergeSelectionSpans(selectedSpans))
-                    {
-                        g.FillRectangle(selBrush,
-                            span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
-                    }
-
-                    if (selectionState >= 0)
-                        g.Restore(selectionState);
+                        g.FillRectangle(selBrush, span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
+                    if (selectionState >= 0) g.Restore(selectionState);
                 }
             }
         }
 
-        // Field caret / in-field selection overlay
-        if (_focusedInput != null && _rootBox != null)
-            PaintFieldOverlay(g);
-
+        if (_focusedInput != null && _rootBox != null) PaintFieldOverlay(g);
         PaintEmbeddedMidiControls(g);
 
-        g.Restore(zoomState);
+        g.Restore(overlayState);
         _painter.Blit(e.Graphics);
+    }
+
+    private void PaintFindHighlights(Graphics g, float paintScrollX, float paintScrollY)
+    {
+        if (_findMatches.Count == 0 || string.IsNullOrEmpty(_findText)) return;
+
+        using var matchBrush = new SolidBrush(Color.FromArgb(92, 255, 235, 59));
+        using var activeBrush = new SolidBrush(Color.FromArgb(150, 255, 193, 7));
+        using var activePen = new Pen(Color.FromArgb(220, 160, 100, 0), 1f);
+
+        for (int i = 0; i < _findMatches.Count; i++)
+        {
+            var match = _findMatches[i];
+            int state = -1;
+            float offsetX;
+            float offsetY;
+            RectangleF clip = RectangleF.Empty;
+
+            if (match.Frame == null)
+            {
+                offsetX = -paintScrollX;
+                offsetY = -paintScrollY;
+            }
+            else if (TryGetFrameScreenRect(match.Frame, out var frameRect))
+            {
+                offsetX = frameRect.X - match.Frame.Scroll.X;
+                offsetY = frameRect.Y - match.Frame.Scroll.Y;
+                clip = frameRect;
+                state = g.Save();
+                g.SetClip(clip, CombineMode.Intersect);
+            }
+            else
+            {
+                continue;
+            }
+
+            bool active = i == _findIndex;
+            foreach (var span in SelectionVisualSpans(g, match.Box, match.Start, match.Start + match.Length))
+            {
+                if (span.Width <= 0.01f || span.Height <= 0.01f) continue;
+                var drawRect = new RectangleF(
+                    span.X + offsetX,
+                    span.Y + offsetY,
+                    span.Width,
+                    span.Height);
+                g.FillRectangle(active ? activeBrush : matchBrush, drawRect);
+                if (active)
+                    g.DrawRectangle(activePen, drawRect.X, drawRect.Y,
+                        Math.Max(0.5f, drawRect.Width - 0.5f),
+                        Math.Max(0.5f, drawRect.Height - 0.5f));
+            }
+
+            if (state >= 0)
+                g.Restore(state);
+        }
     }
 
     private void PaintFieldOverlay(Graphics g)
@@ -1979,9 +2000,51 @@ public class BrowserCanvas : Control
     // Scroll
     // ─────────────────────────────────────────────────────────────────────
 
+    /// <summary>Returns the logical scrollable document extent from the CURRENT
+    /// layout tree, never from the last raster. During a zoom transition the
+    /// bitmap can briefly be at a different scale; basing scrollbar geometry
+    /// on that stale raster can falsely report zero overflow and snap the page
+    /// back to (0,0).
+    /// </summary>
+    private (float Width, float Height) GetDocumentContentSize()
+    {
+        if (_rootBox == null) return (1f, 1f);
+
+        var viewport = GetViewportSize();
+        float layoutZoom = Math.Max(0.25f, _layoutZoom);
+        float width = Math.Max(1f, Math.Max(_rootBox.Width, viewport.Width / layoutZoom));
+        float height = Math.Max(1f, Math.Max(_rootBox.Height, viewport.Height / layoutZoom));
+
+        foreach (var box in _rootBox.Descendants())
+        {
+            if (ReferenceEquals(box, _rootBox)) continue;
+            width = Math.Max(width, box.X + Math.Max(0f, box.Width));
+            height = Math.Max(height, box.Y + Math.Max(0f, box.Height));
+        }
+
+        return (width, height);
+    }
+
+    private void ClampScrollOffsetToDocument()
+    {
+        if (_rootBox == null)
+        {
+            _scrollOffset = PointF.Empty;
+            return;
+        }
+
+        var viewport = GetViewportSize();
+        float zoom = Math.Max(0.25f, EffectiveZoom);
+        var content = GetDocumentContentSize();
+        float maxX = Math.Max(0f, content.Width - viewport.Width / zoom);
+        float maxY = Math.Max(0f, content.Height - viewport.Height / zoom);
+        _scrollOffset.X = Math.Clamp(float.IsFinite(_scrollOffset.X) ? _scrollOffset.X : 0f, 0f, maxX);
+        _scrollOffset.Y = Math.Clamp(float.IsFinite(_scrollOffset.Y) ? _scrollOffset.Y : 0f, 0f, maxY);
+    }
+
     private void UpdateScrollBars()
     {
-        if (_renderedBitmap == null)
+        if (_rootBox == null)
         {
             _vScroll.Visible = false;
             _hScroll.Visible = false;
@@ -1989,93 +2052,65 @@ public class BrowserCanvas : Control
             return;
         }
 
-        int docW = _renderedBitmap.Width;
-        int docH = _renderedBitmap.Height;
+        float zoom = Math.Max(0.25f, EffectiveZoom);
+        var content = GetDocumentContentSize();
+        float logicalDocW = content.Width;
+        float logicalDocH = content.Height;
+        float physicalDocW = logicalDocW * zoom;
+        float physicalDocH = logicalDocH * zoom;
         bool wasVVisible = _vScroll.Visible;
         bool wasHVisible = _hScroll.Visible;
+        int vpW = Math.Max(1, ClientSize.Width);
+        int vpH = Math.Max(1, ClientSize.Height);
 
-        // Work in the same coordinate system as painting: the viewport is
-        // the client area minus whichever scrollbars are actually visible.
-        // The old code exposed the document size directly as ScrollBar.Maximum
-        // and then manually treated Maximum-LargeChange as the usable range.
-        // WinForms already applies that page-size semantics internally, and
-        // the two ranges could drift apart (most visibly on long pages: the
-        // thumb would stop before the document's real bottom while the canvas
-        // still had content below it).
-        int vpW = Math.Max(1, (int)Math.Floor(ClientSize.Width / _pluginZoom));
-        int vpH = Math.Max(1, (int)Math.Floor(ClientSize.Height / _pluginZoom));
-
-        bool needV = docH > vpH;
-        if (needV) vpW = Math.Max(0, vpW - _vScroll.Width);
-
-        // Layout and bitmap dimensions are rounded independently. Treat a
-        // one-pixel discrepancy as viewport rasterisation noise; otherwise
-        // ordinary pages get a horizontal bar even though their content fits.
-        bool needH = docW > vpW + 1;
-        if (needH) vpH = Math.Max(0, vpH - _hScroll.Height);
-
-        // A horizontal scrollbar reduces the viewport height and can itself
-        // make a previously unnecessary vertical scrollbar necessary.
-        if (!needV && docH > vpH)
+        bool needV = physicalDocH > vpH + 0.5f;
+        if (needV) vpW = Math.Max(1, vpW - _vScroll.Width);
+        bool needH = physicalDocW > vpW + 0.5f;
+        if (needH) vpH = Math.Max(1, vpH - _hScroll.Height);
+        if (!needV && physicalDocH > vpH + 0.5f)
         {
             needV = true;
-            vpW = Math.Max(0, vpW - _vScroll.Width);
+            vpW = Math.Max(1, vpW - _vScroll.Width);
         }
 
         _vScroll.Visible = needV;
         _hScroll.Visible = needH;
-
-        // Scrollbars reduce the real client viewport. Rebuild the layout at
-        // that reduced width so inline text wraps beside the visible bar,
-        // rather than keeping the pre-scrollbar line width.
-        if ((wasVVisible != needV || wasHVisible != needH) &&
-            _document != null && _rootBox != null)
+        if ((wasVVisible != needV || wasHVisible != needH) && _document != null && _rootBox != null)
         {
             _resizeReflowTimer.Stop();
             _resizeReflowTimer.Start();
         }
 
-        float maxX = needH ? Math.Max(0, docW - vpW) : 0;
-        float maxY = needV ? Math.Max(0, docH - vpH) : 0;
-        _scrollOffset.X = Math.Clamp(_scrollOffset.X, 0, maxX);
-        _scrollOffset.Y = Math.Clamp(_scrollOffset.Y, 0, maxY);
+        float maxX = needH ? Math.Max(0f, logicalDocW - vpW / zoom) : 0f;
+        float maxY = needV ? Math.Max(0f, logicalDocH - vpH / zoom) : 0f;
+        _scrollOffset.X = Math.Clamp(_scrollOffset.X, 0f, maxX);
+        _scrollOffset.Y = Math.Clamp(_scrollOffset.Y, 0f, maxY);
+        int logicalVpW = Math.Max(1, (int)MathF.Floor(vpW / zoom));
+        int logicalVpH = Math.Max(1, (int)MathF.Floor(vpH / zoom));
 
         if (needV)
         {
-            int page = Math.Max(1, vpH);
-            int maxValue = (int)Math.Min(int.MaxValue - 1L, maxY) + page - 1;
-            _vScroll.Minimum = 0;
-            _vScroll.LargeChange = page;
-            _vScroll.SmallChange = Math.Max(1, page / 10);
+            int page = logicalVpH;
+            int maxValue = (int)Math.Min(int.MaxValue - 1L, MathF.Ceiling(maxY)) + page - 1;
+            _vScroll.Minimum = 0; _vScroll.LargeChange = page; _vScroll.SmallChange = Math.Max(1, page / 10);
             _vScroll.Maximum = Math.Max(page - 1, maxValue);
-            _vScroll.Value = Math.Clamp((int)_scrollOffset.Y, 0, (int)maxY);
+            _vScroll.Value = Math.Clamp((int)MathF.Round(_scrollOffset.Y), 0, Math.Max(0, _vScroll.Maximum - _vScroll.LargeChange + 1));
         }
         else
         {
-            _vScroll.Minimum = 0;
-            _vScroll.LargeChange = 1;
-            _vScroll.SmallChange = 1;
-            _vScroll.Maximum = 0;
-            _vScroll.Value = 0;
+            _vScroll.Minimum = 0; _vScroll.LargeChange = 1; _vScroll.SmallChange = 1; _vScroll.Maximum = 0; _vScroll.Value = 0;
         }
-
         if (needH)
         {
-            int page = Math.Max(1, vpW);
-            int maxValue = (int)Math.Min(int.MaxValue - 1L, maxX) + page - 1;
-            _hScroll.Minimum = 0;
-            _hScroll.LargeChange = page;
-            _hScroll.SmallChange = Math.Max(1, page / 10);
+            int page = logicalVpW;
+            int maxValue = (int)Math.Min(int.MaxValue - 1L, MathF.Ceiling(maxX)) + page - 1;
+            _hScroll.Minimum = 0; _hScroll.LargeChange = page; _hScroll.SmallChange = Math.Max(1, page / 10);
             _hScroll.Maximum = Math.Max(page - 1, maxValue);
-            _hScroll.Value = Math.Clamp((int)_scrollOffset.X, 0, (int)maxX);
+            _hScroll.Value = Math.Clamp((int)MathF.Round(_scrollOffset.X), 0, Math.Max(0, _hScroll.Maximum - _hScroll.LargeChange + 1));
         }
         else
         {
-            _hScroll.Minimum = 0;
-            _hScroll.LargeChange = 1;
-            _hScroll.SmallChange = 1;
-            _hScroll.Maximum = 0;
-            _hScroll.Value = 0;
+            _hScroll.Minimum = 0; _hScroll.LargeChange = 1; _hScroll.SmallChange = 1; _hScroll.Maximum = 0; _hScroll.Value = 0;
         }
     }
 
@@ -2114,11 +2149,13 @@ public class BrowserCanvas : Control
 
     public void ScrollTo(int x, int y)
     {
-        if (_renderedBitmap == null) return;
+        if (_rootBox == null) return;
         CloseMenusOnScroll();
         var vp = GetViewportSize();
-        float maxX = Math.Max(0, _renderedBitmap.Width - vp.Width / _pluginZoom);
-        float maxY = Math.Max(0, _renderedBitmap.Height - vp.Height / _pluginZoom);
+        float zoom = Math.Max(0.25f, EffectiveZoom);
+        var content = GetDocumentContentSize();
+        float maxX = Math.Max(0f, content.Width - vp.Width / zoom);
+        float maxY = Math.Max(0f, content.Height - vp.Height / zoom);
         _scrollOffset.X = Math.Max(0, Math.Min(x, maxX));
         _scrollOffset.Y = Math.Max(0, Math.Min(y, maxY));
         if (_vScroll.Visible) _vScroll.Value = Math.Clamp((int)_scrollOffset.Y,
@@ -2136,8 +2173,8 @@ public class BrowserCanvas : Control
 
     private bool HandleHorizontalWheel(int delta, System.Drawing.Point clientPoint)
     {
-        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
-        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+        float x = clientPoint.X / EffectiveZoom + _scrollOffset.X;
+        float y = clientPoint.Y / EffectiveZoom + _scrollOffset.Y;
 
         if (TryHitFrame(x, y, out var frameHit) && frameHit.View.ScrollingEnabled)
         {
@@ -2155,10 +2192,11 @@ public class BrowserCanvas : Control
             return false;
         }
 
-        if (_renderedBitmap == null) return false;
+        if (_rootBox == null) return false;
 
         var viewport = GetViewportSize();
-        float maxX = Math.Max(0f, _renderedBitmap.Width - viewport.Width / _pluginZoom);
+        var content = GetDocumentContentSize();
+        float maxX = Math.Max(0f, content.Width - viewport.Width / Math.Max(0.25f, EffectiveZoom));
         if (maxX <= 0f) return false;
 
         CloseMenusOnScroll();
@@ -2181,8 +2219,8 @@ public class BrowserCanvas : Control
             int delta = (short)((m.WParam.ToInt64() >> 16) & 0xFFFF);
             if (delta != 0)
             {
-                float fx = clientPoint.X / _pluginZoom + _scrollOffset.X;
-                float fy = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+                float fx = clientPoint.X / EffectiveZoom + _scrollOffset.X;
+                float fy = clientPoint.Y / EffectiveZoom + _scrollOffset.Y;
                 if (ScrollFocusedFieldHorizontally(delta / 120f * 40f, fx, fy))
                     return;
             }
@@ -2195,9 +2233,47 @@ public class BrowserCanvas : Control
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
+        // Ctrl+wheel is gesture zoom. It may magnify above the current
+        // button/menu zoom, and once magnified it may return exactly to that
+        // pre-gesture zoom. It must never zoom below the pre-gesture baseline:
+        // Ctrl+wheel-down at an unzoomed state is therefore a no-op rather than
+        // unexpectedly shrinking the page.
+        if ((ModifierKeys & Keys.Control) == Keys.Control)
+        {
+            float baseline = Math.Max(0.25f, _layoutZoom);
+            float current = EffectiveZoom;
+
+            if (e.Delta > 0)
+            {
+                float target = Math.Min(4f, NextZoomStep(current, 1));
+                if (target > current + 0.0005f)
+                    ZoomAtPoint(target, e.Location);
+            }
+            else if (e.Delta < 0 && _gestureZoom > 1.0005f)
+            {
+                // Step down in the same effective-zoom ladder, but clamp to
+                // the layout zoom so the gesture can only undo its own zoom.
+                float stepped = NextZoomStep(current, -1);
+                float target = Math.Max(baseline, stepped);
+                if (target < current - 0.0005f)
+                    ZoomAtPoint(target, e.Location);
+                else
+                {
+                    // At the final gesture step, snap cleanly back to the
+                    // exact baseline instead of leaving a tiny residual factor
+                    // from floating-point arithmetic.
+                    float baselineEpsilon = Math.Max(0.0005f, baseline * 0.0005f);
+                    if (current > baseline + baselineEpsilon)
+                        ZoomAtPoint(baseline, e.Location);
+                }
+            }
+
+            return;
+        }
+
         base.OnMouseWheel(e);
-        float px = e.X / _pluginZoom + _scrollOffset.X;
-        float py = e.Y / _pluginZoom + _scrollOffset.Y;
+        float px = e.X / EffectiveZoom + _scrollOffset.X;
+        float py = e.Y / EffectiveZoom + _scrollOffset.Y;
         if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jab) && jab.HitTest(px, py))
         {
             SendJavaAppletInput(_focusedJavaAppletElement, jab, new Retro96.Engine.Java.JavaInput(
@@ -2212,8 +2288,8 @@ public class BrowserCanvas : Control
             return;
         }
 
-        float x = e.X / _pluginZoom + _scrollOffset.X;
-        float y = e.Y / _pluginZoom + _scrollOffset.Y;
+        float x = e.X / EffectiveZoom + _scrollOffset.X;
+        float y = e.Y / EffectiveZoom + _scrollOffset.Y;
 
         if (TryGetSelectAtPoint(x, y, out var wheelSelect, out _, out _, out _, out _))
         {
@@ -2274,7 +2350,7 @@ public class BrowserCanvas : Control
             return;
         }
 
-        if (_renderedBitmap == null) return;
+        if (_rootBox == null) return;
 
         if ((ModifierKeys & Keys.Shift) == Keys.Shift)
         {
@@ -2286,7 +2362,8 @@ public class BrowserCanvas : Control
 
         // Update immediately. Repainting the existing bitmap is cheap.
         CloseMenusOnScroll();
-        float max = Math.Max(0, _renderedBitmap.Height - GetViewportSize().Height / _pluginZoom);
+        var content = GetDocumentContentSize();
+        float max = Math.Max(0f, content.Height - GetViewportSize().Height / Math.Max(0.25f, EffectiveZoom));
         _scrollOffset.Y = Math.Clamp(_scrollOffset.Y - (e.Delta / 120f) * 80f, 0f, max);
         if (_vScroll.Visible)
             _vScroll.Value = Math.Clamp((int)_scrollOffset.Y,
@@ -2314,12 +2391,14 @@ public class BrowserCanvas : Control
             _fontCache == null || _imageCache == null || _resourceLoader == null)
             return;
 
-        var vp = GetViewportSize();
+        var physicalViewport = GetViewportSize();
+        if (physicalViewport.Width <= 0 || physicalViewport.Height <= 0) return;
+        var vp = GetLayoutViewportSize();
         if (vp.Width <= 0 || vp.Height <= 0) return;
 
-        // PERF: the debounce fires even when the size didn't actually
-        // change (e.g. scrollbar toggle ping-pong) — skip redundant
-        // full-tree rebuilds.
+        // Scrollbar visibility must never cause the document to be reflowed at
+        // physical pixels. Doing that discarded the active button zoom and
+        // produced the top-left/unscrollable state after a later gesture zoom.
         if (vp.Width == _lastLayoutWidth && vp.Height == _lastLayoutHeight)
             return;
         _lastLayoutWidth = vp.Width;
@@ -3440,8 +3519,8 @@ public class BrowserCanvas : Control
         // scrollbar, or form control elsewhere.
         ClearPageSelection();
 
-        float x = e.X / _pluginZoom + _scrollOffset.X;
-        float y = e.Y / _pluginZoom + _scrollOffset.Y;
+        float x = e.X / EffectiveZoom + _scrollOffset.X;
+        float y = e.Y / EffectiveZoom + _scrollOffset.Y;
 
         if (e.Button == MouseButtons.Left && TryBeginJavaAppletInput(x, y, e))
         {
@@ -3822,8 +3901,8 @@ public class BrowserCanvas : Control
 
         if (_pressedJavaAppletElement != null && Capture)
         {
-            float px = e.X / _pluginZoom + _scrollOffset.X;
-            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            float px = e.X / EffectiveZoom + _scrollOffset.X;
+            float py = e.Y / EffectiveZoom + _scrollOffset.Y;
             if (TryGetJavaAppletBox(_pressedJavaAppletElement, out var jb))
                 SendJavaAppletInput(_pressedJavaAppletElement, jb, new Retro96.Engine.Java.JavaInput(
                     Retro96.Engine.Java.JavaInputKind.MouseDrag, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
@@ -3836,8 +3915,8 @@ public class BrowserCanvas : Control
         // captured by the pressed applet above.
         if (_rootBox != null)
         {
-            float hx = e.X / _pluginZoom + _scrollOffset.X;
-            float hy = e.Y / _pluginZoom + _scrollOffset.Y;
+            float hx = e.X / EffectiveZoom + _scrollOffset.X;
+            float hy = e.Y / EffectiveZoom + _scrollOffset.Y;
             var hit = HitTestDeepestBox(_rootBox, hx, hy);
             var hovered = hit?.Element?.TagName.Equals("applet", StringComparison.OrdinalIgnoreCase) == true ? hit!.Element : null;
             if (!ReferenceEquals(hovered, _hoveredJavaAppletElement))
@@ -3860,8 +3939,8 @@ public class BrowserCanvas : Control
 
         if (_pressedEmbeddedElement != null && Capture)
         {
-            float px = e.X / _pluginZoom + _scrollOffset.X;
-            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            float px = e.X / EffectiveZoom + _scrollOffset.X;
+            float py = e.Y / EffectiveZoom + _scrollOffset.Y;
             if (TryGetEmbeddedBox(_pressedEmbeddedElement, out var eb))
                 SendEmbeddedInput(_pressedEmbeddedElement, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseMove, e, eb, px, py));
             return;
@@ -3872,8 +3951,8 @@ public class BrowserCanvas : Control
             var root = _selectScrollbarDragFrame?.RootBox ?? _rootBox;
             if (root != null)
             {
-                float px = e.X / _pluginZoom + _scrollOffset.X;
-                float py = e.Y / _pluginZoom + _scrollOffset.Y;
+                float px = e.X / EffectiveZoom + _scrollOffset.X;
+                float py = e.Y / EffectiveZoom + _scrollOffset.Y;
                 float localY = py;
                 if (_selectScrollbarDragFrame != null)
                 {
@@ -3914,8 +3993,8 @@ public class BrowserCanvas : Control
             var root = _textareaScrollbarDragFrame?.RootBox ?? _rootBox;
             if (root != null)
             {
-                float px = e.X / _pluginZoom + _scrollOffset.X;
-                float py = e.Y / _pluginZoom + _scrollOffset.Y;
+                float px = e.X / EffectiveZoom + _scrollOffset.X;
+                float py = e.Y / EffectiveZoom + _scrollOffset.Y;
                 float localY = py;
                 if (_textareaScrollbarDragFrame != null)
                 {
@@ -3952,7 +4031,7 @@ public class BrowserCanvas : Control
 
         if (_embeddedMidiVolumeDragging && _embeddedMidiElement != null && _embeddedMidiRect != RectangleF.Empty)
         {
-            float x = e.X / _pluginZoom + _scrollOffset.X;
+            float x = e.X / EffectiveZoom + _scrollOffset.X;
             var box = FindBoxForElement(_rootBox!, _embeddedMidiElement);
             if (box != null)
             {
@@ -3978,8 +4057,8 @@ public class BrowserCanvas : Control
         if (_frameScrollbarDragView != null && _frameScrollbarDragBox != null && Capture)
         {
             float pointer = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
-                ? e.Y / _pluginZoom + _scrollOffset.Y
-                : e.X / _pluginZoom + _scrollOffset.X;
+                ? e.Y / EffectiveZoom + _scrollOffset.Y
+                : e.X / EffectiveZoom + _scrollOffset.X;
             var metrics = GetFrameScrollMetrics(_frameScrollbarDragBox, _frameScrollbarDragView);
             float trackLength = _frameScrollbarDragAxis == FrameScrollbarAxis.Vertical
                 ? metrics.VerticalTrackLength
@@ -4004,8 +4083,8 @@ public class BrowserCanvas : Control
 
         if (_fieldDragging && _focusedInput != null && _rootBox != null)
         {
-            float x = e.X / _pluginZoom + _scrollOffset.X;
-            float y = e.Y / _pluginZoom + _scrollOffset.Y;
+            float x = e.X / EffectiveZoom + _scrollOffset.X;
+            float y = e.Y / EffectiveZoom + _scrollOffset.Y;
             if (_focusedInputFrame != null &&
                 TryHitFrame(x, y, out var fieldHit) &&
                 ReferenceEquals(fieldHit.View, _focusedInputFrame))
@@ -4030,8 +4109,8 @@ public class BrowserCanvas : Control
 
         if (_selecting)
         {
-            float x = e.X / _pluginZoom + _scrollOffset.X;
-            float y = e.Y / _pluginZoom + _scrollOffset.Y;
+            float x = e.X / EffectiveZoom + _scrollOffset.X;
+            float y = e.Y / EffectiveZoom + _scrollOffset.Y;
             LayoutBox? f = null;
             var oldFocus = _selFocus;
             int oldFocusOffset = _selFocusOffset;
@@ -4083,8 +4162,8 @@ public class BrowserCanvas : Control
 
         if (_rootBox == null || _document == null) return;
 
-        float mx = e.X / _pluginZoom + _scrollOffset.X;
-        float my = e.Y / _pluginZoom + _scrollOffset.Y;
+        float mx = e.X / EffectiveZoom + _scrollOffset.X;
+        float my = e.Y / EffectiveZoom + _scrollOffset.Y;
 
         DomElement? element;
         DomDocument doc = _document;
@@ -4218,8 +4297,8 @@ public class BrowserCanvas : Control
         {
             var applet = _pressedJavaAppletElement;
             _pressedJavaAppletElement = null;
-            float px = e.X / _pluginZoom + _scrollOffset.X;
-            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            float px = e.X / EffectiveZoom + _scrollOffset.X;
+            float py = e.Y / EffectiveZoom + _scrollOffset.Y;
             if (TryGetJavaAppletBox(applet, out var jb))
                 SendJavaAppletInput(applet, jb, new Retro96.Engine.Java.JavaInput(
                     Retro96.Engine.Java.JavaInputKind.MouseUp, (int)Math.Round(px - jb.X), (int)Math.Round(py - jb.Y),
@@ -4232,8 +4311,8 @@ public class BrowserCanvas : Control
         {
             var embed = _pressedEmbeddedElement;
             _pressedEmbeddedElement = null;
-            float px = e.X / _pluginZoom + _scrollOffset.X;
-            float py = e.Y / _pluginZoom + _scrollOffset.Y;
+            float px = e.X / EffectiveZoom + _scrollOffset.X;
+            float py = e.Y / EffectiveZoom + _scrollOffset.Y;
             if (TryGetEmbeddedBox(embed, out var eb))
                 SendEmbeddedInput(embed, MakeEmbeddedMouseEvent(EmbeddedInputEventKind.MouseUp, e, eb, px, py));
             Capture = false;
@@ -4327,8 +4406,8 @@ public class BrowserCanvas : Control
 
         if (wasPressed)
         {
-            float ux = e.X / _pluginZoom + _scrollOffset.X;
-            float uy = e.Y / _pluginZoom + _scrollOffset.Y;
+            float ux = e.X / EffectiveZoom + _scrollOffset.X;
+            float uy = e.Y / EffectiveZoom + _scrollOffset.Y;
             DomElement? upEl = null;
             if (pressedFrame != null)
             {
@@ -4360,8 +4439,8 @@ public class BrowserCanvas : Control
         if (_rootBox == null || e.Button != MouseButtons.Left)
             return;
 
-        float x = e.X / _pluginZoom + _scrollOffset.X;
-        float y = e.Y / _pluginZoom + _scrollOffset.Y;
+        float x = e.X / EffectiveZoom + _scrollOffset.X;
+        float y = e.Y / EffectiveZoom + _scrollOffset.Y;
 
         // Double-click inside an editable field: the primary mouse-down path
         // already performs the selection. Keep this WinForms event as a
@@ -4818,8 +4897,8 @@ public class BrowserCanvas : Control
 
     private void ShowContextMenu(System.Drawing.Point clientPoint)
     {
-        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
-        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+        float x = clientPoint.X / EffectiveZoom + _scrollOffset.X;
+        float y = clientPoint.Y / EffectiveZoom + _scrollOffset.Y;
         _contextElement = _rootBox != null ? HitTestElement(_rootBox, x, y) : null;
 
         var menu = new ContextMenuStrip();
@@ -4849,8 +4928,8 @@ public class BrowserCanvas : Control
     {
         if (_rootBox == null || _document == null) return;
 
-        float x = clientPoint.X / _pluginZoom + _scrollOffset.X;
-        float y = clientPoint.Y / _pluginZoom + _scrollOffset.Y;
+        float x = clientPoint.X / EffectiveZoom + _scrollOffset.X;
+        float y = clientPoint.Y / EffectiveZoom + _scrollOffset.Y;
         if (TryHitFrame(x, y, out var hit))
         {
             _focusedFrame = hit.Box;
@@ -6256,14 +6335,23 @@ public class BrowserCanvas : Control
     private void SubmitFormInternal(DomElement form, DomDocument document,
                                     JsInterpreter? js,
                                     (string Name, int X, int Y)? imageClick,
-                                    FrameView? sourceFrame, DomElement? submitter = null)
+                                    FrameView? sourceFrame, DomElement? submitter = null,
+                                    bool dispatchSubmitEvent = true)
     {
-        // Only an explicit `return false` cancels the submit.  FireEvent
-        // returns JsValue.Undefined when the form has no onsubmit handler,
-        // and Undefined.ToBoolean() is false — so the bare `!ToBoolean()`
-        // check aborted EVERY form without an onsubmit (Go / Enter dead).
-        var result = js?.FireEvent(form, "onsubmit");
-        if (result is { Type: JsType.Boolean } && !result.ToBoolean()) return;
+        // User-initiated submission (submit button / Enter) fires onsubmit.
+        // Programmatic HTMLFormElement.submit() is different: it performs the
+        // submission directly and deliberately bypasses the form's submit event.
+        // Treating both paths identically made `form.submit()` unexpectedly
+        // fire onsubmit — and pages that use submit() from inside onsubmit could
+        // re-enter the handler or hit the same `return false` guard again.
+        if (dispatchSubmitEvent)
+        {
+            // Only an explicit `return false` cancels the submit. FireEvent
+            // returns Undefined when the form has no handler; that must NOT
+            // cancel the default submit.
+            var result = js?.FireEvent(form, "onsubmit");
+            if (result is { Type: JsType.Boolean } && !result.ToBoolean()) return;
+        }
 
         var req = Engine.Forms.FormSubmitter.BuildRequest(
             form, document.BaseUrl, document.BaseTarget, imageClick, submitter);
@@ -6291,12 +6379,13 @@ public class BrowserCanvas : Control
         IReadOnlyList<Engine.Forms.MultipartField>? MultipartFields,
         IReadOnlyList<Engine.Forms.MultipartFile>? MultipartFiles)>? FormSubmitRequested;
 
-    public void SubmitForm(DomElement? form, object? clickCoords)
+    public void SubmitForm(DomElement? form, object? clickCoords, bool dispatchSubmitEvent = true)
     {
         if (form == null || _document == null) return;
         (string Name, int X, int Y)? coords = null;
         if (clickCoords is ValueTuple<string,int,int> tuple) coords = tuple;
-        SubmitFormInternal(form, _document, _jsInterpreter, coords, null);
+        SubmitFormInternal(form, _document, _jsInterpreter, coords, null,
+            dispatchSubmitEvent: dispatchSubmitEvent);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -6507,10 +6596,10 @@ public class BrowserCanvas : Control
         if (box == null) return;
         var br = box.BorderRect;
         var r = new System.Drawing.Rectangle(
-            (int)Math.Ceiling((br.X - _scrollOffset.X) * _pluginZoom),
-            (int)Math.Ceiling((br.Y - _scrollOffset.Y) * _pluginZoom),
-            Math.Max(1, (int)Math.Ceiling(br.Width * _pluginZoom)),
-            Math.Max(1, (int)Math.Ceiling(br.Height * _pluginZoom)));
+            (int)Math.Ceiling((br.X - _scrollOffset.X) * EffectiveZoom),
+            (int)Math.Ceiling((br.Y - _scrollOffset.Y) * EffectiveZoom),
+            Math.Max(1, (int)Math.Ceiling(br.Width * EffectiveZoom)),
+            Math.Max(1, (int)Math.Ceiling(br.Height * EffectiveZoom)));
         r.Inflate(2, 2);
         Invalidate(r);
     }
@@ -6559,19 +6648,151 @@ public class BrowserCanvas : Control
             SetStatus(status.GetString());
     }
 
+    private static float NextZoomStep(float current, int direction)
+    {
+        float[] steps =
+        { 0.25f, 0.33f, 0.50f, 0.67f, 0.75f, 0.80f, 0.90f, 1.00f,
+          1.10f, 1.25f, 1.50f, 1.75f, 2.00f, 2.50f, 3.00f, 4.00f };
+        if (direction > 0)
+        {
+            foreach (float step in steps)
+                if (step > current + 0.0005f) return step;
+            return 4f;
+        }
+        for (int i = steps.Length - 1; i >= 0; i--)
+            if (steps[i] < current - 0.0005f) return steps[i];
+        return 0.25f;
+    }
+
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     [Browsable(false)]
     public float ZoomFactor
     {
-        get => _pluginZoom;
-        set
+        get => _layoutZoom;
+        set => SetZoom(value, null);
+    }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    [Browsable(false)]
+    public float VisualZoomFactor => EffectiveZoom;
+
+    /// <summary>Move the shared discrete zoom ladder by one step.  This is
+    /// intentionally implemented by BrowserCanvas rather than Form1 so
+    /// toolbar/menu zoom and Ctrl+wheel gesture zoom always operate on the
+    /// same effective zoom value.  A button action commits the resulting
+    /// visual zoom as the new layout baseline and clears the temporary gesture
+    /// factor.
+    /// </summary>
+    public bool ChangeZoomStep(int direction, System.Drawing.Point? anchorClient = null)
+    {
+        if (direction == 0) return false;
+
+        int sign = Math.Sign(direction);
+        float current = EffectiveZoom;
+        float target = NextZoomStep(current, sign);
+        if (Math.Abs(target - current) <= 0.0005f) return false;
+
+        SetZoom(target, anchorClient);
+        return Math.Abs(EffectiveZoom - target) <= 0.001f;
+    }
+
+    /// <summary>Toolbar/menu/plugin zoom: change the CSS viewport, rebuild the
+    /// layout, and rasterize directly at the resulting scale.</summary>
+    public void SetZoom(float value, System.Drawing.Point? anchorClient)
+    {
+        float next = Math.Clamp(float.IsFinite(value) ? value : 1f, 0.25f, 4f);
+        float previousLayout = _layoutZoom;
+        float previousGesture = _gestureZoom;
+        float previousEffective = EffectiveZoom;
+        if (Math.Abs(next - previousLayout) < 0.0005f && Math.Abs(previousGesture - 1f) < 0.0005f) return;
+
+        var physicalBefore = GetViewportSize();
+        float anchorX = anchorClient?.X ?? physicalBefore.Width / 2f;
+        float anchorY = anchorClient?.Y ?? physicalBefore.Height / 2f;
+        anchorX = Math.Clamp(anchorX, 0, Math.Max(0, physicalBefore.Width - 1));
+        anchorY = Math.Clamp(anchorY, 0, Math.Max(0, physicalBefore.Height - 1));
+        float docX = _scrollOffset.X + anchorX / Math.Max(0.0001f, previousEffective);
+        float docY = _scrollOffset.Y + anchorY / Math.Max(0.0001f, previousEffective);
+        if (!float.IsFinite(docX)) docX = _scrollOffset.X;
+        if (!float.IsFinite(docY)) docY = _scrollOffset.Y;
+
+        // A button/menu zoom is a layout zoom operation.  If a temporary
+        // gesture zoom is active, the requested target is the current visual
+        // zoom step, and committing it here makes that value the new gesture
+        // baseline.  This prevents Ctrl+wheel and the toolbar from fighting
+        // over two unrelated zoom values.
+        _layoutZoom = next;
+        _gestureZoom = 1f;
+        if (_document == null || _rootBox == null || _fontCache == null || _imageCache == null || _resourceLoader == null)
         {
-            float next = Math.Clamp(value, 0.5f, 3f);
-            if (Math.Abs(next - _pluginZoom) < 0.001f) return;
-            _pluginZoom = next;
-            UpdateScrollBars();
-            Invalidate();
+            UpdateScrollBars(); RequestRerender(); ZoomChanged?.Invoke(EffectiveZoom); return;
         }
+
+        try
+        {
+            var layoutViewport = GetLayoutViewportSize();
+            Engine.Css.StyleResolver.Resolve(_document, layoutViewport.Width);
+            var newRoot = LayoutEngineApi.BuildLayoutTree(_document, layoutViewport.Width, layoutViewport.Height);
+            _lastLayoutWidth = layoutViewport.Width;
+            _lastLayoutHeight = layoutViewport.Height;
+            ApplyRelayout(_document, newRoot);
+
+            float nextScrollX = docX - anchorX / Math.Max(0.0001f, EffectiveZoom);
+            float nextScrollY = docY - anchorY / Math.Max(0.0001f, EffectiveZoom);
+            if (float.IsFinite(nextScrollX)) _scrollOffset.X = Math.Max(0, nextScrollX);
+            if (float.IsFinite(nextScrollY)) _scrollOffset.Y = Math.Max(0, nextScrollY);
+            ClampScrollOffsetToDocument();
+            UpdateScrollBars();
+            RequestRerender();
+        }
+        catch (Exception ex)
+        {
+            Retro96.DebugLog.WriteException("SetZoom", ex);
+            _layoutZoom = previousLayout;
+            _gestureZoom = previousGesture;
+            UpdateScrollBars();
+            RequestRerender();
+        }
+        ZoomChanged?.Invoke(EffectiveZoom);
+    }
+
+    /// <summary>Temporary Ctrl+wheel magnification. Gesture zoom is bounded
+    /// below by the current layout zoom: it can return to the pre-gesture
+    /// baseline but cannot zoom farther out than that baseline. Every gesture
+    /// change re-rasterizes at the requested physical scale.</summary>
+    public void ZoomAtPoint(float value, System.Drawing.Point clientPoint)
+    {
+        float current = EffectiveZoom;
+        float layout = Math.Max(0.25f, _layoutZoom);
+        // Gesture zoom may move in either direction, but never below the
+        // layout zoom that was in effect before the gesture started. This is
+        // what makes Ctrl+wheel-down useful for undoing a gesture zoom while
+        // remaining a no-op when there is nothing to undo.
+        float target = Math.Clamp(float.IsFinite(value) ? value : current, layout, 4f);
+        if (Math.Abs(target - current) <= 0.0005f) return;
+
+        float nextGesture = target / layout;
+        float maxGesture = Math.Max(1f, 4f / layout);
+        if (!float.IsFinite(nextGesture)) nextGesture = 1f;
+        _gestureZoom = Math.Clamp(nextGesture, 1f, maxGesture);
+
+        float docX = _scrollOffset.X + clientPoint.X / Math.Max(0.0001f, current);
+        float docY = _scrollOffset.Y + clientPoint.Y / Math.Max(0.0001f, current);
+        float nextScrollX = docX - clientPoint.X / Math.Max(0.0001f, EffectiveZoom);
+        float nextScrollY = docY - clientPoint.Y / Math.Max(0.0001f, EffectiveZoom);
+        if (float.IsFinite(nextScrollX)) _scrollOffset.X = Math.Max(0, nextScrollX);
+        if (float.IsFinite(nextScrollY)) _scrollOffset.Y = Math.Max(0, nextScrollY);
+        ClampScrollOffsetToDocument();
+        // Queue the raster first. A scrollbar visibility change can itself
+        // invalidate the control; posting the render before that invalidation
+        // makes the crisp frame win the message-loop race.
+        RequestRerender();
+        UpdateScrollBars();
+        // Never paint the previous 1x bitmap at the new zoom. That one-frame
+        // resample is the characteristic blurry/MS-Paint preview.
+        // RequestRerender() coalesces wheel bursts and ReRenderPage() calls
+        // Invalidate only after the new-scale bitmap is ready.
+        ZoomChanged?.Invoke(EffectiveZoom);
     }
 
     public byte[] CaptureViewportPng()
@@ -6584,57 +6805,332 @@ public class BrowserCanvas : Control
         g.InterpolationMode = Retro96.Drawing.InterpolationMode.NearestNeighbor;
         if (_renderedBitmap != null)
         {
-            int sx = Math.Clamp((int)_scrollOffset.X, 0, Math.Max(0, _renderedBitmap.Width - 1));
-            int sy = Math.Clamp((int)_scrollOffset.Y, 0, Math.Max(0, _renderedBitmap.Height - 1));
-            int sw = Math.Min((int)Math.Ceiling(width / _pluginZoom), _renderedBitmap.Width - sx);
-            int sh = Math.Min((int)Math.Ceiling(height / _pluginZoom), _renderedBitmap.Height - sy);
+            float zoom = Math.Max(0.25f, EffectiveZoom);
+            int sx = Math.Clamp((int)MathF.Floor(PaintScrollX * zoom), 0, Math.Max(0, _renderedBitmap.Width - 1));
+            int sy = Math.Clamp((int)MathF.Floor(PaintScrollY * zoom), 0, Math.Max(0, _renderedBitmap.Height - 1));
+            int sw = Math.Min(width, _renderedBitmap.Width - sx);
+            int sh = Math.Min(height, _renderedBitmap.Height - sy);
             if (sw > 0 && sh > 0)
-            {
-                g.InterpolationMode = _pluginZoom < 1f
-                    ? Retro96.Drawing.InterpolationMode.HighQualityBicubic
-                    : Retro96.Drawing.InterpolationMode.NearestNeighbor;
-                g.DrawImage(_renderedBitmap, new Rectangle(0, 0, width, height), new Rectangle(sx, sy, sw, sh), GraphicsUnit.Pixel);
-            }
+                g.DrawImage(_renderedBitmap, new Rectangle(0, 0, sw, sh), new Rectangle(sx, sy, sw, sh), GraphicsUnit.Pixel);
         }
         return bmp.EncodePng();
     }
 
     public void FindInPage(string text, bool caseSensitive, bool wrapAround)
     {
-        _findText = text ?? string.Empty; _findCaseSensitive = caseSensitive; _findWrap = wrapAround;
-        _findMatches = new List<DomElement>(); _findIndex = -1;
-        if (_document == null || string.IsNullOrEmpty(_findText)) { Invalidate(); return; }
-        StringComparison comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-        foreach (var element in _document.ElementDescendants())
-            if (element.InnerText.IndexOf(_findText, comparison) >= 0) _findMatches.Add(element);
-        FindNext();
+        _findText = text ?? string.Empty;
+        _findCaseSensitive = caseSensitive;
+        _findWrap = wrapAround;
+        _findIndex = -1;
+        RefreshFindMatches(preserveCurrent: false);
+        if (_findMatches.Count > 0)
+            FindNext();
     }
 
     public void FindNext()
     {
-        if (_findMatches.Count == 0) return;
-        int next = _findIndex + 1;
+        if (_findMatches.Count == 0)
+        {
+            RaiseFindChanged();
+            return;
+        }
+
+        int next;
+        if (_findIndex < 0)
+            next = 0;
+        else
+            next = _findIndex + 1;
+
         if (next >= _findMatches.Count)
         {
-            if (!_findWrap) return;
+            if (!_findWrap)
+            {
+                RaiseFindChanged();
+                return;
+            }
             next = 0;
         }
+
         _findIndex = next;
-        var element = _findMatches[_findIndex];
-        var box = _rootBox == null ? null : FindBoxForElement(_rootBox, element);
-        if (box != null)
-        {
-            ClearPageSelection();
-            ScrollTo((int)_scrollOffset.X, Math.Max(0, (int)box.Y - 20));
-        }
+        EnsureFindMatchVisible(_findMatches[_findIndex]);
+        RaiseFindChanged();
         Invalidate();
     }
 
-    public void FindClear()
+    public void FindPrevious()
     {
-        _findText = string.Empty; _findMatches.Clear(); _findIndex = -1; ClearPageSelection(); Invalidate();
+        if (_findMatches.Count == 0)
+        {
+            RaiseFindChanged();
+            return;
+        }
+
+        int previous = _findIndex < 0 ? _findMatches.Count - 1 : _findIndex - 1;
+        if (previous < 0)
+        {
+            if (!_findWrap)
+            {
+                RaiseFindChanged();
+                return;
+            }
+            previous = _findMatches.Count - 1;
+        }
+
+        _findIndex = previous;
+        EnsureFindMatchVisible(_findMatches[_findIndex]);
+        RaiseFindChanged();
+        Invalidate();
     }
 
+    public void FindClear() => ClearFindState();
+
+    private void ClearFindState()
+    {
+        bool changed = _findText.Length != 0 || _findMatches.Count != 0 || _findIndex != -1;
+        _findText = string.Empty;
+        _findMatches.Clear();
+        _findIndex = -1;
+        if (changed) RaiseFindChanged();
+        Invalidate();
+    }
+
+    private void RefreshFindMatches(bool preserveCurrent)
+    {
+        if (string.IsNullOrEmpty(_findText) || _rootBox == null)
+        {
+            _findMatches.Clear();
+            _findIndex = -1;
+            RaiseFindChanged();
+            Invalidate();
+            return;
+        }
+
+        DomElement? oldElement = null;
+        int oldStart = -1;
+        if (preserveCurrent && _findIndex >= 0 && _findIndex < _findMatches.Count)
+        {
+            var old = _findMatches[_findIndex];
+            oldElement = old.Box.Element;
+            oldStart = old.Start;
+        }
+
+        var matches = new List<FindMatch>();
+        StringComparison comparison = _findCaseSensitive
+            ? StringComparison.Ordinal
+            : StringComparison.OrdinalIgnoreCase;
+
+        CollectFindMatches(_rootBox, null, matches, comparison);
+        foreach (var (_, frame) in _frames)
+            CollectFindMatchesInFrameTree(frame, matches, comparison);
+
+        _findMatches.Clear();
+        _findMatches.AddRange(matches);
+        if (_findMatches.Count == 0)
+        {
+            _findIndex = -1;
+        }
+        else if (preserveCurrent && oldElement != null)
+        {
+            _findIndex = _findMatches.FindIndex(m =>
+                ReferenceEquals(m.Box.Element, oldElement) && m.Start == oldStart);
+            if (_findIndex < 0) _findIndex = Math.Min(_findIndex, _findMatches.Count - 1);
+        }
+        else
+        {
+            _findIndex = -1;
+        }
+
+        RaiseFindChanged();
+    }
+
+    private void CollectFindMatches(LayoutBox root, FrameView? frame,
+                                    List<FindMatch> output,
+                                    StringComparison comparison)
+    {
+        var stack = new Stack<LayoutBox>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var box = stack.Pop();
+            string run = box.TextRun ?? string.Empty;
+            if (run.Length > 0)
+            {
+                int from = 0;
+                while (from <= run.Length - _findText.Length)
+                {
+                    int at = run.IndexOf(_findText, from, comparison);
+                    if (at < 0) break;
+                    output.Add(new FindMatch(frame, box, at, _findText.Length));
+                    from = at + Math.Max(1, _findText.Length);
+                }
+            }
+
+            for (int i = box.Children.Count - 1; i >= 0; i--)
+                stack.Push(box.Children[i]);
+        }
+    }
+
+    private void CollectFindMatchesInFrameTree(FrameView frame, List<FindMatch> output,
+                                               StringComparison comparison)
+    {
+        CollectFindMatches(frame.RootBox, frame, output, comparison);
+        foreach (var (_, child) in frame.ChildFrames)
+            CollectFindMatchesInFrameTree(child, output, comparison);
+    }
+
+    private void RaiseFindChanged() => FindChanged?.Invoke(
+        _findMatches.Count,
+        _findIndex >= 0 && _findIndex < _findMatches.Count ? _findIndex + 1 : 0);
+
+    private void EnsureFindMatchVisible(FindMatch match)
+    {
+        if (match.Frame == null)
+        {
+            EnsureTopLevelFindMatchVisible(match.Box);
+            return;
+        }
+
+        // Scroll the matched frame internally first. The frame tree is then
+        // recomposed so nested-frame changes become visible immediately.
+        var metrics = TryGetFrameBoxForView(match.Frame, out var frameBox)
+            ? GetFrameScrollMetrics(frameBox, match.Frame)
+            : default;
+        if (metrics.MaxScrollX > 0 || metrics.MaxScrollY > 0)
+        {
+            float targetX = match.Frame.Scroll.X;
+            float targetY = match.Frame.Scroll.Y;
+            if (match.Box.X < targetX + 12f)
+                targetX = match.Box.X - 12f;
+            else if (match.Box.X + match.Box.Width > targetX + metrics.ViewportWidth - 12f)
+                targetX = match.Box.X + match.Box.Width - metrics.ViewportWidth + 12f;
+            if (match.Box.Y < targetY + 12f)
+                targetY = match.Box.Y - 12f;
+            else if (match.Box.Y + match.Box.Height > targetY + metrics.ViewportHeight - 12f)
+                targetY = match.Box.Y + match.Box.Height - metrics.ViewportHeight + 12f;
+
+            match.Frame.Scroll.X = Math.Clamp(targetX, 0, metrics.MaxScrollX);
+            match.Frame.Scroll.Y = Math.Clamp(targetY, 0, metrics.MaxScrollY);
+            RecomposeFrameTree(match.Frame);
+        }
+
+        // Also bring the outer frame into view. For deeply nested frames this
+        // follows their composed screen rectangle without dereferencing stale
+        // layout boxes from a previous reflow.
+        if (TryGetFrameScreenRect(match.Frame, out var rect))
+        {
+            var vp = GetViewportSize();
+            float nextX = _scrollOffset.X;
+            float nextY = _scrollOffset.Y;
+            if (rect.Left < 0) nextX += rect.Left;
+            else if (rect.Right > vp.Width) nextX += rect.Right - vp.Width;
+            if (rect.Top < 0) nextY += rect.Top;
+            else if (rect.Bottom > vp.Height) nextY += rect.Bottom - vp.Height;
+            if (Math.Abs(nextX - _scrollOffset.X) > 0.1f || Math.Abs(nextY - _scrollOffset.Y) > 0.1f)
+                ScrollTo((int)nextX, (int)nextY);
+        }
+    }
+
+    private void EnsureTopLevelFindMatchVisible(LayoutBox box)
+    {
+        var vp = GetViewportSize();
+        float viewportW = Math.Max(1, vp.Width) / Math.Max(0.25f, EffectiveZoom);
+        float viewportH = Math.Max(1, vp.Height) / Math.Max(0.25f, EffectiveZoom);
+        float nextX = _scrollOffset.X;
+        float nextY = _scrollOffset.Y;
+        float width = Math.Max(1f, box.BorderRect.Width);
+        float height = Math.Max(1f, box.BorderRect.Height);
+
+        if (width > viewportW)
+            nextX = box.X;
+        else if (box.X < nextX + 12f)
+            nextX = box.X - 12f;
+        else if (box.X + width > nextX + viewportW - 12f)
+            nextX = box.X + width - viewportW + 12f;
+
+        if (height > viewportH)
+            nextY = box.Y;
+        else if (box.Y < nextY + 16f)
+            nextY = box.Y - 16f;
+        else if (box.Y + height > nextY + viewportH - 16f)
+            nextY = box.Y + height - viewportH + 16f;
+
+        ScrollTo((int)Math.Max(0, nextX), (int)Math.Max(0, nextY));
+    }
+
+    private bool TryGetFrameBoxForView(FrameView target, out LayoutBox box)
+    {
+        foreach (var pair in _frames)
+        {
+            if (ReferenceEquals(pair.Value, target))
+            {
+                box = pair.Key;
+                return true;
+            }
+            if (TryFindFrameBoxRecursive(pair.Value, target, out box))
+                return true;
+        }
+        box = null!;
+        return false;
+    }
+
+    private static bool TryFindFrameBoxRecursive(FrameView current, FrameView target, out LayoutBox box)
+    {
+        foreach (var (childBox, child) in current.ChildFrames)
+        {
+            if (ReferenceEquals(child, target))
+            {
+                box = childBox;
+                return true;
+            }
+            if (TryFindFrameBoxRecursive(child, target, out box))
+                return true;
+        }
+        box = null!;
+        return false;
+    }
+
+    private bool TryGetFrameScreenRect(FrameView target, out RectangleF rect)
+    {
+        float scrollX = PaintScrollX;
+        float scrollY = PaintScrollY;
+        foreach (var (box, frame) in _frames)
+        {
+            var top = new RectangleF(box.X - scrollX, box.Y - scrollY, box.Width, box.Height);
+            if (ReferenceEquals(frame, target))
+            {
+                rect = top;
+                return true;
+            }
+            if (TryGetNestedFrameScreenRect(top, frame, target, out rect))
+                return true;
+        }
+        rect = RectangleF.Empty;
+        return false;
+    }
+
+    private static bool TryGetNestedFrameScreenRect(RectangleF parentRect, FrameView parent,
+                                                    FrameView target, out RectangleF rect)
+    {
+        foreach (var (box, child) in parent.ChildFrames)
+        {
+            var childRect = new RectangleF(
+                parentRect.X + box.X - parent.Scroll.X,
+                parentRect.Y + box.Y - parent.Scroll.Y,
+                box.Width,
+                box.Height);
+            if (ReferenceEquals(child, target))
+            {
+                rect = childRect;
+                return true;
+            }
+            if (TryGetNestedFrameScreenRect(childRect, child, target, out rect))
+                return true;
+        }
+        rect = RectangleF.Empty;
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // ─────────────────────────────────────────────────────────────────────
     // Shell hooks
     // ─────────────────────────────────────────────────────────────────────

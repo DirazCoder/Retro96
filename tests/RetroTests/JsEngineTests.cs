@@ -134,6 +134,24 @@ public class JsEngineTests
     }
 
     [Fact]
+    public void FormSubmitMethodBypassesOnSubmitHandler()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><form id='f' onsubmit=\"return false;\"><input type='submit' value='Go'></form></body></html>");
+
+        page.Eval("document.getElementById('f').submit();");
+
+        Check.That(page.Canvas.Log.FormSubmitDispatchFlags.Count == 1,
+            "form.submit() reaches the shell submission path once",
+            page.Canvas.Log.FormSubmitDispatchFlags.Count.ToString());
+        Check.That(page.Canvas.Log.FormSubmitDispatchFlags.Count == 1 &&
+                   page.Canvas.Log.FormSubmitDispatchFlags[0] == false,
+            "programmatic form.submit() bypasses onsubmit",
+            page.Canvas.Log.FormSubmitDispatchFlags.Count == 0 ? "no call" : page.Canvas.Log.FormSubmitDispatchFlags[0].ToString());
+        Check.Done();
+    }
+
+    [Fact]
     public void OnclickFires_SetAttributeWiring()
     {
         var page = new PageHarness();

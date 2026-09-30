@@ -39,6 +39,10 @@ public partial class Form1
     {
         MessageBox.Show(this,
             "Enter          Navigate or search\n" +
+            "Ctrl+F         Find in page\n" +
+            "F3 / Shift+F3  Find next / previous\n" +
+            "Ctrl+Plus/Minus Zoom in / out\n" +
+            "Ctrl+0         Reset zoom\n" +
             "Ctrl+J         Open downloads\n" +
             "F11            Toggle box outlines\n" +
             "F12            Write layout diagnostics",

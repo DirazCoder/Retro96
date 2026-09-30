@@ -1395,7 +1395,9 @@ public static class DomBindings
             if (name == "submit" && _element.TagName == "form")
                 return JsValue.FromFunction(new JsFunction((self, args) =>
                 {
-                    _canvas?.SubmitForm(_element, null);
+                    // HTMLFormElement.submit() is the programmatic fast path:
+                    // it bypasses onsubmit instead of dispatching a new submit event.
+                    _canvas?.SubmitForm(_element, null, dispatchSubmitEvent: false);
                     return JsValue.Undefined;
                 }, _scope, "submit"));
 

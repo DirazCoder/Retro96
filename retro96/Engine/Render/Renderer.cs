@@ -139,7 +139,8 @@ public class Renderer
                           DomElement? hoveredElement,
                           bool blinkVisible,
                           bool showBoxOutlines = false,
-                          DomElement? focusedElement = null)
+                          DomElement? focusedElement = null,
+                          float renderScale = 1f)
     {
         if (rootBox == null)
             return new Bitmap(1, 1);
@@ -150,16 +151,19 @@ public class Renderer
         _viewportWidth = viewportWidth;
         _viewportHeight = viewportHeight;
 
+        renderScale = float.IsFinite(renderScale) ? Math.Clamp(renderScale, 0.25f, 4f) : 1f;
+
         float docWidth = Math.Max(rootBox.Width, viewportWidth);
         float docHeight = Math.Max(rootBox.Height, viewportHeight);
 
-        // FIX: the bitmap size is now CAPPED.  A hostile width/height attr
-        // or CSS percent chain used to arrive here as e.g. 100000×80000 —
-        // a guaranteed multi-gigabyte GDI+ allocation (instant OOM/DoS).
-        // Content beyond the cap is simply not rendered; the shell's
-        // scrollbars size to the capped bitmap.
-        int bw = Math.Max(1, (int)Math.Ceiling(docWidth));
-        int bh = Math.Max(1, (int)Math.Ceiling(docHeight));
+        // The layout tree stays in CSS/logical pixels, while the raster surface
+        // is allocated at the requested browser zoom. The old path rendered a
+        // 1× page and then enlarged that bitmap on screen, which made text look
+        // like a blurry MS-Paint screenshot. Rasterizing the vector/text
+        // primitives directly at the final zoom keeps glyphs and rules crisp
+        // while the narrower logical viewport drives real line reflow.
+        int bw = Math.Max(1, (int)Math.Ceiling(docWidth * renderScale));
+        int bh = Math.Max(1, (int)Math.Ceiling(docHeight * renderScale));
         if (bw > MaxSurfaceDimension) bw = MaxSurfaceDimension;
         if (bh > MaxSurfaceDimension) bh = MaxSurfaceDimension;
         if ((long)bw * bh > MaxSurfacePixels)
@@ -176,15 +180,20 @@ public class Renderer
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.Default;
 
-        // ── Page background: colour fill FIRST, then the tiled image on
-        //    top (the old order painted the tiles and then blanked them
-        //    with the fill).
+        // ── Page background: fill the physical surface first, then switch to
+        //    logical CSS coordinates for the whole page. This makes background
+        //    images, borders, text and embedded content participate in the same
+        //    crisp zoom transform rather than being resampled afterwards.
         Color pageBackground = BrowserRuntime.ResolveBackground(ResolveBodyBackgroundColor(document));
         using (var bgBrush = new SolidBrush(pageBackground))
         {
             g.FillRectangle(bgBrush, 0, 0, bmp.Width, bmp.Height);
         }
-        PaintBodyBackgroundImage(document, images, g, bmp.Width, bmp.Height);
+
+        int zoomState = g.Save();
+        if (Math.Abs(renderScale - 1f) > 0.0005f)
+            g.ScaleTransform(renderScale, renderScale);
+        PaintBodyBackgroundImage(document, images, g, docWidth, docHeight);
 
         try
         {
@@ -208,6 +217,7 @@ public class Renderer
                 errFont, errBrush, 8f, Math.Max(8f, bmp.Height - 24f));
         }
 
+        g.Restore(zoomState);
         return bmp;
     }
 
