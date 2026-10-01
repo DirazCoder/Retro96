@@ -61,6 +61,11 @@ public class ImageCache : IDisposable
     /// </summary>
     public event Action<string>? ImageRecovered;
 
+    /// <summary>Raised once when an image finishes decoding successfully and is cached.
+    /// The shell uses this to move newly discovered animated GIFs from the static
+    /// display list into the dynamic GPU image path without polling every frame.</summary>
+    public event Action<string>? ImageLoaded;
+
     private sealed class AnimationState
     {
         public int FrameIndex;
@@ -241,6 +246,7 @@ public class ImageCache : IDisposable
                     }
                     _cache[absoluteUrl] = dataDecoded;
                     NaturalImageSizes.Register(absoluteUrl, dataDecoded);
+                    try { ImageLoaded?.Invoke(absoluteUrl); } catch { }
                     return dataDecoded;
                 }
 
@@ -298,6 +304,7 @@ public class ImageCache : IDisposable
 
                 _cache[absoluteUrl] = fileDecoded;
                 NaturalImageSizes.Register(absoluteUrl, fileDecoded);
+                try { ImageLoaded?.Invoke(absoluteUrl); } catch { }
                 return fileDecoded;
             }
 
@@ -384,6 +391,7 @@ public class ImageCache : IDisposable
 
             _cache[absoluteUrl] = decoded;
             NaturalImageSizes.Register(absoluteUrl, decoded);
+            try { ImageLoaded?.Invoke(absoluteUrl); } catch { }
             Retro96.DebugLog.Write($"[IMAGE] cached url='{absoluteUrl}'");
             if (_wasTransient.TryRemove(absoluteUrl, out _))
             {

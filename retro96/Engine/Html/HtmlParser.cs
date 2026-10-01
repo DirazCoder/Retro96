@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Network;
+using Retro96.Engine.Js;
 
 namespace Retro96.Engine.Html;
 
@@ -1138,45 +1139,54 @@ public static class HtmlParser
             if (_onScript == null)
                 return "";
 
+            string language = scriptElement.GetAttrOrDefault("language", "").Trim().ToLowerInvariant();
+            string type = scriptElement.GetAttrOrDefault("type", "").Trim().ToLowerInvariant();
+            bool vbScript = language.StartsWith("vbscript", StringComparison.Ordinal) ||
+                            type.StartsWith("text/vbscript", StringComparison.Ordinal) ||
+                            type.StartsWith("application/vbscript", StringComparison.Ordinal) ||
+                            type.StartsWith("application/x-vbscript", StringComparison.Ordinal);
+            bool javaScript = language.Length == 0 ||
+                              language.StartsWith("java", StringComparison.Ordinal) ||
+                              language.StartsWith("jscript", StringComparison.Ordinal) ||
+                              language.StartsWith("ecmascript", StringComparison.Ordinal) ||
+                              language.StartsWith("livescript", StringComparison.Ordinal) ||
+                              type.Length == 0 ||
+                              type.StartsWith("text/javascript", StringComparison.Ordinal) ||
+                              type.StartsWith("application/javascript", StringComparison.Ordinal) ||
+                              type.StartsWith("application/ecmascript", StringComparison.Ordinal);
+
+            if (!vbScript && !javaScript)
+                return "";
+
             // Classic browsers execute an external script synchronously at
             // the point where the parser encounters </script>. Resolve and
             // fetch through the shell's scheme-aware resource pipeline, then
-            // feed the resulting source into the same JS executor as inline
-            // script. A failed external resource is simply skipped, matching
-            // the existing non-fatal script-error policy.
+            // feed the resulting source into the same in-process JS runtime.
+            // VBScript is translated to the browser's supported JS 1.2 surface
+            // before execution, which also keeps event-handler functions defined
+            // by VBScript visible to the existing DOM bindings.
+            string? source = null;
             if (scriptElement.HasAttr("src"))
             {
                 if (_loadExternalScript == null) return "";
                 string src = scriptElement.GetAttrOrDefault("src", "").Trim();
                 if (src.Length == 0) return "";
-                try
-                {
-                    string? external = _loadExternalScript(_doc, src);
-                    if (string.IsNullOrEmpty(external)) return "";
-                    return _onScript(_doc, external) ?? "";
-                }
-                catch
-                {
-                    return "";
-                }
+                try { source = _loadExternalScript(_doc, src); }
+                catch { return ""; }
+            }
+            else
+            {
+                var textNode = scriptElement.Children.OfType<DomText>().FirstOrDefault();
+                source = textNode?.Data;
             }
 
-            string language = scriptElement.GetAttrOrDefault("language", "").ToLowerInvariant();
-            string type = scriptElement.GetAttrOrDefault("type", "").ToLowerInvariant();
-            if (language.Length > 0 &&
-                !(language.StartsWith("java") || language.StartsWith("jscript") ||
-                  language.StartsWith("ecmascript") || language.StartsWith("livescript")))
-                return "";
-            if (type.Length > 0 && type != "text/javascript")
-                return "";
-
-            var textNode = scriptElement.Children.OfType<DomText>().FirstOrDefault();
-            if (textNode == null || string.IsNullOrEmpty(textNode.Data))
+            if (string.IsNullOrEmpty(source))
                 return "";
 
             try
             {
-                return _onScript(_doc, textNode.Data) ?? "";
+                string executable = vbScript ? VbScriptTranslator.Translate(source) : source;
+                return _onScript(_doc, executable) ?? "";
             }
             catch
             {

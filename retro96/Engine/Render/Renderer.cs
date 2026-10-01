@@ -59,6 +59,11 @@ public class Renderer
     private static readonly Dictionary<Color, SKPaint> _fillPaints = new();
     private static readonly Dictionary<(Color Color, int Width), SKPaint> _strokePaints = new();
 
+    // Marquee timing is scoped to this renderer/document rather than tied to
+    // process uptime. BEHAVIOR=slide therefore starts at the entry edge when
+    // the marquee is first painted, makes one traversal, then stays parked.
+    private readonly Dictionary<DomElement, long> _marqueeStartTicks = new();
+
     private static SKPaint CreateFillPaint(Color c, bool antialias = true) => new()
     {
         Color = c.ToSkColor(),
@@ -465,7 +470,9 @@ public class Renderer
                                DomElement? focusedElement = null,
                                float renderScale = 1f,
                                bool clearBackground = true,
-                               GRContext? gpuContext = null)
+                               GRContext? gpuContext = null,
+                               bool skipAnimatedContent = false,
+                               bool skipAnimatedImages = false)
     {
         ArgumentNullException.ThrowIfNull(canvas);
         ArgumentNullException.ThrowIfNull(rootBox);
@@ -498,7 +505,8 @@ public class Renderer
             try
             {
                 canvas.Translate(-_scrollX, -_scrollY);
-                PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement);
+                PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement,
+                    skipAnimatedContent, skipAnimatedImages);
                 if (showBoxOutlines)
                     PaintBoxOutlines(g, rootBox);
             }
@@ -621,11 +629,20 @@ public class Renderer
 
     private void PaintBox(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                           ImageCache images, DomElement? hoveredElement,
-                          bool blinkVisible, DomElement? focusedElement = null)
+                          bool blinkVisible, DomElement? focusedElement = null,
+                          bool skipAnimatedContent = false, bool skipAnimatedImages = false)
     {
         if (box == null) return;
 
         if (box.Element?.Style?.Visibility == VisibilityValue.Hidden)
+            return;
+
+        // Animation subtrees are omitted from the cached display list so the
+        // High-refresh animation path can redraw only those boxes directly on the GPU
+        // without rebuilding the entire page display list on every frame.
+        if (skipAnimatedContent && IsAnimatedSubtree(box.Element))
+            return;
+        if (skipAnimatedImages && IsAnimatedImageBox(box, images))
             return;
 
         // <blink> content toggles on the shell's timer.  The layout engine
@@ -688,7 +705,8 @@ public class Renderer
             // failure, log it, keep painting the rest of the page.
             try
             {
-                PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
+                PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement,
+                    skipAnimatedContent, skipAnimatedImages);
             }
             catch (Exception ex)
             {
@@ -702,12 +720,78 @@ public class Renderer
 
     // ── Marquee ─────────────────────────────────────────────────────
 
+    // Each marquee gets its own animation epoch so page load/repaint order does
+    // not inherit an arbitrary phase from system uptime. This is essential for
+    // BEHAVIOR=slide, which must start at the entry edge and never wrap.
+    private long GetMarqueeElapsedMs(DomElement elem, long now)
+    {
+        if (!_marqueeStartTicks.TryGetValue(elem, out long start))
+        {
+            start = now;
+            _marqueeStartTicks[elem] = start;
+            return 0L;
+        }
+
+        long elapsed = now - start;
+        return elapsed < 0L ? 0L : elapsed;
+    }
+
+    internal float GetMarqueeTranslationX(LayoutBox marqueeBox, long now)
+    {
+        var elem = marqueeBox.Element;
+        if (elem == null) return 0f;
+        var rect = marqueeBox.ContentRect;
+        if (rect.Width <= 0f || rect.Height <= 0f) return 0f;
+
+        float contentW = 0f;
+        foreach (var child in marqueeBox.Children)
+            contentW = Math.Max(contentW,
+                child.X + child.BorderLeft + child.PaddingLeft + child.Width - marqueeBox.X);
+        if (contentW <= 0f) return 0f;
+
+        float scrollAmount = Math.Clamp(elem.GetAttrInt("scrollamount", 6), 1, 4096);
+        int scrollDelay = Math.Clamp(elem.GetAttrInt("scrolldelay", 85), 1, 60_000);
+        string behavior = elem.GetAttrOrDefault("behavior", "scroll").Trim().ToLowerInvariant();
+        bool rightward = elem.GetAttrOrDefault("direction", "left").Trim().ToLowerInvariant() == "right";
+        float pxPerMs = scrollAmount / (float)scrollDelay;
+        long elapsedMs = GetMarqueeElapsedMs(elem, now);
+
+        switch (behavior)
+        {
+            case "alternate":
+                {
+                    float span = Math.Max(1f, rect.Width - contentW);
+                    long cycleMs = Math.Max(1L,
+                        (long)Math.Ceiling((2f * span) / Math.Max(0.0001f, pxPerMs)));
+                    float pos = (elapsedMs % cycleMs) * pxPerMs;
+                    if (pos > span) pos = 2f * span - pos;
+                    return rightward ? pos : (rect.Width - contentW) - pos;
+                }
+
+            case "slide":
+                {
+                    // Slide is one pass only: enter fully from the requested
+                    // edge, travel across the marquee viewport, then stop at the
+                    // resting edge. Never modulo the elapsed time.
+                    float done = Math.Clamp(elapsedMs * pxPerMs, 0f, rect.Width);
+                    return rightward ? -contentW + done : rect.Width - done;
+                }
+
+            default: // scroll
+                {
+                    float travel = rect.Width + contentW;
+                    long cycleMs = Math.Max(1L,
+                        (long)Math.Ceiling(travel / Math.Max(0.0001f, pxPerMs)));
+                    float pos = (elapsedMs % cycleMs) * pxPerMs;
+                    return rightward ? -contentW + pos : rect.Width - pos;
+                }
+        }
+    }
+
     /// <summary>
-    /// Paints a &lt;marquee&gt;'s children shifted by the current scroll phase.
-    /// Supports BEHAVIOR=scroll (default) / alternate / slide, DIRECTION=
-    /// left (default) / right, SCROLLAMOUNT (px per move, default 6) and
-    /// SCROLLDELAY (ms per move, default 85). The phase derives from
-    /// wall-clock time so the speed is exact even when repaints are sparse.
+    /// Paints a &lt;marquee&gt;'s children shifted by the current animation phase.
+    /// The content is clipped to the marquee viewport and replayed directly on
+    /// the GPU animation path. BEHAVIOR=slide makes one traversal and parks.
     /// </summary>
     private void PaintMarqueeContent(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                      ImageCache images, DomElement? hoveredElement,
@@ -717,7 +801,6 @@ public class Renderer
         var rect = box.ContentRect;
         if (rect.Width <= 0f || rect.Height <= 0f) return;
 
-        // BGCOLOR face (era default: no fill unless given)
         string? bg = elem.GetAttr("bgcolor");
         if (!string.IsNullOrEmpty(bg))
         {
@@ -727,95 +810,114 @@ public class Renderer
                     g.FillRectangle(brush, rect);
         }
 
-        // Content extent laid out at the marquee's width
         float contentW = 0f;
         foreach (var child in box.Children)
             contentW = Math.Max(contentW,
                 child.X + child.BorderLeft + child.PaddingLeft + child.Width - box.X);
         if (contentW <= 0f) return;
 
-        // FIX: attribute clamps — SCROLLDELAY=0 used to divide by zero and
-        // absurd values overflowed the phase arithmetic.
-        float scrollAmount = Math.Clamp(elem.GetAttrInt("scrollamount", 6), 1, 4096);
-        int scrollDelay = Math.Clamp(elem.GetAttrInt("scrolldelay", 85), 1, 60_000);
-        string behavior = (elem.GetAttrOrDefault("behavior", "scroll")).Trim().ToLowerInvariant();
-        bool rightward = (elem.GetAttrOrDefault("direction", "left")).Trim().ToLowerInvariant() == "right";
+        string behavior = elem.GetAttrOrDefault("behavior", "scroll").Trim().ToLowerInvariant();
+        bool rightward = elem.GetAttrOrDefault("direction", "left").Trim().ToLowerInvariant() == "right";
+        float translationX = GetMarqueeTranslationX(box, Environment.TickCount64);
+        float travel = rect.Width + contentW;
 
-        // FIX: the phase used TickCount64 % 1_000_000 (exactly 1000 s) — the
-        // wrap is NOT a multiple of the travel distance, so every ~16.7
-        // minutes the marquee visibly snapped back to its start.  The modulo
-        // period is now derived from the traversal cycle, making the wrap
-        // seamless by construction.
-        float pxPerMs = scrollAmount / scrollDelay;   // = (1000/delay)·amount/1000
-        float originX = box.X;
-        float travel = rect.Width + contentW;   // full traversal distance
-        float baseX;
-
-        switch (behavior)
-        {
-            case "alternate":
-                {
-                    // Bounce between the two edges; amplitude shrinks when the
-                    // content is wider than the box (clip shows the middle run).
-                    float span = Math.Max(1f, rect.Width - contentW);
-                    long cycleMs = Math.Max(1L, (long)((2f * span) / pxPerMs));
-                    float pos = (Environment.TickCount64 % cycleMs) * pxPerMs;
-                    if (pos > span) pos = 2f * span - pos;
-                    baseX = rightward
-                        ? originX + pos                              // left edge → right edge
-                        : originX + (rect.Width - contentW) - pos;   // right → left
-                    break;
-                }
-            case "slide":
-                {
-                    // One pass, then parked at the resting edge (left edge for
-                    // direction=left, right edge for direction=right).  The 24h
-                    // modulo only bounds the float's magnitude; Min parks it.
-                    float elapsed = (Environment.TickCount64 % 86_400_000L) * pxPerMs;
-                    float done = Math.Min(elapsed, rect.Width);
-                    baseX = rightward
-                        ? originX - contentW + done
-                        : originX + rect.Width - done;
-                    break;
-                }
-            default: // scroll — enters from the off edge, wraps seamlessly
-                {
-                    long cycleMs = Math.Max(1L, (long)(travel / pxPerMs));
-                    float pos = (Environment.TickCount64 % cycleMs) * pxPerMs;
-                    baseX = rightward
-                        ? originX - contentW + pos         // starts off-left, travels right
-                        : originX + rect.Width - pos;      // starts off-right, travels left
-                    break;
-                }
-        }
-
-        var clip = g.Save();
-        g.SetClip(rect, SKClipOperation.Intersect);
-
-        // SCROLL draws a second copy one travel-distance behind the first,
-        // so as one copy exits the visible edge the next is already
-        // entering — the seamless wrap every 1996 marquee had.
-        bool dual = behavior == "scroll";
-
+        int marqueeState = g.Save();
         try
         {
-            g.Canvas.Translate(baseX - originX, 0f);
+            g.SetClip(rect, SKClipOperation.Intersect);
+            g.Canvas.Translate(translationX, 0f);
             foreach (var child in PaintOrder(box))
-                PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
+                PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement, false);
 
-            if (dual)
+            if (behavior == "scroll")
             {
                 float secondDx = rightward ? -travel : travel;
                 g.Canvas.Translate(secondDx, 0f);
-                foreach (var child in box.Children)
-                    PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
+                foreach (var child in PaintOrder(box))
+                    PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement, false);
             }
         }
         finally
         {
-            g.Canvas.ResetMatrix();
-            g.Restore(clip);
+            // Restore both the marquee clip and the caller's transform. Do not
+            // ResetMatrix here: the renderer may be inside a zoomed page, frame,
+            // or nested marquee, and resetting to identity loses that parent
+            // transform and makes later content jump to the wrong position.
+            g.Restore(marqueeState);
         }
+    }
+
+    /// <summary>Paints a single animated image box directly into the caller's GPU canvas.
+    /// The image is sampled at paint time, so GIF frame advancement never requires
+    /// rebuilding the static page display list.
+    /// </summary>
+    internal void RenderAnimatedImageToCanvas(SKCanvas canvas, LayoutBox box,
+                                              DomDocument document, ImageCache images,
+                                              GRContext? gpuContext = null)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(box);
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(images);
+
+        _baseUrl = document.BaseUrl?.ToAbsolute();
+        using var g = new SkiaRenderContext(canvas, gpuContext);
+        PaintImage(g, box, images);
+    }
+
+    /// <summary>Paints one animation subtree directly into the caller's GPU canvas.
+    /// Unlike RenderToCanvas this never clears the surface or rebuilds unrelated
+    /// page content, so marquee motion and blink repaints stay on the GPU fast path.
+    /// </summary>
+    internal void RenderAnimatedBoxToCanvas(SKCanvas canvas, LayoutBox box,
+                                            DomDocument document, FontCache fonts,
+                                            ImageCache images,
+                                            DomElement? hoveredElement,
+                                            bool blinkVisible,
+                                            DomElement? focusedElement = null,
+                                            GRContext? gpuContext = null)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(box);
+        ArgumentNullException.ThrowIfNull(document);
+
+        _baseUrl = document.BaseUrl?.ToAbsolute();
+        using var g = new SkiaRenderContext(canvas, gpuContext);
+        PaintBox(g, box, fonts, images, hoveredElement, blinkVisible, focusedElement,
+            skipAnimatedContent: false);
+    }
+
+    private bool IsAnimatedImageBox(LayoutBox box, ImageCache images)
+    {
+        var element = box.Element;
+        if (element == null || box.BoxType != BoxType.Replaced ||
+            !element.TagName.Equals("img", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string? src = element.GetAttr("src");
+        if (string.IsNullOrWhiteSpace(src)) return false;
+        try
+        {
+            return images.IsAnimated(ImageCache.ResolveUrl(src, _baseUrl));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsAnimatedSubtree(DomElement? elem)
+        => (BrowserRuntime.BlinkEnabled && InsideBlink(elem)) ||
+           (BrowserRuntime.MarqueeEnabled && InsideMarquee(elem));
+
+    private static bool InsideMarquee(DomElement? elem)
+    {
+        for (var node = (DomNode?)elem; node != null; node = node.Parent)
+        {
+            if (node is DomElement de && de.TagName == "marquee")
+                return true;
+        }
+        return false;
     }
 
     /// <summary>True when the element is, or descends from, a &lt;blink&gt;.</summary>
@@ -1831,11 +1933,23 @@ public class Renderer
     {
         try
         {
-            var task = images.GetAsync(absoluteUrl, _resourceLoader, default);
-            if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
+            // The high-refresh animated-image path calls PaintImage every
+            // display frame. Once decoded, avoid allocating an async Task and
+            // touching the loader on every paint; GetCurrentFrame is the cheap
+            // time-based sampler for cached images.
+            if (images.IsLoaded(absoluteUrl) && !images.IsBroken(absoluteUrl))
             {
-                frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
-                return true;
+                frame = images.GetCurrentFrame(absoluteUrl);
+                if (frame != null) return true;
+            }
+            else
+            {
+                var task = images.GetAsync(absoluteUrl, _resourceLoader, default);
+                if (task.IsCompletedSuccessfully && task.Result?.Frames.Count > 0)
+                {
+                    frame = images.GetCurrentFrame(absoluteUrl) ?? task.Result.Frames[0];
+                    return true;
+                }
             }
         }
         catch { }
@@ -2258,7 +2372,22 @@ public class Renderer
             if (isPassword && box.Element != null)
             {
                 int length = text.Length;
-                DrawPasswordMaskRange(g, length, font, brush, textRect.X, textRect.Y,
+                float glyphWidth = font.SkFont.MeasureText("*");
+                if (!float.IsFinite(glyphWidth) || glyphWidth <= 0f)
+                    glyphWidth = MathF.Max(1f, font.Size * 0.5f);
+                float advance = MathF.Max(1f, MathF.Round((glyphWidth + 1.25f) * 4f) / 4f);
+                float totalWidth = length * advance;
+                float passwordX = textRect.X;
+                if (totalWidth < textRect.Width - 0.01f)
+                {
+                    passwordX = textAlign switch
+                    {
+                        SKTextAlign.Center => textRect.X + (textRect.Width - totalWidth) * 0.5f,
+                        SKTextAlign.Right => textRect.Right - totalWidth,
+                        _ => textRect.X
+                    };
+                }
+                DrawPasswordMaskRange(g, length, font, brush, passwordX, textRect.Y,
                     textRect.Height, 0, length);
             }
             else
@@ -2285,8 +2414,18 @@ public class Renderer
             glyphWidth = MathF.Max(1f, font.Size * 0.5f);
         float advance = MathF.Max(1f, MathF.Round((glyphWidth + 1.25f) * 4f) / 4f);
 
+        // Use the same centered-in-line metrics as ordinary control text. The
+        // previous x/y overload treated y as a baseline, so password masks were
+        // painted at the top of the input instead of vertically centered. A
+        // per-glyph rectangle also makes the horizontal alignment deterministic.
+        var glyphOptions = new SkiaTextOptions(
+            SKTextAlign.Center, verticalCenter: true, clip: true, ellipsis: false);
         for (int i = start; i < end; i++)
-            g.DrawString("*", font, paint, x + i * advance, y, TypographicText);
+        {
+            var glyphRect = new RectangleF(
+                x + i * advance, y, Math.Max(1f, advance), Math.Max(1f, height));
+            g.DrawString("*", font, paint, glyphRect, glyphOptions);
+        }
     }
 
     private static void PaintCheckboxOrRadio(SkiaRenderContext g, LayoutBox box, bool isRadio)

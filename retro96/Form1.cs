@@ -431,7 +431,12 @@ public partial class Form1 : Form
         _statusLabel.Margin = Padding.Empty;
         _statusLabel.Padding = new Padding(4, 0, 4, 0);
         _statusLabel.DisplayStyle = ToolStripItemDisplayStyle.Text;
-        _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
+        // Website-driven window.status tickers rely on the native status bar's
+        // leading edge and often pad/rotate the string themselves. Centering the
+        // label made those updates appear trapped in a small band in the middle
+        // of the strip. Use the full spring-expanded strip from the left edge so
+        // the site's own horizontal ticker can traverse the entire available area.
+        _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _statusLabel.Text = "Ready";
         _statusLabel.Spring = true;
 
