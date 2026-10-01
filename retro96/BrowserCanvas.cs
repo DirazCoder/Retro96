@@ -5560,21 +5560,30 @@ public class BrowserCanvas : SKGLControl
             if (el.HasAttr("disabled"))
                 return;
 
-            string type = el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
             if (IsEditableField(el))
             {
                 if (HandleEditableFieldMouseDown(el, deepest!, x, y, null, _jsInterpreter, e))
                     return;
                 return;
             }
-            if (!IsPageSelectableControl(el))
-                return;
 
-            // Keep the pressed visual/activation state, but allow the pointer
-            // to fall through to the page range model so dragging can select
-            // the control's label instead of suppressing selection entirely.
+            // Paint the native-looking Win95 press immediately.  The chrome is
+            // recorded into the cached display list, so merely invalidating the
+            // control is not enough after changing PressedElement.
             _pressedControl = el;
             _pressedControlFrame = null;
+            RerenderNow();
+
+            if (!IsPageSelectableControl(el))
+            {
+                // Push buttons and other activation-only controls must own the
+                // pointer until mouse-up so their click is delivered reliably.
+                Capture = true;
+                return;
+            }
+
+            // Selectable controls still fall through to the page range model so
+            // dragging can select their label instead of suppressing selection.
         }
 
         // Page text selection drag.  FIX: a fresh press on blank space used

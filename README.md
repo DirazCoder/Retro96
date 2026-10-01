@@ -6,7 +6,7 @@ Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** `retro96/` alone is around 57k lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), a JDK 1.1 bytecode interpreter for Java applets, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This project alone is around 80K lines (entire codebase repo if you count every file) — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), a JDK 1.1 bytecode interpreter for Java applets, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -153,7 +153,7 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project is roughly 25k lines. Retro96 is roughly 57k. one of them works
+the Rust project is roughly 29k lines. Retro96 is roughly 80k. one of them works
 
 ## Status
 
