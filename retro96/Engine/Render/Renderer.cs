@@ -819,6 +819,21 @@ public class Renderer
         string behavior = elem.GetAttrOrDefault("behavior", "scroll").Trim().ToLowerInvariant();
         bool rightward = elem.GetAttrOrDefault("direction", "left").Trim().ToLowerInvariant() == "right";
         float translationX = GetMarqueeTranslationX(box, Environment.TickCount64);
+
+        // The marquee is repainted every display frame directly onto the GPU.
+        // Feeding a glyph run a continuously-changing fractional X position can
+        // make Skia re-rasterize the glyph edges differently on successive frames,
+        // which is perceived as a tiny horizontal wobble (especially while the
+        // page itself is being scrolled).  Keep the animation clock continuous,
+        // but quantize only the final marquee translation to one device pixel so
+        // the text samples a stable raster position while still advancing at the
+        // display refresh cadence.
+        float deviceScaleX = MathF.Abs(g.Canvas.TotalMatrix.ScaleX);
+        if (!float.IsFinite(deviceScaleX) || deviceScaleX < 0.01f)
+            deviceScaleX = 1f;
+        float devicePixel = 1f / deviceScaleX;
+        translationX = MathF.Round(translationX / devicePixel) * devicePixel;
+
         float travel = rect.Width + contentW;
 
         int marqueeState = g.Save();
