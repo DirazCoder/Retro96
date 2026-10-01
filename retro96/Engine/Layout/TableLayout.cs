@@ -11,7 +11,7 @@ namespace Retro96.Engine.Layout;
 /// <summary>
 /// Implements the 1996 auto table layout algorithm (pre-CSS2.1 table-layout).
 ///
-/// Column sizing uses real GDI text measurement (via InlineLayout's font
+/// Column sizing uses SkiaSharp text measurement (via InlineLayout's font
 /// cache) instead of character-count estimates, so proportional fonts size
 /// columns the way Netscape did.  The table's own width is shrink-to-fit by
 /// default: preferred content width, capped at the available width, floored
@@ -1212,7 +1212,7 @@ public static class TableLayout
 
     // Small safety margin on top of the fragment-matched measurement above:
     // even with matching fragmentation, float summation order and per-call
-    // GDI rounding can still land a hair apart. A couple of spare pixels
+    // font-metric rounding can still land a hair apart. A couple of spare pixels
     // costs nothing visually and removes any remaining razor-edge wraps —
     // cheaper than chasing the last fraction of a pixel of "exactness".
     private const float PrefWidthSlack = 2f;
@@ -1221,7 +1221,7 @@ public static class TableLayout
         Math.Max(1f, MeasurePref(cell)) + PrefWidthSlack + 2f * cellPadding + 2f * borderWidth;
 
     /// <summary>
-    /// Minimum width: the widest unbreakable word (real GDI measurement).
+    /// Minimum width: the widest unbreakable word (SkiaSharp measurement).
     /// PRE text never wraps, so its minimum is the full line width.
     /// </summary>
     private static float MeasureMin(LayoutBox box)
@@ -1377,7 +1377,7 @@ public static class TableLayout
     }
 
     /// <summary>
-    /// Preferred width: full unconstrained content width (real GDI
+    /// Preferred width: full unconstrained content width (SkiaSharp
     /// measurement), with the same sum-inline / max-block child discipline.
     /// </summary>
     private static float MeasurePref(LayoutBox box)

@@ -333,7 +333,7 @@ internal static class JavaAwtComponent
             if (i.Receiver.AsObject()?.NativeState is not JavaImageState st) return JValue.Ref(null);
             // getGraphics on an offscreen image is the double-buffering
             // entry point.
-            var g = Retro96.Drawing.Graphics.FromImage(st.Bitmap);
+            var g = Retro96.Drawing.Graphics.FromBitmap(st.Bitmap);
             return JValue.Ref(vm.GraphicsFactory.CreateGraphics(g, st.Bitmap.Width, st.Bitmap.Height));
         });
         vm.RegisterNative(c.Name, "flush", "()V", i =>

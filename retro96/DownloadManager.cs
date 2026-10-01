@@ -16,6 +16,7 @@ public sealed class DownloadItem
     public string? Error { get; internal set; }
     internal CancellationTokenSource Cancellation { get; } = new();
     public double? Progress => TotalBytes is > 0 ? Math.Min(1d, (double)BytesDownloaded / TotalBytes.Value) : null;
+    public string ProgressDisplay => Progress is double p ? $"{p:P0}" : "…";
 }
 
 internal sealed class DownloadManager : IDisposable
@@ -109,7 +110,13 @@ internal sealed class DownloadsDialog : Form
         _grid.MultiSelect = false;
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "File", DataPropertyName = nameof(DownloadItem.FileName), Width = 210 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "URL", DataPropertyName = nameof(DownloadItem.Url), Width = 380 });
-        _grid.Columns.Add(new DownloadProgressColumn { HeaderText = "Progress", Width = 180, SortMode = DataGridViewColumnSortMode.NotSortable });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Progress",
+            Width = 180,
+            SortMode = DataGridViewColumnSortMode.NotSortable,
+            DataPropertyName = nameof(DownloadItem.ProgressDisplay)
+        });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             HeaderText = "Status",
@@ -188,53 +195,6 @@ internal sealed class DownloadsDialog : Form
         Resize += (_, _) => UpdateGridColumns();
         Shown += (_, _) => UpdateGridColumns();
         RefreshGrid();
-    }
-
-    private sealed class DownloadProgressColumn : DataGridViewColumn
-    {
-        public DownloadProgressColumn() : base(new DownloadProgressCell())
-        {
-            HeaderText = "Progress";
-            Width = 180;
-            SortMode = DataGridViewColumnSortMode.NotSortable;
-        }
-    }
-
-    private sealed class DownloadProgressCell : DataGridViewCell
-    {
-        public override Type ValueType => typeof(double);
-        public override Type FormattedValueType => typeof(double);
-        public override object Clone() => new DownloadProgressCell();
-
-        protected override void Paint(Graphics graphics, Rectangle clipBounds, Rectangle cellBounds, int rowIndex,
-            DataGridViewElementStates cellState, object? value, object? formattedValue, string? errorText,
-            DataGridViewCellStyle cellStyle, DataGridViewAdvancedBorderStyle advancedBorderStyle,
-            DataGridViewPaintParts paintParts)
-        {
-            base.Paint(graphics, clipBounds, cellBounds, rowIndex, cellState, null, null, errorText,
-                cellStyle, advancedBorderStyle, paintParts & ~DataGridViewPaintParts.ContentForeground);
-
-            double? progress = value is double d ? d : formattedValue is double f ? f : null;
-            int x = cellBounds.X + 6;
-            int y = cellBounds.Y + Math.Max(4, (cellBounds.Height - 16) / 2);
-            int w = Math.Max(10, cellBounds.Width - 12);
-            int h = 14;
-            using var border = new Pen(SystemColors.ControlDark);
-            using var back = new SolidBrush(SystemColors.Window);
-            using var fill = new SolidBrush(SystemColors.Highlight);
-            graphics.FillRectangle(back, x, y, w, h);
-            graphics.DrawRectangle(border, x, y, w - 1, h - 1);
-            if (progress.HasValue)
-            {
-                int fillWidth = (int)Math.Round(Math.Clamp(progress.Value, 0d, 1d) * (w - 2));
-                if (fillWidth > 0) graphics.FillRectangle(fill, x + 1, y + 1, fillWidth, h - 2);
-            }
-            else
-            {
-                using var brush = new SolidBrush(SystemColors.GrayText);
-                graphics.DrawString("…", cellStyle.Font ?? SystemFonts.DefaultFont, brush, x + w / 2f - 4, y - 2);
-            }
-        }
     }
 
     private void UpdateGridColumns()
@@ -342,7 +302,7 @@ internal sealed class DownloadsDialog : Form
             _grid.Rows.Clear();
             foreach (var item in items)
             {
-                int rowIndex = _grid.Rows.Add(item.FileName, item.Url, item.Progress.HasValue ? (object)item.Progress.Value : null!, item.Status.ToString());
+                int rowIndex = _grid.Rows.Add(item.FileName, item.Url, item.ProgressDisplay, item.Status.ToString());
                 var row = _grid.Rows[rowIndex];
                 row.Tag = item;
                 row.Cells[3].ToolTipText = item.Error ?? string.Empty;

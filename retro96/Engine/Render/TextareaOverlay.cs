@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Retro96.Drawing;
+using SkiaSharp;
 
 namespace Retro96.Engine.Render;
 
@@ -40,6 +41,183 @@ public static class TextareaOverlay
             g.DrawString(text[start..end], font, brush,
                 new RectangleF(x, drawY, Math.Max(1f, width), lineHeight), format);
         }
+    }
+
+    // Direct SkiaSharp rendering/layout overloads used by the main page renderer.
+    // The legacy Graphics overloads remain for shell hit-testing/selection code
+    // that has not yet been migrated.
+    internal static void DrawLines(SKCanvas canvas, string text, Font font,
+                                   List<(int Start, int End)> lines,
+                                   SKPaint paint, float x, float y,
+                                   float width, float lineHeight,
+                                   int scrollLine = 0)
+    {
+        int first = Math.Max(0, scrollLine);
+        for (int line = first; line < lines.Count; line++)
+        {
+            var (start, end) = lines[line];
+            if (end <= start) continue;
+            float drawY = y + (line - scrollLine) * lineHeight;
+            if (drawY + lineHeight < y - lineHeight) continue;
+            float baseline = drawY + font.AscentPx;
+            canvas.DrawText(text[start..end], x, baseline,
+                SKTextAlign.Left, font.SkFont, paint);
+        }
+    }
+
+    internal static Layout CalculateLayout(SKCanvas canvas, string text, Font font,
+                                           float faceWidth, float faceHeight, bool wrapOff)
+    {
+        text ??= string.Empty;
+        float fullViewport = Math.Max(1f, faceWidth - 6f);
+        float lineHeight = Math.Max(1f, font.GetHeight());
+        int visibleLines = Math.Max(1, (int)Math.Floor(
+            Math.Max(1f, faceHeight - 4f) / lineHeight));
+
+        var fullLines = BreakLinesCoreSkia(text, font, fullViewport, wrapOff);
+        float fullTextWidth = MaxLineWidthSkia(text, font, fullLines);
+
+        if (fullLines.Count <= visibleLines || faceWidth < 16f)
+            return new Layout(fullLines, fullTextWidth, fullViewport,
+                lineHeight, visibleLines, false);
+
+        float reservedViewport = Math.Max(1f, fullViewport - ScrollbarGutter);
+        var reservedLines = BreakLinesCoreSkia(text, font, reservedViewport, wrapOff);
+        if (reservedLines.Count <= visibleLines)
+            return new Layout(fullLines, fullTextWidth, fullViewport,
+                lineHeight, visibleLines, false);
+
+        float reservedTextWidth = MaxLineWidthSkia(text, font, reservedLines);
+        return new Layout(reservedLines, reservedTextWidth,
+            reservedViewport, lineHeight, visibleLines, true);
+    }
+
+    private static List<(int Start, int End)> BreakLinesCoreSkia(
+        string text, Font font, float wrapWidth, bool wrapOff)
+    {
+        var lines = new List<(int Start, int End)>();
+        if (text.Length == 0)
+        {
+            lines.Add((0, 0));
+            return lines;
+        }
+
+        int segmentStart = 0;
+        int cursor = 0;
+        while (cursor <= text.Length)
+        {
+            int breakAt = cursor;
+            while (breakAt < text.Length && text[breakAt] is not ('\r' or '\n'))
+                breakAt++;
+
+            if (breakAt == segmentStart)
+                lines.Add((segmentStart, segmentStart));
+            else
+                AppendWrappedSegmentSkia(text, font, segmentStart, breakAt,
+                    wrapWidth, wrapOff, lines);
+
+            if (breakAt >= text.Length)
+                break;
+
+            cursor = breakAt + 1;
+            if (text[breakAt] == '\r' && cursor < text.Length && text[cursor] == '\n')
+                cursor++;
+
+            segmentStart = cursor;
+            if (segmentStart == text.Length)
+            {
+                lines.Add((text.Length, text.Length));
+                break;
+            }
+        }
+
+        return lines.Count == 0 ? new List<(int, int)> { (0, 0) } : lines;
+    }
+
+    private static void AppendWrappedSegmentSkia(
+        string text, Font font, int start, int end, float wrapWidth,
+        bool wrapOff, List<(int Start, int End)> lines)
+    {
+        if (start >= end)
+        {
+            lines.Add((start, end));
+            return;
+        }
+
+        int pos = start;
+        while (pos < end)
+        {
+            int lineEnd;
+            if (wrapOff)
+            {
+                lineEnd = end;
+            }
+            else
+            {
+                lineEnd = FindFittingEndSkia(text, font, pos, end, wrapWidth);
+                if (lineEnd <= pos)
+                    lineEnd = NextTextElementBoundary(text, pos, end);
+
+                if (lineEnd < end)
+                {
+                    int preferred = LastWhitespaceBoundary(text, pos, lineEnd);
+                    if (preferred > pos)
+                        lineEnd = preferred;
+                }
+            }
+
+            if (lineEnd <= pos)
+                lineEnd = Math.Min(end, pos + 1);
+            lines.Add((pos, lineEnd));
+            pos = lineEnd;
+        }
+    }
+
+    private static int FindFittingEndSkia(string text, Font font,
+                                          int start, int end, float maxWidth)
+    {
+        var boundaries = new List<int>();
+        int p = start;
+        while (p < end)
+        {
+            p = NextTextElementBoundary(text, p, end);
+            boundaries.Add(p);
+        }
+        if (boundaries.Count == 0) return start;
+
+        bool Fits(int boundary) =>
+            font.SkFont.MeasureText(text[start..boundary]) <= maxWidth + 0.01f;
+
+        if (!Fits(boundaries[0])) return boundaries[0];
+        if (Fits(boundaries[^1])) return boundaries[^1];
+
+        int lo = 0, hi = boundaries.Count - 1, best = 0;
+        while (lo <= hi)
+        {
+            int mid = lo + (hi - lo) / 2;
+            if (Fits(boundaries[mid]))
+            {
+                best = mid;
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        return boundaries[best];
+    }
+
+    private static float MaxLineWidthSkia(string text, Font font,
+                                          List<(int Start, int End)> lines)
+    {
+        float max = 0f;
+        foreach (var (start, end) in lines)
+        {
+            if (end <= start) continue;
+            max = Math.Max(max, font.SkFont.MeasureText(text[start..end]));
+        }
+        return max;
     }
 
     /// <summary>

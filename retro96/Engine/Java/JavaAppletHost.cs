@@ -4,6 +4,7 @@ using Retro96.Drawing;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
+using SkiaSharp;
 
 namespace Retro96.Engine.Java;
 
@@ -77,6 +78,71 @@ public sealed class JavaAppletHost : IDisposable
         || (string.Equals(element.TagName, "object", StringComparison.OrdinalIgnoreCase)
             && element.GetAttr("classid")?.StartsWith("java:", StringComparison.OrdinalIgnoreCase) == true);
 
+    /// <summary>Paints an applet directly into the active Skia canvas. The live
+    /// browser path never allocates a per-paint CPU bitmap for Java content.</summary>
+    public bool RenderToCanvas(SKCanvas canvas, DomElement element, LayoutBox box, bool printRendering, GRContext? gpuContext = null)
+    {
+        if (_disposed || printRendering || !IsJavaElement(element)) return false;
+
+        Instance? instance;
+        lock (_gate) _instances.TryGetValue(element, out instance);
+        if (instance == null)
+        {
+            RenderFallbackToCanvas(canvas, element, box);
+            return true;
+        }
+
+        int w = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Width > 0 ? box.ContentRect.Width : instance.State.Width));
+        int h = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Height > 0 ? box.ContentRect.Height : instance.State.Height));
+        instance.State.Width = w;
+        instance.State.Height = h;
+
+        var componentState = JavaComponentBridge.State(instance.Object);
+        componentState.Width = w;
+        componentState.Height = h;
+
+        int save = canvas.Save();
+        try
+        {
+            canvas.Translate(box.X, box.Y);
+            canvas.ClipRect(SKRect.Create(0, 0, w, h), SKClipOperation.Intersect, antialias: false);
+            canvas.Clear(componentState.Background.ToSkColor());
+
+            using var g = Graphics.FromCanvas(canvas, gpuContext);
+            g.SetClip(new RectangleF(0, 0, w, h));
+            instance.Vm.HostGraphics = g;
+            try
+            {
+                var graphics = instance.Vm.GraphicsFactory.CreateGraphics(g, w, h, gpuContext: gpuContext);
+                if (graphics.NativeState is JavaGraphicsState gs) gs.Background = componentState.Background;
+                instance.Vm.InvokeVirtual(instance.Object, "update", "(Ljava/awt/Graphics;)V", JValue.Ref(graphics));
+            }
+            finally
+            {
+                instance.Vm.HostGraphics = null;
+            }
+            return true;
+        }
+        catch (JvmException ex)
+        {
+            instance.Vm.HostGraphics = null;
+            Retro96.DebugLog.Write($"[JAVA] uncaught {ex.Object.Class.Name}: {ex.Object.NativeState}");
+            RenderFallbackToCanvas(canvas, element, box);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            instance.Vm.HostGraphics = null;
+            Retro96.DebugLog.WriteException("JavaApplet.paint", ex);
+            RenderFallbackToCanvas(canvas, element, box);
+            return true;
+        }
+        finally
+        {
+            canvas.RestoreToCount(save);
+        }
+    }
+
     public Bitmap? Resolve(DomElement element, LayoutBox box, bool printRendering)
     {
         if (_disposed || !IsJavaElement(element)) return null;
@@ -94,7 +160,7 @@ public sealed class JavaAppletHost : IDisposable
             componentState.Height = h;
 
             var bitmap = new Bitmap(w, h);
-            using var g = Graphics.FromImage(bitmap);
+            using var g = Graphics.FromBitmap(bitmap);
             g.Clear(componentState.Background);
             // The applet's own coordinate system starts at the top-left of
             // its area with the clip set to its bounds.
@@ -379,6 +445,38 @@ public sealed class JavaAppletHost : IDisposable
     // Alt/fallback rendering: the ALT attribute (or the element's inline
     // fallback text) drawn on the classic gray placeholder when the applet
     // cannot run.
+    private static void RenderFallbackToCanvas(SKCanvas canvas, DomElement element, LayoutBox box)
+    {
+        int w = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Width > 0 ? box.ContentRect.Width : box.Width));
+        int h = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Height > 0 ? box.ContentRect.Height : box.Height));
+        if (w <= 1 || h <= 1) return;
+        string? alt = element.GetAttr("alt");
+        if (string.IsNullOrWhiteSpace(alt)) alt = element.InnerText?.Trim();
+
+        int save = canvas.Save();
+        try
+        {
+            canvas.Translate(box.X, box.Y);
+            canvas.ClipRect(SKRect.Create(0, 0, w, h), SKClipOperation.Intersect, antialias: false);
+            using var bg = new SKPaint { Color = new SKColor(0xC0, 0xC0, 0xC0, 0xFF), IsAntialias = false };
+            using var border = new SKPaint { Color = SKColors.Gray, Style = SKPaintStyle.Stroke, StrokeWidth = 1, IsAntialias = false };
+            canvas.DrawRect(SKRect.Create(0, 0, w, h), bg);
+            canvas.DrawRect(SKRect.Create(0.5f, 0.5f, Math.Max(0, w - 1f), Math.Max(0, h - 1f)), border);
+            if (!string.IsNullOrWhiteSpace(alt))
+            {
+                using var typeface = SKTypeface.FromFamilyName("Arial");
+                using var font = new SKFont(typeface, 12f) { Edging = SKFontEdging.Antialias };
+                using var fg = new SKPaint { Color = SKColors.Black, IsAntialias = true };
+                float baseline = Math.Clamp((h + 12f) * 0.5f, 12f, Math.Max(12f, h - 2f));
+                canvas.DrawText(alt, 6f, baseline, SKTextAlign.Left, font, fg);
+            }
+        }
+        finally
+        {
+            canvas.RestoreToCount(save);
+        }
+    }
+
     private static Bitmap? RenderFallback(DomElement element, LayoutBox box)
     {
         int w = Math.Max(1, (int)Math.Ceiling(box.ContentRect.Width));
@@ -388,7 +486,7 @@ public sealed class JavaAppletHost : IDisposable
         if (string.IsNullOrWhiteSpace(alt)) alt = element.InnerText?.Trim();
         if (string.IsNullOrWhiteSpace(alt)) return null;
         var bitmap = new Bitmap(w, h);
-        using var g = Graphics.FromImage(bitmap);
+        using var g = Graphics.FromBitmap(bitmap);
         using var bg = new SolidBrush(Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(bg, 0, 0, w, h);
         using var border = new Pen(Color.Gray, 1);

@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net11.0-windows</TargetFramework>
+    <TargetFramework>net11.0-windows10.0.19041.0</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -23,7 +23,8 @@
     <!-- The exact property needed to suppress error NETSDK1175 -->
     <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
     <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
-    <NoWarn>\$(NoWarn);IL2104;IL2026;IL3000;IL3002;IL3050;IL3053;NETSDK1175</NoWarn>
+    <SuppressNETCoreSdkPreviewMessage>true</SuppressNETCoreSdkPreviewMessage>
+    <NoWarn>$(NoWarn);IL2104;IL2026;IL3000;IL3002;IL3050;IL3053;NETSDK1175;NETSDK1057</NoWarn>
 
     <!-- ========================================== -->
     <!-- MAXIMUM HIGH-PERFORMANCE ENGINE TUNING     -->
@@ -66,7 +67,7 @@
     <IlcTrimMetadata>true</IlcTrimMetadata>
   </PropertyGroup>
 
-  <!-- SkiaSharp replaced System.Drawing/GDI+ as the engine's rendering, 
+  <!-- SkiaSharp is the engine's rendering, 
        text-measurement and image-decoding stack. -->
   <ItemGroup>
     <!-- The WinForms SDK injects a GLOBAL `using System.Drawing;` which 
@@ -83,7 +84,8 @@
        Keeping the contract in the host also means the sandbox worker can hand the host
        assembly to PluginAssemblyLoadContext for the shared API type identity. -->
   <ItemGroup>
-    <PackageReference Include="SkiaSharp" Version="3.116.1" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <PackageReference Include="SkiaSharp.Views.WindowsForms" Version="4.153.1" />
   </ItemGroup>
 
   <!-- ========================================== -->

@@ -1,6 +1,6 @@
 // Retro96.Graphics — colour value type + HTML/CSS colour translation.
 //
-// Replaces System.Drawing.Color and ColorTranslator for the engine.  The
+// Engine-local colour types are backed directly by SkiaSharp. The
 // ARGB layout, the Empty/Transparent sentinels and the FromArgb overloads
 // keep the exact semantics the CSS resolver, the renderer and the shell
 // overlays were written against (Empty = "unset", Transparent = "alpha 0").
@@ -13,7 +13,7 @@ public readonly struct Color : IEquatable<Color>
     /// <summary>The unset colour — no alpha, no channels, not "transparent black".</summary>
     public static readonly Color Empty = default;
 
-    /// <summary>Fully transparent white (GDI-compatible sentinel).</summary>
+    /// <summary>Fully transparent white (legacy-compatible sentinel).</summary>
     public static readonly Color Transparent = new(0x00, 0xFF, 0xFF, 0xFF);
 
     public byte A { get; }
@@ -49,7 +49,7 @@ public readonly struct Color : IEquatable<Color>
     {
         if (NamedColors.TryGetValue(Normalize(name), out uint argb))
             return FromArgb(argb);
-        // GDI FromName returns a phantom zero colour for unknown names — the
+        // legacy FromName returns a phantom zero colour for unknown names — the
         // callers detect it via the all-zero check, so mirror that exactly.
         return default;
     }
@@ -57,7 +57,7 @@ public readonly struct Color : IEquatable<Color>
     private static string Normalize(string name) =>
         name.Trim().ToLowerInvariant().Replace(" ", "");
 
-    /// <summary>The colour's CSS name when it has one, else #RRGGBB (GDI compat).</summary>
+    /// <summary>The colour's CSS name when it has one, else #RRGGBB (legacy compat).</summary>
     public string Name => ColorTranslator.ToHtml(this);
 
     public bool Equals(Color other) =>
@@ -176,7 +176,7 @@ public static class ColorTranslator
     /// <summary>
     /// Parses #rrggbb, #rgb and named HTML/CSS colours.  Junk input yields
     /// <see cref="Color.Empty"/> (callers treat that as "unparsed"), matching
-    /// the previous GDI+ behaviour the renderer relies on.
+    /// the historical renderer behaviour.
     /// </summary>
     public static Color FromHtml(string html)
     {

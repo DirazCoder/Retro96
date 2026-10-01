@@ -7,6 +7,7 @@ using System.Security;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Forms;
+using SkiaSharp;
 using Retro96.Engine.Network;
 using Retro96.Drawing;
 using Retro96.Engine.Dom;
@@ -57,6 +58,7 @@ public sealed class PluginManager : IDisposable
         Directory.CreateDirectory(_rootDirectory);
         CleanupPendingPluginDeletes();
         _browser.PluginCanvas.EmbeddedFrameResolver = ResolveEmbeddedFrame;
+        _browser.PluginCanvas.EmbeddedCanvasResolver = RenderEmbeddedCanvas;
         _browser.PluginCanvas.EmbeddedInputDispatcher = DispatchEmbeddedInput;
         _browser.PluginCanvas.EmbeddedScriptInfoResolver = GetEmbeddedScriptInfo;
         _browser.PluginCanvas.EmbeddedScriptCall = CallEmbeddedScriptAsync;
@@ -582,6 +584,57 @@ public sealed class PluginManager : IDisposable
         }
     }
 
+    private bool RenderEmbeddedCanvas(SKCanvas canvas, DomElement element, LayoutBox box, bool isPrint)
+    {
+        if (isPrint || Volatile.Read(ref _disposed) != 0 ||
+            element.TagName != "embed" || box.Width <= 0 || box.Height <= 0)
+            return false;
+
+        int width = Math.Max(1, (int)Math.Ceiling(box.Width));
+        int height = Math.Max(1, (int)Math.Ceiling(box.Height));
+        lock (_embedLock)
+        {
+            if (!_embedded.TryGetValue(element, out var runtime))
+            {
+                runtime = new EmbeddedRuntime(element);
+                _embedded[element] = runtime;
+            }
+            EnsureEmbeddedStart(runtime, element, width, height);
+            if (runtime.Instance != null)
+            {
+                if (!runtime.VisibleNotified)
+                {
+                    runtime.Instance.Session?.RaiseEmbeddedVisibility(runtime.Instance.InstanceToken, true);
+                    runtime.VisibleNotified = true;
+                }
+                if (runtime.LastNotifiedWidth != width || runtime.LastNotifiedHeight != height)
+                {
+                    runtime.Instance.Session?.RaiseEmbeddedResize(runtime.Instance.InstanceToken, width, height);
+                    runtime.LastNotifiedWidth = width;
+                    runtime.LastNotifiedHeight = height;
+                }
+            }
+
+            var image = runtime.LastFrame?.GetGpuImage(_browser.PluginCanvas.GRContext);
+            if (image == null || runtime.LastWidth <= 0 || runtime.LastHeight <= 0)
+                return false;
+
+            var dest = SKRect.Create(box.X, box.Y, box.Width, box.Height);
+            int save = canvas.Save();
+            try
+            {
+                canvas.ClipRect(dest, SKClipOperation.Intersect, antialias: false);
+                canvas.DrawImage(image, dest,
+                    new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+                return true;
+            }
+            finally
+            {
+                canvas.RestoreToCount(save);
+            }
+        }
+    }
+
     private Bitmap? ResolveEmbeddedFrame(DomElement element, LayoutBox box, bool isPrint)
     {
         if (Volatile.Read(ref _disposed) != 0 || element.TagName != "embed" || box.Width <= 0 || box.Height <= 0) return null;
@@ -640,21 +693,16 @@ public sealed class PluginManager : IDisposable
         runtime.StartTask = StartEmbeddedAsync(runtime, element, width, height);
     }
 
-    // IMPORTANT: GDI+ Bitmap objects are not thread-safe and must only be
-    // constructed, drawn, or disposed on the UI thread. Building the Bitmap
-    // here (background thread) while OnPaint draws/disposes the previous one
-    // concurrently on the UI thread is a real GDI+ handle-table hazard —
-    // it manifests as a full-process hang (multiple threads blocked in
-    // combase.dll/coreclr.dll waiting on GDI+'s internal synchronization),
-    // not a clean crash. This was rare before the ~30fps render timer, but
-    // firing RequestEmbeddedRender continuously makes the race window nearly
-    // guaranteed to be hit. Only decode into a plain byte[] here; the actual
-    // Bitmap gets built on the UI thread inside the BeginInvoke callback below.
+    // IMPORTANT: rendered frame buffers are shared across worker/UI activity,
+    // so native bitmap ownership must be serialized. Building the frame
+    // here (background thread) while the previous frame is being presented
+    // on the UI thread can race native resource lifetime. Only decode into a
+    // plain byte[] here; the actual SkiaSharp bitmap is built on the UI thread
+    // inside the BeginInvoke callback below.
     private static byte[] ExtractPixels(EmbeddedFrameBuffer frame)
     {
         // Frame is already tightly packed (stride == width*4) coming out of
-        // RenderAsync's own conversion; if not, re-pack it here so the UI
-        // thread's Bitmap construction is a straight LockBits copy.
+        // RenderAsync's own conversion; if not, re-pack it here.
         if (frame.Stride == frame.Width * 4)
             return frame.Pixels;
 
@@ -669,14 +717,19 @@ public sealed class PluginManager : IDisposable
     // Must be called on the UI thread only.
     private static Bitmap BuildBitmap(byte[] pixels, int width, int height)
     {
-        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
-        var data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        try
-        {
-            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, data.Scan0, Math.Min(pixels.Length, data.Stride * height));
-        }
-        finally { bitmap.UnlockBits(data); }
-        return bitmap;
+        int rowBytes = checked(width * 4);
+        int byteCount = checked(rowBytes * height);
+        var skBitmap = new SKBitmap(new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+        Span<byte> destination = skBitmap.GetPixelSpan();
+        destination.Clear();
+        pixels.AsSpan(0, Math.Min(pixels.Length, byteCount)).CopyTo(destination);
+        skBitmap.NotifyPixelsChanged();
+        skBitmap.SetImmutable();
+        var image = SKImage.FromBitmap(skBitmap);
+        skBitmap.Dispose();
+        return image == null
+            ? throw new InvalidOperationException("Could not create plugin frame SKImage.")
+            : new Bitmap(image);
     }
 
     private void RequestEmbeddedRender(EmbeddedRuntime runtime, int width, int height, bool isPrint)
@@ -692,7 +745,7 @@ public sealed class PluginManager : IDisposable
                 byte[] pixels = ExtractPixels(frame);
                 if (runtime.IsDisposed) return;
 
-                // Hop to the UI thread before touching any GDI+ object.
+                // Hop to the UI thread before publishing the native frame buffer.
                 if (_browser.IsHandleCreated && !_browser.IsDisposed)
                 {
                     _browser.BeginInvoke((Action)(() =>
@@ -1729,6 +1782,7 @@ public sealed class PluginManager : IDisposable
         _embedRenderTimer.Dispose();
         _browser.PluginCanvas.PageChanged -= OnPageChanged;
         _browser.PluginCanvas.EmbeddedFrameResolver = null;
+        _browser.PluginCanvas.EmbeddedCanvasResolver = null;
         _browser.PluginCanvas.EmbeddedInputDispatcher = null;
         _browser.PluginCanvas.EmbeddedScriptInfoResolver = null;
         _browser.PluginCanvas.EmbeddedScriptCall = null;

@@ -20,7 +20,7 @@ namespace Retro96.Engine.Layout;
 ///   ZZ — the box has children but its own W/H is 0: something that should
 ///        have recursed into it (table/block layout) skipped or bailed early.
 ///
-/// This has no GDI+/WinForms dependency, so it can be unit-tested or run
+/// This has no WinForms dependency, so it can be unit-tested or run
 /// from a console harness independently of the renderer.
 /// </summary>
 public static class LayoutDebug

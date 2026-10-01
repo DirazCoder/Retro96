@@ -7,8 +7,8 @@ using System.Text;
 namespace Retro96.Engine.Layout;
 
 /// <summary>
-/// GDI+ font cache + word-wrap helper.  Generic CSS families
-/// (serif / sans-serif / monospace / cursive / fantasy) map to GDI+ generic
+/// SkiaSharp font cache + word-wrap helper.  Generic CSS families
+/// (serif / sans-serif / monospace / cursive / fantasy) map to the shared
 /// families; every other family is tried in order and falls back to the
 /// platform default — the FACE= fallback chain behaviour of 1996 engines.
 /// Measurement uses the same GenericTypographic format as the renderer and
@@ -28,14 +28,12 @@ public class TextMeasurer : IDisposable
     private readonly Dictionary<string, FontFamily> _familyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _familyMisses = new(StringComparer.OrdinalIgnoreCase);
 
-    private readonly Bitmap _measureBitmap;
     private readonly Graphics _measureGfx;
     private bool _disposed;
 
     public TextMeasurer()
     {
-        _measureBitmap = new Bitmap(1, 1);
-        _measureGfx = Graphics.FromImage(_measureBitmap);
+        _measureGfx = Graphics.CreateMeasurementContext();
         _measureGfx.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
         _measureGfx.SmoothingMode = SmoothingMode.None;
         _measureGfx.PixelOffsetMode = PixelOffsetMode.None;
@@ -59,7 +57,7 @@ public class TextMeasurer : IDisposable
 
         // FIX: invariant culture.  The default float ToString is culture-
         // sensitive ("16,5" on de-DE); if the thread culture ever changes
-        // mid-process the cache keys silently split and duplicate GDI fonts
+        // mid-process the cache keys silently split and duplicate font resources
         // accumulate for the same face.
         string sizeKey = sizePx.ToString("0.###", CultureInfo.InvariantCulture);
 
@@ -245,7 +243,6 @@ public class TextMeasurer : IDisposable
         // Fonts first, then the families they were created from — disposing
         // a FontFamily while fonts derived from it are alive is undefined.
         _measureGfx?.Dispose();
-        _measureBitmap?.Dispose();
         foreach (var font in _fontCache.Values)
             font.Dispose();
         _fontCache.Clear();

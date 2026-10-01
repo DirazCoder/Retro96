@@ -70,7 +70,7 @@ internal static class FontCatalog
 
     /// <summary>
     /// Resolves a family name to a typeface, or null when nothing (real or
-    /// metric-compatible) matches — GDI's "family absent" signal.
+    /// metric-compatible) matches — legacy "family absent" signal.
     /// </summary>
     public static SKTypeface? Resolve(string familyName)
     {
@@ -224,7 +224,7 @@ public sealed class FontFamily : IDisposable
 
     /// <summary>
     /// Resolves a family by name; throws ArgumentException when the family
-    /// (nor a metric-compatible stand-in) exists — GDI+ semantics, which the
+    /// (nor a metric-compatible stand-in) exists — historical font semantics, which the
     /// FACE= fallback chains in TextMeasurer/FontCache depend on.
     /// </summary>
     public FontFamily(string familyName)
@@ -363,7 +363,7 @@ public sealed class Font : IDisposable
         };
 
         // Families without a real bold face get Skia's synthetic embolden —
-        // the equivalent of GDI+'s automatic bold synthesis.
+        // the equivalent of automatic bold synthesis.
         if (Weight >= 600 && Typeface.FontStyle.Weight < 550)
             SkFont.Embolden = true;
 
@@ -391,7 +391,7 @@ public sealed class Font : IDisposable
     internal float AscentPx => _ascent;
 
     /// <summary>The full line height (ascent + descent + leading) in pixels —
-    /// what GDI+ Font.GetHeight returned.</summary>
+    /// what the historical Font.GetHeight contract returned.</summary>
     public float GetHeight() => _lineHeight;
 
     public float GetHeight(Graphics? g) => _lineHeight;

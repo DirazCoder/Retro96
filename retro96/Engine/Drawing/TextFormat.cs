@@ -1,6 +1,6 @@
 // Retro96.Graphics — string formatting state.
 //
-// GDI-shaped surface (GenericTypographic template + flags) over Skia's
+// legacy-shaped surface (GenericTypographic template + flags) over Skia's
 // text engine.  The renderer, the layout measurer and the field overlays
 // all construct the same NoWrap|MeasureTrailingSpaces typographic format,
 // so measurement and painting can never disagree.

@@ -7,16 +7,15 @@ using System.Text;
 namespace Retro96.Engine.Render;
 
 /// <summary>
-/// Resolves and caches System.Drawing.Font objects.  Thread-safe: layout
+/// Resolves and caches Retro96.Drawing.Font objects over SkiaSharp. Thread-safe: layout
 /// runs after async continuations and image prefetches can overlap, so
 /// every cache access is serialized.
 ///
 /// FACE= fallback chain per the era: each comma-separated family is tried
-/// in order against the installed fonts, generic CSS families map to GDI+
+/// in order against the installed fonts, generic CSS families map to the shared Skia font catalog
 /// generics, name heuristics catch the common period families ("courier",
 /// "helvetica", "verdana"…), and the platform default (serif) catches the
-/// rest.  Bold/italic variants that a family lacks are synthesised by
-/// GDI+ automatically.
+/// rest.  Bold/italic variants are resolved or synthesized by SkiaSharp.
 /// </summary>
 public class FontCache : IDisposable
 {
@@ -25,7 +24,7 @@ public class FontCache : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, FontFamily> _familyCache =
         new(StringComparer.OrdinalIgnoreCase);
-    // Families created via new FontFamily(...) own a GDI+ handle and must
+    // Families created via new FontFamily(...) own their Skia typeface and must
     // be disposed on teardown; the Generic* statics are process-wide and
     // never are.
     private readonly HashSet<FontFamily> _ownedFamilies = new();

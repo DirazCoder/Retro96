@@ -1,9 +1,9 @@
 // Retro96.Graphics — geometry primitives.
 //
-// Part of the SkiaSharp rendering layer that replaced System.Drawing/GDI+
+// Part of the SkiaSharp rendering layer used throughout the engine.
 // wholesale: the engine, the layout measurer and the renderer operate on
 // these value types so every platform (Linux test rig included) shares one
-// identical geometry model.  Member shapes intentionally mirror the GDI+
+// identical geometry model. Member shapes intentionally mirror the engine's
 // structs the code was written against, so the port kept its logic intact.
 namespace Retro96.Drawing;
 

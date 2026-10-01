@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Retro96.Drawing;
 using System.Linq;
 using System.Text;
+using SkiaSharp;
 
 namespace Retro96.Engine.Render;
 
@@ -92,61 +93,59 @@ public static class DataUriDecoder
         var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
         try
         {
-            using var g = Graphics.FromImage(bmp);
-            g.SmoothingMode = SmoothingMode.None;
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-            g.Clear(Color.Transparent);
+            using var surface = SKSurface.Create(bmp.SkBitmap.Info, bmp.SkBitmap.GetPixels(), bmp.SkBitmap.RowBytes)
+                ?? throw new InvalidOperationException("Unable to create SVG surface.");
+            var canvas = surface.Canvas;
+            canvas.Clear(SKColors.Transparent);
 
-            // every <rect …/> in document order
             foreach (var rect in ExtractElements(svg, "rect"))
             {
                 var fill = Attr(rect, "fill") is { } f && TryParseColor(f, out var c)
-                    ? c : Color.Black;
+                    ? c.ToSkColor() : SKColors.Black;
                 float rx = ParseFloat(Attr(rect, "x")),
                       ry = ParseFloat(Attr(rect, "y")),
                       rw = ParseFloat(Attr(rect, "width"), w),
                       rh = ParseFloat(Attr(rect, "height"), h);
                 if (rw <= 0 || rh <= 0) continue;
-                using var brush = new SolidBrush(fill);
-                g.FillRectangle(brush, rx, ry, rw, rh);
+                using var paint = new SKPaint { Color = fill, IsAntialias = false, Style = SKPaintStyle.Fill };
+                canvas.DrawRect(SKRect.Create(rx, ry, rw, rh), paint);
             }
 
-            // every <text …>…</text>
             foreach (var text in ExtractElements(svg, "text"))
             {
                 string content = TextContent(svg, text);
                 if (string.IsNullOrWhiteSpace(content)) continue;
 
                 var fill = Attr(text, "fill") is { } f && TryParseColor(f, out var c)
-                    ? c : Color.Black;
-                float size = ParseFloat(Attr(text, "font-size"), 12f);
+                    ? c.ToSkColor() : SKColors.Black;
+                float size = Math.Max(1f, ParseFloat(Attr(text, "font-size"), 12f));
                 string family = Attr(text, "font-family") ?? "Arial";
-                bool bold = string.Equals(Attr(text, "font-weight"), "bold",
-                    StringComparison.OrdinalIgnoreCase);
-
-                using var font = new Font(new FontFamily(MapFamily(family)), size,
-                    bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
-                using var brush = new SolidBrush(fill);
+                bool bold = string.Equals(Attr(text, "font-weight"), "bold", StringComparison.OrdinalIgnoreCase);
+                var style = new SKFontStyle(bold ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
+                    SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
+                using var typeface = SKTypeface.FromFamilyName(MapFamily(family), style) ?? SKTypeface.Default;
+                using var font = new SKFont(typeface, size) { Edging = SKFontEdging.Antialias };
+                using var paint = new SKPaint { Color = fill, IsAntialias = true };
 
                 float tx = ParseFloat(Attr(text, "x"), w / 2f);
                 float ty = ParseFloat(Attr(text, "y"), h / 2f);
                 string anchor = (Attr(text, "text-anchor") ?? "").ToLowerInvariant();
-
-                using var sf = new StringFormat(StringFormat.GenericTypographic);
-                if (anchor == "middle")
-                    sf.Alignment = StringAlignment.Center;
-                else if (anchor == "end")
-                    sf.Alignment = StringAlignment.Far;
-
-                // SVG text y = BASELINE; GDI+ draws from the top — nudge by
-                // the ascent so single-line labels sit right.
-                float ascent = font.FontFamily.GetCellAscent(font.Style) *
-                               font.Size / font.FontFamily.GetEmHeight(font.Style);
-                g.DrawString(content, font, brush, tx, ty - ascent, sf);
+                SKTextAlign align = anchor switch
+                {
+                    "middle" => SKTextAlign.Center,
+                    "end" => SKTextAlign.Right,
+                    _ => SKTextAlign.Left
+                };
+                canvas.DrawText(content, tx, ty, align, font, paint);
             }
 
-            return new DecodedImage(
-                new List<Bitmap> { bmp }, new List<int> { 0 }, false);
+            surface.Flush();
+            bmp.SkBitmap.SetImmutable();
+            var image = SKImage.FromBitmap(bmp.SkBitmap);
+            bmp.Dispose();
+            return image == null
+                ? null
+                : new DecodedImage([new Bitmap(image)], [0], false);
         }
         catch
         {

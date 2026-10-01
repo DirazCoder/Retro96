@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using SkiaSharp;
+using SkiaSharp.Views.Desktop;
 using Retro96.Engine;
 using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
@@ -99,13 +100,13 @@ public partial class Form1 : Form
     private readonly StatusStrip _statusStrip = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
     private const bool ThrobberEnabled = false;
-    private readonly Panel _throbberBox = new() { BorderStyle = BorderStyle.Fixed3D };
+    private readonly SKGLControl _throbberBox = new();
 
     // Throbber state
     private DecodedImage? _throbberDecoded;
     private int _throbberFrameIndex;
     private System.Windows.Forms.Timer? _throbberTimer;
-    private Bitmap? _staticBitmap;
+    private SKBitmap? _staticBitmap;
     private string? _throbberDiag;   // why static.png is missing, drawn into the box
     private bool _isLoading;
 
@@ -371,34 +372,31 @@ public partial class Form1 : Form
         _pluginCommandsMenu.Visible = false;
         _btnFile.DropDownItems.Add(_pluginCommandsMenu);
 
-        _throbberBox.BorderStyle = BorderStyle.None;
         _throbberBox.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        _throbberBox.Paint += (s, e) =>
+        _throbberBox.PaintSurface += (s, e) =>
         {
-            // Draw into the full client rect so the image scales with the box.
-            var target = _throbberBox.ClientRectangle;
-            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            var canvas = e.Surface.Canvas;
+            canvas.Clear(SKColors.Transparent);
 
+            var target = new SKRect(0, 0, e.Info.Width, e.Info.Height);
             if (_isLoading && _throbberDecoded != null && _throbberDecoded.Frames.Count > 0)
             {
                 var frame = _throbberDecoded.Frames[_throbberFrameIndex % _throbberDecoded.Frames.Count];
-                if (frame != null)
-                {
-                    using var gdiFrame = SkiaWinForms.ToGdi(frame);
-                    if (gdiFrame != null)
-                        e.Graphics.DrawImage(gdiFrame, target);
-                }
+                if (frame?.SkBitmap != null)
+                    canvas.DrawBitmap(frame.SkBitmap, target, SKSamplingOptions.Default);
             }
             else if (_staticBitmap != null)
             {
-                e.Graphics.DrawImage(_staticBitmap, target);
+                canvas.DrawBitmap(_staticBitmap, target, SKSamplingOptions.Default);
             }
             else if (_throbberDiag != null)
             {
-                // Loud on purpose: a blank box hid this bug for two rounds.
-                e.Graphics.Clear(Color.MistyRose);
-                using var f = new Font("Segoe UI", 7f);
-                e.Graphics.DrawString(_throbberDiag, f, Brushes.DarkRed, target);
+                using var bg = new SKPaint { Color = SKColors.MistyRose, IsAntialias = false };
+                canvas.DrawRect(target, bg);
+                using var typeface = SKTypeface.FromFamilyName("Segoe UI");
+                using var font = new SKFont(typeface, 7f);
+                using var text = new SKPaint { Color = SKColors.DarkRed, IsAntialias = true };
+                canvas.DrawText(_throbberDiag, 4f, Math.Max(10f, 4f + font.Size), SKTextAlign.Left, font, text);
             }
         };
 
@@ -525,14 +523,10 @@ public partial class Form1 : Form
         // THE measurement hookup: InlineLayout measures every text run,
         // table column, button label and select width — and it was never
         // given the FontCache, so every width fell back to the
-        // characters × 8px heuristic. The renderer, however, draws with
-        // REAL GDI fonts, so measured widths and drawn widths disagreed
-        // on every string: words drifted apart or collided ("texts too
-        // far or too close"), buttons never auto-sized because the
-        // hasFont guard in MeasureBox requires the cache (labels kept the
-        // 80px default and spilled outside the bevel), and table columns
-        // were sized from the same 8px-per-char overestimate, blowing
-        // tables wide past the viewport.
+        // characters × 8px heuristic. The renderer and layout now share
+        // the same SkiaSharp font metrics, so measured and drawn widths
+        // stay aligned. This fixes drifting/colliding text, incorrectly
+        // sized buttons, and table columns that used to overestimate width.
         InlineLayout.SetFontCache(_fontCache);
 
         // JS history.back()/forward()/go() actually navigates
@@ -1869,14 +1863,10 @@ public partial class Form1 : Form
     {
         content.Document.VisitedUrls.UnionWith(_visitedUrls);
         // Replacing a frame document invalidates every nested iframe/frameset
-        // view that belonged to the old document. Dispose them before the new
-        // bitmap is rendered, otherwise stale child surfaces remain painted.
+        // view that belonged to the old document. Dispose the old frame tree
+        // before the new document is installed so no stale GPU composition
+        // survives the navigation.
         _canvas.ClearChildFrames(view);
-        // Drop the old bitmap before installing the replacement document.
-        // Otherwise a navigated frame can keep displaying the previous page
-        // (and its nested iframe composition) until a later repaint happens.
-        view.Rendered?.Dispose();
-        view.Rendered = null;
         view.Document = content.Document;
         view.RootBox = content.RootBox;
         view.Url = content.AbsoluteUrl;
@@ -2752,18 +2742,18 @@ public partial class Form1 : Form
         // back to the existing bitmap keeps printing useful if a transient
         // render failure occurs.
         var printEngineBitmap = _canvas.CreatePrintBitmap();
-        var engineBitmap = printEngineBitmap ?? _canvas.RenderedBitmap;
+        var engineBitmap = printEngineBitmap;
         if (engineBitmap == null)
         {
             _statusLabel.Text = "Nothing to print";
             return;
         }
 
-        using var gdiBitmap = SkiaWinForms.ToGdi(engineBitmap);
+        using var printerBitmap = SkiaPrintInterop.ToPrinterBitmap(engineBitmap);
         if (printEngineBitmap != null)
             printEngineBitmap.Dispose();
 
-        if (gdiBitmap == null)
+        if (printerBitmap == null)
         {
             _statusLabel.Text = "Nothing to print";
             return;
@@ -2787,7 +2777,7 @@ public partial class Form1 : Form
             try
             {
                 var graphics = e.Graphics;
-                if (graphics == null || gdiBitmap.Width <= 0 || gdiBitmap.Height <= 0)
+                if (graphics == null || printerBitmap.Width <= 0 || printerBitmap.Height <= 0)
                 {
                     e.HasMorePages = false;
                     return;
@@ -2799,18 +2789,18 @@ public partial class Form1 : Form
                 // the same scale, so there is no DPI double-conversion or
                 // vertical drift between pages.
                 float destWidth = Math.Max(1f, e.MarginBounds.Width);
-                float scale = destWidth / gdiBitmap.Width;
+                float scale = destWidth / printerBitmap.Width;
                 float srcPageHeight = Math.Max(1f, e.MarginBounds.Height / scale);
                 float srcY = pageIndex * srcPageHeight;
 
-                if (srcY >= gdiBitmap.Height - 0.01f)
+                if (srcY >= printerBitmap.Height - 0.01f)
                 {
                     e.HasMorePages = false;
                     return;
                 }
 
-                float srcHeight = Math.Min(srcPageHeight, gdiBitmap.Height - srcY);
-                var srcRect = new RectangleF(0f, srcY, gdiBitmap.Width, srcHeight);
+                float srcHeight = Math.Min(srcPageHeight, printerBitmap.Height - srcY);
+                var srcRect = new RectangleF(0f, srcY, printerBitmap.Width, srcHeight);
                 var destRect = new RectangleF(
                     e.MarginBounds.Left,
                     e.MarginBounds.Top,
@@ -2826,7 +2816,7 @@ public partial class Form1 : Form
                     graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                     graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
 
-                    graphics.DrawImage(gdiBitmap, destRect, srcRect, GraphicsUnit.Pixel);
+                    graphics.DrawImage(printerBitmap, destRect, srcRect, GraphicsUnit.Pixel);
                 }
                 finally
                 {
@@ -2834,7 +2824,7 @@ public partial class Form1 : Form
                 }
 
                 pageIndex++;
-                e.HasMorePages = srcY + srcHeight < gdiBitmap.Height - 0.01f;
+                e.HasMorePages = srcY + srcHeight < printerBitmap.Height - 0.01f;
                 if (!e.HasMorePages)
                     _statusLabel.Text = $"Printed ({pageIndex} page{(pageIndex == 1 ? "" : "s")}).";
             }
@@ -2856,23 +2846,6 @@ public partial class Form1 : Form
         }
     }
 
-    private static float PageWidth(System.Drawing.Printing.PrintDocument doc) =>
-        doc.PrinterSettings.DefaultPageSettings.PrintableArea.Width > 0
-            ? doc.PrinterSettings.DefaultPageSettings.PrintableArea.Width
-            : 650f;
-
-    private static float SafeBitmapDpi(System.Drawing.Bitmap bitmap, bool horizontal)
-    {
-        try
-        {
-            float dpi = horizontal ? bitmap.HorizontalResolution : bitmap.VerticalResolution;
-            return float.IsFinite(dpi) && dpi > 0f ? dpi : 96f;
-        }
-        catch (Exception)
-        {
-            return 96f;
-        }
-    }
 
     private static string Retro96HomePageHtml()
     {
@@ -3124,6 +3097,7 @@ code {
 </html>
 """;
 
+
     private SKBitmap LoadEmbeddedAsset(string resourceName)
     {
         var assembly = Assembly.GetExecutingAssembly();
@@ -3131,7 +3105,7 @@ code {
         {
             if (stream == null)
                 throw new FileNotFoundException($"Embedded asset not found: {resourceName}");
-            return SKBitmap.Decode(stream);
+            return SKBitmap.Decode(stream) ?? throw new InvalidDataException($"Embedded asset could not be decoded: {resourceName}");
         }
     }
 
@@ -3140,11 +3114,7 @@ code {
         try
         {
             using var staticSkia = LoadEmbeddedAsset("Retro96.assets.static.png");
-            using var staticMs = new MemoryStream();
-            staticSkia.Encode(SKEncodedImageFormat.Png, 100).SaveTo(staticMs);
-            staticMs.Position = 0;
-            using var raw = new Bitmap(staticMs);
-            _staticBitmap = new Bitmap(raw);
+            _staticBitmap = staticSkia.Copy();
 
             string resourceName = "Retro96.assets.throbber.gif";
             var assembly = Assembly.GetExecutingAssembly();
@@ -3180,6 +3150,7 @@ code {
             DebugLog.WriteException("LoadThrobberGif", ex);
         }
     }
+
 
     private void SetAppIcon()
     {

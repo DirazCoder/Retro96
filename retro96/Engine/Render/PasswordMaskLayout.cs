@@ -5,7 +5,7 @@ namespace Retro96.Engine.Render;
 
 /// <summary>
 /// Shared password-mask geometry.  Password fields deliberately do not use
-/// GDI+'s whole-run kerning/advance calculation for each selection boundary:
+/// SkiaSharp's whole-run kerning/advance calculation for each selection boundary:
 /// repeated '*' glyphs can be grid-fitted at slightly different fractional
 /// edges, which makes the selection clip disagree with the painted glyphs.
 /// A single measured glyph advance is therefore used consistently for paint,

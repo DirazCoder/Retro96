@@ -223,8 +223,9 @@ public sealed class Region : IDisposable
 
     public Region(RectangleF rect)
     {
-        Path = new SKPath();
-        Path.AddRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height));
+        using var builder = new SKPathBuilder();
+        builder.AddRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height));
+        Path = builder.Detach();
     }
 
     public Region(PointF[] polygon)
@@ -232,11 +233,12 @@ public sealed class Region : IDisposable
         if (polygon == null) throw new ArgumentNullException(nameof(polygon));
         if (polygon.Length < 3) throw new ArgumentException("A clip polygon needs at least three points.", nameof(polygon));
 
-        Path = new SKPath();
-        Path.MoveTo(polygon[0].X, polygon[0].Y);
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(polygon[0].X, polygon[0].Y);
         for (int i = 1; i < polygon.Length; i++)
-            Path.LineTo(polygon[i].X, polygon[i].Y);
-        Path.Close();
+            builder.LineTo(polygon[i].X, polygon[i].Y);
+        builder.Close();
+        Path = builder.Detach();
     }
 
     public void Dispose()
@@ -250,7 +252,7 @@ public sealed class Region : IDisposable
 /// <summary>
 /// The Light/Dark shade ladder for 3-D borders.  Formulas are the same
 /// linear blends the previous headless ControlPaint stub used, so groove /
-/// ridge / inset / outset rendering is unchanged from the GDI+ baseline.
+/// ridge / inset / outset rendering preserves the historical baseline.
 /// </summary>
 public static class ControlPaint
 {

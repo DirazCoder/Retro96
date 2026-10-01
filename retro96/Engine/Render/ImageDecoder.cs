@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using Retro96.Drawing;
@@ -27,8 +26,8 @@ public record DecodedImage(
 /// GIF87a/GIF89a (multi-frame, per-frame delay, disposal, interlaced,
 /// transparency) decode through Skia's SKCodec — each frame is composited
 /// onto the running canvas with its disposal method applied, exactly what
-/// GDI+'s SelectActiveFrame used to do; JPEG baseline/progressive, PNG, BMP
-/// and ICO decode straight through SKBitmap; XBM (the era's other icon
+/// legacy frame-selection code previously did; JPEG baseline/progressive, PNG, BMP, ICO and other Skia-supported
+/// formats decode directly into immutable SKImage objects; XBM (the era's other icon
 /// format) through a hand parser.  Anything unrecognised or truncated
 /// yields the broken-image icon so layout keeps a stable box instead of
 /// collapsing.
@@ -48,12 +47,17 @@ public static class ImageDecoder
             if (IsXbm(data, contentType))
                 return DecodeXbm(data);
 
-            // JPEG / PNG / BMP / ICO — anything Skia understands.
-            using var ms = new MemoryStream(data);
-            var sk = SKBitmap.Decode(ms);
-            if (sk == null || sk.Width <= 0 || sk.Height <= 0)
+            // JPEG / PNG / BMP / ICO / WebP / AVIF — keep the decoded web
+            // resource as an immutable SKImage. Skia can decode lazily and
+            // the browser's GPU canvas can promote the same image to a
+            // texture without another bitmap-blit layer.
+            var image = SKImage.FromEncodedData(data);
+            if (image == null || image.Width <= 0 || image.Height <= 0)
+            {
+                image?.Dispose();
                 return Broken();
-            return new DecodedImage([new Bitmap(sk)], [0], false);
+            }
+            return new DecodedImage([new Bitmap(image)], [0], false);
         }
         catch
         {
@@ -106,7 +110,13 @@ public static class ImageDecoder
                 single.Dispose();
                 return Broken();
             }
-            return new DecodedImage([new Bitmap(single)], [0], false);
+            single.NotifyPixelsChanged();
+            single.SetImmutable();
+            var image = SKImage.FromBitmap(single);
+            single.Dispose();
+            return image == null
+                ? Broken()
+                : new DecodedImage([new Bitmap(image)], [0], false);
         }
 
         var frames = new List<Bitmap>(frameCount);
@@ -127,7 +137,13 @@ public static class ImageDecoder
                 break;
             }
 
-            frames.Add(new Bitmap(frame));
+            frame.NotifyPixelsChanged();
+            frame.SetImmutable();
+            var image = SKImage.FromBitmap(frame);
+            frame.Dispose();
+            if (image == null)
+                break;
+            frames.Add(new Bitmap(image));
             int dur = codec.FrameInfo[i].Duration;
             delays.Add(dur > 0 ? dur : 100);
         }
@@ -194,28 +210,30 @@ public static class ImageDecoder
         }
 
         var bmp = new Bitmap(width, height);
-        var locked = bmp.LockBits(new Rectangle(0, 0, width, height),
-            ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        try
+        Span<byte> pixels = bmp.SkBitmap.GetPixelSpan();
+        pixels.Clear();
+        int rowBytes = bmp.SkBitmap.RowBytes;
+        for (int y = 0; y < height; y++)
         {
-            for (int y = 0; y < height; y++)
+            int row = y * rowBytes;
+            for (int x = 0; x < width; x++)
             {
-                IntPtr row = locked.Scan0 + y * locked.Stride;
-                for (int x = 0; x < width; x++)
-                {
-                    bool set = (bits[y * bytesPerRow + (x >> 3)] & (1 << (x & 7))) != 0;
-                    // 1-bit = black opaque; 0-bit = transparent
-                    int pixel = set ? unchecked((int)0xFF000000u) : 0;
-                    Marshal.WriteInt32(row, x * 4, pixel);
-                }
+                bool set = (bits[y * bytesPerRow + (x >> 3)] & (1 << (x & 7))) != 0;
+                if (!set) continue;
+                int offset = row + x * 4;
+                pixels[offset + 0] = 0;   // B
+                pixels[offset + 1] = 0;   // G
+                pixels[offset + 2] = 0;   // R
+                pixels[offset + 3] = 255; // A
             }
         }
-        finally
-        {
-            bmp.UnlockBits(locked);
-        }
-
-        return new DecodedImage([bmp], [0], false);
+        bmp.SkBitmap.NotifyPixelsChanged();
+        bmp.SkBitmap.SetImmutable();
+        var image = SKImage.FromBitmap(bmp.SkBitmap);
+        bmp.Dispose();
+        return image == null
+            ? Broken()
+            : new DecodedImage([new Bitmap(image)], [0], false);
     }
 }
 
@@ -237,15 +255,24 @@ public static class BrokenImageIcon
             if (_cached == null)
             {
                 var bmp = new Bitmap(24, 24);
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.FillRectangle(Brushes.LightGray, 0, 0, 24, 24);
-                    g.DrawRectangle(Pens.Gray, 0, 0, 23, 23);
-                    using var redPen = new Pen(Color.Red, 2);
-                    g.DrawLine(redPen, 4, 4, 19, 19);
-                    g.DrawLine(redPen, 19, 4, 4, 19);
-                }
-                _cached = bmp;
+                using var surface = SKSurface.Create(bmp.SkBitmap.Info, bmp.SkBitmap.GetPixels(), bmp.SkBitmap.RowBytes)
+                    ?? throw new InvalidOperationException("Unable to create broken-image surface.");
+                var canvas = surface.Canvas;
+                using var bg = new SKPaint { Color = new SKColor(0xD3, 0xD3, 0xD3, 0xFF), IsAntialias = false, Style = SKPaintStyle.Fill };
+                using var border = new SKPaint { Color = SKColors.Gray, IsAntialias = false, Style = SKPaintStyle.Stroke, StrokeWidth = 1 };
+                using var red = new SKPaint { Color = SKColors.Red, IsAntialias = false, Style = SKPaintStyle.Stroke, StrokeWidth = 2 };
+                canvas.Clear(SKColors.Transparent);
+                canvas.DrawRect(SKRect.Create(0, 0, 24, 24), bg);
+                canvas.DrawRect(SKRect.Create(0.5f, 0.5f, 23, 23), border);
+                canvas.DrawLine(4, 4, 19, 19, red);
+                canvas.DrawLine(19, 4, 4, 19, red);
+                surface.Flush();
+                bmp.SkBitmap.SetImmutable();
+                var image = SKImage.FromBitmap(bmp.SkBitmap);
+                bmp.Dispose();
+                if (image == null)
+                    throw new InvalidOperationException("Could not create broken-image SKImage.");
+                _cached = new Bitmap(image);
             }
             return _cached.Clone();
         }

@@ -227,7 +227,7 @@ public class FloatContext
 }
 
 /// <summary>
-/// The inline formatting context: fragments + line boxes with GDI+
+/// The inline formatting context: fragments + line boxes using the shared SkiaSharp font metrics.
 /// measurement, baseline alignment, HTML ALIGN= vertical modes, and text
 /// reflow around floats.
 /// </summary>
@@ -236,12 +236,11 @@ public static class InlineLayout
     private static readonly List<string> DefaultFontFamily = ["Times New Roman", "serif"];
 
     private static Render.FontCache? _fontCache;
-    private static readonly Bitmap _measureBmp = new(1, 1);
     private static readonly Graphics _measureG;
 
     static InlineLayout()
     {
-        _measureG = Graphics.FromImage(_measureBmp);
+        _measureG = Graphics.CreateMeasurementContext();
         // ClearType did not exist in the 1996 target. Use grayscale
         // antialiasing so measurement and drawing match the era-oriented
         // renderer without introducing sub-pixel colour fringes.

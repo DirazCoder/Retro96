@@ -1057,24 +1057,12 @@ internal sealed class PermissionInfoButton : Button
         Height = 24;
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
-        Text = string.Empty;
+        Text = "i";
         UseVisualStyleBackColor = false;
         Margin = new Padding(2, 2, 0, 0);
         _toolTip.SetToolTip(this, "About permission " + permissionName);
         Click += click;
     }
 
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        base.OnPaint(e);
-        int d = Math.Max(10, Math.Min(ClientSize.Width, ClientSize.Height) - 6);
-        int x = (ClientSize.Width - d) / 2;
-        int y = (ClientSize.Height - d) / 2;
-        using var pen = new Pen(SystemColors.WindowText, Math.Max(1f, DeviceDpi / 96f));
-        using var brush = new SolidBrush(SystemColors.WindowText);
-        e.Graphics.DrawEllipse(pen, x, y, d - 1, d - 1);
-        using var font = new Font(Font.FontFamily, Math.Max(7f, Font.Size - 1.5f), FontStyle.Bold, GraphicsUnit.Point);
-        var size = e.Graphics.MeasureString("i", font);
-        e.Graphics.DrawString("i", font, brush, (ClientSize.Width - size.Width) / 2f, (ClientSize.Height - size.Height) / 2f - 1f);
-    }
+
 }

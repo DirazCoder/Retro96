@@ -20,6 +20,7 @@ public sealed class JavaGraphicsState
     // canvas state on dispose().
     public bool IsDerived { get; set; }
     public bool Disposed { get; set; }
+    public GRContext? GpuContext { get; set; }
     // Non-null in XOR mode; each pixel becomes dst ^ xorColor ^ drawColor.
     public Color? XorColor { get; set; }
     // Tracked clip in DEVICE coordinates (null = whole surface).
@@ -56,11 +57,16 @@ public sealed class JavaGraphicsFactory
     private readonly JavaVm _vm;
     public JavaGraphicsFactory(JavaVm vm) => _vm = vm;
 
-    public JObject CreateGraphics(Retro96.Drawing.Graphics g, int width, int height, int originX = 0, int originY = 0, int savedState = 0, bool derived = false)
+    public JObject CreateGraphics(Retro96.Drawing.Graphics g, int width, int height, int originX = 0, int originY = 0, int savedState = 0, bool derived = false, GRContext? gpuContext = null)
     {
         var cls = _vm.LoadClass("java.awt.Graphics");
         var o = _vm.NewObject(cls);
-        o.NativeState = new JavaGraphicsState(g, width, height, originX, originY) { SavedState = savedState, IsDerived = derived };
+        o.NativeState = new JavaGraphicsState(g, width, height, originX, originY)
+        {
+            SavedState = savedState,
+            IsDerived = derived,
+            GpuContext = gpuContext
+        };
         return o;
     }
 
@@ -340,8 +346,9 @@ internal static class JavaAwtGraphics
         if (name.Contains("Round"))
         {
             float arcW = Math.Max(0, i.Arguments[4].AsInt()), arcH = Math.Max(0, i.Arguments[5].AsInt());
-            using var path = new SKPath();
-            path.AddRoundRect(rect, arcW / 2f, arcH / 2f);
+            using var builder = new SKPathBuilder();
+            builder.AddRoundRect(rect, arcW / 2f, arcH / 2f);
+            using var path = builder.Detach();
             using var paint = fill ? FillPaint(s, s.Color) : StrokePaint(s, s.Color);
             canvas.DrawPath(path, paint);
             return JValue.Void;
@@ -400,7 +407,7 @@ internal static class JavaAwtGraphics
         // Skia's DrawText places y at the baseline, exactly Java's contract.
         if (s.XorColor != null)
         {
-            s.Graphics.Canvas.DrawText(text, x, y, font.SkFont, paint);
+            s.Graphics.Canvas.DrawText(text, x, y, SKTextAlign.Left, font.SkFont, paint);
         }
         else
         {
@@ -428,10 +435,11 @@ internal static class JavaAwtGraphics
         var ys = i.Arguments[1].AsArray();
         int n = Math.Clamp(i.Arguments[2].AsInt(), 0, Math.Min(xs?.Elements.Length ?? 0, ys?.Elements.Length ?? 0));
         if (n == 0) return JValue.Void;
-        using var path = new SKPath();
-        path.MoveTo(xs!.Elements[0].AsInt(), ys!.Elements[0].AsInt());
-        for (int k = 1; k < n; k++) path.LineTo(xs.Elements[k].AsInt(), ys.Elements[k].AsInt());
-        if (close) path.Close();
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(xs!.Elements[0].AsInt(), ys!.Elements[0].AsInt());
+        for (int k = 1; k < n; k++) builder.LineTo(xs.Elements[k].AsInt(), ys.Elements[k].AsInt());
+        if (close) builder.Close();
+        using var path = builder.Detach();
         using var paint = fill ? FillPaint(s, s.Color) : StrokePaint(s, s.Color);
         s.Graphics.Canvas.DrawPath(path, paint);
         return JValue.Void;
@@ -444,16 +452,17 @@ internal static class JavaAwtGraphics
         var poly = i.Arguments[0].AsObject();
         if (poly?.NativeState is not JavaPolygonState st) return JValue.Void;
         if (st.NPoints == 0) return JValue.Void;
-        using var path = new SKPath();
-        path.MoveTo(st.XPoints[0], st.YPoints[0]);
-        for (int k = 1; k < st.NPoints; k++) path.LineTo(st.XPoints[k], st.YPoints[k]);
-        if (close) path.Close();
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(st.XPoints[0], st.YPoints[0]);
+        for (int k = 1; k < st.NPoints; k++) builder.LineTo(st.XPoints[k], st.YPoints[k]);
+        if (close) builder.Close();
+        using var path = builder.Detach();
         using var paint = fill ? FillPaint(s, s.Color) : StrokePaint(s, s.Color);
         s.Graphics.Canvas.DrawPath(path, paint);
         return JValue.Void;
     }
 
-    // Java measures arcs counterclockwise from 3 o'clock; GDI-style APIs
+    // Java measures arcs counterclockwise from 3 o'clock; legacy desktop APIs
     // sweep clockwise with y-down, so both angles are negated.
     private static JValue Arc(JavaVm vm, JavaInvocation i, bool fill)
     {
@@ -470,10 +479,11 @@ internal static class JavaAwtGraphics
         {
             // Pie semantics: connect the arc through the centre.
             var bounds = SKRect.Create(x, y, w, h);
-            using var path = new SKPath();
-            path.MoveTo(bounds.MidX, bounds.MidY);
-            path.ArcTo(bounds, skiaStart, skiaSweep, false);
-            path.Close();
+            using var builder = new SKPathBuilder();
+            builder.MoveTo(bounds.MidX, bounds.MidY);
+            builder.ArcTo(bounds, skiaStart, skiaSweep, false);
+            builder.Close();
+            using var path = builder.Detach();
             s.Graphics.Canvas.DrawPath(path, paint);
         }
         else
@@ -541,7 +551,8 @@ internal static class JavaAwtGraphics
         if (w > 0 && h > 0)
         {
             using var paint = ImagePaint(s);
-            canvas.DrawBitmap(state.Bitmap.SkBitmap, SKRect.Create(x, y, w, h), paint);
+            canvas.DrawImage(state.Bitmap.GetGpuImage(s.GpuContext),
+                SKRect.Create(x, y, w, h), SKSamplingOptions.Default, paint);
         }
         return JValue.Int(1);
     }
@@ -563,7 +574,8 @@ internal static class JavaAwtGraphics
             if (mirrorX) canvas.Scale(-1, 1);
             if (mirrorY) canvas.Scale(1, -1);
             if (mirrorX || mirrorY) canvas.Translate(mirrorX ? -dw : 0, mirrorY ? -dh : 0);
-            canvas.DrawBitmap(state.Bitmap.SkBitmap, SKRect.Create(0, 0, dw, dh), srcRect, paint);
+            canvas.DrawImage(state.Bitmap.GetGpuImage(s.GpuContext),
+                srcRect, SKRect.Create(0, 0, dw, dh), SKSamplingOptions.Default, paint);
         }
         finally
         {
@@ -613,7 +625,7 @@ internal static class JavaAwtGraphics
             var bytes = vm.ResolveResourceBytes(st.SourceUrl);
             if (bytes is { Length: > 0 })
             {
-                var decoded = SKBitmap.Decode(bytes);
+                var decoded = SKImage.FromEncodedData(bytes);
                 if (decoded != null)
                 {
                     var old = st.Bitmap;
@@ -768,7 +780,7 @@ internal static class JavaAwtGraphics
             // the save/restore pair.
             canvas.ResetMatrix();
             using var paint = new SKPaint { BlendMode = SKBlendMode.SrcOver };
-            canvas.DrawBitmap(subset, src.Left + dx, src.Top + dy, paint);
+            canvas.DrawBitmap(subset, src.Left + dx, src.Top + dy, SKSamplingOptions.Default, paint);
         }
         finally
         {

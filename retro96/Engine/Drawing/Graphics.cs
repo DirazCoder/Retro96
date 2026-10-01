@@ -1,17 +1,17 @@
 // Retro96.Graphics — the drawing surface.
 //
-// A GDI-shaped canvas over Skia's SKCanvas.  Every stroke, fill, image
+// A compatibility canvas over Skia's SKCanvas.  Every stroke, fill, image
 // blit, text draw and text measurement in the engine and the layout rig
 // funnels through here, which is what makes the whole rendering pipeline
 // platform-independent (Linux test rig == Windows browser, same pixels).
 //
 // Metric contracts the engine depends on:
 //   • DrawString(x, y) puts the line-box TOP at (x, y) — baseline at
-//     y + ascent, exactly the GDI+ GenericTypographic placement.
+//     y + ascent, matching the historical GenericTypographic placement.
 //   • MeasureString returns tight advance width (trailing spaces included
 //     when the format asks for them) and full line height.
 //   • Save/Restore/TranslateTransform/ResetTransform/SetClip nest exactly
-//     like the GDI state stack the marquee and clip code was written for.
+//     like the legacy state stack the marquee and clip code was written for.
 using System.Text;
 
 using SkiaSharp;
@@ -20,9 +20,11 @@ namespace Retro96.Drawing;
 
 public sealed class Graphics : IDisposable
 {
-    private readonly SKSurface _surface;
-    private readonly SKCanvas _canvas;
-    private readonly Bitmap _bitmap;
+    private readonly SKSurface? _surface;
+    private readonly SKCanvas? _canvas;
+    private readonly Bitmap? _bitmap;
+    private readonly bool _ownsSurface;
+    private readonly GRContext? _gpuContext;
 
     public TextRenderingHint TextRenderingHint { get; set; } = TextRenderingHint.ClearTypeGridFit;
     public SmoothingMode SmoothingMode { get; set; } = SmoothingMode.Default;
@@ -35,10 +37,10 @@ public sealed class Graphics : IDisposable
     public float DpiY => 96f;
 
     // Same-assembly escape hatch for the Java applet engine, which needs
-    // XOR compositing, copyArea and subimage blits that the GDI-shaped
+    // XOR compositing, copyArea and subimage blits that the compatibility-shaped
     // surface does not model. Nothing outside Retro96.Drawing sees these.
-    internal SKCanvas Canvas => _canvas;
-    internal Bitmap Bitmap => _bitmap;
+    internal SKCanvas Canvas => _canvas ?? throw new InvalidOperationException("This Graphics has no drawing canvas.");
+    internal Bitmap Bitmap => _bitmap ?? throw new InvalidOperationException("This Graphics is not backed by a Bitmap.");
 
     // Skia Save/Restore preserves the canvas matrix/clip, but these rendering
     // properties live on the Retro96 wrapper (and some also mutate the cached
@@ -58,18 +60,56 @@ public sealed class Graphics : IDisposable
 
     private Graphics(Bitmap bitmap)
     {
-        _bitmap = bitmap;
+        _bitmap = bitmap ?? throw new ArgumentNullException(nameof(bitmap));
         var sk = bitmap.SkBitmap;
         _surface = SKSurface.Create(sk.Info, sk.GetPixels(), sk.RowBytes)
                    ?? throw new InvalidOperationException("Could not create a raster surface for the bitmap.");
         _canvas = _surface.Canvas;
+        _ownsSurface = true;
+        _gpuContext = null;
     }
 
-    public static Graphics FromImage(Bitmap bitmap) => new(bitmap);
+    private Graphics(SKCanvas canvas, GRContext? gpuContext)
+    {
+        _canvas = canvas ?? throw new ArgumentNullException(nameof(canvas));
+        _surface = null;
+        _bitmap = null;
+        _ownsSurface = false;
+        _gpuContext = gpuContext;
+    }
+
+    private Graphics(bool measurementOnly)
+    {
+        if (!measurementOnly)
+            throw new ArgumentException("This constructor is for measurement contexts only.", nameof(measurementOnly));
+        _canvas = null;
+        _surface = null;
+        _bitmap = null;
+        _ownsSurface = false;
+        _gpuContext = null;
+    }
+
+    public static Graphics FromBitmap(Bitmap bitmap) => new(bitmap);
+
+    /// <summary>Wraps an existing Skia canvas without creating or owning a raster surface.
+    /// When a GRContext is supplied, image draws are promoted to cached GPU textures.</summary>
+    public static Graphics FromCanvas(SKCanvas canvas, GRContext? gpuContext = null) => new(canvas, gpuContext);
+
+    /// <summary>Creates a zero-output Skia canvas for text measurement/layout.
+    /// No bitmap or CPU pixel buffer is allocated.</summary>
+    public static Graphics CreateMeasurementContext() => new(measurementOnly: true);
 
     public void Dispose()
     {
-        _surface.Dispose();
+        if (_ownsSurface)
+        {
+            _surface?.Flush();
+            _surface?.Dispose();
+            _bitmap?.NotifyPixelsChanged();
+        }
+        _srcCopyPaint?.Dispose();
+        _srcCopyPaint = null;
+        _savedStates.Clear();
         GC.SuppressFinalize(this);
     }
 
@@ -77,7 +117,7 @@ public sealed class Graphics : IDisposable
 
     public int Save()
     {
-        int state = _canvas.Save();
+        int state = Canvas.Save();
         _savedStates.Add(new SavedGraphicsState(
             state,
             TextRenderingHint,
@@ -91,9 +131,9 @@ public sealed class Graphics : IDisposable
 
     public void Restore(int state)
     {
-        _canvas.RestoreToCount(state);
+        Canvas.RestoreToCount(state);
 
-        // Match GDI+/Skia's non-top restore semantics: restoring to an older
+        // Match Skia's non-top restore semantics: restoring to an older
         // save invalidates nested saves as well. If the caller restored a
         // canvas state created internally by DrawString(), there is no wrapper
         // snapshot and therefore nothing on this stack to restore.
@@ -113,23 +153,23 @@ public sealed class Graphics : IDisposable
         }
     }
 
-    public void TranslateTransform(float dx, float dy) => _canvas.Translate(dx, dy);
+    public void TranslateTransform(float dx, float dy) => Canvas.Translate(dx, dy);
 
-    public void ScaleTransform(float sx, float sy) => _canvas.Scale(sx, sy);
+    public void ScaleTransform(float sx, float sy) => Canvas.Scale(sx, sy);
 
-    public void ResetTransform() => _canvas.ResetMatrix();
+    public void ResetTransform() => Canvas.ResetMatrix();
 
     public void SetClip(RectangleF rect, CombineMode combineMode = CombineMode.Replace) =>
         // Skia dropped the deprecated Replace clip op; every engine
         // Replace-clip site runs inside a Save/Restore pair, where
         // Intersect-from-clean state is behaviourally identical.
-        _canvas.ClipRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height),
+        Canvas.ClipRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height),
             SKClipOperation.Intersect);
 
     public void SetClip(Region region, CombineMode combineMode = CombineMode.Replace) =>
-        _canvas.ClipPath(region.Path, SKClipOperation.Intersect);
+        Canvas.ClipPath(region.Path, SKClipOperation.Intersect);
 
-    public void Clear(Color color) => _canvas.Clear(color.ToSkColor());
+    public void Clear(Color color) => Canvas.Clear(color.ToSkColor());
 
     // ── Shapes ─────────────────────────────────────────────────────────
 
@@ -141,7 +181,7 @@ public sealed class Graphics : IDisposable
     public void FillRectangle(Brush brush, float x, float y, float width, float height)
     {
         if (brush is not SolidBrush sb || width <= 0f || height <= 0f) return;
-        _canvas.DrawRect(x, y, width, height, sb.Prepare(ShapeAntiAlias));
+        Canvas.DrawRect(x, y, width, height, sb.Prepare(ShapeAntiAlias));
     }
 
     public void DrawRectangle(Pen pen, RectangleF rect) =>
@@ -150,59 +190,61 @@ public sealed class Graphics : IDisposable
     public void DrawRectangle(Pen pen, float x, float y, float width, float height)
     {
         if (pen == null || width < 0f || height < 0f) return;
-        _canvas.DrawRect(x, y, Math.Max(width, 0.01f), Math.Max(height, 0.01f), pen.Prepare(ShapeAntiAlias));
+        Canvas.DrawRect(x, y, Math.Max(width, 0.01f), Math.Max(height, 0.01f), pen.Prepare(ShapeAntiAlias));
     }
 
     public void DrawLine(Pen pen, float x1, float y1, float x2, float y2)
     {
         if (pen == null) return;
-        _canvas.DrawLine(x1, y1, x2, y2, pen.Prepare(ShapeAntiAlias));
+        Canvas.DrawLine(x1, y1, x2, y2, pen.Prepare(ShapeAntiAlias));
     }
 
     public void DrawEllipse(Pen pen, float x, float y, float width, float height)
     {
         if (pen == null || width <= 0f || height <= 0f) return;
-        _canvas.DrawOval(SKRect.Create(x, y, width, height), pen.Prepare(ShapeAntiAlias));
+        Canvas.DrawOval(SKRect.Create(x, y, width, height), pen.Prepare(ShapeAntiAlias));
     }
 
     public void FillEllipse(Brush brush, float x, float y, float width, float height)
     {
         if (brush is not SolidBrush sb || width <= 0f || height <= 0f) return;
-        _canvas.DrawOval(SKRect.Create(x, y, width, height), sb.Prepare(ShapeAntiAlias));
+        Canvas.DrawOval(SKRect.Create(x, y, width, height), sb.Prepare(ShapeAntiAlias));
     }
 
     public void FillPolygon(Brush brush, PointF[] points)
     {
         if (brush is not SolidBrush sb || points == null || points.Length < 3) return;
-        using var path = new SKPath();
-        var skPoints = new SKPoint[points.Length];
-        for (int i = 0; i < points.Length; i++)
-            skPoints[i] = new SKPoint(points[i].X, points[i].Y);
-        path.AddPoly(skPoints, true);
-        _canvas.DrawPath(path, sb.Prepare(ShapeAntiAlias));
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(points[0].X, points[0].Y);
+        for (int i = 1; i < points.Length; i++)
+            builder.LineTo(points[i].X, points[i].Y);
+        builder.Close();
+        using var path = builder.Detach();
+        Canvas.DrawPath(path, sb.Prepare(ShapeAntiAlias));
     }
 
     public void DrawPolygon(Pen pen, PointF[] points)
     {
         if (pen == null || points == null || points.Length < 2) return;
-        using var path = new SKPath();
-        var skPoints = new SKPoint[points.Length];
-        for (int i = 0; i < points.Length; i++)
-            skPoints[i] = new SKPoint(points[i].X, points[i].Y);
-        path.AddPoly(skPoints, true);
-        _canvas.DrawPath(path, pen.Prepare(ShapeAntiAlias));
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(points[0].X, points[0].Y);
+        for (int i = 1; i < points.Length; i++)
+            builder.LineTo(points[i].X, points[i].Y);
+        builder.Close();
+        using var path = builder.Detach();
+        Canvas.DrawPath(path, pen.Prepare(ShapeAntiAlias));
     }
 
     public void DrawArc(Pen pen, float x, float y, float width, float height, float startAngle, float sweepAngle)
     {
         if (pen == null || width <= 0f || height <= 0f) return;
-        _canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, false, pen.Prepare(ShapeAntiAlias));
+        Canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, false, pen.Prepare(ShapeAntiAlias));
     }
 
     public void FillPie(Brush brush, float x, float y, float width, float height, float startAngle, float sweepAngle)
     {
         if (brush is not SolidBrush sb || width <= 0f || height <= 0f) return;
-        _canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, true, sb.Prepare(ShapeAntiAlias));
+        Canvas.DrawArc(SKRect.Create(x, y, width, height), startAngle, sweepAngle, true, sb.Prepare(ShapeAntiAlias));
     }
 
     // ── Images ─────────────────────────────────────────────────────────
@@ -223,46 +265,36 @@ public sealed class Graphics : IDisposable
 
     private SKPaint? _srcCopyPaint;
 
-    /// <summary>Zero-copy image view over the bitmap's live pixels; the
-    /// owning Bitmap is referenced by every caller for the draw's duration.</summary>
-    private static SKImage? Wrap(Image image)
-    {
-        var sk = image.Sk;
-        if (sk == null) return null;
-        return SKImage.FromPixels(sk.Info, sk.GetPixels(), sk.RowBytes);
-    }
+    private SKImage ImageForDraw(Image image) => image.GetGpuImage(_gpuContext);
 
     public void DrawImage(Image image, float x, float y)
     {
-        if (image?.Sk == null) return;
-        using var img = Wrap(image);
-        if (img == null) return;
-        _canvas.DrawImage(img, SKRect.Create(x, y, image.Width, image.Height), Sampling, ImagePaint());
+        if (image == null || image.Width <= 0 || image.Height <= 0) return;
+        Canvas.DrawImage(ImageForDraw(image),
+            SKRect.Create(x, y, image.Width, image.Height),
+            Sampling, ImagePaint());
     }
 
     public void DrawImage(Image image, RectangleF destRect)
     {
-        if (image?.Sk == null) return;
-        using var img = Wrap(image);
-        if (img == null) return;
-        _canvas.DrawImage(img, SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
+        if (image == null || destRect.Width <= 0f || destRect.Height <= 0f) return;
+        Canvas.DrawImage(ImageForDraw(image),
+            SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
             Sampling, ImagePaint());
     }
 
     public void DrawImage(Image image, float x, float y, float width, float height)
     {
-        if (image?.Sk == null) return;
-        using var img = Wrap(image);
-        if (img == null) return;
-        _canvas.DrawImage(img, SKRect.Create(x, y, width, height), Sampling, ImagePaint());
+        if (image == null || width <= 0f || height <= 0f) return;
+        Canvas.DrawImage(ImageForDraw(image), SKRect.Create(x, y, width, height),
+            Sampling, ImagePaint());
     }
 
     public void DrawImage(Image image, RectangleF destRect, RectangleF srcRect, GraphicsUnit srcUnit)
     {
-        if (image?.Sk == null) return;
-        using var img = Wrap(image);
-        if (img == null) return;
-        _canvas.DrawImage(img,
+        if (image == null || destRect.Width <= 0f || destRect.Height <= 0f ||
+            srcRect.Width <= 0f || srcRect.Height <= 0f) return;
+        Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(srcRect.X, srcRect.Y, srcRect.Width, srcRect.Height),
             SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
             Sampling, ImagePaint());
@@ -270,10 +302,9 @@ public sealed class Graphics : IDisposable
 
     public void DrawImage(Image image, Rectangle destRect, Rectangle srcRect, GraphicsUnit srcUnit)
     {
-        if (image?.Sk == null) return;
-        using var img = Wrap(image);
-        if (img == null) return;
-        _canvas.DrawImage(img,
+        if (image == null || destRect.Width <= 0 || destRect.Height <= 0 ||
+            srcRect.Width <= 0 || srcRect.Height <= 0) return;
+        Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(srcRect.X, srcRect.Y, srcRect.Width, srcRect.Height),
             SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
             Sampling, ImagePaint());
@@ -347,7 +378,7 @@ public sealed class Graphics : IDisposable
                 DrawTextWithSpecialGlyphs(text, font, sb, x, baseline);
                 return;
             }
-            _canvas.DrawText(text, x, baseline, font.SkFont, sb.Prepare(antialias: true));
+            Canvas.DrawText(text, x, baseline, SKTextAlign.Left, font.SkFont, sb.Prepare(antialias: true));
         }
         finally
         {
@@ -377,7 +408,7 @@ public sealed class Graphics : IDisposable
             if (i > start)
             {
                 string normal = text[start..i];
-                _canvas.DrawText(normal, cursor, baseline, font.SkFont, paint);
+                Canvas.DrawText(normal, cursor, baseline, SKTextAlign.Left, font.SkFont, paint);
                 cursor += MeasureAdvance(font, normal);
             }
 
@@ -390,7 +421,7 @@ public sealed class Graphics : IDisposable
                     Style = SKPaintStyle.Fill,
                     Color = paint.Color
                 };
-                _canvas.DrawOval(SKRect.Create(left, centerY - diameter * 0.5f,
+                Canvas.DrawOval(SKRect.Create(left, centerY - diameter * 0.5f,
                     diameter, diameter), dot);
                 cursor += bulletAdvance;
                 start = i + 1;
@@ -445,11 +476,11 @@ public sealed class Graphics : IDisposable
                 _ => layoutRect.Y,
             };
 
-            int save = _canvas.Save();
+            int save = Canvas.Save();
             try
             {
                 if ((sf.FormatFlags & StringFormatFlags.NoClip) == 0)
-                    _canvas.ClipRect(SKRect.Create(layoutRect.X, layoutRect.Y,
+                    Canvas.ClipRect(SKRect.Create(layoutRect.X, layoutRect.Y,
                         layoutRect.Width, layoutRect.Height), SKClipOperation.Intersect);
 
                 for (int i = 0; i < lines.Count; i++)
@@ -465,12 +496,12 @@ public sealed class Graphics : IDisposable
                     if (lines[i].IndexOf(LegacyBulletMarker) >= 0)
                         DrawTextWithSpecialGlyphs(lines[i], font, sb, x, baseline);
                     else
-                        _canvas.DrawText(lines[i], x, baseline, font.SkFont, paint);
+                        Canvas.DrawText(lines[i], x, baseline, SKTextAlign.Left, font.SkFont, paint);
                 }
             }
             finally
             {
-                _canvas.RestoreToCount(save);
+                Canvas.RestoreToCount(save);
             }
         }
         finally
@@ -572,7 +603,7 @@ public sealed class Graphics : IDisposable
     /// <summary>
     /// Word-wrapping measurement: reports how many characters fit inside
     /// the layout area (charsFitted) and how many lines the full text needs.
-    /// Mirrors the GDI overload the textarea line-breaker was written for.
+    /// Mirrors the legacy overload the textarea line-breaker was written for.
     /// </summary>
     public SizeF MeasureString(string? text, Font font, SizeF layoutArea,
                                 StringFormat? format, out int charsFitted, out int linesFilled)

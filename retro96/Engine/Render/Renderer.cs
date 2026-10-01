@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Retro96.Drawing;
 using System.Linq;
+using SkiaSharp;
 using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Layout;
@@ -11,7 +12,7 @@ using ControlPaint = Retro96.Drawing.ControlPaint;
 namespace Retro96.Engine.Render;
 
 /// <summary>
-/// Paints the LayoutBox tree into a Bitmap using GDI+.
+/// Paints the LayoutBox tree into a SkiaSharp-backed Bitmap abstraction.
 ///
 /// The whole document is rendered at document size (no viewport culling —
 /// the shell blits the visible region).  Text uses ClearType antialiasing; thin era rules remain pixel-crisp; nothing else is resampled.  The output bitmap is capped
@@ -46,56 +47,277 @@ public class Renderer
     /// background on a huge rect used to be an unbounded loop.</summary>
     private const int MaxBackgroundTiles = 100_000;
 
-    // Shared, immutable formats (DrawString never mutates a StringFormat):
-    // one per paint used to allocate a fresh format for EVERY WORD BOX.
-    private static readonly StringFormat TypographicFormat = new(StringFormat.GenericTypographic)
+    private readonly record struct SkiaTextOptions(SKTextAlign Alignment, bool verticalCenter, bool clip, bool ellipsis);
+
+    private static readonly SkiaTextOptions TypographicText = new(
+        SKTextAlign.Left, verticalCenter: false, clip: false, ellipsis: false);
+
+    private static readonly SkiaTextOptions ButtonText = new(
+        SKTextAlign.Center, verticalCenter: true, clip: false, ellipsis: false);
+
+    // Reuse immutable fill/stroke paints for the common CSS colours.
+    private static readonly Dictionary<Color, SKPaint> _fillPaints = new();
+    private static readonly Dictionary<(Color Color, int Width), SKPaint> _strokePaints = new();
+
+    private static SKPaint CreateFillPaint(Color c, bool antialias = true) => new()
     {
-        FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-        Trimming = StringTrimming.None,
-        LineAlignment = StringAlignment.Near,
-        Alignment = StringAlignment.Near
+        Color = c.ToSkColor(),
+        Style = SKPaintStyle.Fill,
+        IsAntialias = antialias,
+        BlendMode = SKBlendMode.SrcOver
     };
 
-    private static readonly StringFormat ButtonFormat = new(StringFormat.GenericTypographic)
+    private static SKPaint CreateStrokePaint(Color c, float width = 1f, bool antialias = true) => new()
     {
-        FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip
-                    | StringFormatFlags.MeasureTrailingSpaces,
-        LineAlignment = StringAlignment.Center,
-        Alignment = StringAlignment.Center,
-        Trimming = StringTrimming.None
+        Color = c.ToSkColor(),
+        Style = SKPaintStyle.Stroke,
+        StrokeWidth = Math.Max(1f, width),
+        IsAntialias = antialias,
+        BlendMode = SKBlendMode.SrcOver
     };
 
-    // Small shared brush/pen pools: text runs and backgrounds repeat the
-    // same few colours per page; the old per-box `new SolidBrush` churned
-    // GDI objects on every paint.  Capped — a hostile page cycling colours
-    // cannot grow it unboundedly (cap hit = dispose-all + rebuild).
-    private static readonly Dictionary<Color, SolidBrush> _solidBrushes = new();
-    private static readonly Dictionary<Color, Pen> _solidPens = new();
-
-    private static SolidBrush SolidBrushFor(Color c)
+    private static SKPaint FillPaintFor(Color c)
     {
-        if (_solidBrushes.TryGetValue(c, out var b)) return b;
-        if (_solidBrushes.Count > 64)
+        if (_fillPaints.TryGetValue(c, out var paint)) return paint;
+        if (_fillPaints.Count > 64)
         {
-            foreach (var pb in _solidBrushes.Values) pb.Dispose();
-            _solidBrushes.Clear();
+            foreach (var value in _fillPaints.Values) value.Dispose();
+            _fillPaints.Clear();
         }
-        b = new SolidBrush(c);
-        _solidBrushes[c] = b;
-        return b;
+        paint = CreateFillPaint(c);
+        _fillPaints[c] = paint;
+        return paint;
     }
 
-    private static Pen SolidPenFor(Color c)
+    private static SKPaint StrokePaintFor(Color c, int width = 1)
     {
-        if (_solidPens.TryGetValue(c, out var p)) return p;
-        if (_solidPens.Count > 64)
+        var key = (c, Math.Max(1, width));
+        if (_strokePaints.TryGetValue(key, out var paint)) return paint;
+        if (_strokePaints.Count > 128)
         {
-            foreach (var pp in _solidPens.Values) pp.Dispose();
-            _solidPens.Clear();
+            foreach (var value in _strokePaints.Values) value.Dispose();
+            _strokePaints.Clear();
         }
-        p = new Pen(c, 1);
-        _solidPens[c] = p;
-        return p;
+        paint = CreateStrokePaint(c, key.Item2);
+        _strokePaints[key] = paint;
+        return paint;
+    }
+
+    private sealed class SkiaRenderContext : IDisposable
+    {
+        private const char LegacyBulletMarker = '\uE000';
+        private static readonly SKSamplingOptions LinearSampling =
+            new(SKFilterMode.Linear, SKMipmapMode.None);
+
+        public SKCanvas Canvas { get; }
+        private readonly GRContext? _gpuContext;
+
+        public SkiaRenderContext(SKCanvas canvas, GRContext? gpuContext = null)
+        {
+            Canvas = canvas ?? throw new ArgumentNullException(nameof(canvas));
+            _gpuContext = gpuContext;
+        }
+
+        public int Save() => Canvas.Save();
+        public void Restore(int state) => Canvas.RestoreToCount(state);
+
+        public void SetClip(RectangleF rect, SKClipOperation operation = SKClipOperation.Intersect)
+        {
+            Canvas.ClipRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height), operation);
+        }
+
+        public void SetClip(Region region, SKClipOperation operation = SKClipOperation.Intersect)
+        {
+            if (region == null) throw new ArgumentNullException(nameof(region));
+            Canvas.ClipPath(region.Path, operation);
+        }
+
+        public void FillRectangle(SKPaint paint, RectangleF rect) =>
+            Canvas.DrawRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height), paint);
+
+        public void FillRectangle(SKPaint paint, float x, float y, float width, float height) =>
+            Canvas.DrawRect(SKRect.Create(x, y, width, height), paint);
+
+        public void DrawRectangle(SKPaint paint, RectangleF rect) =>
+            Canvas.DrawRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height), paint);
+
+        public void DrawRectangle(SKPaint paint, float x, float y, float width, float height) =>
+            Canvas.DrawRect(SKRect.Create(x, y, width, height), paint);
+
+        public void DrawLine(SKPaint paint, float x1, float y1, float x2, float y2) =>
+            Canvas.DrawLine(x1, y1, x2, y2, paint);
+
+        public void DrawEllipse(SKPaint paint, float x, float y, float width, float height) =>
+            Canvas.DrawOval(SKRect.Create(x, y, width, height), paint);
+
+        public void FillEllipse(SKPaint paint, float x, float y, float width, float height) =>
+            Canvas.DrawOval(SKRect.Create(x, y, width, height), paint);
+
+        public void FillPolygon(SKPaint paint, PointF[] points)
+        {
+            if (points == null || points.Length < 3) return;
+            using var builder = new SKPathBuilder();
+            builder.MoveTo(points[0].X, points[0].Y);
+            for (int i = 1; i < points.Length; i++)
+                builder.LineTo(points[i].X, points[i].Y);
+            builder.Close();
+            using var path = builder.Detach();
+            Canvas.DrawPath(path, paint);
+        }
+
+        public void DrawImage(Image image, RectangleF destRect, SKSamplingOptions? sampling = null)
+        {
+            if (image == null || destRect.Width <= 0f || destRect.Height <= 0f) return;
+            Canvas.DrawImage(image.GetGpuImage(_gpuContext),
+                SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
+                sampling ?? LinearSampling);
+        }
+
+        public void DrawImage(Image image, float x, float y, float width, float height,
+                              SKSamplingOptions? sampling = null)
+        {
+            if (image == null || width <= 0f || height <= 0f) return;
+            Canvas.DrawImage(image.GetGpuImage(_gpuContext),
+                SKRect.Create(x, y, width, height), sampling ?? LinearSampling);
+        }
+
+        public void DrawImageNearest(Image image, float x, float y, float width, float height) =>
+            DrawImage(image, x, y, width, height,
+                new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
+
+        public void DrawString(string? text, Font font, SKPaint paint, float x, float y,
+                               SkiaTextOptions options)
+        {
+            if (string.IsNullOrEmpty(text) || font == null) return;
+            float baseline = y + font.AscentPx;
+            DrawSingleLine(text, font, paint, x, baseline, options.Alignment);
+        }
+
+        public void DrawString(string? text, Font font, SKPaint paint, float x, float y)
+            => DrawString(text, font, paint, x, y, TypographicText);
+
+        public void DrawString(string? text, Font font, SKPaint paint, RectangleF rect,
+                               SkiaTextOptions options)
+        {
+            if (string.IsNullOrEmpty(text) || font == null || rect.Width <= 0f || rect.Height <= 0f)
+                return;
+
+            string line = options.ellipsis ? EllipsizeToWidth(text, font, rect.Width) : text;
+            float width = font.SkFont.MeasureText(line);
+            float x = options.Alignment switch
+            {
+                SKTextAlign.Center => rect.X + (rect.Width - width) * 0.5f,
+                SKTextAlign.Right => rect.Right - width,
+                _ => rect.X,
+            };
+            float y = rect.Y;
+            if (options.verticalCenter)
+                y += Math.Max(0f, (rect.Height - font.GetHeight()) * 0.5f);
+
+            float baseline = y + font.AscentPx;
+            if (options.clip)
+            {
+                int save = Canvas.Save();
+                try
+                {
+                    Canvas.ClipRect(SKRect.Create(rect.X, rect.Y, rect.Width, rect.Height),
+                        SKClipOperation.Intersect);
+                    DrawSingleLine(line, font, paint, x, baseline, SKTextAlign.Left);
+                }
+                finally
+                {
+                    Canvas.RestoreToCount(save);
+                }
+            }
+            else
+            {
+                DrawSingleLine(line, font, paint, x, baseline, SKTextAlign.Left);
+            }
+        }
+
+        public SKSize MeasureString(string? text, Font font)
+        {
+            if (string.IsNullOrEmpty(text) || font == null)
+                return SKSize.Empty;
+            return new SKSize(font.SkFont.MeasureText(text), font.GetHeight());
+        }
+
+        public SKSize MeasureString(string? text, Font font, int maxWidth, SkiaTextOptions options) =>
+            MeasureString(text, font);
+
+        private void DrawSingleLine(string text, Font font, SKPaint paint,
+                                    float x, float baseline, SKTextAlign align)
+        {
+            if (text.IndexOf(LegacyBulletMarker) >= 0)
+            {
+                DrawTextWithSpecialGlyphs(text, font, paint, x, baseline);
+                return;
+            }
+
+            Canvas.DrawText(text, x, baseline, align, font.SkFont, paint);
+        }
+
+        private void DrawTextWithSpecialGlyphs(string text, Font font, SKPaint paint,
+                                               float x, float baseline)
+        {
+            float cursor = x;
+            int start = 0;
+            float lineHeight = font.GetHeight();
+            float bulletAdvance = Math.Max(1f, font.SkFont.MeasureText("·"));
+            float diameter = Math.Clamp(lineHeight * 0.30f, 2.5f, 5.5f);
+            float centerY = baseline - font.AscentPx + lineHeight * 0.52f;
+
+            for (int i = 0; i <= text.Length; i++)
+            {
+                if (i < text.Length && text[i] != LegacyBulletMarker)
+                    continue;
+
+                if (i > start)
+                {
+                    string normal = text[start..i];
+                    Canvas.DrawText(normal, cursor, baseline, SKTextAlign.Left, font.SkFont, paint);
+                    cursor += font.SkFont.MeasureText(normal);
+                }
+
+                if (i < text.Length)
+                {
+                    float left = cursor + (bulletAdvance - diameter) * 0.5f;
+                    using var dot = new SKPaint
+                    {
+                        IsAntialias = true,
+                        Style = SKPaintStyle.Fill,
+                        Color = paint.Color,
+                        BlendMode = SKBlendMode.SrcOver
+                    };
+                    Canvas.DrawOval(SKRect.Create(left, centerY - diameter * 0.5f,
+                        diameter, diameter), dot);
+                    cursor += bulletAdvance;
+                    start = i + 1;
+                }
+            }
+        }
+
+        private static string EllipsizeToWidth(string text, Font font, float maxWidth)
+        {
+            if (font.SkFont.MeasureText(text) <= maxWidth) return text;
+            const string ellipsis = "…";
+            if (font.SkFont.MeasureText(ellipsis) > maxWidth) return string.Empty;
+
+            string candidate = text;
+            while (candidate.Length > 1)
+            {
+                candidate = candidate[..^1] + ellipsis;
+                if (font.SkFont.MeasureText(candidate) <= maxWidth)
+                    return candidate;
+                candidate = candidate[..^2];
+            }
+            return ellipsis;
+        }
+
+        public void Dispose()
+        {
+            // The render context does not own the SKCanvas/SKSurface.
+        }
     }
 
     /// <summary>Control currently held down — painted with the Win95
@@ -114,7 +336,18 @@ public class Renderer
 
     private readonly ResourceLoader _resourceLoader;
 
-    /// <summary>Host-provided secure embedded-content compositor. The renderer never exposes its bitmap or native window to the plugin.</summary>
+    /// <summary>Host-provided GPU-native embedded-content compositor. When present it
+    /// paints directly into the active Skia canvas and avoids a CPU bitmap staging buffer.</summary>
+    public Func<SKCanvas, DomElement, LayoutBox, bool, bool>? EmbeddedCanvasResolver { get; set; }
+
+    /// <summary>When true, embedded/replaced content is left as a lightweight
+    /// fallback in the display list and the live host paints the dynamic embed
+    /// separately on the GPU canvas. This prevents a plugin/Java frame update
+    /// from invalidating the entire document display list.
+    /// </summary>
+    public bool SkipEmbeddedContent { get; set; }
+
+    /// <summary>CPU bitmap fallback used only by print/export and legacy embedded providers.</summary>
     public Func<DomElement, LayoutBox, bool, Bitmap?>? EmbeddedFrameResolver { get; set; }
     public bool IsPrintRendering { get; set; }
     private string? _baseUrl;
@@ -172,27 +405,22 @@ public class Renderer
             else bh = (int)Math.Max(1, MaxSurfacePixels / bw);
         }
 
-        var bmp = new Bitmap(bw, bh);
-
-        using var g = Graphics.FromImage(bmp);
-
-        g.TextRenderingHint = Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.PixelOffsetMode = PixelOffsetMode.Default;
+        var skBitmap = new SKBitmap(new SKImageInfo(
+            bw, bh, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using var surface = SKSurface.Create(skBitmap.Info, skBitmap.GetPixels(), skBitmap.RowBytes)
+            ?? throw new InvalidOperationException("Could not create Skia raster surface.");
+        using var g = new SkiaRenderContext(surface.Canvas);
 
         // ── Page background: fill the physical surface first, then switch to
         //    logical CSS coordinates for the whole page. This makes background
         //    images, borders, text and embedded content participate in the same
         //    crisp zoom transform rather than being resampled afterwards.
         Color pageBackground = BrowserRuntime.ResolveBackground(ResolveBodyBackgroundColor(document));
-        using (var bgBrush = new SolidBrush(pageBackground))
-        {
-            g.FillRectangle(bgBrush, 0, 0, bmp.Width, bmp.Height);
-        }
+        g.FillRectangle(FillPaintFor(pageBackground), 0, 0, skBitmap.Width, skBitmap.Height);
 
         int zoomState = g.Save();
         if (Math.Abs(renderScale - 1f) > 0.0005f)
-            g.ScaleTransform(renderScale, renderScale);
+            g.Canvas.Scale(renderScale, renderScale);
         PaintBodyBackgroundImage(document, images, g, docWidth, docHeight);
 
         try
@@ -211,14 +439,103 @@ public class Renderer
             Retro96.DebugLog.WriteException("Renderer.Render/PaintBox", ex);
             using var errFont = new Font(FontFamily.GenericSansSerif, 11f, FontStyle.Regular,
                 GraphicsUnit.Pixel);
-            using var errBrush = new SolidBrush(Color.FromArgb(0x80, 0x00, 0x00));
+            using var errBrush = CreateFillPaint(Color.FromArgb(0x80, 0x00, 0x00));
             g.DrawString(
                 $"Rendering stopped part-way: {ex.Message}",
-                errFont, errBrush, 8f, Math.Max(8f, bmp.Height - 24f));
+                errFont, errBrush, 8f, Math.Max(8f, skBitmap.Height - 24f), TypographicText);
         }
 
         g.Restore(zoomState);
-        return bmp;
+        g.Canvas.Flush();
+        return new Bitmap(skBitmap);
+    }
+
+    /// <summary>
+    /// Paints a document directly into the caller's Skia canvas. The caller may
+    /// supply a GPU-backed SKCanvas (SKGLControl) or a raster canvas for export.
+    /// No intermediate page bitmap is allocated by this path.
+    /// </summary>
+    public void RenderToCanvas(SKCanvas canvas, LayoutBox rootBox, DomDocument document,
+                               FontCache fonts, ImageCache images,
+                               float viewportWidth, float viewportHeight,
+                               float scrollX, float scrollY,
+                               DomElement? hoveredElement,
+                               bool blinkVisible,
+                               bool showBoxOutlines = false,
+                               DomElement? focusedElement = null,
+                               float renderScale = 1f,
+                               bool clearBackground = true,
+                               GRContext? gpuContext = null)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(rootBox);
+        ArgumentNullException.ThrowIfNull(document);
+
+        _baseUrl = document.BaseUrl?.ToAbsolute();
+        _scrollX = float.IsFinite(scrollX) ? Math.Max(0f, scrollX) : 0f;
+        _scrollY = float.IsFinite(scrollY) ? Math.Max(0f, scrollY) : 0f;
+        _viewportWidth = Math.Max(1f, viewportWidth);
+        _viewportHeight = Math.Max(1f, viewportHeight);
+        renderScale = float.IsFinite(renderScale) ? Math.Clamp(renderScale, 0.25f, 4f) : 1f;
+
+        float docWidth = Math.Max(rootBox.Width, _viewportWidth);
+        float docHeight = Math.Max(rootBox.Height, _viewportHeight);
+        Color pageBackground = BrowserRuntime.ResolveBackground(ResolveBodyBackgroundColor(document));
+
+        int state = canvas.Save();
+        try
+        {
+            if (Math.Abs(renderScale - 1f) > 0.0005f)
+                canvas.Scale(renderScale, renderScale);
+
+            canvas.ClipRect(SKRect.Create(0f, 0f, _viewportWidth, _viewportHeight), SKClipOperation.Intersect);
+            if (clearBackground)
+                canvas.DrawRect(SKRect.Create(0f, 0f, _viewportWidth, _viewportHeight), FillPaintFor(pageBackground));
+
+            using var g = new SkiaRenderContext(canvas, gpuContext);
+            PaintBodyBackgroundImage(document, images, g, docWidth, docHeight);
+            canvas.Save();
+            try
+            {
+                canvas.Translate(-_scrollX, -_scrollY);
+                PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement);
+                if (showBoxOutlines)
+                    PaintBoxOutlines(g, rootBox);
+            }
+            finally
+            {
+                canvas.Restore();
+            }
+        }
+        catch (Exception ex)
+        {
+            Retro96.DebugLog.WriteException("Renderer.RenderToCanvas/PaintBox", ex);
+            using var errFont = new Font(FontFamily.GenericSansSerif, 11f, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var errBrush = CreateFillPaint(Color.FromArgb(0x80, 0x00, 0x00));
+            float errorY = Math.Max(8f, _scrollY + _viewportHeight - errFont.GetHeight() - 8f);
+            using var errorContext = new SkiaRenderContext(canvas, gpuContext);
+            errorContext.DrawString($"Rendering stopped part-way: {ex.Message}", errFont, errBrush,
+                _scrollX + 8f, errorY, TypographicText);
+        }
+        finally
+        {
+            canvas.RestoreToCount(state);
+        }
+    }
+
+    /// <summary>GPU-local render helper for a frame's content viewport.</summary>
+    internal void RenderLocalToCanvas(SKCanvas canvas, LayoutBox rootBox, DomDocument document,
+                                      FontCache fonts, ImageCache images,
+                                      float viewportWidth, float viewportHeight,
+                                      float scrollX, float scrollY,
+                                      DomElement? hoveredElement, bool blinkVisible,
+                                      DomElement? focusedElement = null,
+                                      bool showBoxOutlines = false)
+    {
+        RenderToCanvas(canvas, rootBox, document, fonts, images,
+            viewportWidth, viewportHeight, scrollX, scrollY,
+            hoveredElement, blinkVisible, showBoxOutlines, focusedElement,
+            renderScale: 1f, clearBackground: true);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -249,7 +566,7 @@ public class Renderer
     }
 
     private void PaintBodyBackgroundImage(DomDocument? doc,
-        ImageCache images, Graphics g, float w, float h)
+        ImageCache images, SkiaRenderContext g, float w, float h)
     {
         if (!BrowserRuntime.ImagesEnabled ||
             BrowserRuntime.Settings.BackgroundMode == BackgroundMode.Force) return;
@@ -302,7 +619,7 @@ public class Renderer
             .Select(p => p.child);
     }
 
-    private void PaintBox(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintBox(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                           ImageCache images, DomElement? hoveredElement,
                           bool blinkVisible, DomElement? focusedElement = null)
     {
@@ -361,7 +678,7 @@ public class Renderer
                 box.Y + box.BorderTop,
                 box.Width + box.PaddingLeft + box.PaddingRight,
                 box.Height + box.PaddingTop + box.PaddingBottom),
-                CombineMode.Intersect);
+                SKClipOperation.Intersect);
         }
 
         foreach (var child in PaintOrder(box))
@@ -392,7 +709,7 @@ public class Renderer
     /// SCROLLDELAY (ms per move, default 85). The phase derives from
     /// wall-clock time so the speed is exact even when repaints are sparse.
     /// </summary>
-    private void PaintMarqueeContent(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintMarqueeContent(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                      ImageCache images, DomElement? hoveredElement,
                                      bool blinkVisible, DomElement? focusedElement)
     {
@@ -406,7 +723,7 @@ public class Renderer
         {
             Color c = ParseHtmlColor(bg);
             if (c != Color.Empty)
-                using (var brush = new SolidBrush(c))
+                using (var brush = CreateFillPaint(c))
                     g.FillRectangle(brush, rect);
         }
 
@@ -473,7 +790,7 @@ public class Renderer
         }
 
         var clip = g.Save();
-        g.SetClip(rect, CombineMode.Intersect);
+        g.SetClip(rect, SKClipOperation.Intersect);
 
         // SCROLL draws a second copy one travel-distance behind the first,
         // so as one copy exits the visible edge the next is already
@@ -482,21 +799,21 @@ public class Renderer
 
         try
         {
-            g.TranslateTransform(baseX - originX, 0f);
+            g.Canvas.Translate(baseX - originX, 0f);
             foreach (var child in PaintOrder(box))
                 PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
 
             if (dual)
             {
                 float secondDx = rightward ? -travel : travel;
-                g.TranslateTransform(secondDx, 0f);
+                g.Canvas.Translate(secondDx, 0f);
                 foreach (var child in box.Children)
                     PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement);
             }
         }
         finally
         {
-            g.ResetTransform();
+            g.Canvas.ResetMatrix();
             g.Restore(clip);
         }
     }
@@ -514,7 +831,7 @@ public class Renderer
 
     // ── Background ───────────────────────────────────────────────────────
 
-    private void PaintBackground(Graphics g, LayoutBox box, ImageCache images)
+    private void PaintBackground(SkiaRenderContext g, LayoutBox box, ImageCache images)
     {
         if (box.Element == null) return;   // anonymous boxes have no background
 
@@ -525,7 +842,7 @@ public class Renderer
         if (box.Element.TagName == "body" &&
             BrowserRuntime.Settings.BackgroundMode == BackgroundMode.Force)
         {
-            g.FillRectangle(SolidBrushFor(BrowserRuntime.Settings.GetForcedBackgroundColor()),
+            g.FillRectangle(FillPaintFor(BrowserRuntime.Settings.GetForcedBackgroundColor()),
                 rect.X, rect.Y, rect.Width, rect.Height);
             return;
         }
@@ -542,8 +859,8 @@ public class Renderer
 
         if (bg != Color.Transparent && bg != Color.Empty)
         {
-            // FIX: shared brush pool — was a fresh SolidBrush per box per paint.
-            g.FillRectangle(SolidBrushFor(bg), rect.X, rect.Y, rect.Width, rect.Height);
+            // FIX: shared brush pool — was a fresh SKPaint per box per paint.
+            g.FillRectangle(FillPaintFor(bg), rect.X, rect.Y, rect.Width, rect.Height);
         }
 
         // Background image
@@ -570,7 +887,7 @@ public class Renderer
         catch { }
     }
 
-    private void PaintBackgroundImage(Graphics g, RectangleF rect,
+    private void PaintBackgroundImage(SkiaRenderContext g, RectangleF rect,
                                              Image image, ComputedStyle style)
     {
         float iw = image.Width;
@@ -591,23 +908,17 @@ public class Renderer
         var state = g.Save();
         try
         {
-            using var clip = new Region(rect);
-            g.SetClip(clip, CombineMode.Replace);
+            g.SetClip(rect, SKClipOperation.Intersect);
 
             // FIX: draw cap — a small tile on a large element used to be an
             // unbounded loop (worst case: millions of DrawImage calls).
             int drawn = 0;
-            var oldInterpolation = g.InterpolationMode;
-            var oldPixelOffset = g.PixelOffsetMode;
-            g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            g.PixelOffsetMode = PixelOffsetMode.None;
-
             try
             {
                 switch (style.BackgroundRepeat)
                 {
                     case BackgroundRepeat.NoRepeat:
-                        g.DrawImage(image, anchorX, anchorY, iw, ih);
+                        g.DrawImageNearest(image, anchorX, anchorY, iw, ih);
                         break;
 
                     case BackgroundRepeat.RepeatX:
@@ -617,7 +928,7 @@ public class Renderer
                             float x0 = BackOffToCover(anchorX, rect.Left, iw);
                             for (float x = x0; x < rect.Right && drawn < MaxBackgroundTiles; x += iw)
                             {
-                                g.DrawImage(image, x, anchorY, iw, ih);
+                                g.DrawImageNearest(image, x, anchorY, iw, ih);
                                 drawn++;
                             }
                             break;
@@ -627,7 +938,7 @@ public class Renderer
                             float y0 = BackOffToCover(anchorY, rect.Top, ih);
                             for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
                             {
-                                g.DrawImage(image, anchorX, y, iw, ih);
+                                g.DrawImageNearest(image, anchorX, y, iw, ih);
                                 drawn++;
                             }
                             break;
@@ -639,7 +950,7 @@ public class Renderer
                             for (float y = y0; y < rect.Bottom && drawn < MaxBackgroundTiles; y += ih)
                                 for (float x = x0; x < rect.Right && drawn < MaxBackgroundTiles; x += iw)
                                 {
-                                    g.DrawImage(image, x, y, iw, ih);
+                                    g.DrawImageNearest(image, x, y, iw, ih);
                                     drawn++;
                                 }
                             break;
@@ -648,8 +959,6 @@ public class Renderer
             }
             finally
             {
-                g.InterpolationMode = oldInterpolation;
-                g.PixelOffsetMode = oldPixelOffset;
             }
         }
         finally
@@ -667,7 +976,7 @@ public class Renderer
 
     // ── Border ───────────────────────────────────────────────────────────
 
-    private void PaintBorder(Graphics g, LayoutBox box)
+    private void PaintBorder(SkiaRenderContext g, LayoutBox box)
     {
         if (box.Element == null) return;
 
@@ -738,7 +1047,7 @@ public class Renderer
     /// <summary>An unset border colour paints black (an Empty colour makes an invisible pen).</summary>
     private static Color BorderColorOrBlack(Color c) => c == Color.Empty ? Color.Black : c;
 
-    private static void PaintTableOuterBorder(Graphics g, LayoutBox box)
+    private static void PaintTableOuterBorder(SkiaRenderContext g, LayoutBox box)
     {
         var rect = box.BorderRect;
         if (rect.Width <= 0 || rect.Height <= 0) return;
@@ -747,11 +1056,11 @@ public class Renderer
         Color background = ResolveLocalBackground(box.Element, Color.White);
         Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
         Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
-        using var penDark = new Pen(dark, 1);
-        using var penLight = new Pen(light, 1);
+        using var penDark = CreateStrokePaint(dark, 1);
+        using var penLight = CreateStrokePaint(light, 1);
         if (NeedsStrongBevelOutline(background))
         {
-            using var outline = new Pen(BevelOutlineColor(background), 1);
+            using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
             g.DrawRectangle(outline, rect.X, rect.Y, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
         }
 
@@ -770,12 +1079,12 @@ public class Renderer
     }
 
     /// <summary>3-D sunken frame placeholder for frame/iframe boxes.</summary>
-    private static void PaintFramePlaceholder(Graphics g, LayoutBox box)
+    private static void PaintFramePlaceholder(SkiaRenderContext g, LayoutBox box)
     {
         var rect = box.BorderRect;
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
-        using var bg = new SolidBrush(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        using var bg = CreateFillPaint(Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(bg, rect);
         PaintSunkenRect(g, rect, 2, Color.FromArgb(0xC0, 0xC0, 0xC0));
     }
@@ -784,7 +1093,7 @@ public class Renderer
     /// &lt;hr&gt;: SIZE thick 3-D inset rule; NOSHADE draws a flat grey bar.
     /// Width/size/alignment were resolved during layout.
     /// </summary>
-    private static void PaintHr(Graphics g, LayoutBox box)
+    private static void PaintHr(SkiaRenderContext g, LayoutBox box)
     {
         var elem = box.Element!;
         var style = elem.Style;
@@ -810,7 +1119,7 @@ public class Renderer
         if (noshade)
         {
             // NOSHADE is a flat rule: paint the authored COLOR verbatim.
-            g.FillRectangle(SolidBrushFor(color),
+            g.FillRectangle(FillPaintFor(color),
                 x1, rect.Y, rect.Width, thick);
             return;
         }
@@ -822,8 +1131,8 @@ public class Renderer
         var dark = EnsureBevelContrast(Shade(color, 0.55f), background, preferLighter: false);
         var light = EnsureBevelContrast(Tint(color, 0.65f), background, preferLighter: true);
         int half = (thick + 1) / 2;
-        using var penDark = new Pen(dark, 1);
-        using var penLight = new Pen(light, 1);
+        using var penDark = CreateStrokePaint(dark, 1);
+        using var penLight = CreateStrokePaint(light, 1);
         for (int i = 0; i < thick; i++)
         {
             float y = rect.Y + i;
@@ -845,7 +1154,7 @@ public class Renderer
 
     private enum BorderSide { Top, Right, Bottom, Left }
 
-    private static void PaintBorderSide(Graphics g, RectangleF rect, float width,
+    private static void PaintBorderSide(SkiaRenderContext g, RectangleF rect, float width,
         BorderStyleValue bStyle, Color color, BorderSide side, Color background,
         float nearCornerWidth, float farCornerWidth, bool authoredStyle)
     {
@@ -885,14 +1194,14 @@ public class Renderer
     }
 
     /// <summary>Draws border scanlines with mitered endpoints and CSS-scaled dash spacing.</summary>
-    private static void PaintSimpleSide(Graphics g, RectangleF rect, int w,
+    private static void PaintSimpleSide(SkiaRenderContext g, RectangleF rect, int w,
         BorderStyleValue style, Color color, BorderSide side,
         float nearCornerWidth, float farCornerWidth)
     {
         using var clip = new Region(GetBorderPolygon(
             rect, w, side, nearCornerWidth, farCornerWidth));
         int state = g.Save();
-        using var brush = new SolidBrush(color);
+        using var brush = CreateFillPaint(color);
         float dashLength = Math.Max(3f, w * 3f);
         float dashGap = Math.Max(2f, w * 2f);
         float dotPitch = w * 2f;
@@ -909,7 +1218,7 @@ public class Renderer
 
         try
         {
-            g.SetClip(clip, CombineMode.Intersect);
+            g.SetClip(clip, SKClipOperation.Intersect);
             if (style == BorderStyleValue.Dotted)
             {
                 for (float position = axisStart; position < axisEnd; position += dotPitch)
@@ -985,7 +1294,7 @@ public class Renderer
         end = lengthEnd - farCornerWidth * fraction;
     }
 
-    private static void DrawBorderScanline(Graphics g, Brush brush, RectangleF rect,
+    private static void DrawBorderScanline(SkiaRenderContext g, SKPaint brush, RectangleF rect,
         BorderSide side, int offset, float start, float end)
     {
         if (end <= start) return;
@@ -1001,7 +1310,7 @@ public class Renderer
         }
     }
 
-    private static void Paint3DBorder(Graphics g, RectangleF rect,
+    private static void Paint3DBorder(SkiaRenderContext g, RectangleF rect,
         BorderStyleValue style, int w, Color baseColor, BorderSide side, Color background)
     {
         if (w < 1) return;
@@ -1025,7 +1334,7 @@ public class Renderer
                     ? raised == topLeft ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f)
                     : raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
             }
-            using var brush = new SolidBrush(shade);
+            using var brush = CreateFillPaint(shade);
             switch (side)
             {
                 case BorderSide.Top: g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, w); break;
@@ -1058,8 +1367,8 @@ public class Renderer
         }
         int first = Math.Max(1, w / 2);
         int second = Math.Max(1, w - first);
-        using var outerBrush = new SolidBrush(outer);
-        using var innerBrush = new SolidBrush(inner);
+        using var outerBrush = CreateFillPaint(outer);
+        using var innerBrush = CreateFillPaint(inner);
 
         switch (side)
         {
@@ -1082,7 +1391,7 @@ public class Renderer
         }
     }
 
-    private static void PaintDoubleBorder(Graphics g, RectangleF rect, int w,
+    private static void PaintDoubleBorder(SkiaRenderContext g, RectangleF rect, int w,
         Color color, BorderSide side, float nearCornerWidth, float farCornerWidth)
     {
         if (w < 3)
@@ -1094,7 +1403,7 @@ public class Renderer
 
         int line = Math.Max(1, w / 3);
         int secondLineStart = w - line;
-        using var brush = new SolidBrush(color);
+        using var brush = CreateFillPaint(color);
         for (int offset = 0; offset < w; offset++)
         {
             if (offset < line || offset >= secondLineStart)
@@ -1110,7 +1419,7 @@ public class Renderer
     // Content
     // ─────────────────────────────────────────────────────────────────────
 
-    private void PaintContent(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintContent(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                               ImageCache images, DomElement? hoveredElement,
                               DomElement? focusedElement = null)
     {
@@ -1145,6 +1454,17 @@ public class Renderer
                     case "applet":
                     case "embed":
                     case "object":
+                        if (SkipEmbeddedContent)
+                        {
+                            string? deferredSrc = box.Element.GetAttr("src");
+                            string deferredPath = deferredSrc?.Split('?', '#')[0] ?? string.Empty;
+                            bool deferredMidi = deferredPath.EndsWith(".mid", StringComparison.OrdinalIgnoreCase) ||
+                                deferredPath.EndsWith(".midi", StringComparison.OrdinalIgnoreCase);
+                            if (!deferredMidi) PaintFallbackContent(g, box);
+                            return;
+                        }
+                        if (EmbeddedCanvasResolver?.Invoke(g.Canvas, box.Element, box, IsPrintRendering) == true)
+                            return;
                         if (EmbeddedFrameResolver?.Invoke(box.Element, box, IsPrintRendering) is { } embeddedFrame)
                         {
                             g.DrawImage(embeddedFrame, box.X, box.Y, box.Width, box.Height);
@@ -1245,13 +1565,13 @@ public class Renderer
 
         float textY = contentRect.Y;
         if (style.LineHeightMode != LineHeightMode.Normal)
-            textY += Math.Max(0f, (contentRect.Height - font.GetHeight(g)) / 2f);
+            textY += Math.Max(0f, (contentRect.Height - font.GetHeight()) / 2f);
 
         // FIX: shared format + shared brush — a text-heavy page used to
-        // allocate one StringFormat and one SolidBrush per WORD BOX on
+        // allocate one Skia text options and one SKPaint per WORD BOX on
         // every repaint (the caret blink repaints twice a second).
-        var brush = SolidBrushFor(textColor);
-        var sf = TypographicFormat;
+        var brush = FillPaintFor(textColor);
+        var sf = TypographicText;
 
         string text = style.TextTransform switch
         {
@@ -1297,16 +1617,16 @@ public class Renderer
             // of the dashed "_  _  _" the per-word measurement produced.
             float lineRight = contentRect.X + Math.Max(box.Width, 0f);
             if (!float.IsFinite(lineRight)) return;
-            var decoP = SolidPenFor(textColor);
+            var decoP = StrokePaintFor(textColor);
 
             if (deco.HasFlag(TextDecoration.Underline))
             {
-                float uy = textY + font.GetHeight(g) - 1;
+                float uy = textY + font.GetHeight() - 1;
                 g.DrawLine(decoP, contentRect.X, uy, lineRight, uy);
             }
             if (deco.HasFlag(TextDecoration.LineThrough))
             {
-                float sy = textY + font.GetHeight(g) / 2f;
+                float sy = textY + font.GetHeight() / 2f;
                 g.DrawLine(decoP, contentRect.X, sy, lineRight, sy);
             }
             if (deco.HasFlag(TextDecoration.Overline))
@@ -1317,8 +1637,8 @@ public class Renderer
         }
     }
 
-    private static void PaintSpacedText(Graphics g, float x, float y, string text,
-                                        Font font, Brush brush, ComputedStyle style, StringFormat sf)
+    private static void PaintSpacedText(SkiaRenderContext g, float x, float y, string text,
+                                        Font font, SKPaint brush, ComputedStyle style, SkiaTextOptions sf)
     {
         // Draw glyphs individually when CSS1 tracking is non-zero. A single
         // DrawString call can report the expanded advance to layout while
@@ -1341,9 +1661,9 @@ public class Renderer
     }
 
     /// <summary>True for a text run made only of collapsible whitespace.</summary>
-    private static void PaintSmallCapsText(Graphics g, float x, float y, string text,
+    private static void PaintSmallCapsText(SkiaRenderContext g, float x, float y, string text,
                                            ComputedStyle style, FontCache fonts,
-                                           Color color, StringFormat sf)
+                                           Color color, SkiaTextOptions sf)
     {
         float smallSize = Math.Max(1f, style.FontSize * 0.80f);
         var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
@@ -1351,7 +1671,7 @@ public class Renderer
         bool oblique = style.FontStyle == FontStyleValue.Oblique;
         var smallFont = fonts.Resolve(family, smallSize, (int)style.FontWeight, italic, oblique);
         var fullFont = fonts.Resolve(family, style.FontSize > 0f ? style.FontSize : 16f, (int)style.FontWeight, italic, oblique);
-        using var runBrush = new SolidBrush(color);
+        using var runBrush = CreateFillPaint(color);
 
         int i = 0;
         float drawX = x;
@@ -1457,7 +1777,7 @@ public class Renderer
 
     // ── Images ────────────────────────────────────────────────────────────
 
-    private void PaintImage(Graphics g, LayoutBox box, ImageCache images)
+    private void PaintImage(SkiaRenderContext g, LayoutBox box, ImageCache images)
     {
         var elem = box.Element!;
         var rect = box.ContentRect;
@@ -1501,7 +1821,7 @@ public class Renderer
             FindAncestorElement(elem, "a")?.HasAttr("href") == true)
         {
             var doc = elem.OwnerDocument();
-            using var linkPen = new Pen(
+            using var linkPen = CreateStrokePaint(
                 doc != null ? StyleResolver.GetLinkColor(doc) : Color.FromArgb(0, 0, 0xEE), 2);
             g.DrawRectangle(linkPen, drawRect.X + 1, drawRect.Y + 1, dw - 2, dh - 2);
         }
@@ -1523,13 +1843,13 @@ public class Renderer
         return false;
     }
 
-    private static void DrawBrokenImage(Graphics g, LayoutBox box, RectangleF br)
+    private static void DrawBrokenImage(SkiaRenderContext g, LayoutBox box, RectangleF br)
     {
-        g.FillRectangle(Brushes.LightGray, br);
-        g.DrawRectangle(Pens.DarkGray, br.X, br.Y, br.Width - 1, br.Height - 1);
+        g.FillRectangle(FillPaintFor(Color.LightGray), br);
+        g.DrawRectangle(StrokePaintFor(Color.DarkGray), br.X, br.Y, br.Width - 1, br.Height - 1);
 
         float iconSize = Math.Min(20f, Math.Max(12f, br.Height - 4f));
-        using var p = new Pen(Color.Red, 2);
+        using var p = CreateStrokePaint(Color.Red, 2);
         g.DrawLine(p, br.X + 2, br.Y + 2,
             br.X + iconSize - 2, br.Y + iconSize - 2);
         g.DrawLine(p, br.X + iconSize - 2, br.Y + 2,
@@ -1540,33 +1860,30 @@ public class Renderer
         string? alt = box.Element?.GetAttr("alt");
         if (!string.IsNullOrEmpty(alt) && br.Width > iconSize + 8)
         {
-            using var sf = new StringFormat
-            {
-                Trimming = StringTrimming.EllipsisCharacter,
-                LineAlignment = StringAlignment.Center,
-                FormatFlags = StringFormatFlags.NoWrap
-            };
-            using var font = SystemFonts.SmallCaptionFont ?? SystemFonts.DefaultFont;
+            var sf = new SkiaTextOptions(
+                SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: true);
+            using var font = new Font(FontFamily.GenericSansSerif, 11f, FontStyle.Regular,
+                GraphicsUnit.Pixel);
             var textRect = new RectangleF(br.X + iconSize + 3, br.Y + 1,
                 br.Width - iconSize - 5, Math.Max(1f, br.Height - 2));
-            g.DrawString(alt, font, Brushes.DarkGray, textRect, sf);
+            g.DrawString(alt, font, FillPaintFor(Color.DarkGray), textRect, sf);
         }
     }
 
     /// <summary>object/embed/applet: reserved box + fallback content.</summary>
-    private static void PaintFallbackContent(Graphics g, LayoutBox box)
+    private static void PaintFallbackContent(SkiaRenderContext g, LayoutBox box)
     {
         var r = box.ContentRect;
         if (r.Width <= 0 || r.Height <= 0) return;
 
-        using var bg = new SolidBrush(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        using var bg = CreateFillPaint(Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(bg, r);
-        g.DrawRectangle(Pens.Gray, r.X, r.Y, r.Width - 1, r.Height - 1);
+        g.DrawRectangle(StrokePaintFor(Color.Gray), r.X, r.Y, r.Width - 1, r.Height - 1);
     }
 
     // ── Form controls ─────────────────────────────────────────────────────
 
-    private void PaintInputElement(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintInputElement(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                    ImageCache images, bool isFocused = false)
     {
         var elem = box.Element!;
@@ -1738,17 +2055,17 @@ public class Renderer
     }
 
     /// <summary>2-tone sunken (inset) rectangle frame, `size` px thick.</summary>
-    private static void PaintSunkenRect(Graphics g, RectangleF rect, int size, Color background = default)
+    private static void PaintSunkenRect(SkiaRenderContext g, RectangleF rect, int size, Color background = default)
     {
         if (background == Color.Empty || background == Color.Transparent)
             background = Color.White;
         Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
         Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
-        using var penDark = new Pen(dark, 1);
-        using var penLight = new Pen(light, 1);
+        using var penDark = CreateStrokePaint(dark, 1);
+        using var penLight = CreateStrokePaint(light, 1);
         if (NeedsStrongBevelOutline(background))
         {
-            using var outline = new Pen(BevelOutlineColor(background), 1);
+            using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
             g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
         }
         for (int i = 0; i < size; i++)
@@ -1764,17 +2081,17 @@ public class Renderer
     }
 
     /// <summary>2-tone raised (outset) rectangle frame, `size` px thick.</summary>
-    private static void PaintRaisedRect(Graphics g, RectangleF rect, int size, Color background = default)
+    private static void PaintRaisedRect(SkiaRenderContext g, RectangleF rect, int size, Color background = default)
     {
         if (background == Color.Empty || background == Color.Transparent)
             background = Color.White;
         Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
         Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
-        using var penLight = new Pen(light, 1);
-        using var penDark = new Pen(dark, 1);
+        using var penLight = CreateStrokePaint(light, 1);
+        using var penDark = CreateStrokePaint(dark, 1);
         if (NeedsStrongBevelOutline(background))
         {
-            using var outline = new Pen(BevelOutlineColor(background), 1);
+            using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
             g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
         }
         for (int i = 0; i < size; i++)
@@ -1789,7 +2106,7 @@ public class Renderer
         }
     }
 
-    private void PaintFileInput(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintFileInput(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                        ComputedStyle style)
     {
         var rect = box.BorderRect;
@@ -1802,7 +2119,7 @@ public class Renderer
         Color textColor = disabled ? Color.Gray
             : style.OwnColor ? style.Color : Color.Black;
 
-        using (var bg = new SolidBrush(outer))
+        using (var bg = CreateFillPaint(outer))
             g.FillRectangle(bg, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 1, outer);
 
@@ -1812,7 +2129,7 @@ public class Renderer
             face.X + 2, face.Y + 2,
             actualButtonWidth, Math.Max(1f, face.Height - 4));
 
-        using (var buttonBrush = new SolidBrush(buttonFace))
+        using (var buttonBrush = CreateFillPaint(buttonFace))
             g.FillRectangle(buttonBrush, button.X, button.Y, button.Width, button.Height);
 
         bool pressed = box.Element != null && ReferenceEquals(box.Element, PressedElement);
@@ -1828,14 +2145,9 @@ public class Renderer
         }
 
         var font = ResolveFont(fonts, style);
-        using var brush = new SolidBrush(textColor);
-        using var fmt = new StringFormat(StringFormat.GenericTypographic)
-        {
-            Alignment = StringAlignment.Center,
-            LineAlignment = StringAlignment.Center,
-            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-            Trimming = StringTrimming.EllipsisCharacter
-        };
+        using var brush = CreateFillPaint(textColor);
+        var fmt = new SkiaTextOptions(
+            SKTextAlign.Center, verticalCenter: true, clip: false, ellipsis: true);
 
         var labelButtonRect = pressed
             ? new RectangleF(button.X + 1, button.Y + 1, Math.Max(0, button.Width - 1), Math.Max(0, button.Height - 1))
@@ -1849,20 +2161,15 @@ public class Renderer
             Math.Max(0f, face.Right - button.Right - 9), face.Height - 2);
 
         string displayLabel = FitFileNameToWidth(g, label, font, Math.Max(0f, labelRect.Width));
-        using var labelFmt = new StringFormat(StringFormat.GenericTypographic)
-        {
-            Alignment = StringAlignment.Near,
-            LineAlignment = StringAlignment.Center,
-            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-            Trimming = StringTrimming.None
-        };
+        var labelFmt = new SkiaTextOptions(
+            SKTextAlign.Left, verticalCenter: true, clip: false, ellipsis: false);
         var clip = g.Save();
-        g.SetClip(labelRect, CombineMode.Intersect);
+        g.SetClip(labelRect, SKClipOperation.Intersect);
         g.DrawString(displayLabel, font, brush, labelRect, labelFmt);
         g.Restore(clip);
     }
 
-    private static string FitFileNameToWidth(Graphics g, string fileName, Font font, float width)
+    private static string FitFileNameToWidth(SkiaRenderContext g, string fileName, Font font, float width)
     {
         if (width <= 0f || string.IsNullOrEmpty(fileName)) return fileName;
         if (g.MeasureString(fileName, font).Width <= width) return fileName;
@@ -1893,7 +2200,7 @@ public class Renderer
         return extension.Length > 0 ? extension : ellipsis;
     }
 
-    private static void PaintTextControl(Graphics g, LayoutBox box, FontCache fonts,
+    private static void PaintTextControl(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                          ComputedStyle style, string text, bool isFocused,
                                          bool isPassword)
     {
@@ -1913,7 +2220,7 @@ public class Renderer
         Color fgColor = disabled ? Color.Gray
                      : style.OwnColor ? style.Color : Color.Black;
 
-        using (var faceBrush = new SolidBrush(bgColor))
+        using (var faceBrush = CreateFillPaint(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2, bgColor);
 
@@ -1921,53 +2228,38 @@ public class Renderer
         // there is no visual difference between focused and unfocused.
         if (isFocused)
         {
-            using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+            using var focusPen = CreateStrokePaint(Color.FromArgb(0, 0, 128), 1);
             g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
         }
 
         var font = ResolveFont(fonts, style);
-        using var brush = new SolidBrush(fgColor);
-        using var sf = new StringFormat(StringFormat.GenericTypographic)
-        {
-            FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-            Trimming = StringTrimming.None,
-            LineAlignment = StringAlignment.Center,
-            // text-align only when the page authored it for THIS control
-            // (the digital-clock idiom centres its digits); an inherited
-            // cell alignment never moves the caret text.
-            Alignment = style.OwnTextAlign
-                ? (style.TextAlign == TextAlign.Center ? StringAlignment.Center
-                  : style.TextAlign == TextAlign.Right ? StringAlignment.Far
-                  : StringAlignment.Near)
-                : StringAlignment.Near
-        };
+        using var brush = CreateFillPaint(fgColor);
+        SKTextAlign textAlign = style.OwnTextAlign
+            ? (style.TextAlign == TextAlign.Center ? SKTextAlign.Center
+              : style.TextAlign == TextAlign.Right ? SKTextAlign.Right
+              : SKTextAlign.Left)
+            : SKTextAlign.Left;
+        var sf = new SkiaTextOptions(
+            textAlign, verticalCenter: true, clip: true, ellipsis: false);
 
         var textRect = new RectangleF(face.X + 3, face.Y,
                                       Math.Max(0, face.Width - 6), face.Height);
-        // TextRenderingHint is a mutable Graphics state.  Password masks may
+        // Skia text edging is a mutable Skia text state. Password masks may
         // use single-bit grid fitting for crisp '*' glyphs, but that setting
         // must never leak into the text painted after this control.  Save the
         // full graphics state and explicitly select the correct hint for this
         // one draw.
         var textState = g.Save();
+        var previousEdging = font.SkFont.Edging;
         try
         {
-            g.SetClip(textRect, CombineMode.Intersect);
-            g.TextRenderingHint = isPassword
-                ? Retro96.Drawing.TextRenderingHint.SingleBitPerPixelGridFit
-                : Retro96.Drawing.TextRenderingHint.ClearTypeGridFit;
+            g.SetClip(textRect, SKClipOperation.Intersect);
+            font.SkFont.Edging = isPassword ? SKFontEdging.Alias : SKFontEdging.Antialias;
             if (isPassword && box.Element != null)
             {
-                using var maskFormat = new StringFormat(StringFormat.GenericTypographic)
-                {
-                    FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.MeasureTrailingSpaces,
-                    Trimming = StringTrimming.None,
-                    LineAlignment = StringAlignment.Center,
-                    Alignment = StringAlignment.Near
-                };
                 int length = text.Length;
-                PasswordMaskLayout.DrawRange(g, length, font, brush, textRect.X, textRect.Y,
-                    textRect.Height, 0, length, maskFormat);
+                DrawPasswordMaskRange(g, length, font, brush, textRect.X, textRect.Y,
+                    textRect.Height, 0, length);
             }
             else
             {
@@ -1976,11 +2268,28 @@ public class Renderer
         }
         finally
         {
+            font.SkFont.Edging = previousEdging;
             g.Restore(textState);
         }
     }
 
-    private static void PaintCheckboxOrRadio(Graphics g, LayoutBox box, bool isRadio)
+    private static void DrawPasswordMaskRange(SkiaRenderContext g, int length, Font font, SKPaint paint,
+                                              float x, float y, float height, int start, int end)
+    {
+        if (length <= 0 || end <= start) return;
+        start = Math.Clamp(start, 0, length);
+        end = Math.Clamp(end, start, length);
+
+        float glyphWidth = font.SkFont.MeasureText("*");
+        if (!float.IsFinite(glyphWidth) || glyphWidth <= 0f)
+            glyphWidth = MathF.Max(1f, font.Size * 0.5f);
+        float advance = MathF.Max(1f, MathF.Round((glyphWidth + 1.25f) * 4f) / 4f);
+
+        for (int i = start; i < end; i++)
+            g.DrawString("*", font, paint, x + i * advance, y, TypographicText);
+    }
+
+    private static void PaintCheckboxOrRadio(SkiaRenderContext g, LayoutBox box, bool isRadio)
     {
         var rect = box.ContentRect;
         float size = Math.Min(rect.Width, rect.Height);
@@ -1993,27 +2302,27 @@ public class Renderer
 
         if (isRadio)
         {
-            using var pen = new Pen(controlColor, 1);
+            using var pen = CreateStrokePaint(controlColor, 1);
             g.DrawEllipse(pen, x, y, size, size);
             if (isChecked)
-                using (var brush = new SolidBrush(controlColor))
+                using (var brush = CreateFillPaint(controlColor))
                     g.FillEllipse(brush,
                     x + size * 0.3f, y + size * 0.3f, size * 0.4f, size * 0.4f);
         }
         else
         {
-            using var pen = new Pen(controlColor, 1);
+            using var pen = CreateStrokePaint(controlColor, 1);
             g.DrawRectangle(pen, x, y, size, size);
             if (isChecked)
             {
-                using var checkPen = new Pen(controlColor, 2);
+                using var checkPen = CreateStrokePaint(controlColor, 2);
                 g.DrawLine(checkPen, x + 2, y + 2, x + size - 2, y + size - 2);
                 g.DrawLine(checkPen, x + size - 2, y + 2, x + 2, y + size - 2);
             }
         }
     }
 
-    private void PaintSelect(Graphics g, LayoutBox box, FontCache fonts)
+    private void PaintSelect(SkiaRenderContext g, LayoutBox box, FontCache fonts)
     {
         var elem = box.Element!;
         var rect = box.BorderRect;
@@ -2034,13 +2343,13 @@ public class Renderer
 
         Color selectFaceColor = disabled
             ? Color.FromArgb(0xE0, 0xE0, 0xE0) : Color.White;
-        using var faceBrush = new SolidBrush(selectFaceColor);
+        using var faceBrush = CreateFillPaint(selectFaceColor);
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2, selectFaceColor);
 
         if (isListbox && options.Count > 0)
         {
-            float rowH = font.GetHeight(g) + 2;
+            float rowH = font.GetHeight() + 2;
             visibleRows = Math.Max(1, visibleRows);
             int maxScroll = Math.Max(0, options.Count - visibleRows);
             int scrollOffset = Math.Clamp(SelectScrollResolver?.Invoke(elem) ?? 0, 0, maxScroll);
@@ -2053,7 +2362,7 @@ public class Renderer
             var state = g.Save();
             try
             {
-                g.SetClip(optionFace, CombineMode.Intersect);
+                g.SetClip(optionFace, SKClipOperation.Intersect);
                 for (int row = 0; row < rows; row++)
                 {
                     var opt = options[scrollOffset + row];
@@ -2062,10 +2371,10 @@ public class Renderer
 
                     bool selected = opt.HasAttr("selected");
                     if (selected)
-                        g.FillRectangle(SystemBrushes.Highlight,
+                        g.FillRectangle(FillPaintFor(Color.Navy),
                             optionFace.X + 1, rowY, Math.Max(1f, optionFace.Width - 2), rowH);
 
-                    using var brush = new SolidBrush(disabled
+                    using var brush = CreateFillPaint(disabled
                         ? Color.Gray : selected ? Color.White : Color.Black);
                     g.DrawString(GlyphSubstitution.MapGlyphs((opt.InnerText ?? "").Trim()), font, brush,
                         optionFace.X + 3, rowY + 1);
@@ -2088,14 +2397,9 @@ public class Renderer
             ? GlyphSubstitution.MapGlyphs(selectedOpt.InnerText?.Trim() ?? "")
             : "";
 
-        using var brush2 = new SolidBrush(disabled ? Color.Gray : Color.Black);
-        using var sf = new StringFormat(StringFormat.GenericTypographic)
-        {
-            FormatFlags = StringFormatFlags.NoWrap,
-            Trimming = StringTrimming.EllipsisCharacter,
-            LineAlignment = StringAlignment.Center,
-            Alignment = StringAlignment.Near
-        };
+        using var brush2 = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+        var sf = new SkiaTextOptions(
+            SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: true);
 
         var textRect = new RectangleF(face.X + 3, face.Y,
                                       Math.Max(0, face.Width - 18), face.Height);
@@ -2104,7 +2408,7 @@ public class Renderer
         // Arrow button
         float arrowX = face.Right - 14;
         float arrowY = face.Y + face.Height / 2;
-        using var arrowBrush = new SolidBrush(disabled ? Color.Gray : Color.Black);
+        using var arrowBrush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
         g.FillPolygon(arrowBrush, new[]
         {
             new PointF(arrowX, arrowY - 4),
@@ -2113,7 +2417,7 @@ public class Renderer
         });
     }
 
-    private static void PaintSelectScrollbar(Graphics g, RectangleF face,
+    private static void PaintSelectScrollbar(SkiaRenderContext g, RectangleF face,
                                               int optionCount, int visibleRows,
                                               int scrollOffset)
     {
@@ -2123,8 +2427,8 @@ public class Renderer
         float trackX = face.Right - barWidth + 1f;
         float trackY = face.Top + 1f;
         float trackHeight = Math.Max(1f, face.Height - 2f);
-        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
-        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        using var track = CreateFillPaint(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var thumb = CreateFillPaint(Color.FromArgb(0x80, 0x80, 0x80));
         g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
         float maxThumbHeight = Math.Max(1f, trackHeight - 2f);
         float thumbHeight = Math.Min(maxThumbHeight, Math.Max(10f,
@@ -2137,7 +2441,7 @@ public class Renderer
             Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
-    private void PaintTextarea(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintTextarea(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                bool isFocused)
     {
         var elem = box.Element!;
@@ -2153,23 +2457,23 @@ public class Renderer
         Color fgColor = disabled ? Color.Gray
                      : style.OwnColor ? style.Color : Color.Black;
 
-        using (var faceBrush = new SolidBrush(bgColor))
+        using (var faceBrush = CreateFillPaint(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2, bgColor);
 
         if (isFocused)
         {
-            using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+            using var focusPen = CreateStrokePaint(Color.FromArgb(0, 0, 128), 1);
             g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
         }
 
         var font = ResolveFont(fonts, style);
         string text = elem.InnerText ?? "";
-        using var brush = new SolidBrush(fgColor);
+        using var brush = CreateFillPaint(fgColor);
         bool wrapOff = elem.GetAttrOrDefault("wrap", "").Trim()
             .Equals("off", StringComparison.OrdinalIgnoreCase);
 
-        var layout = TextareaOverlay.CalculateLayout(g, text, font,
+        var layout = TextareaOverlay.CalculateLayout(g.Canvas, text, font,
             face.Width, face.Height, wrapOff);
         var textareaState = TextareaStateResolver?.Invoke(elem) ?? default;
         int requestedScroll = textareaState.ScrollLine;
@@ -2184,8 +2488,8 @@ public class Renderer
         {
             g.SetClip(new RectangleF(face.X + 1, face.Y + 1,
                 Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
-                CombineMode.Intersect);
-            TextareaOverlay.DrawLines(g, text, font, layout.Lines, brush,
+                SKClipOperation.Intersect);
+            TextareaOverlay.DrawLines(g.Canvas, text, font, layout.Lines, brush,
                 face.X + 3 - scrollX, face.Y + 2,
                 layout.TextWidth, layout.LineHeight, scrollLine);
         }
@@ -2202,7 +2506,7 @@ public class Renderer
                 layout.VisibleLines, scrollLine);
     }
 
-    private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
+    private static void PaintTextareaScrollbar(SkiaRenderContext g, RectangleF face,
                                                int lineCount, int visibleLines,
                                                int scrollLine)
     {
@@ -2212,8 +2516,8 @@ public class Renderer
         float trackX = face.Right - barWidth + 1f;
         float trackY = face.Top + 1f;
         float trackHeight = Math.Max(1f, face.Height - 2f);
-        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
-        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        using var track = CreateFillPaint(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var thumb = CreateFillPaint(Color.FromArgb(0x80, 0x80, 0x80));
         g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
 
         float thumbHeight = Math.Clamp(
@@ -2226,7 +2530,7 @@ public class Renderer
             Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
-    private void PaintButton(Graphics g, LayoutBox box, FontCache fonts, string text)
+    private void PaintButton(SkiaRenderContext g, LayoutBox box, FontCache fonts, string text)
     {
         var style = box.Element!.Style ?? FallbackStyle(box.Element);
         var rect = box.BorderRect;
@@ -2235,7 +2539,7 @@ public class Renderer
         bool pressed = box.Element != null && ReferenceEquals(box.Element, PressedElement);
         bool disabled = box.Element?.HasAttr("disabled") == true;
 
-        using var faceBrush = new SolidBrush(disabled
+        using var faceBrush = CreateFillPaint(disabled
             ? Color.FromArgb(0xE0, 0xE0, 0xE0)
             : Color.FromArgb(0xC0, 0xC0, 0xC0));
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
@@ -2248,12 +2552,12 @@ public class Renderer
             PaintRaisedRect(g, rect, 2, bevelFace);
 
         var font = ResolveFont(fonts, style);
-        using var brush = new SolidBrush(disabled ? Color.Gray : Color.Black);
-        // MUST be GenericTypographic like InlineLayout._sf: a plain StringFormat
+        using var brush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+        // MUST be GenericTypographic like InlineLayout._sf: a plain Skia text options
         // adds ~1/6em of side padding that layout never reserved, which pushed
         // the label past the face and got it ellipsized ("Submit...").
         // Win95 buttons clip, they never ellipsize.
-        var sf = ButtonFormat;
+        var sf = ButtonText;
 
         // Centre on the whole border box (minus the 2px bevel) instead of the
         // content rect, which layout may have shrunk by padding.
@@ -2264,7 +2568,7 @@ public class Renderer
 
     // ── List markers ─────────────────────────────────────────────────────
 
-    private void PaintListMarker(Graphics g, LayoutBox box, FontCache fonts,
+    private void PaintListMarker(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                  ImageCache images)
     {
         var elem = box.Element!;
@@ -2310,7 +2614,7 @@ public class Renderer
             }
         }
 
-        using var brush = new SolidBrush(markerColor);
+        using var brush = CreateFillPaint(markerColor);
 
         if (parentTag == "ol")
         {
@@ -2349,8 +2653,8 @@ public class Renderer
             };
 
             string label = marker + ".";
-            using var sf = new StringFormat(StringFormat.GenericTypographic);
-            var size = g.MeasureString(label, font, int.MaxValue, sf);
+            var sf = TypographicText;
+            var size = g.MeasureString(label, font);
             float markerRight = inside ? insideX + 16f : box.X - 4;
             g.DrawString(label, font, brush, markerRight - size.Width, markerY, sf);
             return;
@@ -2426,17 +2730,15 @@ public class Renderer
                     _ => index.ToString()
                 };
                 string label = marker + ".";
-                var size = g.MeasureString(label, font, int.MaxValue,
-                    new StringFormat(StringFormat.GenericTypographic));
-                g.DrawString(label, font, brush, box.X - size.Width - 4f, markerY,
-                    new StringFormat(StringFormat.GenericTypographic));
+                var size = g.MeasureString(label, font);
+                g.DrawString(label, font, brush, box.X - size.Width - 4f, markerY, TypographicText);
                 return;
             }
 
             switch (shape)
             {
                 case "circle":
-                    using (var pen = new Pen(markerColor, 1))
+                    using (var pen = CreateStrokePaint(markerColor, 1))
                         g.DrawEllipse(pen, cx - half, cy - half, markerSize, markerSize);
                     break;
                 case "square":
@@ -2485,23 +2787,23 @@ public class Renderer
     // DevTools-style overlay
     // ─────────────────────────────────────────────────────────────────────
 
-    // FIX: the four pens used to be allocated PER BOX (inside the recursion)
-    // — F11 on a large tree churned thousands of GDI pens per paint.
-    private static void PaintBoxOutlines(Graphics g, LayoutBox root)
+    // FIX: the four stroke paints are allocated once per overlay (inside the recursion)
+    // — F11 on a large tree churned thousands of native pens per paint.
+    private static void PaintBoxOutlines(SkiaRenderContext g, LayoutBox root)
     {
-        using var marginPen = new Pen(Color.FromArgb(160, Color.Orange), 1);
-        using var borderPen = new Pen(Color.FromArgb(200, Color.Red), 1);
-        using var paddingPen = new Pen(Color.FromArgb(200, Color.Green), 1);
-        using var contentPen = new Pen(Color.FromArgb(220, Color.Blue), 1);
+        using var marginPen = CreateStrokePaint(Color.FromArgb(160, Color.Orange), 1);
+        using var borderPen = CreateStrokePaint(Color.FromArgb(200, Color.Red), 1);
+        using var paddingPen = CreateStrokePaint(Color.FromArgb(200, Color.Green), 1);
+        using var contentPen = CreateStrokePaint(Color.FromArgb(220, Color.Blue), 1);
         PaintBoxOutlinesCore(g, root, marginPen, borderPen, paddingPen, contentPen);
     }
 
-    private static void PaintBoxOutlinesCore(Graphics g, LayoutBox box,
-        Pen marginPen, Pen borderPen, Pen paddingPen, Pen contentPen)
+    private static void PaintBoxOutlinesCore(SkiaRenderContext g, LayoutBox box,
+        SKPaint marginPen, SKPaint borderPen, SKPaint paddingPen, SKPaint contentPen)
     {
         if (box.Width > 0f || box.Height > 0f)
         {
-            static void DrawRect(Graphics g, Pen pen, RectangleF r)
+            static void DrawRect(SkiaRenderContext g, SKPaint pen, RectangleF r)
             {
                 if (r.Width <= 0f || r.Height <= 0f) return;
                 g.DrawRectangle(pen, r.X, r.Y, r.Width, r.Height);

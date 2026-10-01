@@ -7,7 +7,7 @@ namespace Retro96.Engine.Render;
 /// Era-authentic glyph fallback for characters the 1996 core Windows font
 /// set (MS Sans Serif, Arial, Times New Roman, Courier New) does not carry.
 ///
-/// The engine's fonts render those code points through GDI+'s SILEENT
+/// The engine's SkiaSharp fonts render those code points through the shared
 /// font-fallback — a foreign family (Segoe UI Symbol and friends) whose
 /// ascent has nothing to do with the layout's baseline math.  Visually this
 /// produced two distinct defects on real pages:
@@ -15,7 +15,7 @@ namespace Retro96.Engine.Render;
 ///     decorations),
 ///   • narrow filled fallback boxes in the current text colour — the blue
 ///     slivers at the end of link-styled panel titles.
-/// Both vanish when the character never reaches GDI+ in the first place.
+/// Both vanish when the character never reaches the renderer in the first place.
 ///
 /// Substitution is what a 1996 machine actually showed: box-drawing and
 /// geometric decorations collapse to the ASCII art of the period.  Every

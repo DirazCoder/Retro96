@@ -38,7 +38,7 @@ public static class JsDialogGeometry
 
     /// <summary>
     /// Era-approximate label measurement: ~7px per character at the 8.25pt
-    /// dialog font (what GDI+ measures for Segoe UI 8.25pt on average).
+    /// dialog font (historical Segoe UI 8.25pt-era average metrics).
     /// The shell may pass a real measured width via <paramref name="measure"/>
     /// when it has a live Graphics; null falls back to this estimate.
     /// </summary>
