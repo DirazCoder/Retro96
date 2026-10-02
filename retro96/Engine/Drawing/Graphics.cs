@@ -348,28 +348,53 @@ public sealed class Graphics : IDisposable
         return Math.Max(0f, width);
     }
 
-    private SKFontEdging ApplyEdging(Font font)
+    private readonly record struct TextRenderState(SKFontEdging Edging, bool Embolden, bool Subpixel, bool BaselineSnap);
+
+    private TextRenderState ApplyTextRendering(Font font)
     {
-        // Font objects are cached/shared by the renderer.  SKFont.Edging is
-        // mutable, so changing it for one password draw must not permanently
-        // alter the cached font used by later page text. Return the previous
-        // value so each draw can restore it in a finally block.
-        var previous = font.SkFont.Edging;
+        // Font objects are cached/shared by the renderer. SKFont rendering
+        // state is mutable, so every draw must restore exactly what it found.
+        var previous = new TextRenderState(
+            font.SkFont.Edging, font.SkFont.Embolden, font.SkFont.Subpixel, font.SkFont.BaselineSnap);
+
         font.SkFont.Edging = TextRenderingHint switch
         {
             TextRenderingHint.SingleBitPerPixel
-                or TextRenderingHint.SingleBitPerPixelGridFit
-                or TextRenderingHint.SystemDefault => SKFontEdging.Alias,
+                or TextRenderingHint.SingleBitPerPixelGridFit => SKFontEdging.Alias,
+            TextRenderingHint.ClearTypeGridFit => SKFontEdging.SubpixelAntialias,
+            TextRenderingHint.AntiAliasGridFit
+                or TextRenderingHint.AntiAlias => SKFontEdging.Antialias,
+            TextRenderingHint.SystemDefault => Retro96.BrowserRuntime.SupportsInternetExplorerLegacy
+                ? SKFontEdging.SubpixelAntialias
+                : SKFontEdging.Antialias,
             _ => SKFontEdging.Antialias,
         };
+
+        // Preserve legacy small-text stem strength at paint time only.
+        // Measurement remains unchanged because emboldening does not alter
+        // advance widths, so layout and painting continue to agree.
+        font.SkFont.Embolden = previous.Embolden || font.LegacyStrokeBoost;
+        if (Retro96.BrowserRuntime.SupportsInternetExplorerLegacy)
+        {
+            font.SkFont.Subpixel = true;
+            font.SkFont.BaselineSnap = true;
+        }
         return previous;
+    }
+
+    private static void RestoreTextRendering(Font font, TextRenderState state)
+    {
+        font.SkFont.Edging = state.Edging;
+        font.SkFont.Embolden = state.Embolden;
+        font.SkFont.Subpixel = state.Subpixel;
+        font.SkFont.BaselineSnap = state.BaselineSnap;
     }
 
     /// <summary>Plain draw: line-box top at (x, y). Format optional.</summary>
     public void DrawString(string? text, Font font, Brush brush, float x, float y, StringFormat? format)
     {
         if (string.IsNullOrEmpty(text) || font == null || brush is not SolidBrush sb) return;
-        var previousEdging = ApplyEdging(font);
+        var previousTextState = ApplyTextRendering(font);
         try
         {
             float baseline = y + font.AscentPx;
@@ -382,7 +407,7 @@ public sealed class Graphics : IDisposable
         }
         finally
         {
-            font.SkFont.Edging = previousEdging;
+            RestoreTextRendering(font, previousTextState);
         }
     }
 
@@ -437,7 +462,7 @@ public sealed class Graphics : IDisposable
 
         var sf = format ?? new StringFormat();
         bool noWrap = (sf.FormatFlags & StringFormatFlags.NoWrap) != 0;
-        var previousEdging = ApplyEdging(font);
+        var previousTextState = ApplyTextRendering(font);
 
         try
         {
@@ -506,7 +531,7 @@ public sealed class Graphics : IDisposable
         }
         finally
         {
-            font.SkFont.Edging = previousEdging;
+            RestoreTextRendering(font, previousTextState);
         }
     }
 

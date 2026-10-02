@@ -288,6 +288,7 @@ public sealed class Font : IDisposable
     public int Weight { get; }
     public bool Oblique { get; }
     public GraphicsUnit Unit { get; }
+    internal bool LegacyStrokeBoost { get; }
 
     private readonly float _lineHeight;
     private readonly float _ascent;
@@ -357,11 +358,28 @@ public sealed class Font : IDisposable
                 Typeface = family.Typeface;
         }
 
+        // Retro96 is deliberately rasterized like a mid-1990s Windows text
+        // stack: strong native hinting, pixel-aligned baselines, embedded
+        // bitmap strikes where a typeface provides them, and subpixel-aware
+        // positioning.  The old implementation only requested Full hinting;
+        // Graphics then downgraded ClearTypeGridFit to grayscale AA, which
+        // made 12-16px regular stems visibly too light.
+        bool legacyRaster = Retro96.BrowserRuntime.SupportsInternetExplorerLegacy;
         SkFont = new SKFont(Typeface, px)
         {
-            Edging = SKFontEdging.Antialias,
+            Edging = legacyRaster ? SKFontEdging.SubpixelAntialias : SKFontEdging.Antialias,
             Hinting = SKFontHinting.Full,
+            BaselineSnap = legacyRaster,
+            EmbeddedBitmaps = legacyRaster,
+            ForceAutoHinting = legacyRaster,
+            Subpixel = legacyRaster,
         };
+
+        // IE-era GDI text was noticeably darker than a modern grayscale
+        // antialiased regular face at small sizes. Keep the requested weight
+        // and metrics intact, but add a tiny glyph embolden for normal/medium
+        // web text at the sizes where the difference is most visible.
+        LegacyStrokeBoost = legacyRaster && Weight >= 400 && Weight <= 700 && px <= 16f;
 
         // Families without a real bold face get Skia's synthetic embolden —
         // the equivalent of automatic bold synthesis.

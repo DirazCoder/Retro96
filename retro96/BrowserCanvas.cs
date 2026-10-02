@@ -6891,8 +6891,11 @@ public class BrowserCanvas : SKGLControl
             {
                 var oldFrame = _lastHoveredFrame;
                 var oldJs = oldFrame?.Interpreter ?? _jsInterpreter;
+                int oldClientX = e.X, oldClientY = e.Y;
+                if (oldFrame != null)
+                    TryGetFrameRelativeClientPoint(oldFrame, mx, my, out oldClientX, out oldClientY);
                 oldJs?.FireEvent(_lastHoveredElement, "onmouseout",
-                    oldJs.CreateMouseEvent("onmouseout", e.X, e.Y, 0));
+                    oldJs.CreateMouseEvent("onmouseout", oldClientX, oldClientY, 0));
                 bool hoverRelayout = !IsGestureZoomActive &&
                     !skipHoverRelayout &&
                     !IsZoomInteractionStabilizing &&
@@ -6907,8 +6910,14 @@ public class BrowserCanvas : SKGLControl
             if (element != null)
             {
                 var hoverJs = hoverFrame?.Interpreter ?? _jsInterpreter;
+                int hoverClientX = e.X, hoverClientY = e.Y;
+                if (hoverFrame != null)
+                {
+                    hoverClientX = (int)Math.Round(frameHit.ViewX);
+                    hoverClientY = (int)Math.Round(frameHit.ViewY);
+                }
                 hoverJs?.FireEvent(element, "onmouseover",
-                    hoverJs.CreateMouseEvent("onmouseover", e.X, e.Y, 0));
+                    hoverJs.CreateMouseEvent("onmouseover", hoverClientX, hoverClientY, 0));
                 var status = hoverJs?.WindowObject?.Get("status");
                 if (status is { Type: JsType.String } && status.GetString().Length > 0)
                     SetStatus(status.GetString());
@@ -8306,7 +8315,13 @@ public class BrowserCanvas : SKGLControl
         {
             _focusedFrame = hit.Box;
             var frameJs = hit.View.Interpreter ?? _jsInterpreter;
-            var frameEvent = frameJs?.CreateMouseEvent("onclick", clientPoint.X, clientPoint.Y, 1);
+            // clientX/clientY in an iframe are relative to that frame's viewport,
+            // not the outer BrowserCanvas. hit.ViewX/ViewY are the pre-scroll local
+            // viewport coordinates produced by frame hit-testing; LocalX/LocalY
+            // include the frame document's scroll offset and therefore must NOT be
+            // used for the event's client coordinates.
+            var frameEvent = frameJs?.CreateMouseEvent("onclick",
+                (int)Math.Round(hit.ViewX), (int)Math.Round(hit.ViewY), 1);
             HandleClickInView(hit.View, hit.Box, hit.LocalX, hit.LocalY, frameEvent);
             return;
         }
@@ -9577,6 +9592,20 @@ public class BrowserCanvas : SKGLControl
 
         TrackMenu(menu);
         menu.Show(this, pt);
+    }
+
+    private bool TryGetFrameRelativeClientPoint(FrameView target, float pageX, float pageY,
+                                                 out int clientX, out int clientY)
+    {
+        if (TryGetFrameClientOriginLogical(target, out var originX, out var originY))
+        {
+            clientX = (int)Math.Round(pageX - originX);
+            clientY = (int)Math.Round(pageY - originY);
+            return true;
+        }
+
+        clientX = clientY = 0;
+        return false;
     }
 
     private bool TryGetFrameClientOriginLogical(FrameView target, out float logicalX, out float logicalY)

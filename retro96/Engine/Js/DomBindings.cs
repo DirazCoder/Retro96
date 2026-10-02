@@ -1500,8 +1500,14 @@ public static class DomBindings
                             foreach (var node in nodes) _element.Parent.InsertBefore(node, _element);
                         break;
                     case "afterbegin":
-                        foreach (var node in nodes) _element.InsertBefore(node, _element.FirstChild);
-                        break;
+                        {
+                            // Keep fragment order stable. Re-reading FirstChild
+                            // for each insertion reverses multi-node fragments.
+                            var reference = _element.FirstChild;
+                            foreach (var node in nodes)
+                                _element.InsertBefore(node, reference);
+                            break;
+                        }
                     case "beforeend":
                         foreach (var node in nodes) _element.AppendChild(node);
                         break;

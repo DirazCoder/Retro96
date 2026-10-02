@@ -160,7 +160,7 @@ public class JsEngineTests
                   "d.insertAdjacentHTML('afterEnd', '<em>R</em>');");
 
         string text = page.Document.FirstTag("body")?.InnerText ?? "";
-        Check.That(text == "BA XER".Replace(" ", ""),
+        Check.That(text == "BAAER",
             "insertAdjacentHTML updates all four insertion positions", text);
         Check.Done();
     }
@@ -170,18 +170,45 @@ public class JsEngineTests
     {
         var page = new PageHarness();
         page.LoadHtml("<html><body><button id='b'>Go</button>" +
-                      "<script>document.all('b').onclick=function(){ window.eventSeen = " +
-                      "window.event && window.event.srcElement ? 'OK' : 'BAD'; };</script>" +
+                      "<script>document.all('b').onclick=function(){ " +
+                      "window.eventSeen = window.event && window.event.srcElement === this ? 'OK' : 'BAD'; " +
+                      "};</script>" +
                       "</body></html>");
         var button = page.Document.AllTags("button")[0];
 
         page.FireEvent(button, "onclick");
 
         Check.That(page.EvalString("window.eventSeen") == "OK",
-            "window.event exposes srcElement during onclick",
+            "window.event exposes the actual srcElement during onclick",
             page.EvalString("window.eventSeen"));
         Check.That(page.EvalString("typeof window.event") == "undefined",
-            "window.event is cleared after the handler returns");
+            "window.event is cleared after the handler returns",
+            page.EvalString("typeof window.event"));
+        Check.That(page.EvalString("window.hasOwnProperty('event')") == "false",
+            "window.event property is removed after top-level dispatch",
+            page.EvalString("window.hasOwnProperty('event')"));
+        Check.Done();
+    }
+
+    [Fact]
+    public void MouseEventsUseTheOwningInterpreterRealm()
+    {
+        var outer = new PageHarness();
+        outer.LoadHtml("<html><body><div id='outer'></div></body></html>");
+        var frame = new PageHarness();
+        frame.LoadHtml("<html><body><div id='frame'></div></body></html>");
+
+        var outerObjectProto = outer.Scope.Get("Object").GetObjectOrFunction().Get("prototype").GetObject();
+        var frameObjectProto = frame.Scope.Get("Object").GetObjectOrFunction().Get("prototype").GetObject();
+        var evt = frame.Interpreter.CreateMouseEvent("onclick", 7, 9, 1);
+
+        Check.That(!ReferenceEquals(outerObjectProto, frameObjectProto),
+            "independent page/iframe realms have distinct Object.prototype objects");
+        Check.That(ReferenceEquals(evt.Prototype, frameObjectProto),
+            "CreateMouseEvent uses the owning interpreter's Object.prototype");
+        Check.That(outer.Interpreter.EvalString("typeof Object") == "function" &&
+                   frame.Interpreter.EvalString("typeof Object") == "function",
+            "both realms expose their own Object constructor");
         Check.Done();
     }
 

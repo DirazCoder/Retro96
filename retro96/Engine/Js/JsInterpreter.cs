@@ -437,16 +437,24 @@ public class JsInterpreter
                 ? JsValue.FromObject(ElementWrapperHook(element))
                 : JsValue.Undefined;
             scope.Define("this", thisValue);
+
+            JsValue priorWindowEvent = JsValue.Undefined;
+            bool installedLegacyEvent = BrowserRuntime.SupportsInternetExplorerLegacy && eventObj != null;
+            var windowObject = WindowObject;
+            if (installedLegacyEvent && windowObject != null)
+                priorWindowEvent = windowObject.Get("event");
+
             if (eventObj != null)
             {
-                if (BrowserRuntime.SupportsInternetExplorerLegacy)
+                if (installedLegacyEvent)
                 {
-                    // Legacy IE handlers could read the active event from the
-                    // browser global; keep srcElement on the same object.
+                    // Legacy IE handlers read the active event from the browser
+                    // global; use this element as srcElement and restore the prior
+                    // event after dispatch so nested handlers cannot clobber it.
                     eventObj.Set("srcElement", thisValue);
                     eventObj.Set("returnValue", JsValue.From(true));
                     eventObj.Set("cancelBubble", JsValue.From(false));
-                    WindowObject?.Set("event", JsValue.FromObject(eventObj));
+                    windowObject?.Set("event", JsValue.FromObject(eventObj));
                 }
                 scope.Define("event", JsValue.FromObject(eventObj));
             }
@@ -480,8 +488,13 @@ public class JsInterpreter
             finally
             {
                 _currentScope = old;
-                if (BrowserRuntime.SupportsInternetExplorerLegacy)
-                    WindowObject?.Set("event", JsValue.Undefined);
+                if (installedLegacyEvent && windowObject != null)
+                {
+                    if (priorWindowEvent.Type == JsType.Undefined)
+                        windowObject.Delete("event");
+                    else
+                        windowObject.Set("event", priorWindowEvent);
+                }
                 if (isOutermost) _isExecuting = false;
             }
         }
@@ -508,10 +521,28 @@ public class JsInterpreter
         "onmousemove" or "onmouseover" or "onmouseout" or "onmouseenter" or
         "onmouseleave";
 
+    /// <summary>Resolve Object.prototype from this interpreter's own global realm.
+    /// The engine historically kept the built-in prototypes in static fields,
+    /// which means creating an event from a frame could accidentally chain the
+    /// event object to the parent page's most recently installed Object.prototype.
+    /// Use the realm's Object constructor first and keep the static field only as
+    /// a compatibility fallback for hosts that do not expose Object yet.</summary>
+    private JsObject? GetRealmObjectPrototype()
+    {
+        var objectCtor = _globalScope.Get("Object");
+        if (objectCtor.Type is JsType.Object or JsType.Function)
+        {
+            var proto = objectCtor.GetObjectOrFunction().Get("prototype");
+            if (proto.Type == JsType.Object)
+                return proto.GetObject();
+        }
+        return ObjectPrototype;
+    }
+
     /// <summary>Build the legacy IE mouse event object used by window.event.</summary>
     public JsObject CreateMouseEvent(string eventName, int clientX, int clientY, int button)
     {
-        var evt = new JsObject { Prototype = ObjectPrototype };
+        var evt = new JsObject { Prototype = GetRealmObjectPrototype() };
         evt.Set("type", JsValue.From(eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
             ? eventName[2..] : eventName));
         evt.Set("clientX", JsValue.From(clientX));
@@ -533,7 +564,7 @@ public class JsInterpreter
     /// <summary>Build a minimal keyboard event object (key / keyCode / which).</summary>
     public JsObject CreateKeyEvent(string key, int keyCode)
     {
-        var evt = new JsObject { Prototype = ObjectPrototype };
+        var evt = new JsObject { Prototype = GetRealmObjectPrototype() };
         evt.Set("key", JsValue.From(key));
         evt.Set("keyCode", JsValue.From(keyCode));
         evt.Set("which", JsValue.From(keyCode));
@@ -565,14 +596,20 @@ public class JsInterpreter
             _stopwatch.Restart();
             _callDepth = 0;
         }
+        JsValue priorWindowEvent = JsValue.Undefined;
+        bool installedLegacyEvent = BrowserRuntime.SupportsInternetExplorerLegacy && eventObj != null;
+        var windowObject = WindowObject;
+        if (installedLegacyEvent && windowObject != null)
+            priorWindowEvent = windowObject.Get("event");
+
         try
         {
-            if (BrowserRuntime.SupportsInternetExplorerLegacy && eventObj != null)
+            if (installedLegacyEvent)
             {
-                eventObj.Set("srcElement", thisValue);
+                eventObj!.Set("srcElement", thisValue);
                 eventObj.Set("returnValue", JsValue.From(true));
                 eventObj.Set("cancelBubble", JsValue.From(false));
-                WindowObject?.Set("event", JsValue.FromObject(eventObj));
+                windowObject?.Set("event", JsValue.FromObject(eventObj));
             }
             var args = eventObj != null
                 ? new[] { JsValue.FromObject(eventObj) }
@@ -588,8 +625,13 @@ public class JsInterpreter
         }
         finally
         {
-            if (BrowserRuntime.SupportsInternetExplorerLegacy)
-                WindowObject?.Set("event", JsValue.Undefined);
+            if (installedLegacyEvent && windowObject != null)
+            {
+                if (priorWindowEvent.Type == JsType.Undefined)
+                    windowObject.Delete("event");
+                else
+                    windowObject.Set("event", priorWindowEvent);
+            }
             if (isOutermost) _isExecuting = false;
         }
     }
