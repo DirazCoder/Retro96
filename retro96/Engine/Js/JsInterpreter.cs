@@ -375,6 +375,14 @@ public class JsInterpreter
             (elementId.Length > 0 ? $"#{elementId}" : "") +
             $"@{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(element)} event='{normalizedEvent}'");
 
+        // BrowserCanvas supplies a real mouse event for physical input.
+        // Programmatic/test dispatches also need the IE global event object,
+        // otherwise window.event is inexplicably null even though the handler
+        // itself is firing. Synthesize the legacy shape when the caller has no
+        // concrete event payload.
+        if (eventObj == null && IsMouseEventName(normalizedEvent))
+            eventObj = CreateMouseEvent(normalizedEvent, 0, 0, 0);
+
         // DOM-0 property handlers live on the DOM element's scripting state,
         // not on a transient wrapper. This is the source of truth for
         // `element.onclick = function () { ... }`.
@@ -493,6 +501,33 @@ public class JsInterpreter
             PublishConsole("error", message);
             return JsValue.Undefined;
         }
+    }
+
+    private static bool IsMouseEventName(string eventName) => eventName is
+        "onclick" or "ondblclick" or "onmousedown" or "onmouseup" or
+        "onmousemove" or "onmouseover" or "onmouseout" or "onmouseenter" or
+        "onmouseleave";
+
+    /// <summary>Build the legacy IE mouse event object used by window.event.</summary>
+    public JsObject CreateMouseEvent(string eventName, int clientX, int clientY, int button)
+    {
+        var evt = new JsObject { Prototype = ObjectPrototype };
+        evt.Set("type", JsValue.From(eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName[2..] : eventName));
+        evt.Set("clientX", JsValue.From(clientX));
+        evt.Set("clientY", JsValue.From(clientY));
+        evt.Set("screenX", JsValue.From(clientX));
+        evt.Set("screenY", JsValue.From(clientY));
+        evt.Set("x", JsValue.From(clientX));
+        evt.Set("y", JsValue.From(clientY));
+        evt.Set("button", JsValue.From(button));
+        evt.Set("altKey", JsValue.From(false));
+        evt.Set("ctrlKey", JsValue.From(false));
+        evt.Set("shiftKey", JsValue.From(false));
+        evt.Set("metaKey", JsValue.From(false));
+        evt.Set("returnValue", JsValue.From(true));
+        evt.Set("cancelBubble", JsValue.From(false));
+        return evt;
     }
 
     /// <summary>Build a minimal keyboard event object (key / keyCode / which).</summary>

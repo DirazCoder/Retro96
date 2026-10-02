@@ -360,6 +360,7 @@ public sealed class Font : IDisposable
         SkFont = new SKFont(Typeface, px)
         {
             Edging = SKFontEdging.Antialias,
+            Hinting = SKFontHinting.Full,
         };
 
         // Families without a real bold face get Skia's synthetic embolden —

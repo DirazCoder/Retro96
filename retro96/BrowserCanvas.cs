@@ -6891,7 +6891,8 @@ public class BrowserCanvas : SKGLControl
             {
                 var oldFrame = _lastHoveredFrame;
                 var oldJs = oldFrame?.Interpreter ?? _jsInterpreter;
-                oldJs?.FireEvent(_lastHoveredElement, "onmouseout");
+                oldJs?.FireEvent(_lastHoveredElement, "onmouseout",
+                    oldJs.CreateMouseEvent("onmouseout", e.X, e.Y, 0));
                 bool hoverRelayout = !IsGestureZoomActive &&
                     !skipHoverRelayout &&
                     !IsZoomInteractionStabilizing &&
@@ -6906,7 +6907,8 @@ public class BrowserCanvas : SKGLControl
             if (element != null)
             {
                 var hoverJs = hoverFrame?.Interpreter ?? _jsInterpreter;
-                hoverJs?.FireEvent(element, "onmouseover");
+                hoverJs?.FireEvent(element, "onmouseover",
+                    hoverJs.CreateMouseEvent("onmouseover", e.X, e.Y, 0));
                 var status = hoverJs?.WindowObject?.Get("status");
                 if (status is { Type: JsType.String } && status.GetString().Length > 0)
                     SetStatus(status.GetString());
@@ -7677,7 +7679,7 @@ public class BrowserCanvas : SKGLControl
     private static IEnumerable<RectangleF> MergeSelectionSpans(List<RectangleF> spans)
         => SelectionOverlay.MergeSpans(spans);
 
-    private void ClearPageSelection()
+    internal void ClearPageSelection()
     {
         _selectAllPage = false;
         _selAnchor = _selFocus = null;
@@ -8140,6 +8142,8 @@ public class BrowserCanvas : SKGLControl
         return sb.ToString().Trim();
     }
 
+    internal string GetDomSelectionText() => GetSelectedText();
+
     private string GetSelectedText()
     {
         if (_selectAllPage)
@@ -8301,13 +8305,19 @@ public class BrowserCanvas : SKGLControl
         if (TryHitFrame(x, y, out var hit))
         {
             _focusedFrame = hit.Box;
-            HandleClickInView(hit.View, hit.Box, hit.LocalX, hit.LocalY);
+            var frameJs = hit.View.Interpreter ?? _jsInterpreter;
+            var frameEvent = frameJs?.CreateMouseEvent("onclick", clientPoint.X, clientPoint.Y, 1);
+            HandleClickInView(hit.View, hit.Box, hit.LocalX, hit.LocalY, frameEvent);
             return;
         }
 
         var element = HitTestElement(_rootBox, x, y);
         if (element != null)
-            HandleElementClick(element, _document, _jsInterpreter, x, y, isFrame: false);
+        {
+            var mouseEvent = _jsInterpreter?.CreateMouseEvent("onclick", clientPoint.X, clientPoint.Y, 1);
+            HandleElementClick(element, _document, _jsInterpreter, x, y,
+                isFrame: false, mouseEvent: mouseEvent);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -8803,19 +8813,21 @@ public class BrowserCanvas : SKGLControl
     // Click dispatch
     // ─────────────────────────────────────────────────────────────────────
 
-    private void HandleClickInView(FrameView view, LayoutBox frameBox, float lx, float ly)
+    private void HandleClickInView(FrameView view, LayoutBox frameBox, float lx, float ly,
+                                   JsObject? mouseEvent = null)
     {
         var element = HitTestElement(view.RootBox, lx, ly);
         if (element == null) return;
         // FIX: frame clicks ran on the PAGE interpreter — frame scripts'
         // own handlers (and their onsubmit) never saw them.
         HandleElementClick(element, view.Document, view.Interpreter ?? _jsInterpreter,
-            lx, ly, isFrame: true, frameView: view);
+            lx, ly, isFrame: true, frameView: view, mouseEvent: mouseEvent);
     }
 
     private void HandleElementClick(DomElement element, DomDocument document,
                                     JsInterpreter? js, float x, float y,
-                                    bool isFrame, FrameView? frameView = null)
+                                    bool isFrame, FrameView? frameView = null,
+                                    JsObject? mouseEvent = null)
     {
         var layoutRoot = frameView?.RootBox ?? _rootBox;
 
@@ -8840,7 +8852,7 @@ public class BrowserCanvas : SKGLControl
             string type = element.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
             if (type == "file")
             {
-                var clickResult = js?.FireEvent(element, "onclick");
+                var clickResult = js?.FireEvent(element, "onclick", mouseEvent);
                 if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
                     return;
                 ChooseFileForInput(element, js);
@@ -8849,14 +8861,14 @@ public class BrowserCanvas : SKGLControl
             if (type is "text" or "password")
             {
                 FocusControl(element, GetFieldText(element).Length, js);
-                js?.FireEvent(element, "onclick");
+                js?.FireEvent(element, "onclick", mouseEvent);
                 return;
             }
             if (type is "checkbox")
             {
                 if (element.HasAttr("checked")) element.SetAttr("checked", null);
                 else element.SetAttr("checked", "");
-                js?.FireEvent(element, "onclick");
+                js?.FireEvent(element, "onclick", mouseEvent);
                 RequestRerender();
                 return;
             }
@@ -8873,14 +8885,14 @@ public class BrowserCanvas : SKGLControl
                         other.SetAttr("checked", null);
                 }
                 element.SetAttr("checked", "");
-                js?.FireEvent(element, "onclick");
+                js?.FireEvent(element, "onclick", mouseEvent);
                 RequestRerender();
                 return;
             }
             if (type is "submit" or "image")
             {
                 // Browsers run the click handler first; returning false cancels the submit.
-                var clickResult = js?.FireEvent(element, "onclick");
+                var clickResult = js?.FireEvent(element, "onclick", mouseEvent);
                 if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
                     return;
 
@@ -8901,14 +8913,14 @@ public class BrowserCanvas : SKGLControl
             }
             if (type is "reset")
             {
-                js?.FireEvent(element, "onclick");
+                js?.FireEvent(element, "onclick", mouseEvent);
                 ResetForm(FindEnclosingForm(element));
                 RequestRerender();
                 return;
             }
             if (type is "button")
             {
-                js?.FireEvent(element, "onclick");
+                js?.FireEvent(element, "onclick", mouseEvent);
                 return;
             }
             return;
@@ -8918,7 +8930,7 @@ public class BrowserCanvas : SKGLControl
         {
             if (element.GetAttrOrDefault("type", "submit").Trim().ToLowerInvariant() == "submit")
             {
-                var clickResult = js?.FireEvent(element, "onclick");
+                var clickResult = js?.FireEvent(element, "onclick", mouseEvent);
                 if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
                     return;
 
@@ -8929,7 +8941,7 @@ public class BrowserCanvas : SKGLControl
                 }
                 return;
             }
-            js?.FireEvent(element, "onclick");
+            js?.FireEvent(element, "onclick", mouseEvent);
             return;
         }
 
@@ -8958,7 +8970,7 @@ public class BrowserCanvas : SKGLControl
             // Click handlers run before an anchor's default navigation. A
             // handler returning false cancels that navigation, which is the
             // classic JS pattern used by javascript-basic.html.
-            var clickResult = js?.FireEvent(anchor, "onclick");
+            var clickResult = js?.FireEvent(anchor, "onclick", mouseEvent);
             if (clickResult is { Type: JsType.Boolean } && !clickResult.ToBoolean())
                 return;
 
@@ -9056,7 +9068,7 @@ public class BrowserCanvas : SKGLControl
             }
         }
 
-        js?.FireEvent(element, "onclick");
+        js?.FireEvent(element, "onclick", mouseEvent);
     }
 
     private void SelectListBoxOption(DomElement select, float x, float y,

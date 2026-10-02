@@ -134,6 +134,88 @@ public class JsEngineTests
     }
 
     [Fact]
+    public void LegacyInnerTextAssignmentMutatesTheLiveDom()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><span id='d'>Detecting...</span></body></html>");
+
+        page.Eval("document.all('d').innerText = 'Webmaster96';");
+
+        Check.That((page.Document.FirstTag("span")?.InnerText ?? "") == "Webmaster96",
+            "legacy innerText assignment updates the live DOM",
+            page.Document.FirstTag("span")?.InnerText ?? "<empty>");
+        Check.Done();
+    }
+
+    [Fact]
+    public void InsertAdjacentHtmlMutatesTheLiveDom()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><div id='d'>A</div></body></html>");
+
+        page.Eval("var d=document.all('d');" +
+                  "d.insertAdjacentHTML('beforeBegin', '<b>B</b>');" +
+                  "d.insertAdjacentHTML('afterBegin', '<i>A</i>');" +
+                  "d.insertAdjacentHTML('beforeEnd', '<u>E</u>');" +
+                  "d.insertAdjacentHTML('afterEnd', '<em>R</em>');");
+
+        string text = page.Document.FirstTag("body")?.InnerText ?? "";
+        Check.That(text == "BA XER".Replace(" ", ""),
+            "insertAdjacentHTML updates all four insertion positions", text);
+        Check.Done();
+    }
+
+    [Fact]
+    public void LegacyWindowEventIsAvailableDuringMouseEventDispatch()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><button id='b'>Go</button>" +
+                      "<script>document.all('b').onclick=function(){ window.eventSeen = " +
+                      "window.event && window.event.srcElement ? 'OK' : 'BAD'; };</script>" +
+                      "</body></html>");
+        var button = page.Document.AllTags("button")[0];
+
+        page.FireEvent(button, "onclick");
+
+        Check.That(page.EvalString("window.eventSeen") == "OK",
+            "window.event exposes srcElement during onclick",
+            page.EvalString("window.eventSeen"));
+        Check.That(page.EvalString("typeof window.event") == "undefined",
+            "window.event is cleared after the handler returns");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LegacyTextRangeApisAreExposed()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><p>Hello legacy range</p></body></html>");
+
+        Check.That(page.EvalString("typeof document.selection.createRange") == "function",
+            "document.selection.createRange is exposed in IE-compatible mode");
+        Check.That(page.EvalString("typeof document.body.createTextRange") == "function",
+            "document.body.createTextRange is exposed in IE-compatible mode");
+        Check.That(page.EvalString("document.body.createTextRange().text.length > 0") == "true",
+            "body TextRange exposes the document text");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LegacyScriptEngineProbeIsExposed()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body></body></html>");
+
+        Check.That(page.EvalString("typeof ScriptEngine") == "function",
+            "ScriptEngine is exposed in IE-compatible mode");
+        Check.That(page.EvalString("ScriptEngine()") == "JScript",
+            "ScriptEngine reports JScript", page.EvalString("ScriptEngine()"));
+        Check.That(page.EvalString("ScriptEngineMajorVersion()") == "1",
+            "ScriptEngineMajorVersion reports 1");
+        Check.Done();
+    }
+
+    [Fact]
     public void FormSubmitMethodBypassesOnSubmitHandler()
     {
         var page = new PageHarness();

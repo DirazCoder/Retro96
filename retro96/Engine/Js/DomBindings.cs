@@ -299,6 +299,24 @@ public static class DomBindings
         w.Set("scriptEngine", JsValue.From(BrowserRuntime.JavaScriptEngineName));
         w.Set("scriptVersion", JsValue.From(BrowserRuntime.JavaScriptVersion));
 
+        // JScript-era global engine probes.  These are deliberately exposed
+        // only through the IE-compatible host personality; Navigator 3 did
+        // not provide the Microsoft ScriptEngine* globals.
+        if (BrowserRuntime.SupportsInternetExplorerLegacy)
+        {
+            w.Set("ScriptEngine", Fn(scope, "ScriptEngine", (self, args) =>
+                JsValue.From("JScript")));
+            w.Set("ScriptEngineMajorVersion", Fn(scope, "ScriptEngineMajorVersion", (self, args) =>
+                JsValue.From(1)));
+            w.Set("ScriptEngineMinorVersion", Fn(scope, "ScriptEngineMinorVersion", (self, args) =>
+                JsValue.From(0)));
+            w.Set("ScriptEngineBuildVersion", Fn(scope, "ScriptEngineBuildVersion", (self, args) =>
+                JsValue.From(0)));
+        }
+
+        if (!w.Has("event"))
+            w.Set("event", JsValue.Undefined);
+
         scope.Define("window", JsValue.FromObject(w));
     }
 
@@ -407,6 +425,12 @@ public static class DomBindings
         d.Set("links", JsValue.FromObject(BuildElementCollection(scope, doc.Links, state)));
         d.Set("anchors", JsValue.FromObject(BuildElementCollection(scope, doc.Anchors, state)));
         d.Set("embeds", JsValue.FromObject(BuildElementCollection(scope, doc.ElementDescendants().Where(e => e.TagName == "embed"), state)));
+
+        // IE4-era selection host.  The range is live against the browser
+        // selection state rather than being a detached fake object.
+        if (BrowserRuntime.SupportsInternetExplorerLegacy)
+            d.Set("selection", JsValue.FromObject(
+                new LegacySelectionObject(canvas, scope, state)));
 
         d.Set("write", Fn(scope, "write", (self, args) =>
         {
@@ -998,6 +1022,99 @@ public static class DomBindings
         }
     }
 
+    private sealed class LegacySelectionObject : JsObject
+    {
+        private readonly BrowserCanvas _canvas;
+        private readonly JsScope _scope;
+        private readonly DocumentBindingsState _state;
+
+        public LegacySelectionObject(BrowserCanvas canvas, JsScope scope, DocumentBindingsState state)
+        {
+            _canvas = canvas;
+            _scope = scope;
+            _state = state;
+            Class = "IHTMLSelectionObject";
+        }
+
+        public override JsValue Get(string name)
+        {
+            if (name.Equals("createRange", StringComparison.OrdinalIgnoreCase))
+            {
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.FromObject(new LegacyTextRangeObject(
+                        null, _canvas, _scope, _state, useSelection: true)),
+                    _scope, "createRange"));
+            }
+            if (name.Equals("empty", StringComparison.OrdinalIgnoreCase))
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    _canvas.ClearPageSelection();
+                    return JsValue.Undefined;
+                }, _scope, "empty"));
+            return base.Get(name);
+        }
+    }
+
+    private sealed class LegacyTextRangeObject : JsObject
+    {
+        private DomElement? _root;
+        private readonly BrowserCanvas _canvas;
+        private readonly JsScope _scope;
+        private readonly DocumentBindingsState? _state;
+        private readonly bool _useSelection;
+
+        public LegacyTextRangeObject(DomElement? root, BrowserCanvas canvas, JsScope scope,
+                                     DocumentBindingsState? state, bool useSelection)
+        {
+            _root = root;
+            _canvas = canvas;
+            _scope = scope;
+            _state = state;
+            _useSelection = useSelection;
+            Class = "TextRange";
+        }
+
+        public override JsValue Get(string name)
+        {
+            if (name.Equals("text", StringComparison.OrdinalIgnoreCase))
+            {
+                string text = _useSelection
+                    ? _canvas.GetDomSelectionText()
+                    : _root?.InnerText ?? "";
+                return JsValue.From(text);
+            }
+
+            if (name.Equals("parentElement", StringComparison.OrdinalIgnoreCase))
+                return _root == null || _state == null ? JsValue.Null
+                    : JsValue.FromObject(WrapElement(_root, _state));
+
+            if (name.Equals("moveToElementText", StringComparison.OrdinalIgnoreCase))
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length > 0 && args[0].Type == JsType.Object &&
+                        args[0].GetObjectOrFunction() is ElementWrapper wrapper)
+                        _root = wrapper.Element;
+                    return JsValue.Undefined;
+                }, _scope, "moveToElementText"));
+
+            if (name.Equals("duplicate", StringComparison.OrdinalIgnoreCase))
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.FromObject(new LegacyTextRangeObject(
+                        _root, _canvas, _scope, _state, _useSelection)),
+                    _scope, "duplicate"));
+
+            if (name.Equals("collapse", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("select", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("setEndPoint", StringComparison.OrdinalIgnoreCase))
+            {
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.Undefined, _scope, name));
+            }
+
+            return base.Get(name);
+        }
+    }
+
     /// <summary>new Image().src = "..." — starts the preload fetch.</summary>
     private sealed class ImageObject : JsObject
     {
@@ -1355,6 +1472,55 @@ public static class DomBindings
                 return value == null ? JsValue.Null : JsValue.From(value);
             }, _scope, "getAttribute"));
 
+        private JsValue MakeInsertAdjacentHtmlFunction() => JsValue.FromFunction(
+            new JsFunction((self, args) =>
+            {
+                if (!BrowserRuntime.SupportsInternetExplorerLegacy || args.Length < 2)
+                    return JsValue.Undefined;
+
+                string position = args[0].ToJsString().Trim().ToLowerInvariant();
+                string markup = args[1].ToJsString();
+                if (markup.Length == 0) return JsValue.Undefined;
+
+                var doc = _element.OwnerDocument();
+                if (doc == null) return JsValue.Undefined;
+
+                var fragment = HtmlParser.Parse(markup,
+                    doc.BaseUrl ?? ParsedUrl.Parse("about:blank"), doc.Cookies);
+                var body = fragment.ElementDescendants()
+                    .FirstOrDefault(e => e.TagName.Equals("body", StringComparison.OrdinalIgnoreCase));
+                var nodes = (body?.Children ?? fragment.Children).ToList();
+
+                if (nodes.Count == 0) return JsValue.Undefined;
+
+                switch (position)
+                {
+                    case "beforebegin":
+                        if (_element.Parent != null)
+                            foreach (var node in nodes) _element.Parent.InsertBefore(node, _element);
+                        break;
+                    case "afterbegin":
+                        foreach (var node in nodes) _element.InsertBefore(node, _element.FirstChild);
+                        break;
+                    case "beforeend":
+                        foreach (var node in nodes) _element.AppendChild(node);
+                        break;
+                    case "afterend":
+                        if (_element.Parent != null)
+                        {
+                            var parent = _element.Parent;
+                            var reference = _element.NextSibling;
+                            foreach (var node in nodes) parent.InsertBefore(node, reference);
+                        }
+                        break;
+                    default:
+                        return JsValue.Undefined;
+                }
+
+                _canvas?.ReflowDocument();
+                return JsValue.Undefined;
+            }, _scope, "insertAdjacentHTML"));
+
         public override JsValue Get(string name)
         {
             if (_element.TagName == "embed" && _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
@@ -1371,6 +1537,18 @@ public static class DomBindings
                 return MakeSetAttributeFunction();
             if (string.Equals(name, "getAttribute", StringComparison.OrdinalIgnoreCase))
                 return MakeGetAttributeFunction();
+            if (string.Equals(name, "insertAdjacentHTML", StringComparison.OrdinalIgnoreCase))
+                return MakeInsertAdjacentHtmlFunction();
+
+            if (string.Equals(name, "createTextRange", StringComparison.OrdinalIgnoreCase) &&
+                BrowserRuntime.SupportsInternetExplorerLegacy &&
+                _element.TagName.Equals("body", StringComparison.OrdinalIgnoreCase))
+            {
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.FromObject(new LegacyTextRangeObject(
+                        _element, _canvas, _scope, _state, useSelection: false)),
+                    _scope, "createTextRange"));
+            }
 
             // IE's legacy `element.all` is a callable sub-collection of every
             // descendant element. Keep it live so scripts see DOM changes made
@@ -1729,6 +1907,39 @@ public static class DomBindings
                         foreach (var child in body.Children.ToList())
                             _element.AppendChild(child);
                     }
+                }
+                _canvas?.ReflowDocument();
+                return;
+            }
+
+            // IE/Trident exposed innerText as a live writable host property.
+            // The old binding only implemented the getter, so assignment
+            // silently landed in JsObject.Properties and the real DOM stayed
+            // unchanged — exactly why the test bench's detection cells kept
+            // showing "Detecting...". Replace the children with one live text
+            // node and reflow the page.
+            if (name is "innerText" or "text")
+            {
+                foreach (var oldChild in _element.Children.ToList())
+                    _element.RemoveChild(oldChild);
+                _element.AppendChild(new DomText { Data = value.ToJsString() });
+                _canvas?.ReflowDocument();
+                return;
+            }
+
+            if (name == "outerText")
+            {
+                string text = value.ToJsString();
+                if (_element.Parent is DomElement parent)
+                {
+                    parent.InsertBefore(new DomText { Data = text }, _element);
+                    parent.RemoveChild(_element);
+                }
+                else
+                {
+                    foreach (var oldChild in _element.Children.ToList())
+                        _element.RemoveChild(oldChild);
+                    _element.AppendChild(new DomText { Data = text });
                 }
                 _canvas?.ReflowDocument();
                 return;
