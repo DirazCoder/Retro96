@@ -131,8 +131,8 @@ public partial class Form1
                keys == (Keys.Control | Keys.O) ||
                keys == (Keys.Control | Keys.P) ||
                keys == (Keys.Control | Keys.D0) ||
-               keys == (Keys.Control | Keys.Oemplus) ||
-               keys == (Keys.Control | Keys.Shift | Keys.Oemplus) ||
+                keys == (Keys.Control | Keys.Oemplus) ||
+                keys == (Keys.Control | Keys.Shift | Keys.Oemplus) ||
                keys == (Keys.Control | Keys.Add) ||
                keys == (Keys.Control | Keys.OemMinus) ||
                keys == (Keys.Control | Keys.Subtract) ||

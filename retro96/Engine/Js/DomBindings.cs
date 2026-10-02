@@ -1058,12 +1058,12 @@ public static class DomBindings
     private sealed class LegacyTextRangeObject : JsObject
     {
         private DomElement? _root;
-        private readonly BrowserCanvas _canvas;
+        private readonly BrowserCanvas? _canvas;
         private readonly JsScope _scope;
         private readonly DocumentBindingsState? _state;
         private readonly bool _useSelection;
 
-        public LegacyTextRangeObject(DomElement? root, BrowserCanvas canvas, JsScope scope,
+        public LegacyTextRangeObject(DomElement? root, BrowserCanvas? canvas, JsScope scope,
                                      DocumentBindingsState? state, bool useSelection)
         {
             _root = root;
@@ -1079,7 +1079,7 @@ public static class DomBindings
             if (name.Equals("text", StringComparison.OrdinalIgnoreCase))
             {
                 string text = _useSelection
-                    ? _canvas.GetDomSelectionText()
+                    ? _canvas!.GetDomSelectionText()
                     : _root?.InnerText ?? "";
                 return JsValue.From(text);
             }
