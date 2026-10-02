@@ -1,5 +1,6 @@
 using System;
 using Retro96.Drawing;
+using SkiaSharp;
 
 namespace Retro96.Engine.Render;
 
@@ -13,8 +14,6 @@ namespace Retro96.Engine.Render;
 /// </summary>
 internal static class PasswordMaskLayout
 {
-    private const float ExtraAdvance = 1.25f;
-
     public static StringFormat CreateFormat()
     {
         return new StringFormat(StringFormat.GenericTypographic)
@@ -27,20 +26,26 @@ internal static class PasswordMaskLayout
         };
     }
 
-    public static float GetAdvance(Graphics g, Font font, StringFormat? format = null)
+    public static float GetAdvance(Font font)
     {
-        using var canonical = CreateFormat();
-        float glyphWidth = g.MeasureString("*", font, int.MaxValue, canonical).Width;
+        float glyphWidth;
+        try { glyphWidth = font.SkFont.MeasureText("*"); }
+        catch { glyphWidth = MathF.Max(1f, font.Size * 0.5f); }
         if (!float.IsFinite(glyphWidth) || glyphWidth <= 0f)
             glyphWidth = MathF.Max(1f, font.Size * 0.5f);
 
-        // Keep one deterministic advance for every password character. The same
-        // value is used by the page renderer, focused-field overlay, caret,
-        // hit-testing and horizontal scrolling. This prevents two independently
-        // measured masked runs from landing on top of one another.
-        return MathF.Max(1f, MathF.Round((glyphWidth + ExtraAdvance) * 4f) / 4f);
+        // Use the exact Skia glyph advance.  A fixed, DPI-independent padding
+        // term caused the caret/selection mask to drift from the renderer at
+        // different zoom scales and font rasterization resolutions.
+        return MathF.Max(1f, glyphWidth);
     }
 
+    // Compatibility overload used by the GDI-backed shell overlay. The previous
+    // implementation measured the glyph with GDI while the page renderer measured
+    // it with Skia, so the selected password stars slowly drifted out of alignment.
+    // Both paths now consume the exact same Font/Skia advance.
+    public static float GetAdvance(Graphics g, Font font, StringFormat? format = null)
+        => GetAdvance(font);
     public static float TotalWidth(int length, float advance)
         => Math.Max(0, length) * advance;
 
@@ -53,7 +58,7 @@ internal static class PasswordMaskLayout
             Alignment = StringAlignment.Near,
             LineAlignment = StringAlignment.Near
         };
-        return Math.Max(0, index) * GetAdvance(g, font, fmt);
+        return Math.Max(0, index) * GetAdvance(font);
     }
 
     public static int IndexFromX(float x, int length, float advance)
@@ -70,15 +75,41 @@ internal static class PasswordMaskLayout
         if (length <= 0 || end <= start) return;
         start = Math.Clamp(start, 0, length);
         end = Math.Clamp(end, start, length);
-        float advance = GetAdvance(g, font);
+        float advance = GetAdvance(font);
         float drawHeight = Math.Max(1f, height);
 
-        for (int i = start; i < end; i++)
+        // BrowserCanvas field selection is drawn as an overlay on top of the
+        // renderer's cached control. Drawing the selected mask glyphs through
+        // the same SKCanvas/SkFont pair removes the old sub-pixel mismatch where
+        // a white selected '*' sat a fraction to the left of the black '*' under
+        // it. Use exactly the same per-glyph center and vertical-center contract
+        // as Renderer.DrawPasswordMaskRange.
+        var previousEdging = font.SkFont.Edging;
+        try
         {
-            float glyphX = x + i * advance;
-            g.DrawString("*", font, brush,
-                new RectangleF(glyphX, y, Math.Max(1f, advance), drawHeight),
-                format);
+            // Password controls are rendered by Renderer with aliased Skia glyphs.
+            // Do not infer the mask edging from the compatibility Graphics hint: at
+            // high-DPI/zoom that hint can be ClearType/antialiased while the actual
+            // control remains aliased, producing a visible white/black fringe.
+            font.SkFont.Edging = SKFontEdging.Alias;
+
+            float lineY = y + Math.Max(0f, (drawHeight - font.GetHeight()) * 0.5f);
+            float baseline = lineY + font.AscentPx;
+            var paint = brush is SolidBrush solid
+                ? solid.Prepare(antialias: true)
+                : null;
+            if (paint == null) return;
+
+            for (int i = start; i < end; i++)
+            {
+                float centerX = x + i * advance + advance * 0.5f;
+                g.Canvas.DrawText("*", centerX, baseline, SKTextAlign.Center,
+                    font.SkFont, paint);
+            }
+        }
+        finally
+        {
+            font.SkFont.Edging = previousEdging;
         }
     }
 }

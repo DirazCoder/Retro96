@@ -211,10 +211,11 @@ internal sealed class FindInPageDialog : Form
         FormBorderStyle = FormBorderStyle.FixedToolWindow;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(900, 124);
-        MinimumSize = new Size(820, 124);
+        ClientSize = new Size(900, 142);
+        MinimumSize = new Size(820, 142);
         MinimizeBox = false;
         MaximizeBox = false;
+        ControlBox = false;
         KeyPreview = true;
         // The dialog is hand-sized. WinForms DPI autoscaling was compressing
         // the fixed controls and making the text look horizontally/vertically
@@ -226,7 +227,7 @@ internal sealed class FindInPageDialog : Form
         _layout.Padding = new Padding(10);
         _layout.ColumnCount = 1;
         _layout.RowCount = 2;
-        _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f));
+        _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40f));
         _layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
         var topRow = new Panel
@@ -247,30 +248,30 @@ internal sealed class FindInPageDialog : Form
 
         _queryBox.BorderStyle = BorderStyle.FixedSingle;
         _queryBox.TextAlign = HorizontalAlignment.Left;
-        _queryBox.Location = new Point(60, 1);
-        _queryBox.Size = new Size(500, 24);
+        _queryBox.Location = new Point(60, 7);
+        _queryBox.Size = new Size(500, 26);
         _queryBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _queryBox.Margin = Padding.Empty;
         _queryBox.Text = initialQuery ?? string.Empty;
 
         _previousButton.AutoSize = false;
         _previousButton.TextAlign = ContentAlignment.MiddleCenter;
-        _previousButton.Size = new Size(100, 26);
-        _previousButton.Location = new Point(576, 0);
+        _previousButton.Size = new Size(100, 30);
+        _previousButton.Location = new Point(576, 5);
         _previousButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _previousButton.Margin = Padding.Empty;
 
         _nextButton.AutoSize = false;
         _nextButton.TextAlign = ContentAlignment.MiddleCenter;
-        _nextButton.Size = new Size(100, 26);
-        _nextButton.Location = new Point(682, 0);
+        _nextButton.Size = new Size(100, 30);
+        _nextButton.Location = new Point(682, 5);
         _nextButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _nextButton.Margin = Padding.Empty;
 
         _closeButton.AutoSize = false;
         _closeButton.TextAlign = ContentAlignment.MiddleCenter;
-        _closeButton.Size = new Size(86, 26);
-        _closeButton.Location = new Point(788, 0);
+        _closeButton.Size = new Size(86, 30);
+        _closeButton.Location = new Point(788, 5);
         _closeButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _closeButton.Margin = Padding.Empty;
 
@@ -279,6 +280,11 @@ internal sealed class FindInPageDialog : Form
         topRow.Controls.Add(_previousButton);
         topRow.Controls.Add(_nextButton);
         topRow.Controls.Add(_closeButton);
+
+        topRow.Resize += (_, _) =>
+        {
+            label.Top = Math.Max(0, (topRow.ClientSize.Height - label.Height) / 2);
+        };
 
         var bottomRow = new Panel
         {
@@ -373,10 +379,19 @@ internal sealed class FindInPageDialog : Form
 
     private void LayoutTopRow(Control topRow)
     {
-        if (topRow.ClientSize.Width <= 0) return;
+        if (topRow.ClientSize.Width <= 0 || topRow.ClientSize.Height <= 0) return;
+
         const int rightMargin = 2;
         const int gap = 6;
         int right = topRow.ClientSize.Width - rightMargin;
+
+        int buttonTop = Math.Max(0, (topRow.ClientSize.Height - _previousButton.Height) / 2);
+        int queryTop = Math.Max(0, (topRow.ClientSize.Height - _queryBox.Height) / 2);
+
+        _previousButton.Top = buttonTop;
+        _nextButton.Top = buttonTop;
+        _closeButton.Top = buttonTop;
+        _queryBox.Top = queryTop;
 
         _closeButton.Left = right - _closeButton.Width;
         _nextButton.Left = _closeButton.Left - gap - _nextButton.Width;

@@ -430,7 +430,18 @@ public class JsInterpreter
                 : JsValue.Undefined;
             scope.Define("this", thisValue);
             if (eventObj != null)
+            {
+                if (BrowserRuntime.SupportsInternetExplorerLegacy)
+                {
+                    // Legacy IE handlers could read the active event from the
+                    // browser global; keep srcElement on the same object.
+                    eventObj.Set("srcElement", thisValue);
+                    eventObj.Set("returnValue", JsValue.From(true));
+                    eventObj.Set("cancelBubble", JsValue.From(false));
+                    WindowObject?.Set("event", JsValue.FromObject(eventObj));
+                }
                 scope.Define("event", JsValue.FromObject(eventObj));
+            }
 
             var old = _currentScope;
             _currentScope = scope;
@@ -461,6 +472,8 @@ public class JsInterpreter
             finally
             {
                 _currentScope = old;
+                if (BrowserRuntime.SupportsInternetExplorerLegacy)
+                    WindowObject?.Set("event", JsValue.Undefined);
                 if (isOutermost) _isExecuting = false;
             }
         }
@@ -519,6 +532,13 @@ public class JsInterpreter
         }
         try
         {
+            if (BrowserRuntime.SupportsInternetExplorerLegacy && eventObj != null)
+            {
+                eventObj.Set("srcElement", thisValue);
+                eventObj.Set("returnValue", JsValue.From(true));
+                eventObj.Set("cancelBubble", JsValue.From(false));
+                WindowObject?.Set("event", JsValue.FromObject(eventObj));
+            }
             var args = eventObj != null
                 ? new[] { JsValue.FromObject(eventObj) }
                 : Array.Empty<JsValue>();
@@ -533,6 +553,8 @@ public class JsInterpreter
         }
         finally
         {
+            if (BrowserRuntime.SupportsInternetExplorerLegacy)
+                WindowObject?.Set("event", JsValue.Undefined);
             if (isOutermost) _isExecuting = false;
         }
     }
@@ -1276,7 +1298,11 @@ public class JsInterpreter
         for (int i = 0; i < args.Length; i++)
             args[i] = ExecuteExpression(call.Arguments[i]);
 
-        return CallFunction(callee.GetFunction(), thisValue, args);
+        var callable = callee.GetFunction();
+        if (callable.UseFunctionObjectAsThis)
+            thisValue = callee;
+
+        return CallFunction(callable, thisValue, args);
     }
 
     private JsValue ExecuteNew(NewExpr newExpr)
@@ -1800,19 +1826,24 @@ public class JsInterpreter
 
     public void RegisterRuntimeBuiltins()
     {
-        var console = new JsObject { Class = "Console" };
-        foreach (string level in new[] { "log", "info", "warn", "error", "debug" })
+        // Developer consoles are not part of the strict IE3/JScript 1.0 surface.
+        // Retro96 and Navigator retain the broader runtime surface.
+        if (!BrowserRuntime.IsInternetExplorer3)
         {
-            string capturedLevel = level;
-            console.Set(level, Native((self, args) =>
+            var console = new JsObject { Class = "Console" };
+            foreach (string level in new[] { "log", "info", "warn", "error", "debug" })
             {
-                string message = string.Join(" ", args.Select(a => a.ToJsString()));
-                ConsoleMessage?.Invoke(new ConsoleEntry(capturedLevel, message, DateTime.Now));
-                return JsValue.Undefined;
-            }, "console." + level));
+                string capturedLevel = level;
+                console.Set(level, Native((self, args) =>
+                {
+                    string message = string.Join(" ", args.Select(a => a.ToJsString()));
+                    ConsoleMessage?.Invoke(new ConsoleEntry(capturedLevel, message, DateTime.Now));
+                    return JsValue.Undefined;
+                }, "console." + level));
+            }
+            _globalScope.Define("console", JsValue.FromObject(console));
+            WindowObject?.Set("console", JsValue.FromObject(console));
         }
-        _globalScope.Define("console", JsValue.FromObject(console));
-        WindowObject?.Set("console", JsValue.FromObject(console));
 
         Native((self, args) =>
         {
@@ -1821,8 +1852,10 @@ public class JsInterpreter
             return EvalString(args[0].GetString(), _currentScope);
         }, "eval", global: true);
 
-        // Function.prototype.call / apply
-        if (_globalScope.Get("Function") is { Type: JsType.Function } funcCtor &&
+        // Function.prototype.call / apply are hidden only in strict IE3 mode;
+        // Retro96 retains the broader compatibility runtime.
+        if (!BrowserRuntime.IsInternetExplorer3 &&
+            _globalScope.Get("Function") is { Type: JsType.Function } funcCtor &&
             funcCtor.GetFunction().Get("prototype") is { Type: JsType.Object } fp)
         {
             var funcProto = fp.GetObject();
@@ -1880,8 +1913,8 @@ public class JsInterpreter
             return JsValue.Undefined;
         }, "clearInterval", global: true);
 
-        // Array methods that take script callbacks
-        if (ArrayPrototype != null)
+        // Array callback helpers are later ECMAScript additions.
+        if (!BrowserRuntime.IsInternetExplorer3 && ArrayPrototype != null)
         {
             ArrayPrototype.Set("sort", Native((self, args) =>
                 SortArray(self, args), "sort"));

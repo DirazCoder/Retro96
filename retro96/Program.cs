@@ -51,18 +51,15 @@ static class Program
 
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
-        // Blurry UI/canvas fix: with no DPI awareness declared, Windows treats
-        // this as a DPI-unaware app and bitmap-stretches the entire window to
-        // match the display's scale factor (125%/150%/200% are the common
-        // case on modern displays). Combined with WinForms' own AutoScaleMode
-        // doing a SECOND non-integer scale on top (Form1 uses
-        // AutoScaleMode.None precisely to avoid that), every pixel this
-        // engine deliberately renders crisp and unsmoothed (SmoothingMode.
-        // None, PixelOffsetMode.None — the whole point of the 1996 look)
-        // would get smeared by stacked stretches before it reaches the
-        // screen. PerMonitorV2 tells Windows not to do its own scaling at
-        // all; the app then draws at native pixels and stays sharp.
-        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        // Select the process DPI context before creating any WinForms controls.
+        // High-DPI mode is enabled by default and stored in UserSettings so
+        // portable/legacy installs can explicitly opt out. PerMonitorV2 keeps
+        // the Skia canvas and native shell controls in real device pixels on
+        // each monitor; the compatibility mode below intentionally restores
+        // Windows' legacy bitmap-scaled behaviour.
+        var startupSettings = UserSettings.Load();
+        Application.SetHighDpiMode(
+            startupSettings.HighDpiScaleMode ? HighDpiMode.PerMonitorV2 : HighDpiMode.DpiUnaware);
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);

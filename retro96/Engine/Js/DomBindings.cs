@@ -122,6 +122,22 @@ public static class DomBindings
                 windowObj.Set(nm, JsValue.FromObject(WrapElement(img, state)));
         }
 
+        if (BrowserRuntime.SupportsInternetExplorerLegacy)
+        {
+            // IE's legacy host object model made named page elements reachable
+            // from window. Keep forms/images above as the first-class cases,
+            // then fill the remaining names/ids from the live DOM without
+            // overwriting an explicit window property.
+            foreach (var element in document.ElementDescendants())
+            {
+                string? id = element.GetAttr("id");
+                string? name = element.GetAttr("name");
+                string? key = !string.IsNullOrEmpty(id) ? id : name;
+                if (!string.IsNullOrEmpty(key) && !windowObj.HasOwn(key))
+                    windowObj.Set(key, JsValue.FromObject(WrapElement(element, state)));
+            }
+        }
+
         // The global scope falls back to the window object — bare
         // alert()/confirm()/status/scrollTo resolve through it.  Without
         // this, every window function that was not ALSO scope.Define'd was
@@ -277,6 +293,12 @@ public static class DomBindings
 
         if (!w.Has("name")) w.Set("name", JsValue.From(""));
 
+        // The Preferences > Compatibility choice is a real scripting profile,
+        // not merely a User-Agent label.  IE3 exposes the JScript personality
+        // marker while Netscape 3 keeps the Navigator profile.
+        w.Set("scriptEngine", JsValue.From(BrowserRuntime.JavaScriptEngineName));
+        w.Set("scriptVersion", JsValue.From(BrowserRuntime.JavaScriptVersion));
+
         scope.Define("window", JsValue.FromObject(w));
     }
 
@@ -289,18 +311,26 @@ public static class DomBindings
         var prefs = BrowserRuntime.Settings;
         var n = new JsObject();
 
-        // Pretend to be Navigator 3.01 on Windows 95 — this is what
-        // era sniffing scripts expect to find
+        // Compatibility profiles affect both the advertised personality and
+        // the exposed DOM. Retro96 is the engine's native compatibility union:
+        // it keeps its own identity while exposing both IE- and Navigator-era
+        // surfaces instead of pretending to be only one browser.
         if (prefs.EngineMode == RetroEngineMode.InternetExplorer3)
         {
             n.Set("appName", JsValue.From("Microsoft Internet Explorer"));
             n.Set("appVersion", JsValue.From("3.02 (Windows 95)"));
             n.Set("appCodeName", JsValue.From("Mozilla"));
         }
-        else
+        else if (prefs.EngineMode == RetroEngineMode.Netscape3)
         {
             n.Set("appName", JsValue.From("Netscape"));
             n.Set("appVersion", JsValue.From("3.01 (Win95; I)"));
+            n.Set("appCodeName", JsValue.From("Mozilla"));
+        }
+        else
+        {
+            n.Set("appName", JsValue.From("Retro96"));
+            n.Set("appVersion", JsValue.From("1.0 (Windows 95; IE3+NN3 compatibility)"));
             n.Set("appCodeName", JsValue.From("Mozilla"));
         }
 
@@ -400,10 +430,10 @@ public static class DomBindings
         d.Set("close", Fn(scope, "close", (self, args) => JsValue.Undefined));
         d.Set("clear", Fn(scope, "clear", (self, args) => JsValue.Undefined));
 
-        // getElementById — the CSS1-era modal dialogs
-        // (document.getElementById("welcomeDialog").style.display = …)
-        // died with "'getElementById' is not a function" before this.
-        d.Set("getElementById", Fn(scope, "getElementById", (self, args) =>
+        // getElementById is a later DOM API. IE3 mode deliberately does not
+        // expose it; IE3 pages use document.all / named access instead.
+        if (!BrowserRuntime.IsInternetExplorer3)
+            d.Set("getElementById", Fn(scope, "getElementById", (self, args) =>
         {
             string id = args.Length > 0 ? args[0].ToJsString().Trim() : "";
             if (id.Length == 0) return JsValue.Null;
@@ -426,9 +456,9 @@ public static class DomBindings
                 : JsValue.FromObject(WrapElement(el, state));
         }));
 
-        // createElement — old pages use this for small bits of dynamic DOM
-        // (usually an element is created, configured, then appended later).
-        d.Set("createElement", Fn(scope, "createElement", (self, args) =>
+        // createElement was not part of the IE3 DOM surface.
+        if (!BrowserRuntime.IsInternetExplorer3)
+            d.Set("createElement", Fn(scope, "createElement", (self, args) =>
         {
             string tagName = args.Length > 0 ? args[0].ToJsString() : "";
             if (string.IsNullOrWhiteSpace(tagName)) return JsValue.Null;
@@ -437,9 +467,9 @@ public static class DomBindings
             return JsValue.FromObject(WrapElement(element, state));
         }));
 
-        // getElementsByTagName — legacy pages use this constantly for broad
-        // DOM scans, including document.getElementsByTagName("a") and "*".
-        d.Set("getElementsByTagName", Fn(scope, "getElementsByTagName", (self, args) =>
+        // getElementsByTagName is a later DOM API, so hide it in strict IE3 mode.
+        if (!BrowserRuntime.IsInternetExplorer3)
+            d.Set("getElementsByTagName", Fn(scope, "getElementsByTagName", (self, args) =>
         {
             string tagName = args.Length > 0 ? args[0].ToJsString() : "";
             if (string.IsNullOrEmpty(tagName)) return JsValue.FromObject(NewArray(scope));
@@ -452,8 +482,9 @@ public static class DomBindings
             return JsValue.FromObject(BuildElementCollection(scope, matches, state));
         }));
 
-        // getElementsByName — named lookups over anchors/inputs
-        d.Set("getElementsByName", Fn(scope, "getElementsByName", (self, args) =>
+        // getElementsByName is a later DOM API, so hide it in strict IE3 mode.
+        if (!BrowserRuntime.IsInternetExplorer3)
+            d.Set("getElementsByName", Fn(scope, "getElementsByName", (self, args) =>
         {
             string nm = args.Length > 0 ? args[0].ToJsString() : "";
             var arr = NewArray(scope);
@@ -781,34 +812,28 @@ public static class DomBindings
             {
                 case "title": return JsValue.From(_doc.Title);
                 case "body":
-                case "documentElement":
                     {
-                        // document.body — the live wrapper (bgColor etc.
-                        // route through Set; scripts also probe its existence)
-                        var target = name == "body"
-                            ? Body
-                            : _doc.ElementDescendants().FirstOrDefault(e => e.TagName == "html");
-                        if (target == null) return JsValue.Null;
-                        if (_state == null) return JsValue.Null;
+                        var target = Body;
+                        if (target == null || _state == null) return JsValue.Null;
+                        return JsValue.FromObject(WrapElement(target, _state));
+                    }
+                case "documentElement" when !BrowserRuntime.IsInternetExplorer3:
+                    {
+                        var target = _doc.ElementDescendants().FirstOrDefault(e => e.TagName == "html");
+                        if (target == null || _state == null) return JsValue.Null;
                         return JsValue.FromObject(WrapElement(target, _state));
                     }
                 case "cookie":
                     if (!BrowserRuntime.CookiesEnabled) return JsValue.From("");
                     try { return JsValue.From(_doc.Cookies.Get(BaseUrlOrBlank)); }
                     catch { return JsValue.From(""); }
-                case "all" when BrowserRuntime.Settings.EngineMode == RetroEngineMode.InternetExplorer3:
-                    {
-                        var all = NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope());
-                        if (_state != null)
-                        {
-                            int i = 0;
-                            foreach (var e in _doc.ElementDescendants())
-                                all.Set((i++).ToString(), JsValue.FromObject(WrapElement(e, _state)));
-                            all.Set("length", JsValue.From(i));
-                        }
-                        return JsValue.FromObject(all);
-                    }
-                case "layers" when BrowserRuntime.Settings.EngineMode == RetroEngineMode.Netscape3:
+                case "all" when BrowserRuntime.SupportsInternetExplorerLegacy:
+                    return _state == null
+                        ? JsValue.Undefined
+                        : JsValue.FromFunction(CreateLegacyElementCollection(
+                            _state, () => _doc.ElementDescendants(),
+                            "all", supportsTags: true));
+                case "layers" when BrowserRuntime.SupportsNetscapeLegacy:
                     return JsValue.FromObject(NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope()));
                 case "bgColor": return JsValue.From(Body?.GetAttr("bgcolor") ?? "#c0c0c0");
                 case "fgColor": return JsValue.From(_doc.BodyTextColor);
@@ -825,6 +850,16 @@ public static class DomBindings
                     // read its form fields as undefined.
                     if (_state != null)
                     {
+                        if (BrowserRuntime.SupportsInternetExplorerLegacy)
+                        {
+                            foreach (var element in _doc.ElementDescendants())
+                            {
+                                if (string.Equals(element.GetAttr("id"), name, StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(element.GetAttr("name"), name, StringComparison.OrdinalIgnoreCase))
+                                    return JsValue.FromObject(WrapElement(element, _state));
+                            }
+                        }
+
                         foreach (var form in _doc.Forms)
                             if (string.Equals(form.GetAttr("name"), name,
                                 StringComparison.Ordinal))
@@ -987,6 +1022,164 @@ public static class DomBindings
     }
 
     /// <summary>
+    /// Callable IE-style document.all / element.all collection. The old DOM
+    /// exposed these collections as host objects that were simultaneously
+    /// callable (`all(0)`, `all("id")`) and property-addressable
+    /// (`all[0]`, `all.foo`). A plain JsObject/Array cannot be called by the
+    /// interpreter, which was the root cause of the "all is not a function"
+    /// failures.
+    /// </summary>
+    private sealed class LegacyDomCollection : JsFunction
+    {
+        private readonly Func<IEnumerable<DomElement>> _source;
+        private readonly DocumentBindingsState _state;
+        private readonly JsScope _scope;
+        private readonly bool _supportsTags;
+
+        public LegacyDomCollection(DocumentBindingsState state, JsScope scope,
+                                   Func<IEnumerable<DomElement>> source,
+                                   string name, bool supportsTags)
+            : base((self, args) => self.GetObjectOrFunction() is LegacyDomCollection c
+                ? c.ResolveCall(args)
+                : JsValue.Undefined, scope, name, useFunctionObjectAsThis: true)
+        {
+            _state = state;
+            _scope = scope;
+            _source = source;
+            _supportsTags = supportsTags;
+            Class = "HTMLCollection";
+
+            Set("item", JsValue.FromFunction(new JsFunction((self, args) =>
+            {
+                return self.GetObjectOrFunction() is LegacyDomCollection c
+                    ? c.ResolveItem(args)
+                    : JsValue.Undefined;
+            }, _scope, "item")));
+
+            Set("namedItem", JsValue.FromFunction(new JsFunction((self, args) =>
+            {
+                return self.GetObjectOrFunction() is LegacyDomCollection c
+                    ? c.ResolveNamedItem(args)
+                    : JsValue.Undefined;
+            }, _scope, "namedItem")));
+
+            if (_supportsTags)
+            {
+                Set("tags", JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (self.GetObjectOrFunction() is not LegacyDomCollection c)
+                        return JsValue.Undefined;
+                    string tag = args.Length > 0 ? args[0].ToJsString().Trim() : "";
+                    if (tag.Length == 0)
+                        return CreateLegacyElementCollection(c._state, () => Array.Empty<DomElement>(),
+                            "tags", supportsTags: false).AsValue();
+
+                    return CreateLegacyElementCollection(c._state,
+                        () => c._source().Where(e => string.Equals(
+                            e.TagName, tag, StringComparison.OrdinalIgnoreCase)),
+                        "tags", supportsTags: false).AsValue();
+                }, _scope, "tags")));
+            }
+        }
+
+        public JsValue AsValue() => JsValue.FromFunction(this);
+
+        private List<DomElement> Snapshot() => _source().Where(e => e != null).ToList();
+
+        private DomElement? ResolveIndex(int index)
+        {
+            if (index < 0) return null;
+            var list = Snapshot();
+            return index < list.Count ? list[index] : null;
+        }
+
+        private IEnumerable<DomElement> ResolveNamed(string key)
+        {
+            if (string.IsNullOrEmpty(key))
+                yield break;
+
+            foreach (var element in Snapshot())
+            {
+                string? id = element.GetAttr("id");
+                string? elementName = element.GetAttr("name");
+                if (string.Equals(id, key, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(elementName, key, StringComparison.OrdinalIgnoreCase))
+                    yield return element;
+            }
+        }
+
+        private JsValue Wrap(DomElement element) =>
+            JsValue.FromObject(DomBindings.WrapElement(element, _state));
+
+        private JsValue ResolveItem(JsValue[] args)
+        {
+            if (args.Length == 0) return JsValue.Undefined;
+
+            if (args[0].Type == JsType.Number)
+            {
+                int index = (int)args[0].ToNumber();
+                var indexed = ResolveIndex(index);
+                return indexed == null ? JsValue.Undefined : Wrap(indexed);
+            }
+
+            string key = args[0].ToJsString();
+            if (int.TryParse(key, out int numericIndex))
+            {
+                var indexed = ResolveIndex(numericIndex);
+                return indexed == null ? JsValue.Undefined : Wrap(indexed);
+            }
+
+            var matches = ResolveNamed(key).ToList();
+            if (matches.Count == 0) return JsValue.Undefined;
+
+            if (args.Length > 1)
+            {
+                int duplicateIndex = (int)args[1].ToNumber();
+                return duplicateIndex >= 0 && duplicateIndex < matches.Count
+                    ? Wrap(matches[duplicateIndex])
+                    : JsValue.Undefined;
+            }
+
+            return Wrap(matches[0]);
+        }
+
+        private JsValue ResolveNamedItem(JsValue[] args)
+        {
+            if (args.Length == 0) return JsValue.Undefined;
+            var match = ResolveNamed(args[0].ToJsString()).FirstOrDefault();
+            return match == null ? JsValue.Undefined : Wrap(match);
+        }
+
+        private JsValue ResolveCall(JsValue[] args) => ResolveItem(args);
+
+        public override JsValue Get(string name)
+        {
+            if (string.Equals(name, "length", StringComparison.Ordinal))
+                return JsValue.From(Snapshot().Count);
+
+            if (int.TryParse(name, out int index))
+            {
+                var indexed = ResolveIndex(index);
+                return indexed == null ? JsValue.Undefined : Wrap(indexed);
+            }
+
+            if (name is "item" or "namedItem" or "tags")
+                return base.Get(name);
+
+            var named = ResolveNamed(name).FirstOrDefault();
+            return named == null ? base.Get(name) : Wrap(named);
+        }
+    }
+
+    private static LegacyDomCollection CreateLegacyElementCollection(
+        DocumentBindingsState state, Func<IEnumerable<DomElement>> source,
+        string name, bool supportsTags)
+    {
+        var scope = state.Interpreter?.GlobalScope ?? new JsScope();
+        return new LegacyDomCollection(state, scope, source, name, supportsTags);
+    }
+
+    /// <summary>
     /// Live wrapper around a DomElement: reads and writes of the common
     /// DOM-0 properties go straight to the element (and repaint), so
     /// document.images[0].src = 'over.gif' really swaps the image.
@@ -1023,7 +1216,7 @@ public static class DomBindings
             "src", "href", "value", "checked", "name", "id", "target",
             "action", "method", "width", "height", "alt", "border",
             "align", "bgColor", "title", "maxlength", "size", "cols", "rows",
-            "type"
+            "type", "color", "face"
         };
 
         /// <summary>
@@ -1179,7 +1372,45 @@ public static class DomBindings
             if (string.Equals(name, "getAttribute", StringComparison.OrdinalIgnoreCase))
                 return MakeGetAttributeFunction();
 
-            // ── node identity / tree navigation (era scripts probed these) ──
+            // IE's legacy `element.all` is a callable sub-collection of every
+            // descendant element. Keep it live so scripts see DOM changes made
+            // after the wrapper was first obtained.
+            if (name == "all" && BrowserRuntime.SupportsInternetExplorerLegacy && _state != null)
+                return JsValue.FromFunction(CreateLegacyElementCollection(
+                    _state, () => _element.ElementDescendants().Skip(1),
+                    "all", supportsTags: true));
+
+            if (name == "children")
+            {
+                if (_state == null) return JsValue.Null;
+                return JsValue.FromObject(BuildElementCollection(
+                    _scope, _element.ElementChildren(), _state));
+            }
+
+            if (name == "contains")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length == 0 || args[0].Type != JsType.Object)
+                        return JsValue.From(false);
+
+                    if (args[0].GetObjectOrFunction() is not ElementWrapper other)
+                        return JsValue.From(false);
+
+                    for (var node = other.Element as DomNode; node != null; node = node.Parent)
+                        if (ReferenceEquals(node, _element))
+                            return JsValue.From(true);
+
+                    return JsValue.From(false);
+                }, _scope, "contains"));
+
+            // ── node identity / tree navigation ──
+            // Strict IE3 predates the later DOM tree/HTML mutation surface.
+            // Retro96 exposes the broader DOM union.
+            if (BrowserRuntime.IsInternetExplorer3 && name is
+                "firstChild" or "lastChild" or "parentNode" or "nextSibling" or
+                "previousSibling" or "childNodes")
+                return JsValue.Undefined;
+
             switch (name)
             {
                 case "tagName":
@@ -1238,17 +1469,18 @@ public static class DomBindings
                     }
             }
 
-            // .style — the CSS1-era modal-dialog pattern
-            // (getElementById("dialog").style.display = "block")
+            // .style is a later IE DOM surface; strict IE3 mode does not expose it.
+            if (name == "style" && BrowserRuntime.IsInternetExplorer3)
+                return JsValue.Undefined;
+
             if (name == "style" && !Properties.ContainsKey("style"))
             {
                 Properties["style"] = JsValue.FromObject(
                     new InlineStyleObject(_element, _canvas, _scope));
             }
 
-            // getElementsByTagName — DOM element collections are descendants
-            // of this element (the element itself is not included).
-            if (name == "getElementsByTagName")
+            // getElementsByTagName — later DOM API; hide it in IE3 mode.
+            if (name == "getElementsByTagName" && !BrowserRuntime.IsInternetExplorer3)
                 return JsValue.FromFunction(new JsFunction((self, args) =>
                 {
                     string tagName = args.Length > 0 ? args[0].ToJsString() : "";
@@ -1350,6 +1582,9 @@ public static class DomBindings
             }
 
             if (name == "text")
+                return JsValue.From(_element.InnerText);
+
+            if (name == "value" && _element.TagName == "textarea")
                 return JsValue.From(_element.InnerText);
 
             if (RoutedAttrs.Contains(name))
@@ -1473,6 +1708,11 @@ public static class DomBindings
 
         public override void Set(string name, JsValue value)
         {
+            // Keep IE3's DOM intentionally old in both reads and writes.
+            if (BrowserRuntime.IsInternetExplorer3 &&
+                name is "innerHTML" or "innerText" or "outerHTML")
+                return;
+
             if (name == "innerHTML")
             {
                 foreach (var oldChild in _element.Children.ToList())
@@ -1516,6 +1756,18 @@ public static class DomBindings
                     _state?.Interpreter?.ClearDomEventProperty(_element, eventName);
                     _element.EventHandlers.Remove(eventName);
                 }
+                return;
+            }
+
+            if (name == "value" && _element.TagName == "textarea")
+            {
+                string text = value.ToJsString();
+                var textNode = _element.Children.OfType<DomText>().FirstOrDefault();
+                if (textNode == null)
+                    _element.AppendChild(new DomText { Data = text });
+                else
+                    textNode.Data = text;
+                _canvas?.RequestRerender();
                 return;
             }
 

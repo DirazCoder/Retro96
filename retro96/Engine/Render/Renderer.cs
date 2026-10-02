@@ -339,6 +339,12 @@ public class Renderer
     // just like textarea scrolling. This resolver keeps the renderer stateless.
     public Func<DomElement, int>? SelectScrollResolver { get; set; }
 
+    // Single-line text inputs can acquire a control-local horizontal viewport when
+    // Find navigates to text that is outside the visible portion of the field.
+    // Keeping this in the renderer (rather than only moving the highlight overlay)
+    // makes the actual text and the highlight share one coordinate system.
+    public Func<DomElement, float>? FieldScrollResolver { get; set; }
+
     private readonly ResourceLoader _resourceLoader;
 
     /// <summary>Host-provided GPU-native embedded-content compositor. When present it
@@ -2329,9 +2335,9 @@ public class Renderer
         return extension.Length > 0 ? extension : ellipsis;
     }
 
-    private static void PaintTextControl(SkiaRenderContext g, LayoutBox box, FontCache fonts,
-                                         ComputedStyle style, string text, bool isFocused,
-                                         bool isPassword)
+    private void PaintTextControl(SkiaRenderContext g, LayoutBox box, FontCache fonts,
+                                  ComputedStyle style, string text, bool isFocused,
+                                  bool isPassword)
     {
         var rect = box.BorderRect;   // chrome sits on the layout-reserved ring
         var face = box.ContentRect;
@@ -2369,28 +2375,30 @@ public class Renderer
               : SKTextAlign.Left)
             : SKTextAlign.Left;
         var sf = new SkiaTextOptions(
-            textAlign, verticalCenter: true, clip: true, ellipsis: false);
+            SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: false);
 
         var textRect = new RectangleF(face.X + 3, face.Y,
                                       Math.Max(0, face.Width - 6), face.Height);
+        float fieldScroll = 0f;
+        if (!isPassword && box.Element != null)
+            fieldScroll = Math.Max(0f, FieldScrollResolver?.Invoke(box.Element) ?? 0f);
+
         // Skia text edging is a mutable Skia text state. Password masks may
         // use single-bit grid fitting for crisp '*' glyphs, but that setting
-        // must never leak into the text painted after this control.  Save the
-        // full graphics state and explicitly select the correct hint for this
-        // one draw.
+        // must never leak into the text painted after this control. Save the
+        // full graphics state and explicitly select the correct hint for this draw.
         var textState = g.Save();
         var previousEdging = font.SkFont.Edging;
         try
         {
             g.SetClip(textRect, SKClipOperation.Intersect);
             font.SkFont.Edging = isPassword ? SKFontEdging.Alias : SKFontEdging.Antialias;
+
+            float lineY = textRect.Y + Math.Max(0f, (textRect.Height - font.GetHeight()) * 0.5f);
             if (isPassword && box.Element != null)
             {
                 int length = text.Length;
-                float glyphWidth = font.SkFont.MeasureText("*");
-                if (!float.IsFinite(glyphWidth) || glyphWidth <= 0f)
-                    glyphWidth = MathF.Max(1f, font.Size * 0.5f);
-                float advance = MathF.Max(1f, MathF.Round((glyphWidth + 1.25f) * 4f) / 4f);
+                float advance = PasswordMaskLayout.GetAdvance(font);
                 float totalWidth = length * advance;
                 float passwordX = textRect.X;
                 if (totalWidth < textRect.Width - 0.01f)
@@ -2405,9 +2413,25 @@ public class Renderer
                 DrawPasswordMaskRange(g, length, font, brush, passwordX, textRect.Y,
                     textRect.Height, 0, length);
             }
-            else
+            else if (!string.IsNullOrEmpty(text))
             {
-                g.DrawString(text, font, brush, textRect, sf);
+                float totalWidth = font.SkFont.MeasureText(text);
+                float drawX = textRect.X;
+                if (totalWidth < textRect.Width - 0.01f)
+                {
+                    drawX = textAlign switch
+                    {
+                        SKTextAlign.Center => textRect.X + (textRect.Width - totalWidth) * 0.5f,
+                        SKTextAlign.Right => textRect.Right - totalWidth,
+                        _ => textRect.X
+                    };
+                }
+                else
+                {
+                    drawX -= Math.Min(fieldScroll, Math.Max(0f, totalWidth - textRect.Width));
+                }
+
+                g.DrawString(text, font, brush, drawX, lineY, sf);
             }
         }
         finally
@@ -2424,10 +2448,7 @@ public class Renderer
         start = Math.Clamp(start, 0, length);
         end = Math.Clamp(end, start, length);
 
-        float glyphWidth = font.SkFont.MeasureText("*");
-        if (!float.IsFinite(glyphWidth) || glyphWidth <= 0f)
-            glyphWidth = MathF.Max(1f, font.Size * 0.5f);
-        float advance = MathF.Max(1f, MathF.Round((glyphWidth + 1.25f) * 4f) / 4f);
+        float advance = PasswordMaskLayout.GetAdvance(font);
 
         // Use the same centered-in-line metrics as ordinary control text. The
         // previous x/y overload treated y as a baseline, so password masks were

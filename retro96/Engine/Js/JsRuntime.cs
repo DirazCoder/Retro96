@@ -315,6 +315,14 @@ public static class JsRuntime
             return JsValue.From(-1);
         }));
 
+        // Strict IE3/JScript 1.0 hides these later ECMAScript Array helpers.
+        // Retro96 and Navigator retain the broader runtime implementation.
+        if (BrowserRuntime.IsInternetExplorer3)
+        {
+            arrProto.Properties.Remove("splice");
+            arrProto.Properties.Remove("indexOf");
+        }
+
         var arrayCtor = new JsFunction((self, args) =>
         {
             var newArr = NewArray(scope);

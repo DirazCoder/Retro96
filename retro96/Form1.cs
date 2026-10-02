@@ -127,6 +127,11 @@ public partial class Form1 : Form
 
     // User preferences (search engine etc.); persisted per-user with a portable retro96.ini mirror
     private readonly UserSettings _settings = UserSettings.Load();
+    // Process DPI awareness is selected by Program before any controls exist,
+    // so keep the startup value separate from the editable preference. This
+    // prevents changing the checkbox at runtime from making a live monitor
+    // transition half-scaled before the required restart.
+    private bool _highDpiScaleModeActive;
 
     // Guards against meta-refresh chains that loop forever
     private string? _metaRefreshChainStartUrl;
@@ -296,6 +301,7 @@ public partial class Form1 : Form
 
     public Form1()
     {
+        _highDpiScaleModeActive = _settings.HighDpiScaleMode;
         BrowserRuntime.Apply(_settings);
         InitializeComponent();
         InitializeBrowser();
@@ -470,7 +476,8 @@ public partial class Form1 : Form
 
         Load += (s, e) =>
         {
-            float scale = DeviceDpi > 0 ? DeviceDpi / 96f : 1f;
+            float scale = _highDpiScaleModeActive && DeviceDpi > 0
+                ? DeviceDpi / 96f : 1f;
             if (scale > 1.01f)
             {
                 Size = new Size((int)(Width * scale), (int)(Height * scale));
@@ -483,6 +490,19 @@ public partial class Form1 : Form
         };
 
         Resize += (s, e) => PositionThrobber();
+        DpiChanged += (s, e) =>
+        {
+            if (!_highDpiScaleModeActive) return;
+
+            // PerMonitorV2 delivers the monitor transition here.  Form1 uses
+            // AutoScaleMode.None because the retro shell owns its pixel layout,
+            // so update the handful of explicitly sized shell controls here and
+            // let Windows provide the recommended window bounds.
+            Bounds = e.SuggestedRectangle;
+            float scale = Math.Max(1f, e.DeviceDpiNew / 96f);
+            _txtUrl.Width = (int)Math.Round(480f * scale);
+            PositionThrobber();
+        };
     }
 
     // Base size at 96 DPI; scaled by the monitor's DPI in PositionThrobber.
@@ -594,6 +614,7 @@ public partial class Form1 : Form
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         var updated = dialog.Settings;
+        bool highDpiModeChanged = updated.HighDpiScaleMode != _settings.HighDpiScaleMode;
         _settings.SearchQueryUrl = UserSettings.NormalizeSearchTemplate(updated.SearchQueryUrl);
         _settings.HomePageUrl = updated.HomePageUrl;
         _settings.EngineMode = updated.EngineMode;
@@ -603,6 +624,7 @@ public partial class Form1 : Form
         _settings.LoadImages = updated.LoadImages;
         _settings.EnableJavaScript = updated.EnableJavaScript;
         _settings.AllowScriptedWindows = updated.AllowScriptedWindows;
+        _settings.HighDpiScaleMode = updated.HighDpiScaleMode;
         _settings.LoadStylesheets = updated.LoadStylesheets;
         _settings.LoadFrames = updated.LoadFrames;
         _settings.AllowFormSubmissions = updated.AllowFormSubmissions;
@@ -629,6 +651,13 @@ public partial class Form1 : Form
             Reload();
         else
             _canvas.RequestRerender();
+
+        if (highDpiModeChanged)
+        {
+            MessageBox.Show(this,
+                "High-DPI scale mode has been saved. Restart Retro96 for the new Windows DPI awareness mode to take effect.",
+                "Retro96", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
     }
 
     private static string EscapeHtmlText(string? s) =>

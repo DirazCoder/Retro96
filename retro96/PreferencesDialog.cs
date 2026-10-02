@@ -20,6 +20,7 @@ internal sealed class PreferencesDialog : Form
     private readonly Button _pickBg = new();
     private readonly CheckBox _images = new();
     private readonly CheckBox _javascript = new();
+    private readonly CheckBox _highDpiScaleMode = new();
     private readonly CheckBox _scriptWindows = new();
     private readonly TrackBar _trust = new();
     private readonly Label _trustTitle = new();
@@ -159,6 +160,19 @@ internal sealed class PreferencesDialog : Form
             _images
         }));
 
+        ConfigureCheckBox(_highDpiScaleMode, "Enable Windows Per-Monitor V2 high-DPI scaling (recommended)");
+        panel.Controls.Add(Group("Display scaling", new Control[]
+        {
+            _highDpiScaleMode,
+            new Label
+            {
+                Text = "When enabled, Retro96 uses PerMonitorV2 DPI awareness so the browser UI and rendering scale correctly across monitors. " +
+                       "The setting is saved immediately but requires restarting Retro96 because Windows selects the process DPI context at startup.",
+                AutoSize = false, Width = 690, Height = 44,
+                ForeColor = Color.FromArgb(90, 96, 104)
+            }
+        }));
+
         page.Controls.Add(panel);
         return page;
     }
@@ -172,6 +186,7 @@ internal sealed class PreferencesDialog : Form
         _engine.Width = 690;
         _engine.Height = 30;
         _engine.DropDownWidth = 690;
+        _engine.Items.Add("Retro96 Engine (all compatibility features)");
         _engine.Items.Add("Netscape Navigator 3");
         _engine.Items.Add("Internet Explorer 3");
         _engine.SelectedIndexChanged += (_, _) => UpdateUserAgentHint();
@@ -182,8 +197,9 @@ internal sealed class PreferencesDialog : Form
             _engine,
             new Label
             {
-                Text = "The mode changes browser-visible compatibility behaviour and navigator values. " +
-                       "It does not replace Retro96's renderer.",
+                Text = "Retro96 Engine is the default native mode and exposes the full compatibility union available in Retro96 " +
+                       "(IE-style document.all/events plus Navigator-era layers, while retaining later DOM/runtime extensions). " +
+                       "Netscape 3 and IE 3 remain strict historical personalities.",
                 AutoSize = true,
                 MaximumSize = new Size(690, 0),
                 ForeColor = Color.FromArgb(90, 96, 104)
@@ -216,9 +232,10 @@ internal sealed class PreferencesDialog : Form
         {
             new Label
             {
-                Text = "Netscape 3 mode exposes Netscape-style navigator values and document.layers-style behaviour. " +
-                       "IE 3 mode exposes Microsoft-style navigator values and document.all-style named access.",
-                AutoSize = false, Height = 78, Width = 690,
+                Text = "Retro96 Engine: native compatibility-union surface with both IE-style and Navigator-style legacy APIs plus the engine's broader DOM/runtime support. " +
+                       "Netscape 3: JavaScript 1.1-era Navigator profile. " +
+                       "IE 3: Microsoft JScript 1.0-era profile with strict IE-era DOM exposure and later extensions hidden.",
+                AutoSize = false, Height = 82, Width = 690,
                 ForeColor = Color.FromArgb(55, 60, 68)
             }
         }));
@@ -508,7 +525,12 @@ internal sealed class PreferencesDialog : Form
     {
         _home.Text = _settings.HomePageUrl;
         _search.Text = _settings.SearchQueryUrl;
-        _engine.SelectedIndex = _settings.EngineMode == RetroEngineMode.InternetExplorer3 ? 1 : 0;
+        _engine.SelectedIndex = _settings.EngineMode switch
+        {
+            RetroEngineMode.InternetExplorer3 => 2,
+            RetroEngineMode.Netscape3 => 1,
+            _ => 0
+        };
         _customUa.Checked = !string.IsNullOrWhiteSpace(_settings.UserAgentOverride);
         _ua.Text = _settings.UserAgentOverride;
         _pageBg.Checked = _settings.BackgroundMode == BackgroundMode.PageDefault;
@@ -517,6 +539,7 @@ internal sealed class PreferencesDialog : Form
         _images.Checked = _settings.LoadImages;
         _javascript.Checked = _settings.EnableJavaScript;
         _scriptWindows.Checked = _settings.AllowScriptedWindows;
+        _highDpiScaleMode.Checked = _settings.HighDpiScaleMode;
         // Clamp: a corrupt/hand-edited settings file with an out-of-range enum
         // value would otherwise throw when assigned to the TrackBar.
         _trust.Value = Math.Clamp((int)_settings.TrustMode, _trust.Minimum, _trust.Maximum);
@@ -542,13 +565,19 @@ internal sealed class PreferencesDialog : Form
 
     private void CopyInto(UserSettings target)
     {
-        target.EngineMode = _engine.SelectedIndex == 1 ? RetroEngineMode.InternetExplorer3 : RetroEngineMode.Netscape3;
+        target.EngineMode = _engine.SelectedIndex switch
+        {
+            2 => RetroEngineMode.InternetExplorer3,
+            1 => RetroEngineMode.Netscape3,
+            _ => RetroEngineMode.Retro96
+        };
         target.UserAgentOverride = _customUa.Checked ? _ua.Text.Trim() : "";
         target.BackgroundMode = _forcedBg.Checked ? BackgroundMode.Force : BackgroundMode.PageDefault;
         target.ForcedBackgroundColor = NormalizeHex(_bgHex.Text);
         target.LoadImages = _images.Checked;
         target.EnableJavaScript = _javascript.Checked;
         target.AllowScriptedWindows = _scriptWindows.Checked;
+        target.HighDpiScaleMode = _highDpiScaleMode.Checked;
         target.TrustMode = (TrustMode)Math.Clamp(_trust.Value, 0, 2);
         target.HostCheckImages = _hostImageCheck.Checked || target.TrustMode == TrustMode.High;
         target.DiscardPageStateOnClose = _discardState.Checked;
@@ -590,9 +619,14 @@ internal sealed class PreferencesDialog : Form
 
     private void UpdateUserAgentHint()
     {
-        string def = _engine.SelectedIndex == 1 ? UserSettings.DefaultIe3UserAgent : UserSettings.DefaultNetscapeUserAgent;
+        (string def, string engine) = _engine.SelectedIndex switch
+        {
+            2 => (UserSettings.DefaultIe3UserAgent, "Microsoft JScript 1.0"),
+            1 => (UserSettings.DefaultNetscapeUserAgent, "Netscape JavaScript 1.1"),
+            _ => (UserSettings.DefaultRetro96UserAgent, "Retro96 Script Engine (1.0/1.1 compatibility union)")
+        };
         _uaHint.Text = "Profile default: " + def + Environment.NewLine +
-                       "The same value is used for the HTTP User-Agent header and navigator.userAgent.";
+                       "Script engine personality: " + engine + ". The same User-Agent is sent in HTTP and exposed as navigator.userAgent.";
     }
 
     private void UpdateUaEnabled() => _ua.Enabled = _customUa.Checked;
@@ -613,19 +647,19 @@ internal sealed class PreferencesDialog : Form
                 _trustDetails.Text =
                     "No page-directed file access. No Process/IO/Reflection capability. " +
                     "Images stay host-mediated and checked before decode; scripted new windows are blocked. " +
-                    "Child processes are blocked and the worker is Job-object isolated. 8 MiB image ceiling.";
+                    "Child processes are blocked and the worker is Job-object isolated. VBScript is disabled entirely. 8 MiB image ceiling.";
                 break;
             case TrustMode.Medium:
                 _trustTitle.Text = "Medium — balanced";
                 _trustDetails.Text =
                     "Still denies page-directed local file access and keeps all site networking/image fetching in the host broker. " +
-                    "Scripted windows are allowed, but child-process creation remains blocked. 16 MiB image ceiling.";
+                    "Scripted windows and VBScript are allowed when JavaScript is enabled, but child-process creation remains blocked. 16 MiB image ceiling.";
                 break;
             default:
                 _trustTitle.Text = "Low — trusted / compatibility";
                 _trustDetails.Text =
                     "Compatibility first. Page-directed file URLs/resources are allowed and network bypasses the host broker. " +
-                    "The JS runtime still exposes no .NET file/process API, and the worker remains separately process-isolated. 32 MiB image ceiling.";
+                    "VBScript is allowed when JavaScript is enabled; the JS runtime still exposes no .NET file/process API, and the worker remains separately process-isolated. 32 MiB image ceiling.";
                 break;
         }
         _hostImageCheck.Checked = mode == TrustMode.High || _hostImageCheck.Checked;

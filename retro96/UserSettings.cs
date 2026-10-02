@@ -7,6 +7,7 @@ namespace Retro96;
 
 public enum RetroEngineMode
 {
+    Retro96,
     Netscape3,
     InternetExplorer3
 }
@@ -32,7 +33,11 @@ public enum TrustMode
 public sealed class UserSettings
 {
     public const string DefaultSearchUrl = "https://www.frogfind.com/?q=%s";
-    public const string DefaultNetscapeUserAgent = "Mozilla/3.0 (compatible; Retro96/1.0; Windows 95)";
+    public const string DefaultRetro96UserAgent = "Mozilla/5.0 (Retro96/1.0; Windows 95; IE3+NN3 compatibility)";
+    // Navigator 3 used the Mozilla/3.0 product token with platform and
+    // security fields in the parenthesized comment. Keep the default
+    // historical rather than carrying the Retro96 product marker.
+    public const string DefaultNetscapeUserAgent = "Mozilla/3.0 (Win95; I)";
     public const string DefaultIe3UserAgent = "Mozilla/2.0 (compatible; MSIE 3.02; Windows 95)";
     public const string DefaultBackgroundColor = "#C0C0C0";
 
@@ -40,13 +45,18 @@ public sealed class UserSettings
     public string HomePageUrl { get; set; } = "retro96:home";
     public bool WelcomeDismissed { get; set; }
 
-    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.Netscape3;
+    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.Retro96;
     public string UserAgentOverride { get; set; } = "";
     public BackgroundMode BackgroundMode { get; set; } = BackgroundMode.PageDefault;
     public string ForcedBackgroundColor { get; set; } = DefaultBackgroundColor;
     public bool LoadImages { get; set; } = true;
     public bool EnableJavaScript { get; set; } = true;
     public bool AllowScriptedWindows { get; set; } = true;
+
+    // Windows display scaling. Enabled by default so the shell and native
+    // controls use PerMonitorV2 rather than being bitmap-stretched by Windows.
+    // Stored as a normal preference so legacy/portable installs can opt out.
+    public bool HighDpiScaleMode { get; set; } = true;
 
     // Advanced browser-engine feature switches.
     public bool LoadStylesheets { get; set; } = true;
@@ -77,9 +87,12 @@ public sealed class UserSettings
 
     public string EffectiveUserAgent =>
         string.IsNullOrWhiteSpace(UserAgentOverride)
-            ? (EngineMode == RetroEngineMode.InternetExplorer3
-                ? DefaultIe3UserAgent
-                : DefaultNetscapeUserAgent)
+            ? EngineMode switch
+            {
+                RetroEngineMode.InternetExplorer3 => DefaultIe3UserAgent,
+                RetroEngineMode.Netscape3 => DefaultNetscapeUserAgent,
+                _ => DefaultRetro96UserAgent
+            }
             : UserAgentOverride.Trim();
 
     public UserSettings Clone() => new()
@@ -94,6 +107,7 @@ public sealed class UserSettings
         LoadImages = LoadImages,
         EnableJavaScript = EnableJavaScript,
         AllowScriptedWindows = AllowScriptedWindows,
+        HighDpiScaleMode = HighDpiScaleMode,
         LoadStylesheets = LoadStylesheets,
         LoadFrames = LoadFrames,
         AllowFormSubmissions = AllowFormSubmissions,
@@ -186,6 +200,9 @@ public sealed class UserSettings
                     case "scriptedwindows.enabled":
                         s.AllowScriptedWindows = ParseBool(value, s.AllowScriptedWindows);
                         break;
+                    case "ui.highdpi":
+                        s.HighDpiScaleMode = ParseBool(value, s.HighDpiScaleMode);
+                        break;
                     case "stylesheets.enabled":
                         s.LoadStylesheets = ParseBool(value, s.LoadStylesheets);
                         break;
@@ -260,6 +277,7 @@ public sealed class UserSettings
         sb.AppendLine("Images.Enabled=" + BoolText(LoadImages));
         sb.AppendLine("JavaScript.Enabled=" + BoolText(EnableJavaScript));
         sb.AppendLine("ScriptedWindows.Enabled=" + BoolText(AllowScriptedWindows));
+        sb.AppendLine("UI.HighDpi=" + BoolText(HighDpiScaleMode));
         sb.AppendLine("Stylesheets.Enabled=" + BoolText(LoadStylesheets));
         sb.AppendLine("Frames.Enabled=" + BoolText(LoadFrames));
         sb.AppendLine("Forms.Enabled=" + BoolText(AllowFormSubmissions));

@@ -123,6 +123,22 @@ public class BrowserCanvas : SKGLControl
     private int _fieldSelAnchor;
     private bool _fieldDragging;
     private float _fieldScrollX;
+    // Last pointer position for an active field drag, kept in the field's
+    // logical coordinate space.  This lets a drag keep selecting when the
+    // pointer reaches the edge of a horizontally scrollable input instead of
+    // clamping the caret at the last visible character forever.
+    private float _fieldDragPointerX;
+    private float _fieldDragPointerY;
+    private FrameView? _fieldDragPointerFrame;
+    private readonly Timer _fieldDragAutoScrollTimer = new() { Interval = 30 };
+    // Find navigation may target a horizontal position inside an unfocused
+    // single-line control. Keep that view per element so the highlight remains
+    // attached while the control is horizontally scrolled or clipped.
+    private readonly Dictionary<DomElement, float> _fieldFindScrollXs = new();
+    // Once the user explicitly clicks back into a field after Find has moved its
+    // internal viewport, that manual/focus action owns the viewport.  Background
+    // Find refreshes must not immediately force the old match back into view.
+    private readonly HashSet<DomElement> _findFieldViewportUserOverrides = new();
     private int _textareaScrollLine;
     // Textarea scrolling belongs to the DOM control, not to focus. Keep it
     // here so blur/unfocus can repaint the field at the same viewport without
@@ -167,6 +183,11 @@ public class BrowserCanvas : SKGLControl
     private bool _suppressNextMouseDoubleClick;
     private DomElement? _selectionSemanticScope;
     private FrameView? _selectionSemanticScopeFrame;
+    // Layout boxes do not change until a relayout swaps the root tree. Cache the
+    // source-order selectable boxes so mouse selection and painting do not rebuild
+    // a full-page list on every pointer event.
+    private LayoutBox? _selectionRangeCacheRoot;
+    private List<LayoutBox>? _selectionRangeCache;
     private LayoutBox? _lastTextClickBox;
     // Layout boxes are rebuilt when hover/active CSS is resolved. Do not use
     // the box reference itself to recognize a double/triple click; keep the
@@ -188,6 +209,7 @@ public class BrowserCanvas : SKGLControl
     private int _fieldClickCount;
 
     private DomElement? _contextElement;
+    private ContextMenuStrip? _openSelectMenu;
 
     // In-page find state is backed by rendered text runs rather than just
     // Element.InnerText. This avoids duplicate matches on nested containers
@@ -312,7 +334,20 @@ public class BrowserCanvas : SKGLControl
 
     public enum FrameScrollMode { Auto, Yes, No }
 
-    private readonly record struct FindMatch(FrameView? Frame, LayoutBox Box, int Start, int Length, DomElement? SourceElement = null);
+    private readonly record struct FindMatchSegment(
+        FrameView? Frame,
+        LayoutBox Box,
+        int Start,
+        int Length,
+        DomElement? SourceElement = null);
+
+    private readonly record struct FindMatch(
+        FrameView? Frame,
+        LayoutBox Box,
+        int Start,
+        int Length,
+        DomElement? SourceElement = null,
+        IReadOnlyList<FindMatchSegment>? Segments = null);
 
     public sealed class FrameView
     {
@@ -367,6 +402,7 @@ public class BrowserCanvas : SKGLControl
         _jsTimer.Tick += OnJsTimerTick;
         _resizeReflowTimer.Tick += OnResizeReflowTick;
         _caretTimer.Tick += OnCaretTick;
+        _fieldDragAutoScrollTimer.Tick += OnFieldDragAutoScrollTick;
         UpdateAnimationRefreshRate();
         _caretTimer.Start();
 
@@ -452,6 +488,7 @@ public class BrowserCanvas : SKGLControl
             _jsTimer.Dispose();
             _resizeReflowTimer.Dispose();
             _caretTimer.Dispose();
+            _fieldDragAutoScrollTimer.Dispose();
             _measureGfx?.Dispose();
             DisposeDisplayLists();
 
@@ -468,6 +505,7 @@ public class BrowserCanvas : SKGLControl
             _controlDefaults.Clear();
             _textareaScrollLines.Clear();
             _textareaScrollXs.Clear();
+            _fieldFindScrollXs.Clear();
             _textareaScrollbarDragging = false;
             _textareaScrollbarDragFrame = null;
             _selectScrollOffsets.Clear();
@@ -693,6 +731,7 @@ public class BrowserCanvas : SKGLControl
         _controlDefaults.Clear();
         _textareaScrollLines.Clear();
         _textareaScrollXs.Clear();
+        _fieldFindScrollXs.Clear();
         _textareaScrollbarDragging = false;
         _textareaScrollbarDragFrame = null;
         _selectScrollOffsets.Clear();
@@ -1450,6 +1489,7 @@ public class BrowserCanvas : SKGLControl
             PressedElement = _pressedControl,
             TextareaStateResolver = GetTextareaRenderState,
             SelectScrollResolver = GetSelectScrollOffset,
+            FieldScrollResolver = GetRendererFieldScrollX,
             EmbeddedFrameResolver = ResolveEmbeddedContent,
             EmbeddedCanvasResolver = RenderEmbeddedCanvas,
             SkipEmbeddedContent = true
@@ -1607,6 +1647,7 @@ public class BrowserCanvas : SKGLControl
         _animationRenderer.PressedElement = _pressedControl;
         _animationRenderer.TextareaStateResolver = GetTextareaRenderState;
         _animationRenderer.SelectScrollResolver = GetSelectScrollOffset;
+        _animationRenderer.FieldScrollResolver = GetRendererFieldScrollX;
         _animationRenderer.EmbeddedFrameResolver = ResolveEmbeddedContent;
         _animationRenderer.EmbeddedCanvasResolver = RenderEmbeddedCanvas;
         _animationRenderer.SkipEmbeddedContent = true;
@@ -1746,7 +1787,11 @@ public class BrowserCanvas : SKGLControl
             try
             {
                 g.SetClip(new RectangleF(0, 0, logicalVw, logicalVh), CombineMode.Intersect);
-                PaintFindHighlights(g, scrollX, scrollY);
+                // Paint focused-field content before find overlays. Otherwise the
+                // field repaint clears the find box whenever the match lives in a
+                // focused input/textarea, especially after internal scrolling.
+                // Find highlighting is the final text overlay and uses the same
+                // field scroll state as the actual control renderer.
                 // Links use the normal Renderer :active/BODY ALINK paint path.
                 // Never paint a second red text copy here: that was the source
                 // of the visible red-on-green ghost and the slight positional jump.
@@ -1761,6 +1806,7 @@ public class BrowserCanvas : SKGLControl
                 if (_focusedInput != null && _rootBox != null &&
                     !IsFocusedFieldSuppressedByPageSelection())
                     PaintFieldOverlay(g);
+                PaintFindHighlights(g, scrollX, scrollY);
                 PaintEmbeddedMidiControls(g);
             }
             finally
@@ -1858,7 +1904,20 @@ public class BrowserCanvas : SKGLControl
     private float MarqueeSelectionTranslationX(LayoutBox marqueeBox, long now)
     {
         var renderer = _animationRenderer ?? GetAnimationRenderer();
-        return renderer?.GetMarqueeTranslationX(marqueeBox, now) ?? 0f;
+        if (renderer == null) return 0f;
+
+        float translationX = renderer.GetMarqueeTranslationX(marqueeBox, now);
+
+        // The animated marquee renderer snaps the final translation to one
+        // device pixel before painting. Selection/Find overlays are painted
+        // afterwards, so using the raw animation phase here leaves the yellow
+        // or blue overlay a fraction of a pixel away from the moving glyphs.
+        // Keep the overlay on the exact same raster position as the renderer.
+        float deviceScaleX = MathF.Abs(EffectiveZoom);
+        if (!float.IsFinite(deviceScaleX) || deviceScaleX < 0.01f)
+            deviceScaleX = 1f;
+        float devicePixel = 1f / deviceScaleX;
+        return MathF.Round(translationX / devicePixel) * devicePixel;
     }
 
     private bool TryGetSelectionAnimationOffset(LayoutBox box, LayoutBox selectionRoot,
@@ -1976,8 +2035,11 @@ public class BrowserCanvas : SKGLControl
                         int off = Math.Clamp(_selFocusOffset, 0, len);
                         if (forward) b0 = off; else a0 = off;
                     }
-                    if (b0 > a0)
-                        PaintSelectionControl(g, box, offsetX, offsetY, selBrush, a0, b0);
+                    if (b0 > a0 &&
+                        TryGetSelectionAnimationOffset(box, frameView.RootBox, out float controlAnimatedX))
+                    {
+                        PaintSelectionControl(g, box, offsetX + controlAnimatedX, offsetY, selBrush, a0, b0);
+                    }
                     continue;
                 }
                 if (!TryGetSelectionAnimationOffset(box, frameView.RootBox, out float animatedX))
@@ -2172,10 +2234,14 @@ public class BrowserCanvas : SKGLControl
                 !IsPageSelectableControl(box.Element))
                 continue;
 
+            if (!TryGetSelectionAnimationOffset(box, root, out float controlAnimatedX))
+                continue;
+
+            float controlOffsetX = offsetX + controlAnimatedX;
             if (IsEditableField(box.Element!))
-                PaintSelectAllEditableField(g, box, offsetX, offsetY);
+                PaintSelectAllEditableField(g, box, controlOffsetX, offsetY);
             else
-                PaintSelectAllControl(g, box, offsetX, offsetY);
+                PaintSelectAllControl(g, box, controlOffsetX, offsetY);
         }
     }
 
@@ -2252,14 +2318,20 @@ public class BrowserCanvas : SKGLControl
         float totalWidth = GetSingleLineFieldTextWidth(g, visual, font, format, password, advance);
         float alignedOffset = GetSingleLineFieldAlignmentOffset(
             visibleWidth, totalWidth, GetFieldTextAlign(el));
-        float textXSingle = face.X + 3f + alignedOffset;
+        // Ctrl+A must paint from the same internal viewport as the renderer.
+        // Find can intentionally move an unfocused input to the right; ignoring
+        // that offset here made the selected value jump back to the left edge.
+        float fieldScroll = password || el.TagName != "input"
+            ? 0f
+            : GetFieldViewportScrollX(el, box);
+        float textXSingle = face.X + 3f + alignedOffset - fieldScroll;
         float alignedTextWidth = totalWidth;
         if (alignedTextWidth <= 0.01f) return;
 
         float visibleLeft = face.Left + 2f;
         float visibleRight = face.Right - 2f;
         float drawLeft = Math.Max(visibleLeft, textXSingle);
-        float drawRight = Math.Min(visibleRight, textXSingle + alignedTextWidth);
+        float drawRight = Math.Min(visibleRight, textXSingle + alignedTextWidth + 1f);
         if (drawRight <= drawLeft) return;
 
         g.FillRectangle(highlight, drawLeft, face.Top,
@@ -2388,7 +2460,7 @@ public class BrowserCanvas : SKGLControl
                     right = Math.Max(left, Math.Min(right, x + fullWidth));
                     if (right > left)
                         g.FillRectangle(brush, left + offsetX, y + offsetY,
-                            Math.Max(1f, right - left), lineH);
+                            Math.Max(1f, right - left + 1f), lineH);
                     return;
                 }
 
@@ -2542,8 +2614,11 @@ public class BrowserCanvas : SKGLControl
                     int off = Math.Clamp(_selFocusOffset, 0, len);
                     if (forward) b0 = off; else a0 = off;
                 }
-                if (b0 > a0)
-                    PaintSelectionControl(g, box, offsetX, offsetY, selBrush, a0, b0);
+                if (b0 > a0 &&
+                    TryGetSelectionAnimationOffset(box, selectionRoot, out float controlAnimatedX))
+                {
+                    PaintSelectionControl(g, box, offsetX + controlAnimatedX, offsetY, selBrush, a0, b0);
+                }
                 continue;
             }
             if (!TryGetSelectionAnimationOffset(box, selectionRoot, out float animatedX))
@@ -2578,82 +2653,493 @@ public class BrowserCanvas : SKGLControl
             Math.Max(0f, right - left), Math.Max(0f, bottom - top));
     }
 
+    // WinForms/GDI text rectangles and the Skia control renderer both use the
+    // font's line height as their vertical centering unit.  Find used to place
+    // the highlight at the raw control-top, so inputs/buttons/selects looked
+    // a few pixels too high even though their text itself was centered. Keep
+    // the overlay on the exact same vertical origin as the control renderer.
+    private static float CenteredFieldTextTop(RectangleF rect, float lineHeight) =>
+        rect.Top + Math.Max(0f, (rect.Height - lineHeight) * 0.5f);
+
     private void PaintFindHighlights(Graphics g, float paintScrollX, float paintScrollY)
     {
         if (_findMatches.Count == 0 || string.IsNullOrEmpty(_findText)) return;
 
-        using var matchBrush = new SolidBrush(Color.FromArgb(92, 255, 235, 59));
-        using var activeBrush = new SolidBrush(Color.FromArgb(150, 255, 193, 7));
-        using var activePen = new Pen(Color.FromArgb(220, 160, 100, 0), 1f);
+        // Find uses one visual treatment everywhere. There is deliberately no
+        // separate active color: every match is the same yellow box + border.
+        using var matchBrush = new SolidBrush(Color.FromArgb(96, 255, 235, 59));
+        using var matchPen = new Pen(Color.FromArgb(190, 160, 100, 0), 1f);
 
         for (int i = 0; i < _findMatches.Count; i++)
         {
             var match = _findMatches[i];
-            int state = -1;
-            float offsetX;
-            float offsetY;
-            RectangleF clip = RectangleF.Empty;
+            var segments = match.Segments;
+            if (segments == null || segments.Count == 0)
+                segments = new[] { new FindMatchSegment(match.Frame, match.Box,
+                    match.Start, match.Length, match.SourceElement) };
 
-            if (match.Frame == null)
+            foreach (var segment in segments)
             {
-                offsetX = -paintScrollX;
-                offsetY = -paintScrollY;
-            }
-            else if (TryGetFrameScreenRect(match.Frame, out var frameRect))
-            {
-                offsetX = frameRect.X - match.Frame.Scroll.X;
-                offsetY = frameRect.Y - match.Frame.Scroll.Y;
-                clip = frameRect;
-                state = g.Save();
-                g.SetClip(clip, CombineMode.Intersect);
-            }
-            else
-            {
-                continue;
-            }
+                if (segment.Length <= 0) continue;
 
-            bool active = i == _findIndex;
-            if (match.SourceElement != null && IsSearchableControlElement(match.SourceElement))
-            {
-                var face = IntersectRect(match.Box.ContentRect, match.Box.BorderRect);
-                if (face.Width > 0.01f && face.Height > 0.01f)
+                int state = -1;
+                float offsetX;
+                float offsetY;
+
+                if (segment.Frame == null)
                 {
-                    var drawRect = new RectangleF(
-                        face.X + offsetX, face.Y + offsetY, face.Width, face.Height);
-                    int controlState = g.Save();
-                    try
-                    {
-                        g.SetClip(drawRect, CombineMode.Intersect);
-                        g.FillRectangle(active ? activeBrush : matchBrush,
-                            drawRect.X, drawRect.Y, drawRect.Width, drawRect.Height);
-                        if (active)
-                            g.DrawRectangle(activePen, drawRect.X, drawRect.Y,
-                                Math.Max(0.5f, drawRect.Width - 0.5f),
-                                Math.Max(0.5f, drawRect.Height - 0.5f));
-                    }
-                    finally { g.Restore(controlState); }
+                    offsetX = -paintScrollX;
+                    offsetY = -paintScrollY;
                 }
-            }
-            else
-            {
-                foreach (var span in SelectionVisualSpans(g, match.Box, match.Start, match.Start + match.Length))
+                else if (TryGetFrameScreenRect(segment.Frame, out var frameRect))
                 {
-                    if (span.Width <= 0.01f || span.Height <= 0.01f) continue;
-                    var drawRect = new RectangleF(
-                        span.X + offsetX,
-                        span.Y + offsetY,
-                        span.Width,
-                        span.Height);
-                    g.FillRectangle(active ? activeBrush : matchBrush, drawRect);
-                    if (active)
-                        g.DrawRectangle(activePen, drawRect.X, drawRect.Y,
+                    offsetX = frameRect.X - segment.Frame.Scroll.X;
+                    offsetY = frameRect.Y - segment.Frame.Scroll.Y;
+                    state = g.Save();
+                    g.SetClip(frameRect, CombineMode.Intersect);
+                }
+                else
+                {
+                    continue;
+                }
+
+                var segmentMatch = new FindMatch(
+                    segment.Frame, segment.Box, segment.Start, segment.Length,
+                    segment.SourceElement);
+
+                LayoutBox? segmentRoot = segment.Frame?.RootBox ?? _rootBox;
+                float animatedX = 0f;
+                if (segmentRoot != null &&
+                    !TryGetSelectionAnimationOffset(segment.Box, segmentRoot, out animatedX))
+                {
+                    if (state >= 0) g.Restore(state);
+                    continue;
+                }
+                float segmentOffsetX = offsetX + animatedX;
+
+                if (segment.SourceElement != null &&
+                    IsSearchableControlElement(segment.SourceElement))
+                {
+                    var face = IntersectRect(segment.Box.ContentRect, segment.Box.BorderRect);
+                    if (face.Width > 0.01f && face.Height > 0.01f)
+                    {
+                        if (segment.SourceElement.TagName == "textarea")
+                        {
+                            PaintTextareaFindHighlight(g, segmentMatch, face,
+                                segmentOffsetX, offsetY, matchBrush, matchBrush,
+                                matchPen, matchPen, active: false);
+                        }
+                        else
+                        {
+                            PaintSearchableControlFindHighlight(g, segmentMatch, face,
+                                segmentOffsetX, offsetY, matchBrush, matchBrush,
+                                matchPen, matchPen, active: false);
+                        }
+                    }
+                }
+                else
+                {
+                    foreach (var span in SelectionVisualSpans(
+                                 g, segment.Box, segment.Start,
+                                 segment.Start + segment.Length))
+                    {
+                        if (span.Width <= 0.01f || span.Height <= 0.01f) continue;
+                        var drawRect = new RectangleF(
+                            span.X + segmentOffsetX,
+                            span.Y + offsetY,
+                            span.Width,
+                            span.Height);
+                        g.FillRectangle(matchBrush, drawRect);
+                        g.DrawRectangle(matchPen, drawRect.X, drawRect.Y,
                             Math.Max(0.5f, drawRect.Width - 0.5f),
                             Math.Max(0.5f, drawRect.Height - 0.5f));
+                    }
                 }
+
+                if (state >= 0)
+                    g.Restore(state);
+            }
+        }
+    }
+
+    private float GetStoredFieldFindScrollX(DomElement element, LayoutBox box)
+    {
+        // Painting is deliberately read-only: it must never rewrite either the
+        // live editor viewport or Find's temporary viewport as a side effect of
+        // drawing a highlight.  Rewriting during paint was what made a manual
+        // scroll/click fight with Find and visibly "snap" back.
+        return GetFieldViewportScrollX(element, box);
+    }
+
+    private void SetStoredFieldFindScrollX(DomElement element, LayoutBox box, float value)
+    {
+        float max = GetSingleLineFieldMaxScroll(element, box);
+        value = Math.Clamp(float.IsFinite(value) ? value : 0f, 0f, max);
+        if (ReferenceEquals(element, _focusedInput))
+            _fieldScrollX = value;
+        else
+            _fieldFindScrollXs[element] = value;
+
+        // The root/frame display lists are cached. This control-local viewport
+        // can change during Find navigation, during manual horizontal scrolling
+        // just before blur, or while focus is being transferred. Invalidate the
+        // cached list so the renderer and the find overlay both consume the same
+        // horizontal offset; otherwise one can move while the other remains at
+        // the old position. This call is intentionally local to field scroll
+        // changes and does not reflow the document.
+        InvalidateDisplayLists();
+    }
+
+    private static Color GetFindControlTextColor(DomElement element)
+    {
+        if (element.HasAttr("disabled")) return Color.Gray;
+        var style = element.Style;
+        return style != null && style.OwnColor ? style.Color : Color.Black;
+    }
+
+    private void EnsureFindControlInternalScrollVisible(FindMatch match)
+    {
+        var element = match.SourceElement;
+        if (element == null || !IsSearchableControlElement(element)) return;
+        if (_findFieldViewportUserOverrides.Contains(element)) return;
+        LayoutBox? box = match.Box;
+        if (box == null || element.TagName is not ("input" or "textarea")) return;
+        var face = IntersectRect(box.ContentRect, box.BorderRect);
+        if (face.Width <= 0.01f || face.Height <= 0.01f) return;
+        var font = ResolveFieldFont(element);
+        if (font == null) return;
+
+        int start = Math.Max(0, match.Start);
+        int end = Math.Max(start, match.Start + match.Length);
+
+        if (element.TagName == "input")
+        {
+            string type = element.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
+            if (type == "file") return; // File inputs have a fixed two-part visual layout, not an editor scroll.
+
+            string source = GetSelectableControlText(element);
+            start = Math.Clamp(start, 0, source.Length);
+            end = Math.Clamp(end, start, source.Length);
+            if (end <= start) return;
+
+            using var format = NewFieldFormat(noWrap: true);
+            string visual = GlyphSubstitution.MapGlyphs(source);
+            float visibleWidth = Math.Max(1f, face.Width - 6f);
+            float totalWidth = MeasureGraphics.MeasureString(visual, font, int.MaxValue, format).Width;
+            float alignOffset = GetSingleLineFieldAlignmentOffset(visibleWidth, totalWidth, GetFieldTextAlign(element));
+            float baseX = face.Left + 3f + alignOffset;
+            float prefixStart = MeasureGraphics.MeasureString(visual[..Math.Min(start, visual.Length)], font, int.MaxValue, format).Width;
+            float prefixEnd = MeasureGraphics.MeasureString(visual[..Math.Min(end, visual.Length)], font, int.MaxValue, format).Width;
+            float fieldVisibleLeft = face.Left + 2f;
+            float fieldVisibleRight = face.Right - 2f;
+            float scroll = GetStoredFieldFindScrollX(element, box);
+            float left = baseX + prefixStart - scroll;
+            float right = baseX + prefixEnd - scroll;
+
+            if (left < fieldVisibleLeft)
+                scroll += left - fieldVisibleLeft;
+            if (right > fieldVisibleRight)
+                scroll += right - fieldVisibleRight;
+            SetStoredFieldFindScrollX(element, box, scroll);
+            return;
+        }
+
+        string text = GetFieldText(element);
+        start = Math.Clamp(start, 0, text.Length);
+        end = Math.Clamp(end, start, text.Length);
+        if (end <= start) return;
+
+        bool wrapOff = element.GetAttrOrDefault("wrap", "").Trim()
+            .Equals("off", StringComparison.OrdinalIgnoreCase);
+        var geo = GetTextareaGeometry(element, box, match.Frame);
+        if (geo == null) return;
+        float lineHeight = Math.Max(1f, geo.Font.GetHeight(MeasureGraphics));
+        var state = GetTextareaRenderState(element);
+        float scrollX = state.ScrollX;
+        int scrollLine = state.ScrollLine;
+        var rects = TextareaOverlay.SelectionRects(
+            MeasureGraphics, text, font, face, 0f, 0f, start, end, wrapOff);
+        if (rects.Count == 0) return;
+
+        float visibleLeft = face.Left + 2f;
+        float visibleRight = face.Right - 2f;
+        float minX = rects.Min(r => r.Left);
+        float maxX = rects.Max(r => r.Right);
+        if (maxX - scrollX > visibleRight)
+            scrollX += maxX - scrollX - visibleRight;
+        if (minX - scrollX < visibleLeft)
+            scrollX += minX - scrollX - visibleLeft;
+
+        float visibleTop = face.Top + 2f;
+        float visibleBottom = face.Bottom - 2f;
+        float minY = rects.Min(r => r.Top);
+        float maxY = rects.Max(r => r.Bottom);
+        float scrollY = scrollLine * lineHeight;
+        if (maxY - scrollY > visibleBottom)
+            scrollY = maxY - visibleBottom;
+        if (minY - scrollY < visibleTop)
+            scrollY = minY - visibleTop;
+        int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
+        scrollLine = Math.Clamp((int)Math.Round(Math.Max(0f, scrollY) / lineHeight), 0, maxLine);
+
+        _textareaScrollXs[element] = Math.Max(0f, scrollX);
+        _textareaScrollLines[element] = scrollLine;
+        if (ReferenceEquals(element, _focusedInput))
+        {
+            _fieldScrollX = Math.Max(0f, scrollX);
+            _textareaScrollLine = scrollLine;
+        }
+    }
+
+    private void PaintSearchableControlFindHighlight(Graphics g, FindMatch match,
+                                                      RectangleF face, float offsetX, float offsetY,
+                                                      Brush matchBrush, Brush activeBrush,
+                                                      Pen matchPen, Pen activePen, bool active)
+    {
+        var el = match.SourceElement;
+        if (el == null) return;
+
+        string source = GetSelectableControlText(el);
+        if (string.IsNullOrEmpty(source) || match.Length <= 0) return;
+        var font = ResolveFieldFont(el);
+        if (font == null) return;
+
+        int start = Math.Clamp(match.Start, 0, source.Length);
+        int end = Math.Clamp(match.Start + match.Length, start, source.Length);
+        if (end <= start) return;
+
+        using var format = NewFieldFormat(noWrap: true);
+        format.LineAlignment = StringAlignment.Center;
+        string visualSource = GlyphSubstitution.MapGlyphs(source);
+        if (visualSource.Length == 0) return;
+        Color textColor = GetFindControlTextColor(el);
+
+        string inputType = el.TagName == "input"
+            ? el.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant()
+            : string.Empty;
+
+        void DrawFindTextRange(RectangleF textRect, string visualText, int rangeStart, int rangeEnd,
+                               StringAlignment align, bool clipToRect = true)
+        {
+            if (rangeEnd <= rangeStart || visualText.Length == 0) return;
+            rangeStart = Math.Clamp(rangeStart, 0, visualText.Length);
+            rangeEnd = Math.Clamp(rangeEnd, rangeStart, visualText.Length);
+            float totalWidth = g.MeasureString(visualText, font, int.MaxValue, format).Width;
+            float x = textRect.Left;
+            if (align == StringAlignment.Center)
+                x += Math.Max(0f, (textRect.Width - totalWidth) * 0.5f);
+            else if (align == StringAlignment.Far)
+                x += Math.Max(0f, textRect.Width - totalWidth);
+
+            float p0 = g.MeasureString(visualText[..rangeStart], font, int.MaxValue, format).Width;
+            float p1 = g.MeasureString(visualText[..rangeEnd], font, int.MaxValue, format).Width;
+            var drawRect = new RectangleF(
+                x + p0 + offsetX,
+                CenteredFieldTextTop(textRect, Math.Max(1f, font.GetHeight(g))) + offsetY,
+                Math.Max(1f, p1 - p0 + 1.0f),
+                Math.Max(1f, font.GetHeight(g)));
+
+            int state = g.Save();
+            try
+            {
+                if (clipToRect)
+                    g.SetClip(new RectangleF(textRect.X + offsetX, textRect.Y + offsetY,
+                        Math.Max(1f, textRect.Width), Math.Max(1f, textRect.Height)), CombineMode.Intersect);
+                g.FillRectangle(matchBrush, drawRect);
+                g.DrawRectangle(matchPen, drawRect.X, drawRect.Y,
+                    Math.Max(0.5f, drawRect.Width - 0.5f),
+                    Math.Max(0.5f, drawRect.Height - 0.5f));
+                // The live renderer already paints the actual glyphs. Redrawing
+                // them here with GDI introduced a second, differently-measured
+                // copy of the text, which became visibly offset/overlapped while
+                // a field was horizontally scrolled. The translucent fill +
+                // border is enough to highlight the existing glyphs.
+            }
+            finally { g.Restore(state); }
+        }
+
+        if (inputType == "file")
+        {
+            const string buttonLabel = "Choose File";
+            string chosen = el.GetAttr("data-file-name") ?? string.Empty;
+            string label = chosen.Length == 0 ? "No file chosen" : chosen;
+            int labelStart = buttonLabel.Length + 1;
+
+            float lineHeight = Math.Max(1f, font.GetHeight(g));
+            float buttonWidth = 92f;
+            float actualButtonWidth = Math.Min(buttonWidth, Math.Max(34f, face.Width - 8f));
+            var button = new RectangleF(
+                face.X + 2f, face.Y + 2f, actualButtonWidth, Math.Max(1f, face.Height - 4f));
+            var labelRect = new RectangleF(
+                button.Right + 6f, face.Y + 1f,
+                Math.Max(0f, face.Right - button.Right - 9f),
+                Math.Max(1f, face.Height - 2f));
+
+            // The file input exposes one logical search string but two distinct
+            // rendered regions. Split the match at the visual boundary so each
+            // part is highlighted in the exact place where Renderer draws it.
+            int buttonEnd = Math.Min(end, buttonLabel.Length);
+            if (start < buttonLabel.Length && buttonEnd > start)
+                DrawFindTextRange(button, buttonLabel, start, buttonEnd, StringAlignment.Center, clipToRect: true);
+
+            int labelRangeStart = Math.Max(start, labelStart) - labelStart;
+            int labelRangeEnd = Math.Min(end, labelStart + label.Length) - labelStart;
+            if (labelRangeEnd > labelRangeStart)
+            {
+                DrawFindTextRange(labelRect, GlyphSubstitution.MapGlyphs(label),
+                    labelRangeStart, labelRangeEnd, StringAlignment.Near, clipToRect: true);
+            }
+            return;
+        }
+
+        if (el.TagName == "select")
+        {
+            var options = el.Descendants().OfType<DomElement>()
+                .Where(o => o.TagName == "option").ToList();
+            bool listbox = el.HasAttr("multiple") || el.GetAttrInt("size", 1) > 1;
+            if (!listbox)
+            {
+                var selected = options.FirstOrDefault(o => o.HasAttr("selected")) ?? options.FirstOrDefault();
+                if (selected == null) return;
+                string selectedText = GetSelectOptionText(selected);
+                source = selectedText;
+                start = Math.Clamp(start, 0, source.Length);
+                end = Math.Clamp(end, start, source.Length);
+                visualSource = GlyphSubstitution.MapGlyphs(source);
+                float textRectWidth = Math.Max(1f, face.Width - 18f);
+                var textRect = new RectangleF(face.Left + 3f, face.Top, textRectWidth, face.Height);
+                DrawFindTextRange(textRect, visualSource, start, end, StringAlignment.Near, true);
+                return;
             }
 
-            if (state >= 0)
-                g.Restore(state);
+            int global = 0;
+            int visibleRows = GetSelectVisibleRows(el);
+            int scrollOffset = GetSelectScrollOffset(el);
+            float rowH = font.GetHeight(g) + 2f;
+            foreach (var (option, optionIndex) in options.Select((o, i) => (o, i)))
+            {
+                string optionText = GetSelectOptionText(option);
+                int rowEnd = global + optionText.Length;
+                if (start < rowEnd && end > global)
+                {
+                    int visibleIndex = optionIndex - scrollOffset;
+                    if (visibleIndex < 0 || visibleIndex >= visibleRows) return;
+                    string rowVisual = GlyphSubstitution.MapGlyphs(optionText);
+                    int localStart = Math.Clamp(start - global, 0, optionText.Length);
+                    int localEnd = Math.Clamp(end - global, localStart, optionText.Length);
+                    var rowRect = new RectangleF(face.Left + 3f,
+                        face.Top + visibleIndex * rowH + 1f,
+                        Math.Max(1f, face.Width - 14f), rowH);
+                    DrawFindTextRange(rowRect, rowVisual, localStart, localEnd, StringAlignment.Near, true);
+                    return;
+                }
+                global += optionText.Length + 1;
+            }
+            return;
+        }
+
+        if (el.TagName == "button" || (el.TagName == "input" &&
+            inputType is "submit" or "reset" or "button"))
+        {
+            var textRect = RectangleF.Inflate(match.Box.BorderRect, -2f, -2f);
+            if (ReferenceEquals(el, _pressedControl))
+                textRect.Offset(1f, 1f);
+            DrawFindTextRange(textRect, visualSource, start, end, StringAlignment.Center, true);
+            return;
+        }
+
+        // Single-line text inputs: use the same internal horizontal scroll as
+        // the field renderer. This keeps a find match attached to its characters
+        // while the user scrolls the value left/right and clips it at the face.
+        float lineHeight2 = Math.Max(1f, font.GetHeight(g));
+        float visibleWidth = Math.Max(1f, face.Width - 6f);
+        float total = g.MeasureString(visualSource, font, int.MaxValue, format).Width;
+        float align = GetSingleLineFieldAlignmentOffset(visibleWidth, total, GetFieldTextAlign(el));
+        float scrollX = GetStoredFieldFindScrollX(el, match.Box);
+        float textX = face.Left + 3f + align - scrollX;
+        float pStart = g.MeasureString(visualSource[..Math.Min(start, visualSource.Length)], font, int.MaxValue, format).Width;
+        float pEnd = g.MeasureString(visualSource[..Math.Min(end, visualSource.Length)], font, int.MaxValue, format).Width;
+        if (pEnd <= pStart) return;
+
+        var drawRect = new RectangleF(
+            textX + pStart + offsetX,
+            CenteredFieldTextTop(face, lineHeight2) + offsetY,
+            Math.Max(1f, pEnd - pStart + 1.0f), lineHeight2);
+        var clipRect = new RectangleF(face.Left + offsetX, face.Top + offsetY,
+            Math.Max(1f, face.Width), Math.Max(1f, face.Height));
+        int state2 = g.Save();
+        try
+        {
+            g.SetClip(clipRect, CombineMode.Intersect);
+            g.FillRectangle(matchBrush, drawRect);
+            g.DrawRectangle(matchPen, drawRect.X, drawRect.Y,
+                Math.Max(0.5f, drawRect.Width - 0.5f),
+                Math.Max(0.5f, drawRect.Height - 0.5f));
+            using var findTextBrush = new SolidBrush(textColor);
+            g.DrawString(visualSource[start..end], font, findTextBrush, drawRect, format);
+        }
+        finally { g.Restore(state2); }
+    }
+
+    private void PaintTextareaFindHighlight(Graphics g, FindMatch match,
+                                               RectangleF face, float offsetX, float offsetY,
+                                               Brush matchBrush, Brush activeBrush,
+                                               Pen matchPen, Pen activePen, bool active)
+    {
+        var el = match.SourceElement;
+        if (el == null || el.TagName != "textarea") return;
+
+        var font = ResolveFieldFont(el);
+        if (font == null) return;
+
+        string text = GetFieldText(el);
+        if (text.Length == 0 || match.Length <= 0) return;
+
+        bool wrapOff = el.GetAttrOrDefault("wrap", "").Trim()
+            .Equals("off", StringComparison.OrdinalIgnoreCase);
+        var state = GetTextareaRenderState(el);
+        var geometry = GetTextareaGeometry(el, match.Box, match.Frame);
+        if (geometry == null) return;
+
+        float lineHeight = geometry.Font.GetHeight(g);
+        int maxScrollLine = Math.Max(0, geometry.Lines.Count - geometry.VisibleLines);
+        int scrollLine = Math.Clamp(state.ScrollLine, 0, maxScrollLine);
+        float scrollY = scrollLine * lineHeight;
+
+        int start = Math.Clamp(match.Start, 0, text.Length);
+        int end = Math.Clamp(match.Start + match.Length, start, text.Length);
+        if (end <= start) return;
+
+        // Use the same line-breaking + prefix-measurement code as the live
+        // textarea editor. That makes a find match line up with the actual
+        // characters even when the match wraps across visual lines.
+        var rects = Engine.Render.TextareaOverlay.SelectionRects(
+            g, text, font, face, state.ScrollX, scrollY, start, end, wrapOff);
+        if (rects.Count == 0) return;
+
+        var clipRect = new RectangleF(
+            face.X + 1f + offsetX, face.Y + 1f + offsetY,
+            Math.Max(1f, face.Width - 2f), Math.Max(1f, face.Height - 2f));
+
+        int clipState = g.Save();
+        try
+        {
+            g.SetClip(clipRect, CombineMode.Intersect);
+            foreach (var rect in rects)
+            {
+                if (rect.Width <= 0.01f || rect.Height <= 0.01f) continue;
+
+                var drawRect = new RectangleF(
+                    rect.X + offsetX, rect.Y + offsetY, rect.Width, rect.Height);
+                g.FillRectangle(active ? activeBrush : matchBrush, drawRect);
+                g.DrawRectangle(active ? activePen : matchPen, drawRect.X, drawRect.Y,
+                    Math.Max(0.5f, drawRect.Width - 0.5f),
+                    Math.Max(0.5f, drawRect.Height - 0.5f));
+            }
+        }
+        finally
+        {
+            g.Restore(clipState);
         }
     }
 
@@ -2683,7 +3169,13 @@ public class BrowserCanvas : SKGLControl
 
         float scrollX = PaintScrollX;
         float scrollY = PaintScrollY;
-        float fieldScroll = EnsureSingleLineCaretVisible(g, text, font, face, _fieldCaret, password);
+        using var scrollFormat = NewFieldFormat(noWrap: true);
+        float visibleWidthForScroll = Math.Max(1f, face.Width - 6f);
+        float passwordAdvanceForScroll = password ? GetPasswordGlyphAdvance(g, font, scrollFormat) : 0f;
+        float totalWidthForScroll = GetSingleLineFieldTextWidth(
+            g, text, font, scrollFormat, password, passwordAdvanceForScroll);
+        float maxFieldScroll = Math.Max(0f, totalWidthForScroll - visibleWidthForScroll);
+        float fieldScroll = Math.Clamp(_fieldScrollX, 0f, maxFieldScroll);
         bool needsTextRepaint = fieldScroll > 0.01f;
 
         float passwordAdvance = password ? GetPasswordGlyphAdvance(g, font, fmt) : 0f;
@@ -2778,7 +3270,7 @@ public class BrowserCanvas : SKGLControl
                 if (sx2 > sx1)
                 {
                     using var selBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-                    g.FillRectangle(selBrush, sx1, top, sx2 - sx1, Math.Max(1f, bottom - top));
+                    g.FillRectangle(selBrush, sx1, top, Math.Max(1f, sx2 - sx1 + 1f), Math.Max(1f, bottom - top));
                 }
 
                 DrawSegment(0, selStart, fieldForeground);
@@ -2935,7 +3427,7 @@ public class BrowserCanvas : SKGLControl
                         float x2 = textX + Measure(start, b);
                         g.FillRectangle(highlight, x1,
                             textY + (line - scrollLine) * lineHeight,
-                            Math.Max(1f, x2 - x1), lineHeight);
+                            Math.Max(1f, x2 - x1 + 1f), lineHeight);
                     }
                 }
 
@@ -3015,7 +3507,7 @@ public class BrowserCanvas : SKGLControl
                     if (sx2 > sx1)
                     {
                         using var highlight = new SolidBrush(Color.FromArgb(120, 0, 0, 170));
-                        g.FillRectangle(highlight, sx1, face.Y, sx2 - sx1, face.Height);
+                        g.FillRectangle(highlight, sx1, face.Y, Math.Max(1f, sx2 - sx1 + 1f), face.Height);
                     }
                     DrawFrameSegment(0, selStart, foregroundColor);
                     DrawFrameSegment(selStart, selEnd, Color.White);
@@ -3124,7 +3616,7 @@ public class BrowserCanvas : SKGLControl
                 float x2 = textX + Measure(start, b);
                 g.FillRectangle(highlight, x1,
                     textY + (line - scrollLine) * lineHeight,
-                    Math.Max(1f, x2 - x1), lineHeight);
+                    Math.Max(1f, x2 - x1 + 1f), lineHeight);
             }
         }
 
@@ -3443,6 +3935,17 @@ public class BrowserCanvas : SKGLControl
             (needV, needH) = SolveScrollbarVisibility(
                 physicalDocW, physicalDocH, ClientSize.Width, ClientSize.Height);
             _scrollbarVisibilityDirty = false;
+        }
+        else if (IsGestureZoomActive)
+        {
+            // Gesture zoom is a visual transform, so the CSS layout cannot be
+            // rebuilt just to discover that the enlarged page now needs a
+            // scrollbar. Calculate the temporary scrollbar state from the
+            // effective visual scale. No layout/reflow is scheduled here.
+            float gestureZoom = Math.Max(0.25f, EffectiveZoom);
+            (needV, needH) = SolveScrollbarVisibility(
+                logicalDocW * gestureZoom, logicalDocH * gestureZoom,
+                ClientSize.Width, ClientSize.Height);
         }
 
         int vpW = Math.Max(1, ClientSize.Width - (needV ? (int)TopScrollbarExtent : 0));
@@ -3796,6 +4299,13 @@ public class BrowserCanvas : SKGLControl
 
         if (_rootBox == null) return false;
 
+        // A horizontal wheel/touchpad message can arrive before the deferred
+        // relayout triggered by a DOM/style change. Do one synchronous stable
+        // pass in that case so the bottom scrollbar and its viewport geometry
+        // agree before we calculate the scroll range.
+        if (_scrollbarVisibilityDirty && !IsGestureZoomActive)
+            ReflowDocumentToStableViewport();
+
         var viewport = GetViewportSize();
         var content = GetDocumentContentSize();
         float maxX = Math.Max(0f, content.Width - viewport.Width / Math.Max(0.25f, EffectiveZoom));
@@ -3951,7 +4461,10 @@ public class BrowserCanvas : SKGLControl
 
         if ((ModifierKeys & Keys.Shift) == Keys.Shift)
         {
-            // Shift+wheel: horizontal
+            // Shift+wheel: horizontal. Keep the committed scrollbar state
+            // synchronized before the first horizontal move after a reflow.
+            if (_scrollbarVisibilityDirty && !IsGestureZoomActive)
+                ReflowDocumentToStableViewport();
             CloseMenusOnScroll();
             ScrollBy(-(e.Delta / 120f) * 60f, 0f);
             return;
@@ -4097,13 +4610,22 @@ public class BrowserCanvas : SKGLControl
         }
         catch { return false; }
 
+        // Preserve the current document position across interaction-only
+        // reflows. Re-centering immediately after ApplyRelayout could zero the
+        // Y offset when an intermediate measurement said the page fit, which is
+        // what made Find + moving back onto the page appear to snap to the top.
+        float keepScrollX = _scrollOffset.X;
+        float keepScrollY = _scrollOffset.Y;
+
         _showVerticalScrollbar = finalV;
         _showHorizontalScrollbar = finalH;
         _lastLayoutWidth = finalWidth;
         _lastLayoutHeight = finalHeight;
         ApplyRelayout(_document, finalRoot);
         UpdateScrollBars(scheduleReflow: false, recomputeVisibility: false);
-        RecenterScrollAxesIfContentFits();
+        if (float.IsFinite(keepScrollX)) _scrollOffset.X = Math.Max(0f, keepScrollX);
+        if (float.IsFinite(keepScrollY)) _scrollOffset.Y = Math.Max(0f, keepScrollY);
+        ClampScrollOffsetToDocument();
         _scrollbarVisibilityDirty = false;
         return true;
     }
@@ -4465,7 +4987,7 @@ public class BrowserCanvas : SKGLControl
     private void CopyFieldSelectionToClipboard()
     {
         var el = _focusedInput;
-        if (el == null) return;
+        if (el == null || IsPasswordField(el)) return;
         try
         {
             int s = Math.Min(_fieldSelAnchor, _fieldCaret);
@@ -4715,19 +5237,25 @@ public class BrowserCanvas : SKGLControl
                 (int)Math.Floor((docY - (face.Y + 2)) / lineH),
                 0, geo.Lines.Count - 1);
             var (ls, le) = geo.Lines[li];
+            float textareaScrollX = ReferenceEquals(el, _focusedInput)
+                ? _fieldScrollX
+                : (_textareaScrollXs.TryGetValue(el, out var storedTextareaX) ? storedTextareaX : 0f);
             return NearestCaretIndex(geo.Text, font, fmt, ls, le,
-                docX - (face.X + 3) + _fieldScrollX);
+                docX - (face.X + 3) + textareaScrollX);
         }
 
         bool password = el.GetAttrOrDefault("type", "text").Trim().Equals("password", StringComparison.OrdinalIgnoreCase);
         float visibleWidth = Math.Max(1f, face.Width - 6f);
+        float viewportScrollX = ReferenceEquals(el, _focusedInput)
+            ? _fieldScrollX
+            : (_fieldFindScrollXs.TryGetValue(el, out var storedFieldX) ? storedFieldX : 0f);
         if (password)
         {
             float advance = GetPasswordGlyphAdvance(MeasureGraphics, font, fmt);
             float passwordTextWidth = text.Length * advance;
             float passwordAlignOffset = GetSingleLineFieldAlignmentOffset(
                 visibleWidth, passwordTextWidth, GetFieldTextAlign(el));
-            float relX = docX - (face.X + 3 + passwordAlignOffset) + _fieldScrollX;
+            float relX = docX - (face.X + 3 + passwordAlignOffset) + viewportScrollX;
             if (relX <= 0f) return 0;
             int index = (int)Math.Floor((relX / Math.Max(advance, 1f)) + 0.5f);
             return Math.Clamp(index, 0, text.Length);
@@ -4738,7 +5266,7 @@ public class BrowserCanvas : SKGLControl
         float alignOffset = GetSingleLineFieldAlignmentOffset(
             visibleWidth, textWidth, GetFieldTextAlign(el));
         return NearestCaretIndex(text, font, fmt, 0, text.Length,
-            docX - (face.X + 3 + alignOffset) + _fieldScrollX);
+            docX - (face.X + 3 + alignOffset) + viewportScrollX);
     }
 
     private static float GetPasswordGlyphAdvance(Graphics g, Font font, StringFormat fmt)
@@ -4910,6 +5438,128 @@ public class BrowserCanvas : SKGLControl
         return Math.Max(0f, maxLine - Math.Max(1f, geo.TextViewportWidth));
     }
 
+    private bool UpdateFieldDragSelection(DomElement field, LayoutBox box,
+                                           float localX, float localY, FrameView? frameView)
+    {
+        if (!IsEditableField(field) || field.HasAttr("disabled")) return false;
+        if (!ReferenceEquals(field, _focusedInput)) return false;
+
+        var face = box.ContentRect;
+        if (face.Width <= 0.01f || face.Height <= 0.01f) return false;
+
+        // Keep the caret in the exact same coordinate system as the rendered
+        // text.  When the drag reaches either viewport edge, advance the
+        // field's internal horizontal scroll and then resolve the caret again
+        // using that new viewport.  The old code only changed the caret index,
+        // so dragging past the final visible glyph simply clamped at the edge.
+        float maxScroll = field.TagName == "textarea"
+            ? GetTextareaMaxHorizontalScroll(field, box, frameView)
+            : GetSingleLineFieldMaxScroll(field, box);
+        float viewportLeft = face.Left + 3f;
+        float viewportRight = face.Right - 3f;
+        float nextScroll = Math.Clamp(_fieldScrollX, 0f, maxScroll);
+
+        if (maxScroll > 0f && field.TagName == "input")
+        {
+            const float edge = 10f;
+            if (localX > viewportRight - edge)
+            {
+                float over = Math.Max(0f, localX - (viewportRight - edge));
+                float speed = Math.Clamp(3f + over * 0.65f, 3f, 28f);
+                nextScroll = Math.Min(maxScroll, nextScroll + speed);
+            }
+            else if (localX < viewportLeft + edge)
+            {
+                float over = Math.Max(0f, (viewportLeft + edge) - localX);
+                float speed = Math.Clamp(3f + over * 0.65f, 3f, 28f);
+                nextScroll = Math.Max(0f, nextScroll - speed);
+            }
+        }
+
+        if (Math.Abs(nextScroll - _fieldScrollX) > 0.001f)
+        {
+            _fieldScrollX = nextScroll;
+            if (field.TagName == "input")
+                _fieldFindScrollXs.Remove(field);
+            InvalidateDisplayLists();
+        }
+
+        _fieldCaret = FieldCaretFromPoint(field, box, localX, localY, frameView);
+        Invalidate();
+        return true;
+    }
+
+    private bool UpdateFieldDragSelectionFromCanvasPoint(float canvasX, float canvasY)
+    {
+        if (!_fieldDragging || _focusedInput == null) return false;
+
+        var frameView = _fieldDragPointerFrame;
+        var root = frameView?.RootBox ?? _rootBox;
+        if (root == null) return false;
+        var box = FindBoxForElement(root, _focusedInput);
+        if (box == null) return false;
+
+        float localX = canvasX;
+        float localY = canvasY;
+        if (frameView != null)
+        {
+            if (TryGetFrameScreenRect(frameView, out var frameRect))
+            {
+                localX = canvasX - frameRect.X + frameView.Scroll.X;
+                localY = canvasY - frameRect.Y + frameView.Scroll.Y;
+            }
+        }
+
+        _fieldDragPointerX = localX;
+        _fieldDragPointerY = localY;
+        return UpdateFieldDragSelection(_focusedInput, box, localX, localY, frameView);
+    }
+
+    private void OnFieldDragAutoScrollTick(object? sender, EventArgs e)
+    {
+        if (!_fieldDragging || _focusedInput == null)
+        {
+            _fieldDragAutoScrollTimer.Stop();
+            return;
+        }
+
+        // Re-apply the edge rule using the last pointer location. This gives
+        // native-like autoscroll even when the pointer is parked just beyond
+        // the right/left edge and Windows sends no additional MouseMove events.
+        var field = _focusedInput;
+        if (field.TagName != "input") return;
+
+        var root = _fieldDragPointerFrame?.RootBox ?? _rootBox;
+        if (root == null) return;
+        var box = FindBoxForElement(root, field);
+        if (box == null) return;
+
+        var face = box.ContentRect;
+        const float edge = 10f;
+        bool nearLeft = _fieldDragPointerX < face.Left + 3f + edge;
+        bool nearRight = _fieldDragPointerX > face.Right - 3f - edge;
+        if (!nearLeft && !nearRight)
+        {
+            _fieldDragAutoScrollTimer.Stop();
+            return;
+        }
+
+        float maxScroll = GetSingleLineFieldMaxScroll(field, box);
+        if (maxScroll <= 0.01f ||
+            (nearLeft && _fieldScrollX <= 0.01f) ||
+            (nearRight && _fieldScrollX >= maxScroll - 0.01f))
+        {
+            _fieldCaret = FieldCaretFromPoint(field, box, _fieldDragPointerX,
+                _fieldDragPointerY, _fieldDragPointerFrame);
+            Invalidate();
+            _fieldDragAutoScrollTimer.Stop();
+            return;
+        }
+
+        UpdateFieldDragSelection(field, box, _fieldDragPointerX,
+            _fieldDragPointerY, _fieldDragPointerFrame);
+    }
+
     private bool ScrollFocusedFieldHorizontally(float delta, float x, float y)
     {
         if (!TryGetEditableFieldAtPoint(x, y, out var field, out var box, out var frameView, out _))
@@ -4922,7 +5572,14 @@ public class BrowserCanvas : SKGLControl
         if (maxScroll <= 0f) return true;
 
         _fieldScrollX = Math.Clamp(_fieldScrollX - delta, 0f, maxScroll);
-        PersistFocusedTextareaScrollState();
+        // The live focused viewport is the single source of truth while the
+        // field is focused. Do not mirror manual scrolling into the unfocused
+        // Find-scroll cache: blur must return an input to x=0.
+        if (field!.TagName == "input")
+            _fieldFindScrollXs.Remove(field);
+        else
+            PersistFocusedTextareaScrollState();
+        InvalidateDisplayLists();
         Invalidate();
         return true;
     }
@@ -4946,7 +5603,25 @@ public class BrowserCanvas : SKGLControl
         _lastFieldClickPoint = e.Location;
         _lastFieldClickTicks = now;
 
+        // Resolve the caret against the viewport that is actually visible now.
+        // For an unfocused input that may be Find's temporary right-shifted
+        // viewport, using only _fieldScrollX would map the click to the wrong
+        // characters and a subsequent caret correction would force the viewport
+        // right again.
         int caret = FieldCaretFromPoint(element, box, localX, localY, frameView);
+        bool hadFindViewport = element.TagName == "input" &&
+            !IsPasswordField(element) && _fieldFindScrollXs.ContainsKey(element);
+        if (hadFindViewport)
+        {
+            // The click is an explicit user action. Let FocusControl perform its
+            // normal single-line reset to x=0, then never let background Find
+            // refreshes reclaim the old viewport until a new Find navigation.
+            _findFieldViewportUserOverrides.Add(element);
+            _fieldFindScrollXs.Remove(element);
+            _fieldScrollX = 0f;
+            InvalidateDisplayLists();
+        }
+
         ClearPageSelection();
         FocusControl(element, caret, js, frameView);
         if (frameView == null)
@@ -4973,6 +5648,13 @@ public class BrowserCanvas : SKGLControl
         }
 
         _fieldDragging = true;
+        _fieldDragPointerFrame = frameView;
+        _fieldDragPointerX = localX;
+        _fieldDragPointerY = localY;
+        // Do not start the autoscroll timer for an ordinary click. It starts
+        // from MouseMove once an actual drag is underway and the pointer is
+        // near a horizontal viewport edge.
+        _fieldDragAutoScrollTimer.Stop();
         Capture = true;
         return true;
     }
@@ -5131,8 +5813,12 @@ public class BrowserCanvas : SKGLControl
                 RestoreTextareaScrollState(el);
             else
             {
-                _fieldScrollX = 0f;
                 _textareaScrollLine = 0;
+                // Single-line inputs are intentionally ephemeral viewports.
+                // Any horizontal position is reset when focus changes so an
+                // input always re-enters from its normal left edge.
+                _fieldScrollX = 0f;
+                _fieldFindScrollXs.Remove(el);
             }
         }
 
@@ -5148,9 +5834,21 @@ public class BrowserCanvas : SKGLControl
         if (el == null) return;
         var ownerFrame = _focusedInputFrame;
         PersistFocusedTextareaScrollState();
+        if (el.TagName == "input")
+        {
+            // A single-line input must snap back to its native left edge as soon
+            // as it loses focus. Never carry the live editor viewport into the
+            // unfocused renderer; Find may create its own temporary viewport,
+            // but ordinary focus/blur must not preserve manual scrolling.
+            _fieldScrollX = 0f;
+            _fieldFindScrollXs.Remove(el);
+            InvalidateDisplayLists();
+        }
         _focusedInput = null;
         _focusedInputFrame = null;
         _fieldDragging = false;
+        _fieldDragPointerFrame = null;
+        _fieldDragAutoScrollTimer.Stop();
 
         var js = ownerFrame?.Interpreter ?? _jsInterpreter;
         // FIX: onchange NEVER fired for text inputs/textareas.  DOM order:
@@ -5219,21 +5917,29 @@ public class BrowserCanvas : SKGLControl
             LayoutBox? frameKey = null;
             FrameView? frameView = null;
             TryFindFrameViewByDocument(doc, out frameView, out _, out frameKey);
-            var vp = doc == _document ? GetViewportSize() :
-                new System.Drawing.Size(
-                    Math.Max(1, frameKey == null ? 800 : (int)frameKey.Width),
-                    Math.Max(1, frameKey == null ? 600 : (int)frameKey.Height));
-            StyleResolver.Resolve(doc, Math.Max(1, vp.Width));
 
             if (ReferenceEquals(doc, _document) && _rootBox != null)
             {
-                var newRoot = LayoutEngineApi.BuildLayoutTree(doc, vp.Width, vp.Height);
-                ApplyRelayout(doc, newRoot);
+                // ROOT CAUSE FIX:
+                // The old path rebuilt the top-level page against the physical
+                // client viewport. At non-100% zoom that is the wrong CSS
+                // viewport, and it bypassed the coupled V/H scrollbar solver.
+                // Merely moving the pointer onto any element therefore changed
+                // wrapping/centering and left scrollbar visibility out of sync
+                // with the newly-built root. The visible symptom was a random
+                // horizontal bar plus the page being pulled toward the left.
+                //
+                // Use the same stable reflow used by resize/zoom so hover/active
+                // CSS can still change geometry without corrupting scroll state.
+                if (!ReflowDocumentToStableViewport())
+                    throw new InvalidOperationException("Unable to rebuild the page for interaction state.");
             }
             else if (frameView != null && frameKey != null)
             {
-                var rebuiltFrameRoot = LayoutEngineApi.BuildLayoutTree(doc,
-                    Math.Max(1, (int)frameKey.Width), Math.Max(1, (int)frameKey.Height));
+                int frameWidth = Math.Max(1, (int)frameKey.Width);
+                int frameHeight = Math.Max(1, (int)frameKey.Height);
+                StyleResolver.Resolve(doc, frameWidth);
+                var rebuiltFrameRoot = LayoutEngineApi.BuildLayoutTree(doc, frameWidth, frameHeight);
                 RemapFrameSelection(frameView, rebuiltFrameRoot);
                 frameView.RootBox = rebuiltFrameRoot;
                 RecomposeFrameTree(frameView);
@@ -5250,6 +5956,9 @@ public class BrowserCanvas : SKGLControl
 
         if (CanFocus && !Focused)
             Focus();
+
+        if (_openSelectMenu != null && !_openSelectMenu.IsDisposed)
+            CloseOpenSelectMenu();
 
         if (e.Button != MouseButtons.Left || _rootBox == null || _document == null)
             return;
@@ -5721,6 +6430,46 @@ public class BrowserCanvas : SKGLControl
             Alt: (ModifierKeys & Keys.Alt) != 0);
     }
 
+    private void UpdateCursorForHit(
+        DomElement? element, FrameView? hoverFrame, FrameHit frameHit, DomDocument doc,
+        bool overTextareaScrollbar, bool overSelectScrollbar, float x, float y)
+    {
+        var hoverAnchor = element != null && element.TagName == "a"
+            ? element
+            : element != null ? FindAncestor(element, "a") : null;
+
+        if (overTextareaScrollbar || overSelectScrollbar)
+        {
+            Cursor = Cursors.Default;
+            SetStatus("");
+            return;
+        }
+
+        if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
+        {
+            Cursor = Cursors.Hand;
+            try
+            {
+                SetStatus(doc.BaseUrl?.Resolve(hoverAnchor.GetAttr("href")!).ToAbsolute() ?? "");
+            }
+            catch { SetStatus(""); }
+            return;
+        }
+
+        bool overText = IsEditableField(element) ||
+            (hoverFrame != null
+                ? HitTestTextBox(hoverFrame.RootBox, frameHit.LocalX, frameHit.LocalY) != null
+                : (_rootBox != null && HitTestTextBox(_rootBox, x, y) != null));
+        Cursor = overText ? Cursors.IBeam : Cursors.Default;
+
+        // Do not erase window.status on every mouse move. Legacy sites use
+        // window.status as a marquee-like ticker and update it from a timer.
+        var statusJs = hoverFrame?.Interpreter ?? _jsInterpreter;
+        var statusValue = statusJs?.WindowObject?.Get("status") is { Type: JsType.String } sv
+            ? sv.GetString() : "";
+        SetStatus(statusValue ?? "");
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
@@ -5777,18 +6526,6 @@ public class BrowserCanvas : SKGLControl
                 SendJavaAppletInput(hovered, hit, new Retro96.Engine.Java.JavaInput(
                     Retro96.Engine.Java.JavaInputKind.MouseMove, (int)Math.Round(hx - hit.X), (int)Math.Round(hy - hit.Y),
                     0, 0, 0, '\0', (ModifierKeys & Keys.Shift) != 0, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Alt) != 0));
-        }
-
-        // Moving the pointer after a temporary gesture zoom must not feed a new
-        // hover/active state through the layout engine. That state change was the
-        // source of the "looks fine until I move the cursor, then it tweaks"
-        // behaviour: hover CSS could trigger a second layout while the page was
-        // still under the temporary scale transform. The transform itself remains
-        // fixed until the gesture is committed by the next real input.
-        if (IsGestureZoomActive && !_selecting && !_fieldDragging)
-        {
-            Invalidate();
-            return;
         }
 
         if (_pressedEmbeddedElement != null && Capture)
@@ -5937,26 +6674,41 @@ public class BrowserCanvas : SKGLControl
 
         if (_fieldDragging && _focusedInput != null && _rootBox != null)
         {
-            float x = e.X / EffectiveZoom + PaintScrollX;
-            float y = e.Y / EffectiveZoom + PaintScrollY;
-            if (_focusedInputFrame != null &&
-                TryHitFrame(x, y, out var fieldHit) &&
-                ReferenceEquals(fieldHit.View, _focusedInputFrame))
+            float canvasX = e.X / EffectiveZoom + PaintScrollX;
+            float canvasY = e.Y / EffectiveZoom + PaintScrollY;
+
+            if (_focusedInputFrame != null)
             {
-                var box = FindBoxForElement(fieldHit.View.RootBox, _focusedInput);
-                if (box != null)
-                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, fieldHit.LocalX, fieldHit.LocalY, fieldHit.View);
-                Invalidate();
+                if (TryHitFrame(canvasX, canvasY, out var fieldHit) &&
+                    ReferenceEquals(fieldHit.View, _focusedInputFrame))
+                {
+                    var box = FindBoxForElement(fieldHit.View.RootBox, _focusedInput);
+                    if (box != null)
+                        UpdateFieldDragSelection(_focusedInput, box, fieldHit.LocalX, fieldHit.LocalY, fieldHit.View);
+                    _fieldDragPointerFrame = fieldHit.View;
+                    _fieldDragPointerX = fieldHit.LocalX;
+                    _fieldDragPointerY = fieldHit.LocalY;
+                    _fieldDragAutoScrollTimer.Start();
+                    return;
+                }
+
+                // Pointer may leave the field itself while remaining over its
+                // frame. Keep converting the pointer into frame-local space so
+                // dragging past the right edge can still autoscroll the input.
+                _fieldDragPointerFrame = _focusedInputFrame;
+                _fieldDragAutoScrollTimer.Start();
+                UpdateFieldDragSelectionFromCanvasPoint(canvasX, canvasY);
                 return;
             }
 
-            if (_focusedInputFrame == null)
+            var topBox = FindBoxForElement(_rootBox, _focusedInput);
+            if (topBox != null)
             {
-                var box = FindBoxForElement(_rootBox, _focusedInput);
-                if (box != null)
-                    _fieldCaret = FieldCaretFromPoint(_focusedInput, box, x, y);
-                Invalidate();
-                return;
+                _fieldDragPointerFrame = null;
+                UpdateFieldDragSelection(_focusedInput, topBox, canvasX, canvasY, null);
+                _fieldDragPointerX = canvasX;
+                _fieldDragPointerY = canvasY;
+                _fieldDragAutoScrollTimer.Start();
             }
             return;
         }
@@ -6106,6 +6858,18 @@ public class BrowserCanvas : SKGLControl
             }
         }
 
+        // Gesture zoom changes only the temporary visual transform. Do not let
+        // it enter CSS hover/active relayout, but still update the cursor from
+        // the current hit-test result. This keeps link/text cursors responsive
+        // while the pointer is over zoomed content.
+        bool gestureCursorOnly = IsGestureZoomActive && !_selecting && !_fieldDragging;
+        if (gestureCursorOnly)
+        {
+            UpdateCursorForHit(element, hoverFrame, frameHit, doc, overTextareaScrollbar, overSelectScrollbar, mx, my);
+            Invalidate();
+            return;
+        }
+
         var hoverAnchor = element != null && element.TagName == "a"
             ? element
             : element != null ? FindAncestor(element, "a") : null;
@@ -6119,39 +6883,7 @@ public class BrowserCanvas : SKGLControl
             !IsZoomInteractionStabilizing;
         UpdateCssInteractionState(doc, element, doc.ActiveElement, doc.FocusedElement,
             relayout: interactionRelayout);
-        if (overTextareaScrollbar || overSelectScrollbar)
-        {
-            Cursor = Cursors.Default;
-            SetStatus("");
-        }
-        else if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
-        {
-            Cursor = Cursors.Hand;
-            try
-            {
-                SetStatus(doc.BaseUrl?.Resolve(hoverAnchor.GetAttr("href")!).ToAbsolute() ?? "");
-            }
-            catch { SetStatus(""); }
-        }
-        else
-        {
-            bool overText = IsEditableField(element) ||
-                (hoverFrame != null
-                    ? HitTestTextBox(hoverFrame.RootBox, frameHit.LocalX, frameHit.LocalY) != null
-                    : (_rootBox != null && HitTestTextBox(_rootBox, mx, my) != null));
-            Cursor = overText ? Cursors.IBeam : Cursors.Default;
-
-            // Do not erase window.status on every mouse move. Legacy sites use
-            // window.status as a marquee-like ticker and update it from a timer;
-            // the old clear here fought those updates and made the ticker flicker.
-            var statusJs = hoverFrame?.Interpreter ?? _jsInterpreter;
-            var statusValue = statusJs?.WindowObject?.Get("status") is { Type: JsType.String } sv
-                ? sv.GetString() : "";
-            if (!string.IsNullOrEmpty(statusValue))
-                SetStatus(statusValue);
-            else
-                SetStatus("");
-        }
+        UpdateCursorForHit(element, hoverFrame, frameHit, doc, overTextareaScrollbar, overSelectScrollbar, mx, my);
 
         if (!ReferenceEquals(element, _lastHoveredElement) || !ReferenceEquals(hoverFrame, _lastHoveredFrame))
         {
@@ -6304,6 +7036,8 @@ public class BrowserCanvas : SKGLControl
         if (_fieldDragging)
         {
             _fieldDragging = false;
+            _fieldDragPointerFrame = null;
+            _fieldDragAutoScrollTimer.Stop();
             // The field click was fully handled at mouse-down. Do not clear
             // the active state through a second full relayout here; doing so
             // moved textarea geometry after a page scroll.
@@ -6473,11 +7207,13 @@ public class BrowserCanvas : SKGLControl
         LayoutBox? selectionRoot = _selectionFrame?.RootBox ?? _rootBox;
         if (selectionRoot == null) return;
 
-        // Triple-click means "select the surrounding text block". The DOM
-        // hierarchy is the authoritative grouping, while LayoutBox.Parent can
-        // contain anonymous inline wrappers and line boxes. First resolve the
-        // nearest semantic container to its actual layout box; this reliably
-        // captures wrapped runs such as the long text directly inside <font>.
+        // Triple-click normally selects the surrounding text block.
+        // <center> is a special 1990s-era container: it is often used as a
+        // broad wrapper for several independent pieces of content, including
+        // image / text / image constructions. Treating the whole <center> as
+        // one semantic block therefore made a triple-click on a tiny label
+        // select every text run in that wrapper (sometimes effectively the
+        // whole page). For <center>, select only the clicked visual line.
         DomElement? scope = null;
         DomElement? inlineFallback = null;
         for (var node = word.Element; node != null; node = node.Parent as DomElement)
@@ -6490,22 +7226,52 @@ public class BrowserCanvas : SKGLControl
             if (inlineFallback == null && IsTripleClickInlineFallbackTag(node.TagName))
                 inlineFallback = node;
         }
-        scope ??= inlineFallback;
-        _selectionSemanticScope = scope;
-        _selectionSemanticScopeFrame = _selectionFrame;
 
         List<LayoutBox> textBoxes = new();
-        if (scope != null)
+        bool centerScope = scope?.TagName == "center";
+        if (centerScope)
         {
-            // Never rely on the scope element having a dedicated LayoutBox.
-            // Inline formatting such as <p><font>...</font></p> and table text
-            // can flatten the DOM across anonymous layout wrappers. The DOM
-            // ancestry filter is stable and collects every fragmented word run
-            // belonging to the same semantic block.
+            // <center> is a layout/alignment container rather than a reliable
+            // text-selection paragraph. Keep only text boxes occupying the same
+            // rendered line as the clicked text. This makes constructions such
+            // as <img> Social Links <img> triple-clickable without pulling in
+            // the rest of the page.
+            float lineTolerance = Math.Max(2f, Math.Min(word.ContentRect.Height, 24f) * 0.5f);
+            float lineTop = word.ContentRect.Top;
             textBoxes = EnumerateSelectionTree(selectionRoot)
                 .Where(IsSelectionEligibleBox)
-                .Where(b => IsElementWithin(b.Element, scope))
+                .Where(b => IsElementWithin(b.Element, scope!))
+                .Where(b => Math.Abs(b.ContentRect.Top - lineTop) <= lineTolerance)
                 .ToList();
+
+            // EnumerateSelectionTree already follows layout/DOM source order.
+            // Keep that order so the ordinary range model can represent the
+            // selected line without screen-coordinate reordering.
+
+            // Do not install <center> as a semantic copy scope. Copying should
+            // follow the exact selected text boxes above, not the center's full
+            // InnerText.
+            _selectionSemanticScope = null;
+            _selectionSemanticScopeFrame = null;
+        }
+        else
+        {
+            scope ??= inlineFallback;
+            _selectionSemanticScope = scope;
+            _selectionSemanticScopeFrame = _selectionFrame;
+
+            if (scope != null)
+            {
+                // Never rely on the scope element having a dedicated LayoutBox.
+                // Inline formatting such as <p><font>...</font></p> and table text
+                // can flatten the DOM across anonymous layout wrappers. The DOM
+                // ancestry filter is stable and collects every fragmented word run
+                // belonging to the same semantic block.
+                textBoxes = EnumerateSelectionTree(selectionRoot)
+                    .Where(IsSelectionEligibleBox)
+                    .Where(b => IsElementWithin(b.Element, scope))
+                    .ToList();
+            }
         }
 
         if (textBoxes.Count == 0)
@@ -6589,7 +7355,7 @@ public class BrowserCanvas : SKGLControl
     private static bool IsTripleClickBlockTag(string tag) => tag is
         "p" or "div" or "li" or "pre" or "blockquote" or
         "h1" or "h2" or "h3" or "h4" or "h5" or "h6" or
-        "td" or "th" or "dt" or "dd";
+        "td" or "th" or "dt" or "dd" or "center";
 
     private static bool IsTripleClickInlineFallbackTag(string tag) => tag is
         "font" or "b" or "strong" or "i" or "em" or "u" or "small" or
@@ -6622,46 +7388,46 @@ public class BrowserCanvas : SKGLControl
 
     private TextSelectionHit? HitTestTextPosition(LayoutBox root, float x, float y)
     {
-        // Animated content is painted at a transformed position, while the
-        // generic layout hit-tester only knows the untransformed layout tree.
-        // Prefer a transformed marquee/blink text hit first so click-dragging
-        // over moving legacy content does not start a selection on unrelated
-        // static text underneath it.
-        TextSelectionHit? animatedHit = null;
-        foreach (var candidate in root.Descendants())
-        {
-            if (!IsSelectionEligibleBox(candidate)) continue;
-            if (!IsSelectionAnimated(candidate.Element)) continue;
-            if (!TryGetSelectionAnimationOffset(candidate, root, out float animatedX))
-                continue;
-
-            var rect = candidate.BorderRect;
-            rect.X += animatedX;
-            if (!rect.Contains(x, y)) continue;
-
-            animatedHit = new TextSelectionHit(candidate,
-                GetTextOffsetAtPoint(candidate, x - animatedX));
-        }
-        if (animatedHit != null) return animatedHit;
-
-        // Form controls are explicit selectable text sources in the page range
-        // model. Resolve them before generic text fragments so the arrow/bevel
-        // of a <select> cannot cause the drag endpoint to fall through to an
-        // unrelated text box behind or beside the control.
+        // Selection dragging is a very hot mouse-move path. Resolve the deepest
+        // hit first; the old code scanned every descendant for animated content
+        // before doing the ordinary hit-test, which caused a visible lag spike
+        // on long pages even for a tiny text selection.
         var deepest = HitTestDeepestBox(root, x, y);
-        var controlBox = FindPageSelectableControlBox(deepest);
-        if (controlBox != null)
-        {
-            var hitRect = controlBox.BorderRect;
-            if (hitRect.Contains(x, y))
-                return new TextSelectionHit(controlBox, GetControlTextOffset(controlBox, x, y));
-        }
 
-        // Controls are often hit by their outer Replaced box even when the
-        // deepest child hit-test lands on the native-looking bevel. Walk upward
-        // from the deepest box as a second chance before searching ordinary text.
         if (deepest != null)
         {
+            // Selectable controls own their text source even when the deepest
+            // layout box is a bevel/arrow child.
+            var controlBox = FindPageSelectableControlBox(deepest);
+            if (controlBox != null)
+            {
+                var hitRect = controlBox.BorderRect;
+                if (hitRect.Contains(x, y))
+                    return new TextSelectionHit(controlBox, GetControlTextOffset(controlBox, x, y));
+            }
+
+            // Common case: the deepest hit is already the text fragment. Avoid a
+            // second tree traversal during the drag. Marquee/blink text gets its
+            // animated offset here when applicable.
+            if (IsSelectionEligibleBox(deepest))
+            {
+                var rect = deepest.BorderRect;
+                if (IsSelectionAnimated(deepest.Element))
+                {
+                    if (TryGetSelectionAnimationOffset(deepest, root, out float animatedX))
+                    {
+                        rect.X += animatedX;
+                        if (rect.Contains(x, y))
+                            return new TextSelectionHit(deepest, GetTextOffsetAtPoint(deepest, x - animatedX));
+                    }
+                }
+                else if (rect.Contains(x, y))
+                {
+                    return new TextSelectionHit(deepest, GetTextOffsetAtPoint(deepest, x));
+                }
+            }
+
+            // Cheap parent-chain fallback for replaced/selectable controls.
             for (var candidate = deepest; candidate != null; candidate = candidate.Parent)
             {
                 if (candidate.BoxType != BoxType.Replaced || !IsPageSelectableControl(candidate.Element))
@@ -6671,6 +7437,21 @@ public class BrowserCanvas : SKGLControl
                     return new TextSelectionHit(candidate, GetControlTextOffset(candidate, x, y));
                 break;
             }
+        }
+
+        // A direct hit failed to resolve. Keep marquee/blink support as a
+        // fallback only, instead of paying the full descendant scan for every
+        // normal text mouse move.
+        foreach (var candidate in root.Descendants())
+        {
+            if (!IsSelectionEligibleBox(candidate) || !IsSelectionAnimated(candidate.Element))
+                continue;
+            if (!TryGetSelectionAnimationOffset(candidate, root, out float animatedX))
+                continue;
+            var rect = candidate.BorderRect;
+            rect.X += animatedX;
+            if (rect.Contains(x, y))
+                return new TextSelectionHit(candidate, GetTextOffsetAtPoint(candidate, x - animatedX));
         }
 
         var box = HitTestTextBox(root, x, y);
@@ -6695,9 +7476,8 @@ public class BrowserCanvas : SKGLControl
         LayoutBox? best = null;
         float bestScore = float.PositiveInfinity;
 
-        foreach (var candidate in EnumerateSelectionTree(root))
+        foreach (var candidate in OrderedSelectionRangeBoxes(root))
         {
-            if (!IsSelectionRangeBox(candidate)) continue;
             var rect = candidate.ContentRect;
             if (rect.Width <= 0.01f || rect.Height <= 0.01f) continue;
 
@@ -6771,15 +7551,33 @@ public class BrowserCanvas : SKGLControl
             (int)style.FontWeight, italic, oblique);
         string visualText = TransformSelectionText(text, style.TextTransform);
         float target = Math.Max(0f, x - box.ContentRect.X);
-        float previous = 0f;
-        for (int i = 1; i <= text.Length; i++)
+        Graphics measureGraphics = _measureGfx ?? MeasureGraphics;
+
+        // Selection hit-testing runs for every mouse move while dragging. The
+        // previous linear prefix scan measured 1, 2, 3, ... characters, turning
+        // a long text run into O(n²) GDI work per pointer event. SelectionAdvance
+        // is monotonic, so binary-search the nearest prefix instead. This keeps
+        // the same visual metrics while reducing the search to O(log n) prefix
+        // measurements.
+        int lo = 0, hi = text.Length;
+        while (lo < hi)
         {
-            float w = SelectionAdvance(_measureGfx ?? MeasureGraphics, font, visualText[..i], style);
-            if (target <= w)
-                return (target - previous) <= (w - target) ? i - 1 : i;
-            previous = w;
+            int mid = lo + (hi - lo + 1) / 2;
+            float width = SelectionAdvance(measureGraphics, font, visualText[..mid], style);
+            if (width < target) lo = mid;
+            else hi = mid - 1;
         }
-        return text.Length;
+
+        int leftIndex = Math.Clamp(lo, 0, text.Length);
+        int rightIndex = Math.Min(text.Length, leftIndex + 1);
+        float leftWidth = SelectionAdvance(measureGraphics, font, visualText[..leftIndex], style);
+        float rightWidth = rightIndex == leftIndex
+            ? leftWidth
+            : SelectionAdvance(measureGraphics, font, visualText[..rightIndex], style);
+        if (rightIndex == leftIndex ||
+            (target - leftWidth) <= (rightWidth - target))
+            return leftIndex;
+        return rightIndex;
     }
 
     private float SelectionAdvance(Graphics g, Font font, string text, ComputedStyle style)
@@ -6890,6 +7688,8 @@ public class BrowserCanvas : SKGLControl
         _pendingSelectionFrame = null;
         _selectionSemanticScope = null;
         _selectionSemanticScopeFrame = null;
+        _selectionRangeCacheRoot = null;
+        _selectionRangeCache = null;
         _suppressNextMouseDoubleClick = false;
     }
 
@@ -6942,6 +7742,12 @@ public class BrowserCanvas : SKGLControl
     {
         try
         {
+            // Password fields are intentionally write-only to the clipboard.
+            // Never fall back to their logical value even when Ctrl+C comes
+            // through the generic context-menu copy path.
+            if (_focusedInput != null && IsPasswordField(_focusedInput))
+                return;
+
             string text = GetSelectedText();
             if (text.Length == 0 && _focusedInput != null)
             {
@@ -6985,7 +7791,7 @@ public class BrowserCanvas : SKGLControl
 
     private static bool IsPageSelectableControl(DomElement? element)
     {
-        if (element == null || element.HasAttr("disabled")) return false;
+        if (element == null) return false;
 
         // Buttons are activation controls, not page-text selection surfaces.
         // Keep their labels available to Find, but never turn the entire
@@ -7015,18 +7821,46 @@ public class BrowserCanvas : SKGLControl
 
     private static bool IsSearchableControlElement(DomElement? element)
     {
-        if (element == null || element.HasAttr("disabled")) return false;
+        if (element == null) return false;
         return element.TagName switch
         {
             "textarea" or "select" or "button" => true,
             "input" => !element.GetAttrOrDefault("type", "text").Trim()
-                .Equals("hidden", StringComparison.OrdinalIgnoreCase),
+                .Equals("hidden", StringComparison.OrdinalIgnoreCase) &&
+                !element.GetAttrOrDefault("type", "text").Trim()
+                    .Equals("password", StringComparison.OrdinalIgnoreCase),
             _ => false
         };
     }
 
     private static string GetSelectOptionText(DomElement option) =>
         option.InnerText.Trim();
+
+    private static bool IsPasswordField(DomElement? element) =>
+        element?.TagName == "input" &&
+        element.GetAttrOrDefault("type", "text").Trim()
+            .Equals("password", StringComparison.OrdinalIgnoreCase);
+
+    private float GetFieldViewportScrollX(DomElement element, LayoutBox? box = null)
+    {
+        if (element.TagName != "input" || IsPasswordField(element) ||
+            element.GetAttrOrDefault("type", "text").Trim().Equals("file", StringComparison.OrdinalIgnoreCase))
+            return 0f;
+
+        float value = ReferenceEquals(element, _focusedInput)
+            ? _fieldScrollX
+            : (_fieldFindScrollXs.TryGetValue(element, out var stored) ? stored : 0f);
+        if (box == null) return Math.Max(0f, value);
+        return Math.Clamp(value, 0f, GetSingleLineFieldMaxScroll(element, box));
+    }
+
+    private float GetRendererFieldScrollX(DomElement element)
+    {
+        // Renderer instances also paint embedded-frame documents, whose LayoutBox
+        // is not part of _rootBox. Do not silently discard a valid Find viewport
+        // just because the owning box belongs to a frame.
+        return GetFieldViewportScrollX(element);
+    }
 
     private static string GetSelectableControlText(DomElement el)
     {
@@ -7036,7 +7870,12 @@ public class BrowserCanvas : SKGLControl
                 return GetFieldText(el);
 
             case "button":
-                return el.InnerText;
+            {
+                string label = (el.InnerText ?? string.Empty).Trim();
+                if (label.Length == 0)
+                    label = el.GetAttr("value") ?? "Button";
+                return label;
+            }
 
             case "select":
             {
@@ -7063,8 +7902,16 @@ public class BrowserCanvas : SKGLControl
             {
                 string type = el.GetAttrOrDefault("type", "text").Trim()
                     .ToLowerInvariant();
-                if (type is "hidden" or "checkbox" or "radio" or "file" or "image")
+                if (type is "hidden" or "checkbox" or "radio" or "image")
                     return string.Empty;
+                if (type == "password")
+                    return string.Empty;
+                if (type == "file")
+                {
+                    string chosen = el.GetAttr("data-file-name") ?? string.Empty;
+                    string label = chosen.Length == 0 ? "No file chosen" : chosen;
+                    return "Choose File " + label;
+                }
 
                 string value = el.GetAttr("value") ?? string.Empty;
                 if (value.Length > 0) return value;
@@ -7103,15 +7950,18 @@ public class BrowserCanvas : SKGLControl
         var selectionRoot = root ?? _selectionFrame?.RootBox ?? _rootBox;
         if (selectionRoot == null) return new List<LayoutBox>();
 
-        // Range semantics must follow the layout/DOM traversal order, not
-        // screen coordinates. Sorting by X/Y makes a drag across wrapped text
-        // or table cells continually change the endpoint ordering as line boxes
-        // move, which is exactly the unstable highlight behaviour seen on long
-        // paragraphs and nested tables. Copying can use visual ordering later;
-        // the live range itself needs a stable source order.
-        return EnumerateSelectionTree(selectionRoot)
+        // Range semantics must follow layout/DOM source order, not screen
+        // coordinates. Cache the result for this root tree; a real relayout swaps
+        // the root reference and naturally invalidates the cache.
+        if (ReferenceEquals(_selectionRangeCacheRoot, selectionRoot) &&
+            _selectionRangeCache != null)
+            return _selectionRangeCache;
+
+        _selectionRangeCacheRoot = selectionRoot;
+        _selectionRangeCache = EnumerateSelectionTree(selectionRoot)
             .Where(IsSelectionRangeBox)
             .ToList();
+        return _selectionRangeCache;
     }
 
     private static LayoutBox? FindPageSelectableControlBox(LayoutBox? hitBox)
@@ -7384,6 +8234,15 @@ public class BrowserCanvas : SKGLControl
     // Menus (auto-disposed on close — they used to pile up until the
     // canvas itself was disposed)
     // ─────────────────────────────────────────────────────────────────────
+
+    private void CloseOpenSelectMenu()
+    {
+        var menu = _openSelectMenu;
+        _openSelectMenu = null;
+        if (menu == null || menu.IsDisposed) return;
+        try { menu.Close(ToolStripDropDownCloseReason.AppClicked); }
+        catch { try { menu.Dispose(); } catch { } }
+    }
 
     private void TrackMenu(ContextMenuStrip menu)
     {
@@ -8112,6 +8971,7 @@ public class BrowserCanvas : SKGLControl
             }
             if (trimmedHref.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase))
             {
+                if (!BrowserRuntime.VbScriptEnabled) return;
                 try
                 {
                     string vbSource = trimmedHref[9..];
@@ -8601,7 +9461,16 @@ public class BrowserCanvas : SKGLControl
         var currentOpt = options.FirstOrDefault(o => o.HasAttr("selected"))
                       ?? options.FirstOrDefault();
 
-        var menu = new ContextMenuStrip();
+        CloseOpenSelectMenu();
+        var menu = new ContextMenuStrip
+        {
+            // Keep the popup open while the pointer merely leaves its bounds,
+            // while restoring normal dismissal for a committed item click or
+            // a click elsewhere on the page.  AutoClose=true does exactly that
+            // without making simple pointer travel outside the popup dismiss it.
+            AutoClose = true
+        };
+        _openSelectMenu = menu;
         System.Drawing.Font? bold = null;
         foreach (var opt in options)
         {
@@ -8625,6 +9494,7 @@ public class BrowserCanvas : SKGLControl
                     }
                     js?.FireEvent(select, "onchange");
                     RequestRerender();
+                    menu.Close(ToolStripDropDownCloseReason.ItemClicked);
                 });
 
             if (isMultiple)
@@ -8643,7 +9513,12 @@ public class BrowserCanvas : SKGLControl
         }
 
         var sharedBold = bold;
-        menu.Disposed += (s, e) => sharedBold?.Dispose();
+        menu.Disposed += (s, e) =>
+        {
+            if (ReferenceEquals(_openSelectMenu, menu))
+                _openSelectMenu = null;
+            sharedBold?.Dispose();
+        };
 
         // ContextMenuStrip uses PHYSICAL WinForms client coordinates, while
         // layout boxes use logical CSS coordinates. Always convert through the
@@ -8956,6 +9831,7 @@ public class BrowserCanvas : SKGLControl
         }
         if (trimmedHref.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase))
         {
+            if (!BrowserRuntime.VbScriptEnabled) return;
             try { _jsInterpreter?.ExecuteString(VbScriptTranslator.Translate(trimmedHref[9..])); }
             catch { }
             return;
@@ -9462,7 +10338,9 @@ public class BrowserCanvas : SKGLControl
         ClampScrollOffsetToDocument();
         _resizeReflowTimer.Stop();
         _zoomInteractionStabilizeUntilTicks = Environment.TickCount64 + 1200;
-        UpdateScrollBars(scheduleReflow: false, recomputeVisibility: false);
+        UpdateScrollBars(
+            scheduleReflow: false,
+            recomputeVisibility: !IsGestureZoomActive);
         // Gesture zoom is a temporary presentation transform, not a committed
         // zoom change. Do not raise ZoomChanged here: consumers of that event
         // (including zoom controls) must never observe or persist a gesture value.
@@ -9531,6 +10409,7 @@ public class BrowserCanvas : SKGLControl
                 PressedElement = _pressedControl,
                 TextareaStateResolver = GetTextareaRenderState,
                 SelectScrollResolver = GetSelectScrollOffset,
+                FieldScrollResolver = GetRendererFieldScrollX,
                 EmbeddedFrameResolver = ResolveEmbeddedContent,
                 EmbeddedCanvasResolver = RenderEmbeddedCanvas
             };
@@ -9551,8 +10430,8 @@ public class BrowserCanvas : SKGLControl
                     Math.Max(0f, box.Width), Math.Max(0f, box.Height));
                 PaintFrameExport(canvas, renderer, box, view, destRect, viewportRect, 0, _fontCache, _imageCache);
             }
-            PaintFindHighlights(overlay, PaintScrollX, PaintScrollY);
             if (_focusedInput != null) PaintFieldOverlay(overlay);
+            PaintFindHighlights(overlay, PaintScrollX, PaintScrollY);
             PaintEmbeddedMidiControls(overlay);
         }
 
@@ -9565,6 +10444,7 @@ public class BrowserCanvas : SKGLControl
 
     public void FindInPage(string text, bool caseSensitive, bool wrapAround)
     {
+        _findFieldViewportUserOverrides.Clear();
         _findText = text ?? string.Empty;
         _findCaseSensitive = caseSensitive;
         _findWrap = wrapAround;
@@ -9576,6 +10456,9 @@ public class BrowserCanvas : SKGLControl
 
     public void FindNext()
     {
+        // A deliberate Find navigation is a new request and may reclaim control
+        // of the field viewport from a prior manual click.
+        _findFieldViewportUserOverrides.Clear();
         if (_findMatches.Count == 0)
         {
             RaiseFindChanged();
@@ -9598,6 +10481,8 @@ public class BrowserCanvas : SKGLControl
             next = 0;
         }
 
+        if (_findIndex >= 0 && _findIndex < _findMatches.Count)
+            ResetFindFieldViewport(_findMatches[_findIndex]);
         _findIndex = next;
         EnsureFindMatchVisible(_findMatches[_findIndex]);
         RaiseFindChanged();
@@ -9606,6 +10491,7 @@ public class BrowserCanvas : SKGLControl
 
     public void FindPrevious()
     {
+        _findFieldViewportUserOverrides.Clear();
         if (_findMatches.Count == 0)
         {
             RaiseFindChanged();
@@ -9623,6 +10509,8 @@ public class BrowserCanvas : SKGLControl
             previous = _findMatches.Count - 1;
         }
 
+        if (_findIndex >= 0 && _findIndex < _findMatches.Count)
+            ResetFindFieldViewport(_findMatches[_findIndex]);
         _findIndex = previous;
         EnsureFindMatchVisible(_findMatches[_findIndex]);
         RaiseFindChanged();
@@ -9637,6 +10525,13 @@ public class BrowserCanvas : SKGLControl
         _findText = string.Empty;
         _findMatches.Clear();
         _findIndex = -1;
+        // Find-created horizontal field viewports are temporary. Once Find is
+        // closed there must be no stale offset left on an unfocused input.
+        _fieldFindScrollXs.Clear();
+        _findFieldViewportUserOverrides.Clear();
+        if (_focusedInput?.TagName == "input")
+            _fieldScrollX = 0f;
+        InvalidateDisplayLists();
         if (changed) RaiseFindChanged();
         Invalidate();
     }
@@ -9690,48 +10585,217 @@ public class BrowserCanvas : SKGLControl
         RaiseFindChanged();
     }
 
+    private readonly record struct FindTextPart(
+        FrameView? Frame,
+        LayoutBox Box,
+        string Text);
+
+    private readonly record struct FindTextMap(
+        int PartIndex,
+        int SourceIndex);
+
+    private static bool FindPartsNeedSeparator(
+        FindTextPart previous,
+        FindTextPart current)
+    {
+        var a = previous.Box.ContentRect;
+        var b = current.Box.ContentRect;
+        if (Math.Abs(b.Top - a.Top) > Math.Max(2f, Math.Min(a.Height, b.Height) * 0.5f))
+            return true;
+
+        return HasLayoutWhitespaceBetween(previous.Box, current.Box) ||
+               b.Left > a.Right + 0.5f;
+    }
+
+    private static void AppendNormalizedFindPart(
+        StringBuilder text,
+        List<FindTextMap> map,
+        FindTextPart part,
+        int partIndex)
+    {
+        bool pendingWhitespace = false;
+        int pendingWhitespaceSource = -1;
+
+        for (int i = 0; i < part.Text.Length; i++)
+        {
+            char ch = part.Text[i];
+            if (char.IsWhiteSpace(ch))
+            {
+                pendingWhitespace = true;
+                if (pendingWhitespaceSource < 0)
+                    pendingWhitespaceSource = i;
+                continue;
+            }
+
+            if (pendingWhitespace && text.Length > 0 && text[^1] != ' ')
+            {
+                text.Append(' ');
+                map.Add(new FindTextMap(partIndex, pendingWhitespaceSource));
+            }
+
+            pendingWhitespace = false;
+            pendingWhitespaceSource = -1;
+            text.Append(ch);
+            map.Add(new FindTextMap(partIndex, i));
+        }
+
+        if (pendingWhitespace && text.Length > 0 && text[^1] != ' ')
+        {
+            text.Append(' ');
+            map.Add(new FindTextMap(partIndex, pendingWhitespaceSource));
+        }
+    }
+
+    private void AddFindMatchesAcrossTextParts(
+        List<FindMatch> output,
+        List<FindTextPart> parts,
+        StringComparison comparison)
+    {
+        if (parts.Count == 0 || _findText.Length == 0) return;
+
+        var normalized = new StringBuilder();
+        var map = new List<FindTextMap>();
+        for (int i = 0; i < parts.Count; i++)
+        {
+            if (normalized.Length > 0 &&
+                FindPartsNeedSeparator(parts[i - 1], parts[i]) &&
+                normalized[^1] != ' ')
+            {
+                normalized.Append(' ');
+                // Synthetic separators participate in matching but never paint
+                // a phantom glyph.
+                map.Add(new FindTextMap(-1, -1));
+            }
+
+            AppendNormalizedFindPart(normalized, map, parts[i], i);
+        }
+
+        string query = NormalizeFindQuery(_findText);
+        if (query.Length == 0 || normalized.Length < query.Length) return;
+
+        string normalizedString = normalized.ToString();
+        int from = 0;
+        while (from <= normalizedString.Length - query.Length)
+        {
+            int at = normalizedString.IndexOf(query, from, comparison);
+            if (at < 0) break;
+
+            int end = at + query.Length;
+            var segments = new List<FindMatchSegment>();
+            var segmentStarts = new Dictionary<int, int>();
+            var segmentEnds = new Dictionary<int, int>();
+
+            for (int i = at; i < end && i < map.Count; i++)
+            {
+                var mapped = map[i];
+                if (mapped.PartIndex < 0) continue;
+
+                if (!segmentStarts.TryGetValue(mapped.PartIndex, out int existingStart))
+                    segmentStarts[mapped.PartIndex] = mapped.SourceIndex;
+                else
+                    segmentStarts[mapped.PartIndex] =
+                        Math.Min(existingStart, mapped.SourceIndex);
+
+                int next = mapped.SourceIndex + 1;
+                if (!segmentEnds.TryGetValue(mapped.PartIndex, out int existingEnd))
+                    segmentEnds[mapped.PartIndex] = next;
+                else
+                    segmentEnds[mapped.PartIndex] = Math.Max(existingEnd, next);
+            }
+
+            foreach (var pair in segmentStarts.OrderBy(p => p.Key))
+            {
+                int partIndex = pair.Key;
+                int segStart = pair.Value;
+                int segEnd = segmentEnds[partIndex];
+                if (segEnd <= segStart) continue;
+
+                var part = parts[partIndex];
+                segments.Add(new FindMatchSegment(
+                    part.Frame, part.Box, segStart, segEnd - segStart, null));
+            }
+
+            if (segments.Count > 0)
+            {
+                var first = segments[0];
+                output.Add(new FindMatch(
+                    first.Frame, first.Box, first.Start, first.Length, null, segments));
+            }
+
+            from = at + Math.Max(1, query.Length);
+        }
+    }
+
+    private static string NormalizeFindQuery(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+
+        var sb = new StringBuilder(text.Length);
+        bool pendingWhitespace = false;
+        foreach (char ch in text)
+        {
+            if (char.IsWhiteSpace(ch))
+            {
+                pendingWhitespace = sb.Length > 0;
+                continue;
+            }
+
+            if (pendingWhitespace)
+                sb.Append(' ');
+            pendingWhitespace = false;
+            sb.Append(ch);
+        }
+
+        return sb.ToString().Trim();
+    }
+
     private void CollectFindMatches(LayoutBox root, FrameView? frame,
                                     List<FindMatch> output,
                                     StringComparison comparison)
     {
         var stack = new Stack<LayoutBox>();
+        var textParts = new List<FindTextPart>();
         stack.Push(root);
+
+        void FlushTextParts()
+        {
+            if (textParts.Count == 0) return;
+            AddFindMatchesAcrossTextParts(output, textParts, comparison);
+            textParts.Clear();
+        }
+
         while (stack.Count > 0)
         {
             var box = stack.Pop();
 
-            string run = box.TextRun ?? string.Empty;
-            if (run.Length > 0)
-                AddFindMatchesForText(output, frame, box, run, comparison, null);
-
-            if (box.BoxType == BoxType.Replaced && IsSearchableControlElement(box.Element))
+            // Searchable replaced controls own their displayed text. Do not also
+            // consume an incidental TextRun on the control, and for a single
+            // select only search the option actually displayed in the field.
+            if (box.BoxType == BoxType.Replaced &&
+                IsSearchableControlElement(box.Element))
             {
-                if (box.Element!.TagName == "select")
-                {
-                    // A dropdown may contain options that are not exposed as a
-                    // TextRun. Search each option label separately; this also
-                    // avoids counting the selected option twice. The match is
-                    // anchored to the select box because that is the visual
-                    // surface that owns the option label.
-                    foreach (var option in box.Element.Descendants().OfType<DomElement>()
-                                 .Where(o => o.TagName == "option"))
-                    {
-                        string optionText = GetSelectOptionText(option);
-                        if (optionText.Length == 0) continue;
-                        AddFindMatchesForText(output, frame, box, optionText, comparison, box.Element);
-                    }
-                }
-                else
-                {
-                    string controlText = GetSelectableControlText(box.Element!);
-                    if (controlText.Length > 0)
-                        AddFindMatchesForText(output, frame, box, controlText, comparison, box.Element);
-                }
+                FlushTextParts();
+
+                string controlText = GetSelectableControlText(box.Element!);
+                if (controlText.Length > 0)
+                    AddFindMatchesForText(output, frame, box, controlText,
+                        comparison, box.Element);
+
+                // The control owns its displayed value. Descendant <option> /
+                // label text is not a second searchable copy; traversing it here
+                // made a single dropdown produce matches for hidden options too.
+                continue;
             }
+
+            string run = box.TextRun ?? string.Empty;
+            if (IsSelectionEligibleBox(box) && run.Length > 0)
+                textParts.Add(new FindTextPart(frame, box, run));
 
             for (int i = box.Children.Count - 1; i >= 0; i--)
                 stack.Push(box.Children[i]);
         }
+
+        FlushTextParts();
     }
 
     private void AddFindMatchesForText(List<FindMatch> output, FrameView? frame,
@@ -9739,14 +10803,54 @@ public class BrowserCanvas : SKGLControl
                                        StringComparison comparison, DomElement? sourceElement)
     {
         if (text.Length == 0 || _findText.Length == 0) return;
+
+        string query = NormalizeFindQuery(_findText);
+        string normalized = NormalizeFindQuery(text);
+        if (query.Length == 0 || normalized.Length == 0) return;
+
         int from = 0;
-        while (from <= text.Length - _findText.Length)
+        while (from <= normalized.Length - query.Length)
         {
-            int at = text.IndexOf(_findText, from, comparison);
+            int at = normalized.IndexOf(query, from, comparison);
             if (at < 0) break;
-            output.Add(new FindMatch(frame, box, at, _findText.Length, sourceElement));
-            from = at + Math.Max(1, _findText.Length);
+
+            int originalStart = FindNormalizedOffsetToSource(text, at);
+            int originalEnd = FindNormalizedOffsetToSource(text, at + query.Length);
+            if (originalEnd <= originalStart)
+                originalEnd = Math.Min(text.Length,
+                    originalStart + Math.Max(1, query.Length));
+
+            output.Add(new FindMatch(frame, box,
+                originalStart, originalEnd - originalStart, sourceElement));
+            from = at + Math.Max(1, query.Length);
         }
+    }
+
+    private static int FindNormalizedOffsetToSource(string source, int normalizedOffset)
+    {
+        if (normalizedOffset <= 0) return 0;
+
+        int normalized = 0;
+        bool inWhitespace = false;
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (char.IsWhiteSpace(source[i]))
+            {
+                if (!inWhitespace)
+                {
+                    if (normalized == normalizedOffset) return i;
+                    normalized++;
+                    inWhitespace = true;
+                }
+                continue;
+            }
+
+            inWhitespace = false;
+            if (normalized == normalizedOffset) return i;
+            normalized++;
+        }
+
+        return source.Length;
     }
 
     private void CollectFindMatchesInFrameTree(FrameView frame, List<FindMatch> output,
@@ -9761,8 +10865,23 @@ public class BrowserCanvas : SKGLControl
         _findMatches.Count,
         _findIndex >= 0 && _findIndex < _findMatches.Count ? _findIndex + 1 : 0);
 
+    private void ResetFindFieldViewport(FindMatch match)
+    {
+        var element = match.SourceElement;
+        if (element?.TagName != "input" || IsPasswordField(element)) return;
+        if (_fieldFindScrollXs.Remove(element))
+            InvalidateDisplayLists();
+        if (ReferenceEquals(element, _focusedInput))
+            _fieldScrollX = 0f;
+    }
+
     private void EnsureFindMatchVisible(FindMatch match)
     {
+        // A match can be inside a horizontally/vertically scrollable form control.
+        // Bring that control-local viewport to the match first; the page scroll
+        // solver then only has to reveal the control itself.
+        EnsureFindControlInternalScrollVisible(match);
+
         if (match.Frame == null)
         {
             EnsureTopLevelFindMatchVisible(match.Box);

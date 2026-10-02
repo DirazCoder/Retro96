@@ -391,13 +391,25 @@ public class JsFunction : JsObject
     public Func<JsValue, JsValue[], JsValue>? Native { get; }
     public JsScope ClosureScope { get; }
 
-    public JsFunction(Func<JsValue, JsValue[], JsValue> native, JsScope closureScope, string? name = null)
+    /// <summary>
+    /// Some legacy host callables are themselves callable collection objects.
+    /// Old IE treated document.all(...) / element.all(...) as invoking the
+    /// collection object, rather than using the containing object/global as
+    /// the JavaScript <c>this</c> value. The interpreter opts into that host
+    /// behaviour only for such functions so ordinary object methods keep the
+    /// normal JavaScript receiver rules.
+    /// </summary>
+    public bool UseFunctionObjectAsThis { get; }
+
+    public JsFunction(Func<JsValue, JsValue[], JsValue> native, JsScope closureScope,
+                      string? name = null, bool useFunctionObjectAsThis = false)
     {
         Native = native ?? throw new ArgumentNullException(nameof(native));
         ClosureScope = closureScope ?? throw new ArgumentNullException(nameof(closureScope));
         Params = Array.Empty<string>();
         Body = null;
         Name = name;
+        UseFunctionObjectAsThis = useFunctionObjectAsThis;
         Class = "Function";
         if (name != null) Set("name", JsValue.From(name));
     }

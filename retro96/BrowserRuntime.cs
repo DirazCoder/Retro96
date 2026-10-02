@@ -21,10 +21,49 @@ public static class BrowserRuntime
     }
 
     public static string UserAgent => Settings.EffectiveUserAgent;
+
+    /// <summary>True when Preferences selected the native Retro96 compatibility-union engine.</summary>
+    public static bool IsRetro96 => Settings.EngineMode == RetroEngineMode.Retro96;
+
+    /// <summary>True when Preferences selected the historical IE3/JScript profile.</summary>
+    public static bool IsInternetExplorer3 => Settings.EngineMode == RetroEngineMode.InternetExplorer3;
+
+    /// <summary>True when Preferences selected the historical Navigator 3 profile.</summary>
+    public static bool IsNetscape3 => Settings.EngineMode == RetroEngineMode.Netscape3;
+
+    /// <summary>True when the native engine exposes the IE-era host-object surface.</summary>
+    public static bool SupportsInternetExplorerLegacy => IsRetro96 || IsInternetExplorer3;
+
+    /// <summary>True when the native engine exposes the Navigator-era surface.</summary>
+    public static bool SupportsNetscapeLegacy => IsRetro96 || IsNetscape3;
+
+    /// <summary>Human-readable script engine personality exposed by the compatibility mode.</summary>
+    public static string JavaScriptEngineName => Settings.EngineMode switch
+    {
+        RetroEngineMode.Retro96 => "Retro96 Script Engine",
+        RetroEngineMode.InternetExplorer3 => "Microsoft JScript 1.0",
+        _ => "Netscape JavaScript 1.1"
+    };
+
+    /// <summary>Compatibility-era ECMAScript surface version used by the script runtime.</summary>
+    public static string JavaScriptVersion => Settings.EngineMode switch
+    {
+        RetroEngineMode.Retro96 => "1.0/1.1 + Retro96 extensions",
+        RetroEngineMode.InternetExplorer3 => "1.0",
+        _ => "1.1"
+    };
+
     public static bool ImagesEnabled => Settings.LoadImages;
     public static bool JavaScriptEnabled => Settings.EnableJavaScript;
     public static bool JavaScriptTimersEnabled => Settings.EnableJavaScript && Settings.EnableJavaScriptTimers;
     public static bool JavaScriptDialogsEnabled => Settings.EnableJavaScript && Settings.EnableJavaScriptDialogs;
+    /// <summary>
+    /// VBScript is a legacy execution surface. It is completely disabled in
+    /// High trust mode and available in Medium/Low when scripting itself is
+    /// enabled. All execution paths consult this single policy gate.
+    /// </summary>
+    public static bool VbScriptEnabled =>
+        Settings.EnableJavaScript && Settings.TrustMode != TrustMode.High;
     public static bool CookiesEnabled => Settings.EnableCookies;
     public static bool ReferrerEnabled => Settings.SendReferrer;
     public static bool RedirectsEnabled => Settings.FollowHttpRedirects;

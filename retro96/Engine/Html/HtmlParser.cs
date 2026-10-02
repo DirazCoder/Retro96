@@ -1155,7 +1155,21 @@ public static class HtmlParser
                               type.StartsWith("application/javascript", StringComparison.Ordinal) ||
                               type.StartsWith("application/ecmascript", StringComparison.Ordinal);
 
+            // IE3-era pages used the language=JavaScript/JScript form and
+            // text/javascript. Do not silently teach the IE3 personality about
+            // later application/* script MIME aliases. The Netscape 3 profile
+            // keeps the broader compatibility accepted by Retro96.
+            if (global::Retro96.BrowserRuntime.IsInternetExplorer3 &&
+                type.StartsWith("application/", StringComparison.Ordinal))
+                javaScript = false;
+
             if (!vbScript && !javaScript)
+                return "";
+
+            // High trust mode has no VBScript execution surface at all.
+            // Return before resolving external sources so a blocked VBScript
+            // cannot cause a network fetch or populate the script runtime.
+            if (vbScript && !global::Retro96.BrowserRuntime.VbScriptEnabled)
                 return "";
 
             // Classic browsers execute an external script synchronously at
