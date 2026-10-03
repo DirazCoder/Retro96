@@ -1105,7 +1105,7 @@ public class NamedBugHeadlessTests
             var jsContent = await FrameLoader.LoadAsync(
                 fileBase, "inner.html", 300, 200,
                 new EngineHttpClient(), cookies, default,
-                (fdoc, scriptSrc) =>
+                (fdoc, scriptSrc, _) =>
                 {
                     state.Document = fdoc;
                     DomBindings.RegisterAll(scope, fdoc, new NavigationHistory(),

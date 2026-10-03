@@ -84,7 +84,7 @@ public sealed class PageHarness
         Interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, State);
 
         Document = HtmlParser.Parse(html, parsed, new CookieStore(),
-            (doc, src) => RunInlineScript(doc, src));
+            (doc, src, _) => RunInlineScript(doc, src));
 
         // The shell re-registers the DOM bindings after the parse completes
         // (pages with NO <script> must still see document/window objects).

@@ -51,12 +51,15 @@ public sealed class UserSettings
     public string ForcedBackgroundColor { get; set; } = DefaultBackgroundColor;
     public bool LoadImages { get; set; } = true;
     public bool EnableJavaScript { get; set; } = true;
+    public bool EnableVBScript { get; set; } = true;
+    public bool EnableJavaApplets { get; set; } = true;
     public bool AllowScriptedWindows { get; set; } = true;
 
     // Windows display scaling. Enabled by default so the shell and native
     // controls use PerMonitorV2 rather than being bitmap-stretched by Windows.
     // Stored as a normal preference so legacy/portable installs can opt out.
     public bool HighDpiScaleMode { get; set; } = true;
+    public int DefaultPageZoomPercent { get; set; } = 100;
 
     // Advanced browser-engine feature switches.
     public bool LoadStylesheets { get; set; } = true;
@@ -106,8 +109,11 @@ public sealed class UserSettings
         ForcedBackgroundColor = ForcedBackgroundColor,
         LoadImages = LoadImages,
         EnableJavaScript = EnableJavaScript,
+        EnableVBScript = EnableVBScript,
+        EnableJavaApplets = EnableJavaApplets,
         AllowScriptedWindows = AllowScriptedWindows,
         HighDpiScaleMode = HighDpiScaleMode,
+        DefaultPageZoomPercent = DefaultPageZoomPercent,
         LoadStylesheets = LoadStylesheets,
         LoadFrames = LoadFrames,
         AllowFormSubmissions = AllowFormSubmissions,
@@ -197,11 +203,21 @@ public sealed class UserSettings
                     case "javascript.enabled":
                         s.EnableJavaScript = ParseBool(value, s.EnableJavaScript);
                         break;
+                    case "vbscript.enabled":
+                        s.EnableVBScript = ParseBool(value, s.EnableVBScript);
+                        break;
+                    case "java.applets.enabled":
+                        s.EnableJavaApplets = ParseBool(value, s.EnableJavaApplets);
+                        break;
                     case "scriptedwindows.enabled":
                         s.AllowScriptedWindows = ParseBool(value, s.AllowScriptedWindows);
                         break;
                     case "ui.highdpi":
                         s.HighDpiScaleMode = ParseBool(value, s.HighDpiScaleMode);
+                        break;
+                    case "ui.defaultpagezoom":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int zoom))
+                            s.DefaultPageZoomPercent = zoom;
                         break;
                     case "stylesheets.enabled":
                         s.LoadStylesheets = ParseBool(value, s.LoadStylesheets);
@@ -276,8 +292,11 @@ public sealed class UserSettings
         sb.AppendLine("Background.Color=" + ForcedBackgroundColor);
         sb.AppendLine("Images.Enabled=" + BoolText(LoadImages));
         sb.AppendLine("JavaScript.Enabled=" + BoolText(EnableJavaScript));
+        sb.AppendLine("VBScript.Enabled=" + BoolText(EnableVBScript));
+        sb.AppendLine("Java.Applets.Enabled=" + BoolText(EnableJavaApplets));
         sb.AppendLine("ScriptedWindows.Enabled=" + BoolText(AllowScriptedWindows));
         sb.AppendLine("UI.HighDpi=" + BoolText(HighDpiScaleMode));
+        sb.AppendLine("UI.DefaultPageZoom=" + DefaultPageZoomPercent.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Stylesheets.Enabled=" + BoolText(LoadStylesheets));
         sb.AppendLine("Frames.Enabled=" + BoolText(LoadFrames));
         sb.AppendLine("Forms.Enabled=" + BoolText(AllowFormSubmissions));
@@ -342,10 +361,27 @@ public sealed class UserSettings
 
     public static string NormalizeSearchTemplate(string? value)
     {
-        string template = (value ?? string.Empty).Trim();
-        if (template.Contains("{searchTerms}", StringComparison.OrdinalIgnoreCase))
-            template = template.Replace("{searchTerms}", "%s", StringComparison.OrdinalIgnoreCase);
-        return template.Contains("%s", StringComparison.Ordinal) ? template : DefaultSearchUrl;
+        return TryNormalizeSearchTemplate(value, out string template)
+            ? template
+            : DefaultSearchUrl;
+    }
+
+    public static bool TryNormalizeSearchTemplate(string? value, out string template)
+    {
+        string candidate = (value ?? string.Empty).Trim();
+        if (candidate.Contains("{searchTerms}", StringComparison.OrdinalIgnoreCase))
+            candidate = candidate.Replace("{searchTerms}", "%s", StringComparison.OrdinalIgnoreCase);
+        if (candidate.Contains("{query}", StringComparison.OrdinalIgnoreCase))
+            candidate = candidate.Replace("{query}", "%s", StringComparison.OrdinalIgnoreCase);
+
+        if (candidate.Contains("%s", StringComparison.Ordinal))
+        {
+            template = candidate;
+            return true;
+        }
+
+        template = string.Empty;
+        return false;
     }
 
     private static void Normalize(UserSettings s)
@@ -357,6 +393,8 @@ public sealed class UserSettings
             s.UserAgentOverride = s.UserAgentOverride[..2048];
         if (!IsHtmlColor(s.ForcedBackgroundColor))
             s.ForcedBackgroundColor = DefaultBackgroundColor;
+        if (s.DefaultPageZoomPercent is not (100 or 125 or 150 or 200))
+            s.DefaultPageZoomPercent = 100;
     }
 
     private static bool IsHtmlColor(string value)

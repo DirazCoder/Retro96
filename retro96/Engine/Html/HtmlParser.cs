@@ -16,7 +16,7 @@ namespace Retro96.Engine.Html;
 /// period-accurate merged-stream behaviour.
 /// Return an empty string when nothing was written.
 /// </summary>
-public delegate string InlineScriptExecutor(DomDocument document, string scriptSource);
+public delegate string InlineScriptExecutor(DomDocument document, string scriptSource, bool isVbScript);
 public delegate string? ExternalScriptLoader(DomDocument document, string sourceUrl);
 
 /// <summary>
@@ -1141,7 +1141,7 @@ public static class HtmlParser
 
             string language = scriptElement.GetAttrOrDefault("language", "").Trim().ToLowerInvariant();
             string type = scriptElement.GetAttrOrDefault("type", "").Trim().ToLowerInvariant();
-            bool vbScript = language.StartsWith("vbscript", StringComparison.Ordinal) ||
+            bool vbScript = language is "vbscript" or "vbs" ||
                             type.StartsWith("text/vbscript", StringComparison.Ordinal) ||
                             type.StartsWith("application/vbscript", StringComparison.Ordinal) ||
                             type.StartsWith("application/x-vbscript", StringComparison.Ordinal);
@@ -1175,10 +1175,7 @@ public static class HtmlParser
             // Classic browsers execute an external script synchronously at
             // the point where the parser encounters </script>. Resolve and
             // fetch through the shell's scheme-aware resource pipeline, then
-            // feed the resulting source into the same in-process JS runtime.
-            // VBScript is translated to the browser's supported JS 1.2 surface
-            // before execution, which also keeps event-handler functions defined
-            // by VBScript visible to the existing DOM bindings.
+            // dispatch to the script engine selected by the element language.
             string? source = null;
             if (scriptElement.HasAttr("src"))
             {
@@ -1199,8 +1196,7 @@ public static class HtmlParser
 
             try
             {
-                string executable = vbScript ? VbScriptTranslator.Translate(source) : source;
-                return _onScript(_doc, executable) ?? "";
+                return _onScript(_doc, source, vbScript) ?? "";
             }
             catch
             {

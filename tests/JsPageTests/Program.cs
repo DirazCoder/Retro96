@@ -107,7 +107,7 @@ public static class Program
             Interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, State);
 
             Document = HtmlParser.Parse(html, url, new CookieStore(),
-                (doc, src) => RunInlineScript(doc, src));
+                (doc, src, _) => RunInlineScript(doc, src));
             return Document;
         }
 

@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -17,7 +18,9 @@ using Retro96.Engine.Js;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
 using Retro96.Engine.Render;
+using Retro96.Engine.Vbs;
 using Retro96.Plugins;
+using JsValue = Retro96.Engine.Js.JsValue;
 using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 
 /// <summary>
@@ -28,11 +31,12 @@ using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 /// held; wheel scrolling is immediate; releasing the mouse OFF a pressed
 /// button cancels activation (browser behaviour).
 /// </summary>
-public class BrowserCanvas : SKGLControl
+public class BrowserCanvas : SKGLControl, IVbsScriptHost
 {
     private DomDocument? _document;
     private LayoutBox? _rootBox;
     private JsInterpreter? _jsInterpreter;
+    private readonly ConditionalWeakTable<DomDocument, VbsPageState> _vbsSessions = new();
     private ImageCache? _imageCache;
     private ImageCache? _imageEventSource;
     private FontCache? _fontCache;
@@ -781,7 +785,10 @@ public class BrowserCanvas : SKGLControl
         _blinkTimer.Stop();
 
         _lastStatus = "";
-        _ = _javaApplets.PreparePageAsync(doc, _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"));
+        if (BrowserRuntime.JavaAppletsEnabled)
+            _ = _javaApplets.PreparePageAsync(doc, _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"));
+        else
+            _javaApplets.StopPage();
         PageChanged?.Invoke();
     }
 
@@ -863,7 +870,340 @@ public class BrowserCanvas : SKGLControl
     public virtual string? ShowPrompt(string message, string defaultValue)
     {
         if (!BrowserRuntime.JavaScriptDialogsEnabled) return null;
-        return PromptDialog.Show(FindForm(), message, defaultValue);
+        return PromptDialog.Show(FindForm(), message, defaultValue, "Retro96 — JavaScript prompt");
+    }
+
+    public void WriteLine(string text) =>
+        PageInspector.PublishConsole("log", text, DateTime.Now);
+
+    public VbsMsgBoxResult MsgBox(string prompt, VbsMsgBoxButtons buttons, string title)
+    {
+        if (!BrowserRuntime.JavaScriptDialogsEnabled)
+            return VbsMsgBoxResult.Cancel;
+
+        MessageBoxButtons nativeButtons = buttons switch
+        {
+            VbsMsgBoxButtons.OkOnly => MessageBoxButtons.OK,
+            VbsMsgBoxButtons.OkCancel => MessageBoxButtons.OKCancel,
+            VbsMsgBoxButtons.AbortRetryIgnore => MessageBoxButtons.AbortRetryIgnore,
+            VbsMsgBoxButtons.YesNoCancel => MessageBoxButtons.YesNoCancel,
+            VbsMsgBoxButtons.YesNo => MessageBoxButtons.YesNo,
+            VbsMsgBoxButtons.RetryCancel => MessageBoxButtons.RetryCancel,
+            _ => MessageBoxButtons.OK
+        };
+        var result = MessageBox.Show(FindForm(), prompt,
+            string.IsNullOrEmpty(title) ? "Retro96" : title, nativeButtons);
+        return result switch
+        {
+            DialogResult.OK => VbsMsgBoxResult.Ok,
+            DialogResult.Cancel => VbsMsgBoxResult.Cancel,
+            DialogResult.Abort => VbsMsgBoxResult.Abort,
+            DialogResult.Retry => VbsMsgBoxResult.Retry,
+            DialogResult.Ignore => VbsMsgBoxResult.Ignore,
+            DialogResult.Yes => VbsMsgBoxResult.Yes,
+            DialogResult.No => VbsMsgBoxResult.No,
+            _ => VbsMsgBoxResult.Cancel
+        };
+    }
+
+    public string? InputBox(string prompt, string title, string defaultValue)
+    {
+        if (!BrowserRuntime.JavaScriptDialogsEnabled) return null;
+        return PromptDialog.Show(FindForm(), prompt, defaultValue,
+            string.IsNullOrEmpty(title) ? "Retro96" : title);
+    }
+
+    public IVbsDispatchObject? CreateObject(string progId) => null;
+    public IVbsDispatchObject? GetObject(string path, string progId) => null;
+
+    /// <summary>Runs a page VBScript block in the document's persistent session.</summary>
+    public string RunVbsScript(DomDocument document, string source)
+        => RunVbsScript(document, source, null);
+
+    public string RunVbsScript(DomDocument document, string source, JsInterpreter? jsInterpreter)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(source);
+
+        var page = _vbsSessions.GetValue(document, _ => new VbsPageState(document, this));
+        page.WriteBuffer.Clear();
+
+        VbsErrorInfo? error;
+        bool succeeded;
+        if (page.Session == null)
+        {
+            try
+            {
+                page.Session = VbsSession.Create(source, this,
+                    new Dictionary<string, IVbsDispatchObject>
+                    {
+                        ["document"] = page.DocumentObject
+                    });
+                succeeded = page.Session.TryRun(out error);
+            }
+            catch (VbsSyntaxException ex)
+            {
+                error = VbsEngine.ToErrorInfo(ex);
+                succeeded = false;
+            }
+        }
+        else
+        {
+            succeeded = page.Session.TryRun(source, out error);
+        }
+
+        if (jsInterpreter != null && page.Session != null)
+            RegisterVbsProcedures(jsInterpreter, page);
+
+        if (!succeeded && error != null)
+        {
+            ReportVbsError(error);
+        }
+
+        string written = page.WriteBuffer.ToString();
+        if (document.ParseComplete)
+        {
+            if (written.Length > 0)
+                ApplyVbsDocumentWrite(document, written);
+            return "";
+        }
+        return written;
+    }
+
+    private void RegisterVbsProcedures(JsInterpreter interpreter, VbsPageState page)
+    {
+        foreach (string procedure in page.Session!.ProcedureNames)
+        {
+            string name = procedure;
+            interpreter.GlobalScope.Define(name, JsValue.FromFunction(
+                new JsFunction((_, args) =>
+                {
+                    try
+                    {
+                        var result = page.Session!.Call(name, args.Select(ToVbsVariant).ToArray());
+                        return ToJsValue(result);
+                    }
+                    catch (VbsRuntimeException ex)
+                    {
+                        ReportVbsError(VbsEngine.ToErrorInfo(ex));
+                        return JsValue.Undefined;
+                    }
+                }, interpreter.GlobalScope, name)));
+        }
+    }
+
+    private static VbsVariant ToVbsVariant(JsValue value) => value.Type switch
+    {
+        JsType.Null => VbsVariant.Null,
+        JsType.Boolean => VbsVariant.Of(value.GetBool()),
+        JsType.Number => VbsVariant.Of(value.GetNumber()),
+        JsType.String => VbsVariant.Of(value.GetString()),
+        _ => VbsVariant.Empty
+    };
+
+    private static JsValue ToJsValue(VbsVariant value) => value.Type switch
+    {
+        VbVarType.Null => JsValue.Null,
+        VbVarType.Empty => JsValue.Undefined,
+        VbVarType.Boolean => JsValue.From(value.AsBoolean()),
+        VbVarType.Byte => JsValue.From(value.AsByte()),
+        VbVarType.Integer => JsValue.From(value.AsInt16()),
+        VbVarType.Long => JsValue.From(value.AsInt32()),
+        VbVarType.Single => JsValue.From(value.AsSingle()),
+        VbVarType.Double => JsValue.From(value.AsDouble()),
+        VbVarType.Currency => JsValue.From((double)value.AsDecimal()),
+        VbVarType.String => JsValue.From(value.AsString()),
+        _ => JsValue.Undefined
+    };
+
+    private void ReportVbsError(VbsErrorInfo error)
+    {
+        string message = error.ToString();
+        PageInspector.PublishConsole("error", $"VBScript error: {message}", DateTime.Now);
+        SetStatus($"VBScript error: {message}");
+    }
+
+    private void ApplyVbsDocumentWrite(DomDocument document, string markup)
+    {
+        if (document.BaseUrl == null) return;
+        var replacement = Engine.Html.HtmlParser.Parse(markup, document.BaseUrl, document.Cookies);
+        foreach (var child in document.Children.ToList())
+            child.Parent = null;
+        document.Children.Clear();
+        foreach (var child in replacement.Children.ToList())
+            document.AppendChild(child);
+
+        document.Title = replacement.Title;
+        document.BaseTarget = replacement.BaseTarget;
+        document.MetaRefresh = replacement.MetaRefresh;
+        document.BodyTextColor = replacement.BodyTextColor;
+        document.BodyLinkColor = replacement.BodyLinkColor;
+        document.BodyVLinkColor = replacement.BodyVLinkColor;
+        document.BodyALinkColor = replacement.BodyALinkColor;
+        document.BodyBackground = replacement.BodyBackground;
+        document.BaseFontSize = replacement.BaseFontSize;
+        document.Charset = replacement.Charset;
+
+        if (ReferenceEquals(document, _document))
+            ReflowDocument();
+    }
+
+    private sealed class VbsPageState
+    {
+        public readonly StringBuilder WriteBuffer = new();
+        public readonly VbsDocumentObject DocumentObject;
+        public VbsSession? Session;
+
+        public VbsPageState(DomDocument document, BrowserCanvas canvas) =>
+            DocumentObject = new VbsDocumentObject(document, canvas, WriteBuffer);
+    }
+
+    private sealed class VbsDocumentObject : IVbsDispatchObject
+    {
+        private readonly DomDocument _document;
+        private readonly BrowserCanvas _canvas;
+        private readonly StringBuilder _writeBuffer;
+        public VbsDocumentObject(DomDocument document, BrowserCanvas canvas, StringBuilder writeBuffer)
+        {
+            _document = document;
+            _canvas = canvas;
+            _writeBuffer = writeBuffer;
+        }
+        public string VbsTypeName => "Document";
+
+        public bool TryGetMember(string name, out VbsVariant value)
+        {
+            var form = _document.ElementDescendants().FirstOrDefault(element =>
+                element.TagName == "form" &&
+                (string.Equals(element.GetAttr("name"), name, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(element.GetAttr("id"), name, StringComparison.OrdinalIgnoreCase)));
+            if (form != null)
+            {
+                value = VbsVariant.Of(new VbsFormObject(form, _canvas));
+                return true;
+            }
+            value = default;
+            return false;
+        }
+
+        public bool TrySetMember(string name, VbsVariant value) => false;
+
+        public bool TryInvoke(string name, VbsVariant[] args, out VbsVariant result)
+        {
+            if (!name.Equals("write", StringComparison.OrdinalIgnoreCase) &&
+                !name.Equals("writeln", StringComparison.OrdinalIgnoreCase))
+            {
+                result = default;
+                return false;
+            }
+
+            foreach (var arg in args)
+                _writeBuffer.Append(arg.Type == VbVarType.Null ? "" : arg.ToStringVariant());
+            if (name.Equals("writeln", StringComparison.OrdinalIgnoreCase))
+                _writeBuffer.Append("\r\n");
+            result = VbsVariant.Empty;
+            return true;
+        }
+
+        public bool TryGetDefault(out VbsVariant value) { value = default; return false; }
+        public bool TrySetDefault(VbsVariant value) => false;
+        public bool TryInvokeDefault(VbsVariant[] args, out VbsVariant result)
+        { result = default; return false; }
+        public bool TryEnumerate(out IEnumerable<VbsVariant> items)
+        { items = Array.Empty<VbsVariant>(); return false; }
+    }
+
+    private sealed class VbsFormObject : IVbsDispatchObject
+    {
+        private readonly DomElement _form;
+        private readonly BrowserCanvas _canvas;
+        public VbsFormObject(DomElement form, BrowserCanvas canvas)
+        {
+            _form = form;
+            _canvas = canvas;
+        }
+        public string VbsTypeName => "Form";
+
+        public bool TryGetMember(string name, out VbsVariant value)
+        {
+            var control = _form.ElementDescendants().FirstOrDefault(element =>
+                string.Equals(element.GetAttr("name"), name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(element.GetAttr("id"), name, StringComparison.OrdinalIgnoreCase));
+            if (control != null)
+            {
+                value = VbsVariant.Of(new VbsFormControlObject(control, _canvas));
+                return true;
+            }
+            value = default;
+            return false;
+        }
+
+        public bool TrySetMember(string name, VbsVariant value) => false;
+        public bool TryInvoke(string name, VbsVariant[] args, out VbsVariant result)
+        { result = default; return false; }
+        public bool TryGetDefault(out VbsVariant value) { value = default; return false; }
+        public bool TrySetDefault(VbsVariant value) => false;
+        public bool TryInvokeDefault(VbsVariant[] args, out VbsVariant result)
+        { result = default; return false; }
+        public bool TryEnumerate(out IEnumerable<VbsVariant> items)
+        { items = Array.Empty<VbsVariant>(); return false; }
+    }
+
+    private sealed class VbsFormControlObject : IVbsDispatchObject
+    {
+        private readonly DomElement _control;
+        private readonly BrowserCanvas _canvas;
+        public VbsFormControlObject(DomElement control, BrowserCanvas canvas)
+        {
+            _control = control;
+            _canvas = canvas;
+        }
+        public string VbsTypeName => "FormControl";
+
+        public bool TryGetMember(string name, out VbsVariant value)
+        {
+            if (name.Equals("value", StringComparison.OrdinalIgnoreCase))
+            {
+                string text = _control.TagName == "textarea"
+                    ? _control.InnerText
+                    : _control.GetAttrOrDefault("value", "");
+                value = VbsVariant.Of(text);
+                return true;
+            }
+            value = default;
+            return false;
+        }
+
+        public bool TrySetMember(string name, VbsVariant value)
+        {
+            if (!name.Equals("value", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string text = value.Type is VbVarType.Null or VbVarType.Empty
+                ? ""
+                : value.ToStringVariant();
+            if (_control.TagName == "textarea")
+            {
+                foreach (var child in _control.Children.ToList())
+                    _control.RemoveChild(child);
+                _control.AppendChild(new DomText(text));
+            }
+            else
+            {
+                _control.SetAttr("value", text);
+            }
+            _canvas.RequestRerender();
+            return true;
+        }
+
+        public bool TryInvoke(string name, VbsVariant[] args, out VbsVariant result)
+        { result = default; return false; }
+        public bool TryGetDefault(out VbsVariant value) { value = default; return false; }
+        public bool TrySetDefault(VbsVariant value) => false;
+        public bool TryInvokeDefault(VbsVariant[] args, out VbsVariant result)
+        { result = default; return false; }
+        public bool TryEnumerate(out IEnumerable<VbsVariant> items)
+        { items = Array.Empty<VbsVariant>(); return false; }
     }
 
     public virtual void CloseHostWindow()
@@ -892,7 +1232,8 @@ public class BrowserCanvas : SKGLControl
     /// </summary>
     private static class PromptDialog
     {
-        public static string? Show(IWin32Window? owner, string message, string defaultValue)
+        public static string? Show(IWin32Window? owner, string message, string defaultValue,
+                                   string title)
         {
             string? result = null;
 
@@ -903,7 +1244,7 @@ public class BrowserCanvas : SKGLControl
 
             using var form = new Form
             {
-                Text = "Retro96 — JavaScript prompt",
+                Text = title,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MinimizeBox = false,
                 MaximizeBox = false,
@@ -1377,6 +1718,11 @@ public class BrowserCanvas : SKGLControl
 
     internal void PrepareJavaAppletsAsync(DomDocument document)
     {
+        if (!BrowserRuntime.JavaAppletsEnabled)
+        {
+            _javaApplets.StopPage();
+            return;
+        }
         if (_resourceLoader == null) return;
         _ = _javaApplets.PreparePageAsync(document, _resourceLoader);
     }
@@ -6393,6 +6739,7 @@ public class BrowserCanvas : SKGLControl
 
     private void SendJavaAppletInput(DomElement element, LayoutBox box, Retro96.Engine.Java.JavaInput input)
     {
+        if (!BrowserRuntime.JavaAppletsEnabled) return;
         try { _javaApplets.DispatchInput(element, box, input); RequestRerender(); }
         catch (Exception ex) { Retro96.DebugLog.WriteException("JavaAppletInput", ex); }
     }
@@ -9051,12 +9398,7 @@ public class BrowserCanvas : SKGLControl
             if (trimmedHref.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase))
             {
                 if (!BrowserRuntime.VbScriptEnabled) return;
-                try
-                {
-                    string vbSource = trimmedHref[9..];
-                    js?.ExecuteString(VbScriptTranslator.Translate(vbSource));
-                }
-                catch { }
+                RunVbsScript(document, trimmedHref[9..]);
                 return;
             }
 
@@ -9925,8 +10267,8 @@ public class BrowserCanvas : SKGLControl
         if (trimmedHref.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase))
         {
             if (!BrowserRuntime.VbScriptEnabled) return;
-            try { _jsInterpreter?.ExecuteString(VbScriptTranslator.Translate(trimmedHref[9..])); }
-            catch { }
+            if (_document != null)
+                RunVbsScript(_document, trimmedHref[9..]);
             return;
         }
 

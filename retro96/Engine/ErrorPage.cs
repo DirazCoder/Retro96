@@ -18,18 +18,18 @@ public static class ErrorPage
     private static string Footer => @"
 <table width=""100%"" cellpadding=""0"" cellspacing=""0"" border=""0"">
 <tr>
-  <td align=""left""><font face=""Arial,Helvetica"" size=""+1"" color=""#808080"">
-    &copy; 2026 Retro96 Project
+  <td align=""left""><font face=""Arial,Helvetica"" size=""-1"" color=""#808080"">
+    &copy; DirazCoder 2026
   </font></td>
-  <td align=""right""><font face=""Arial,Helvetica"" size=""+1"" color=""#808080"">
+  <td align=""right""><font face=""Arial,Helvetica"" size=""-1"" color=""#808080"">
     <a href=""retro96://home"">Home</a>
   </font></td>
 </tr>
 </table>";
 
     // NOTE: The page uses a 100%x100% table to perfectly vertically and 
-    // horizontally centre the dialog. The dialog itself is wider (820px) and 
-    // uses nested tables for correct 1996-era cellular padding.
+    // horizontally centre the compact dialog using nested tables for a
+    // 1996-era raised-window appearance.
     //
     // WARNING: All emoji and astral-plane symbols (e.g. &#9888; &#9201; &#8635;
     // &#9733;) have been removed. They postdate the Unicode 1.1 / 2.0 era and 
@@ -43,21 +43,21 @@ public static class ErrorPage
 <tr>
   <td align=""center"" valign=""middle"">
     
-    <table bgcolor=""#c0c0c0"" border=""2"" cellpadding=""1"" cellspacing=""0"" width=""820"" style=""border-style:outset"">
+    <table bgcolor=""#c0c0c0"" border=""2"" cellpadding=""1"" cellspacing=""0"" width=""640"" style=""border-style:outset"">
     <tr><td>
       <table bgcolor=""#ffffff"" border=""2"" cellpadding=""0"" cellspacing=""0"" width=""100%"" style=""border-style:inset"">
         
         <tr><td bgcolor=""{titleColor}"">
-          <table width=""100%"" cellpadding=""10"" cellspacing=""0"" border=""0"">
+          <table width=""100%"" cellpadding=""6"" cellspacing=""0"" border=""0"">
           <tr>
-            <td align=""left""><font color=""#ffffff"" size=""+3"" face=""Arial,Helvetica""><b>{EscapeHtml(titleText)}</b></font></td>
-            <td align=""right""><font color=""#c0c0c0"" size=""+1"" face=""Arial,Helvetica""><b>Retro96</b></font></td>
+            <td align=""left""><font color=""#ffffff"" size=""+2"" face=""Arial,Helvetica""><b>{EscapeHtml(titleText)}</b></font></td>
+            <td align=""right""><font color=""#c0c0c0"" size=""-1"" face=""Arial,Helvetica""><b>Retro96</b></font></td>
           </tr>
           </table>
         </td></tr>
         
         <tr><td>
-          <table width=""100%"" cellpadding=""32"" cellspacing=""0"" border=""0"">
+          <table width=""100%"" cellpadding=""16"" cellspacing=""0"" border=""0"">
           <tr><td align=""left"" valign=""top"">
           <font face=""Arial,Helvetica"" size=""+1"">
 {bodyContent}
@@ -80,11 +80,11 @@ public static class ErrorPage
 
     // Big, friendly 1996-style warning banner used at the top of each error.
     private static string WarningBanner(string title, string subtitle, string bg, string border, string fg) => $@"
-<table bgcolor=""{bg}"" border=""2"" bordercolor=""{border}"" cellpadding=""14"" cellspacing=""0"" width=""100%"" style=""border-style:outset"">
+<table bgcolor=""{bg}"" border=""2"" bordercolor=""{border}"" cellpadding=""8"" cellspacing=""0"" width=""100%"" style=""border-style:outset"">
 <tr><td>
   <table cellpadding=""0"" cellspacing=""0"" border=""0"">
   <tr>
-    <td width=""40"" align=""center""><font color=""{fg}"" size=""+4"" face=""Arial,Helvetica""><b>!</b></font></td>
+    <td width=""28"" align=""center""><font color=""{fg}"" size=""+3"" face=""Arial,Helvetica""><b>!</b></font></td>
     <td>
       <font color=""{fg}"" face=""Arial,Helvetica""><b><span style=""font-size:larger"">{EscapeHtml(title)}</span></b></font><br>
       <font color=""{fg}"" size=""+1"" face=""Arial,Helvetica"">{EscapeHtml(subtitle)}</font>

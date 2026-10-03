@@ -1,3 +1,5 @@
+using System.Drawing;
+
 namespace Retro96;
 
 public partial class Form1
@@ -51,10 +53,122 @@ public partial class Form1
 
     private void ShowAboutDialog()
     {
-        MessageBox.Show(this,
-            "Retro96\n\nA 1996-era HTML 3.2 / CSS1 / ES3 browser engine.\n\n" +
-            "Engine version " + typeof(Form1).Assembly.GetName().Version?.ToString() +
-            "\n\nBuilt-in tools include the DOM inspector, cache controls, browser data management, and plugin support.",
-            "About Retro96", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        using var dialog = new Form
+        {
+            Text = "About Retro96",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            ClientSize = new Size(440, 500),
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false
+        };
+
+        using Stream? logoStream = typeof(Form1).Assembly.GetManifestResourceStream("Retro96.assets.logo.png");
+        if (logoStream == null)
+            throw new InvalidOperationException("The embedded Retro96 logo resource was not found.");
+        using var decodedLogo = System.Drawing.Image.FromStream(logoStream);
+        var logo = new Bitmap(decodedLogo);
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 6,
+            Padding = new Padding(24, 20, 24, 16)
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 190));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+
+        var logoView = new PictureBox
+        {
+            Image = logo,
+            SizeMode = PictureBoxSizeMode.Zoom,
+            Size = new Size(190, 170),
+            Anchor = AnchorStyles.None,
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        dialog.Disposed += (_, _) => logo.Dispose();
+        layout.Controls.Add(logoView, 0, 0);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Retro96",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = new Font(Font.FontFamily, 18, FontStyle.Bold),
+            AutoSize = true,
+            Margin = new Padding(0, 4, 0, 12)
+        }, 0, 1);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "A hand-built browser for the web as it was in 1996, with classic HTML and CSS, JavaScript and VBScript, and a built-in Java applet runtime. Made for exploring the early web and keeping its sites working.",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.TopCenter,
+            Font = Font,
+            Margin = new Padding(4, 8, 4, 12)
+        }, 0, 2);
+
+        var repositoryLink = new LinkLabel
+        {
+            Text = "https://github.com/DirazCoder/Retro96",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            AutoSize = true,
+            Margin = new Padding(0, 4, 0, 8)
+        };
+        repositoryLink.LinkClicked += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(repositoryLink.Text)
+                {
+                    UseShellExecute = true
+                })?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Could not open the Retro96 repository in your default browser.\n\n{ex.Message}",
+                    "Retro96", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+        layout.Controls.Add(repositoryLink, 0, 3);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "© DirazCoder 2026",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = SystemColors.GrayText,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 8)
+        }, 0, 4);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false
+        };
+        var closeButton = new Button
+        {
+            Text = "Close",
+            DialogResult = DialogResult.OK,
+            AutoSize = true,
+            Anchor = AnchorStyles.Right
+        };
+        buttons.Controls.Add(closeButton);
+        layout.Controls.Add(buttons, 0, 5);
+
+        dialog.Controls.Add(layout);
+        dialog.AcceptButton = closeButton;
+        dialog.CancelButton = closeButton;
+        dialog.ShowDialog(this);
     }
 }

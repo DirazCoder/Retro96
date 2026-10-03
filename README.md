@@ -1,12 +1,12 @@
 # Retro96
 
-A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way it looked in 1996. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, DOM-0 scripting, the whole cursed thing. And it runs Java applets, off its own from-scratch JVM.
+A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way it looked in 1996. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, DOM-0 scripting, the whole cursed thing. It includes its own VBScript 1.0 engine and runs Java applets on a from-scratch JVM.
 
 Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This project alone is around 88K lines (entire codebase repo if you count every file) — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), a JDK 1.1 bytecode interpreter for Java applets, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** The repository currently contains about 84K tracked text lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -40,7 +40,9 @@ Modern browsers in quirks mode still "helpfully" fix things they shouldn't touch
 
 ### DOM-0 scripting that isn't dead
 
-`document.formName.fieldName`. `window.status`. The live clock JavaScript that was on every personal homepage in 1999. The Bravenet counter. The guestbook form. Chrome renders these pages and the scripts just don't run. The clock is frozen. The counter shows `sw=undefined`. Retro96 actually implements the DOM the way it worked then so the scripts actually run. wild concept
+`document.formName.fieldName`. `window.status`. The live clock JavaScript that was on every personal homepage in 1999. The Bravenet counter. The guestbook form. Retro96 implements the era's DOM-0 scripting and includes a separate VBScript 1.0 engine for classic `<script language="VBScript">` pages. wild concept
+
+The VBScript engine is a native parser and interpreter, not a VBScript-to-JavaScript translator. It supports classic procedures and functions, Variants, arrays, runtime error handling, and common intrinsic functions. Each document uses a persistent session so procedures and globals can be shared between VBScript blocks, and browser event handlers can call VBScript procedures. Browser-hosted scripts use browser dialogs and named document/form controls; Windows Script Host objects are intentionally not exposed to pages.
 
 ---
 
@@ -62,9 +64,9 @@ What a plugin can touch, gated behind explicit manifest permissions: reading and
 
 ### Java applets
 
-Retro96 runs Java applets. It does not have a JVM. There's no `java.exe` behind the curtain and no JRE to install. `Engine/Java/` is about 8,000 lines of C# that parse `.class` files and execute the bytecode directly, with the `java.*` classes an applet expects written from scratch underneath. Yes, really. I wrote a JVM to make a 1996 scrolling-text banner work
+Retro96 runs Java applets. It does not have an external JVM. There's no `java.exe` behind the curtain and no JRE to install. `Engine/Java/` is about 7,800 lines of C# that parse `.class` files and execute the bytecode directly, with the `java.*` classes an applet expects written from scratch underneath. Yes, really. I wrote a JVM to make a 1996 scrolling-text banner work
 
-The target is JDK 1.0/1.1 and it's strict about it. The class-file parser takes major version 45 (minor 0-3) and nothing else. Hand it a 1.2+ `.class` and you get a clear "unsupported class version" error instead of half-running it and doing something weird. That's on purpose. A 1996 page shipped 1.0/1.1 bytecode, so that's all it has to be right about. Compiling your own? `javac -target 1.1`.
+The bytecode/class-file target is Java 1.0/1.1: the parser accepts class-file version 45.0 through 45.3. Alongside that period-correct core, the built-in runtime deliberately includes selected later library/API conveniences needed by some later retro applets (for example `StringBuilder` and selected later exception types). That compatibility does not mean newer class-file formats are accepted: Java 1.2+ `.class` files are rejected with an explicit unsupported-version error. Compiling an applet for this interpreter? Target Java 1.1 bytecode.
 
 Applets load the way they did back then, through any of three tags:
 
@@ -95,14 +97,16 @@ Applets are painted into the page like any other replaced element, and mouse and
 
 Some of this is unfinished. Some is on purpose. Better to know up front.
 
-- **No 1.2+ bytecode.** Covered above. That also rules out Swing and the collections framework.
+- **No 1.2+ bytecode.** Covered above. Selected later runtime APIs are provided for compatibility, but Java 1.2+ class-file formats, Swing, and the collections framework are not supported.
 - **No sound.** `getAudioClip()` hands back an object and `AudioClip.play()` returns without playing anything. The methods exist so applets that call them don't crash. They're just silent.
 - **No JavaScript-to-applet scripting.** No LiveConnect. `document.myApplet.someMethod()` from a page script can't reach into the applet. DOM-0 named access covers forms and images, not applets.
 - **No applet-to-applet talking.** `AppletContext.getApplet()` returns null and `getApplets()` returns an empty enumeration, so applets on the same page can't find each other.
 - **Barely any `java.io` or `java.net`.** `URL`, `PrintStream` and the common exceptions exist. No streams, no sockets. An applet that phones home over a raw socket won't work.
 - **`SecurityManager` is a stub.** `checkPermission` does nothing. The actual protection is elsewhere: an applet from a remote page can never touch the local disk, and `file:` resources are only reachable when the page itself was loaded from `file:`.
 
-The Java side has its own tests in `tests/RetroTests/JavaEngineTests.cs`, 49 of them, covering class-file parsing, opcode behavior, the `java.*` natives, `Graphics` pixel output, and full click-to-`paint()` input dispatch. Hand-compiled `.class` fixtures live in `tests/html-websites/java/` and `retro96/assets/java-fixtures/`. `tests/html-websites/java/applet-test.html` is the page to load first.
+The Java side has dedicated tests in `tests/RetroTests/JavaEngineTests.cs`, covering class-file parsing, opcode behavior, the `java.*` natives, `Graphics` pixel output, and full click-to-`paint()` input dispatch. Hand-compiled `.class` fixtures live in `tests/html-websites/java/` and `retro96/assets/java-fixtures/`. `tests/html-websites/java/applet-test.html` is the page to load first.
+
+VBScript has a separate focused regression suite in `tests/VbsTests/`. It can be disabled independently in Preferences and is disabled in High trust mode.
 
 ---
 
@@ -125,11 +129,11 @@ here's what actually happened under the hood:
 
 **layout engine** — the Rust version had one function that did everything. every element, regardless of what it was, got stacked vertically with a hardcoded `current_y += height + 10.0`. that's it. that's the layout engine. ten pixels. between everything. always. framesets returned an empty node. inline layout didn't exist as a concept. Retro96 has `InlineLayout.cs`, `TableLayout.cs`, `LayoutEngine.cs` — actual separate layout passes, actual inline text flow, actual table column width resolution
 
-**CSS parser** — the Rust one had about 11 property matches across 657 lines. Retro96 has an 837-line parser, a 1,294-line computed style system, an 847-line style resolver, and a 411-line selector engine. these are different things that do different things
+**CSS parser** — the Rust version's parser handled only a small set of properties. Retro96 currently has a 741-line parser, a 1,170-line computed style system, a 774-line style resolver, and a 364-line selector engine. these are different things that do different things
 
-**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is one 2,442-line file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, scope — 7,331 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is 2,141 lines on its own
+**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is a single large file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, and scope — currently 7,127 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is currently 1,977 lines on its own
 
-**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 has 204 xUnit facts, 30 live JS contract checks against real pages, 54 hand-authored QA HTML files, a layout lab, and a Playwright visual diff harness that renders pages side-by-side against Chromium and diffs them pixel by pixel. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
+**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 currently has 226 xUnit facts and 6 theory cases in `RetroTests`, plus 23 focused VBScript xUnit tests; the live JS page harness contains 29 contract assertions. There are 54 hand-authored QA HTML files, a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
 
 **real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
 
@@ -153,11 +157,11 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project is roughly 29k lines. Retro96 is roughly 88k. one of them works
+the Rust project was much smaller. Retro96 currently has about 84K tracked text lines. one of them works
 
 ## Status
 
-Side project built for fun, not production software. The engine has a full regression suite (204 xUnit facts, 30 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium).
+Side project built for fun, not production software. The test sources currently define 255 xUnit cases across the main and focused VBScript suites (226 facts, 6 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract assertions. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for the selected pages in `tests/html-websites/` and `testdata/`.
 
 ## Rendering stack
 
@@ -173,14 +177,16 @@ retro96/             the engine + WinForms shell (net11.0-windows)
     Drawing/          SkiaSharp-backed drawing primitives
     Forms/            form submission, hit-testing
     Html/             HTML tokenizer + parser
-    Java/             JDK 1.1 class-file parser, bytecode interpreter, java.* natives, AWT
+    Java/             Java 1.0/1.1 bytecode interpreter + selected later runtime APIs, AWT
     Js/               hand-written ES3 lexer/parser/interpreter + DOM bindings
+    Vbs/              native VBScript 1.0 lexer/parser/interpreter + runtime
     Layout/           block/inline/table layout engine
     Network/          HTTP client, cookies, URL parsing, frame loading
     Plugins/          plugin host, .r96p loading, sandbox worker + broker protocol
     Render/           renderer, font/image caches, glyph substitution
 tests/
   RetroTests/         xUnit regression suite (engine, JS, DOM, forms, frames, CSS1)
+  VbsTests/           focused VBScript 1.0 semantic regression suite
   JsPageTests/        live script-contract checks against real pages
   LayoutLab/          layout laboratory + PageProbe (renders a page, dumps diagnostics)
   VisualDiff/         Retro96-vs-Chromium pixel/geometry diff harness (Playwright)
@@ -204,6 +210,7 @@ dotnet build -p:EnableWindowsTargeting=true
 
 ```
 cd tests/RetroTests  && dotnet test      # engine/JS/DOM/forms/frames + CSS1 regressions
+cd tests/VbsTests    && dotnet test      # VBScript 1.0 semantics
 cd tests/JsPageTests && dotnet run       # live script-contract checks
 cd tests/LayoutLab   && dotnet run       # layout lab, all checks
 ```

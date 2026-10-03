@@ -55,15 +55,19 @@ public static class BrowserRuntime
 
     public static bool ImagesEnabled => Settings.LoadImages;
     public static bool JavaScriptEnabled => Settings.EnableJavaScript;
+    public static bool ScriptingEnabled => JavaScriptEnabled || VbScriptEnabled;
     public static bool JavaScriptTimersEnabled => Settings.EnableJavaScript && Settings.EnableJavaScriptTimers;
-    public static bool JavaScriptDialogsEnabled => Settings.EnableJavaScript && Settings.EnableJavaScriptDialogs;
+    public static bool JavaScriptDialogsEnabled => ScriptingEnabled && Settings.EnableJavaScriptDialogs;
     /// <summary>
     /// VBScript is a legacy execution surface. It is completely disabled in
     /// High trust mode and available in Medium/Low when scripting itself is
     /// enabled. All execution paths consult this single policy gate.
     /// </summary>
     public static bool VbScriptEnabled =>
-        Settings.EnableJavaScript && Settings.TrustMode != TrustMode.High;
+        Settings.EnableVBScript && Settings.TrustMode != TrustMode.High;
+    /// <summary>Java applets are disabled in High trust mode.</summary>
+    public static bool JavaAppletsEnabled =>
+        Settings.EnableJavaApplets && Settings.TrustMode != TrustMode.High;
     public static bool CookiesEnabled => Settings.EnableCookies;
     public static bool ReferrerEnabled => Settings.SendReferrer;
     public static bool RedirectsEnabled => Settings.FollowHttpRedirects;

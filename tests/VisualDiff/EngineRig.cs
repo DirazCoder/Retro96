@@ -121,7 +121,7 @@ public sealed class EngineRig
         interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, state);
 
         var doc = HtmlParser.Parse(html, parsedUrl, _cookies,
-            (d, src) => RunInlineScript(d, src, interpreter, state));
+            (d, src, _) => RunInlineScript(d, src, interpreter, state));
 
         // Post-parse re-registration (pages without scripts still see
         // document/window) — then onload, exactly as Form1 does.
@@ -272,7 +272,7 @@ public sealed class EngineRig
             var loadTask = FrameLoader.LoadAsync(parentUrl.ToAbsolute(), src,
                 Math.Max(1, (int)frameBox.Width), Math.Max(1, (int)frameBox.Height),
                 _http, _cookies, System.Threading.CancellationToken.None,
-                (d, s) => RunInlineScript(d, s, frameInterpreter, frameState));
+                (d, s, _) => RunInlineScript(d, s, frameInterpreter, frameState));
             var swFrame = System.Diagnostics.Stopwatch.StartNew();
             bool loaded = loadTask.Wait(12000);
             swFrame.Stop();

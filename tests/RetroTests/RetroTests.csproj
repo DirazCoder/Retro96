@@ -102,5 +102,6 @@
     <Compile Include="NamedBugHeadlessTests.cs" />
     <Compile Include="ExtendedCorpusRegressionTests.cs" />
     <Compile Include="ScratchDiag.cs" />
+    <Compile Include="UserSettingsTests.cs" />
   </ItemGroup>
 </Project>

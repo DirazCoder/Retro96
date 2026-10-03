@@ -237,7 +237,7 @@ Console.WriteLine("\n=== noscript gate ===");
 {
     string page = "<html><body><noscript><img src=\"counter.gif\"></noscript></body></html>";
     var withJs = HtmlParser.Parse(page, null, new Retro96.Engine.Network.CookieStore(),
-        (d, s) => "");
+        (d, s, _) => "");
     StyleResolver.Resolve(withJs, 640);
     var ns = withJs.ElementDescendants().First(e => e.TagName == "noscript");
     Check("noscript hidden when scripting enabled",

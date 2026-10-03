@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Globalization;
 using System.Windows.Forms;
 using Retro96.Plugins;
 
@@ -18,8 +19,11 @@ internal sealed class PreferencesDialog : Form
     private readonly RadioButton _forcedBg = new();
     private readonly TextBox _bgHex = new();
     private readonly Button _pickBg = new();
+    private readonly ComboBox _defaultPageZoom = new();
     private readonly CheckBox _images = new();
     private readonly CheckBox _javascript = new();
+    private readonly CheckBox _vbscript = new();
+    private readonly CheckBox _javaApplets = new();
     private readonly CheckBox _highDpiScaleMode = new();
     private readonly CheckBox _scriptWindows = new();
     private readonly TrackBar _trust = new();
@@ -95,6 +99,15 @@ internal sealed class PreferencesDialog : Form
 
         ok.Click += (_, _) =>
         {
+            if (!UserSettings.TryNormalizeSearchTemplate(_search.Text, out _))
+            {
+                MessageBox.Show(this,
+                    "The search URL must include a query placeholder: %s, {query}, or {searchTerms}.",
+                    "Invalid search URL", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _search.Focus();
+                return;
+            }
+
             // Do not give the button a DialogResult: WinForms may close the
             // modal form as part of the button activation before a later Click
             // subscriber gets a chance to copy the edited controls. Explicitly
@@ -149,26 +162,34 @@ internal sealed class PreferencesDialog : Form
             new Label { Text = "Example: https://www.frogfind.com/?q=%s", AutoSize = true, ForeColor = SystemColors.GrayText }
         }));
 
-        ConfigureCheckBox(_javascript, "Enable JavaScript");
         ConfigureCheckBox(_scriptWindows, "Allow scripted pop-ups and new windows");
         ConfigureCheckBox(_images, "Load images from web pages");
 
         panel.Controls.Add(Group("Page behaviour", new Control[]
         {
-            _javascript,
             _scriptWindows,
             _images
         }));
 
+        _defaultPageZoom.DropDownStyle = ComboBoxStyle.DropDownList;
+        _defaultPageZoom.Width = 140;
+        _defaultPageZoom.Items.AddRange(new object[] { "100%", "125%", "150%", "200%" });
         ConfigureCheckBox(_highDpiScaleMode, "Enable Windows Per-Monitor V2 high-DPI scaling (recommended)");
         panel.Controls.Add(Group("Display scaling", new Control[]
         {
+            new Label { Text = "Default page zoom", AutoSize = true },
+            _defaultPageZoom,
+            new Label
+            {
+                Text = "Sets the starting zoom for web pages. Use the toolbar or View menu to adjust the current page; the selected default is used again after restarting Retro96.",
+                AutoSize = false, Width = 690, Height = 38,
+                ForeColor = Color.FromArgb(90, 96, 104)
+            },
             _highDpiScaleMode,
             new Label
             {
-                Text = "When enabled, Retro96 uses PerMonitorV2 DPI awareness so the browser UI and rendering scale correctly across monitors. " +
-                       "The setting is saved immediately but requires restarting Retro96 because Windows selects the process DPI context at startup.",
-                AutoSize = false, Width = 690, Height = 44,
+                Text = "Per-Monitor V2 follows Windows display scaling when moving Retro96 between monitors. Changing this Windows DPI-awareness mode requires restarting Retro96.",
+                AutoSize = false, Width = 690, Height = 38,
                 ForeColor = Color.FromArgb(90, 96, 104)
             }
         }));
@@ -342,7 +363,7 @@ internal sealed class PreferencesDialog : Form
             _discardState,
             new Label
             {
-                Text = "Website JavaScript has no .NET/System.IO/Process/Reflection API exposed to it. " +
+                Text = "Page scripts are not given .NET, file, process, or reflection APIs; browser-host VBScript also denies CreateObject/GetObject. " +
                        "High and Medium modes additionally reject page-directed file resources and keep image downloads host-mediated.",
                 AutoSize = false, Width = 690, Height = 78, ForeColor = Color.FromArgb(75, 84, 96)
             }
@@ -381,12 +402,22 @@ internal sealed class PreferencesDialog : Form
                 "Disable to keep form controls usable but block GET/POST submission."),
         }));
 
-        panel.Controls.Add(Group("JavaScript", new Control[]
+        panel.Controls.Add(Group("Scripting", new Control[]
         {
+            AdvancedToggle(_javascript, "Enable JavaScript",
+                "Controls JavaScript script blocks. VBScript can be enabled independently with the setting below."),
+            AdvancedToggle(_vbscript, "Enable VBScript",
+                "Disable to prevent VBScript blocks and event procedures from running. High trust mode always blocks VBScript."),
             AdvancedToggle(_jsTimers, "Run JavaScript timers (setTimeout / setInterval)",
                 "Disable to keep JavaScript enabled while stopping scheduled script callbacks."),
-            AdvancedToggle(_jsDialogs, "Allow JavaScript alert / confirm / prompt dialogs",
-                "Disable to suppress script-created modal dialogs."),
+            AdvancedToggle(_jsDialogs, "Allow script dialogs (JavaScript alert / confirm / prompt; VBScript MsgBox / InputBox)",
+                "Disable to suppress modal dialogs requested by either scripting engine."),
+        }));
+
+        panel.Controls.Add(Group("Java", new Control[]
+        {
+            AdvancedToggle(_javaApplets, "Enable Java applets",
+                "Runs Java 1.0/1.1 bytecode plus selected later runtime APIs in Retro96's built-in interpreter (no external JRE). High trust mode always blocks applets."),
         }));
 
         panel.Controls.Add(Group("Networking", new Control[]
@@ -538,8 +569,11 @@ internal sealed class PreferencesDialog : Form
         _bgHex.Text = _settings.ForcedBackgroundColor;
         _images.Checked = _settings.LoadImages;
         _javascript.Checked = _settings.EnableJavaScript;
+        _vbscript.Checked = _settings.EnableVBScript;
+        _javaApplets.Checked = _settings.EnableJavaApplets;
         _scriptWindows.Checked = _settings.AllowScriptedWindows;
         _highDpiScaleMode.Checked = _settings.HighDpiScaleMode;
+        _defaultPageZoom.SelectedItem = $"{_settings.DefaultPageZoomPercent}%";
         // Clamp: a corrupt/hand-edited settings file with an out-of-range enum
         // value would otherwise throw when assigned to the TrackBar.
         _trust.Value = Math.Clamp((int)_settings.TrustMode, _trust.Minimum, _trust.Maximum);
@@ -576,8 +610,15 @@ internal sealed class PreferencesDialog : Form
         target.ForcedBackgroundColor = NormalizeHex(_bgHex.Text);
         target.LoadImages = _images.Checked;
         target.EnableJavaScript = _javascript.Checked;
+        target.EnableVBScript = _vbscript.Checked;
+        target.EnableJavaApplets = _javaApplets.Checked;
         target.AllowScriptedWindows = _scriptWindows.Checked;
         target.HighDpiScaleMode = _highDpiScaleMode.Checked;
+        target.DefaultPageZoomPercent = int.TryParse(
+            Convert.ToString(_defaultPageZoom.SelectedItem)?.TrimEnd('%'),
+            NumberStyles.Integer, CultureInfo.InvariantCulture, out int zoomPercent)
+            ? zoomPercent
+            : 100;
         target.TrustMode = (TrustMode)Math.Clamp(_trust.Value, 0, 2);
         target.HostCheckImages = _hostImageCheck.Checked || target.TrustMode == TrustMode.High;
         target.DiscardPageStateOnClose = _discardState.Checked;
@@ -647,24 +688,25 @@ internal sealed class PreferencesDialog : Form
                 _trustDetails.Text =
                     "No page-directed file access. No Process/IO/Reflection capability. " +
                     "Images stay host-mediated and checked before decode; scripted new windows are blocked. " +
-                    "Child processes are blocked and the worker is Job-object isolated. VBScript is disabled entirely. 8 MiB image ceiling.";
+                    "Child processes are blocked and the worker is Job-object isolated. VBScript and Java applets are blocked regardless of their Advanced settings. 8 MiB image ceiling.";
                 break;
             case TrustMode.Medium:
                 _trustTitle.Text = "Medium — balanced";
                 _trustDetails.Text =
                     "Still denies page-directed local file access and keeps all site networking/image fetching in the host broker. " +
-                    "Scripted windows and VBScript are allowed when JavaScript is enabled, but child-process creation remains blocked. 16 MiB image ceiling.";
+                    "Scripted windows are allowed by their preference; JavaScript, VBScript, and Java applets have independent Advanced settings. Child-process creation is blocked. 16 MiB image ceiling.";
                 break;
             default:
                 _trustTitle.Text = "Low — trusted / compatibility";
                 _trustDetails.Text =
                     "Compatibility first. Page-directed file URLs/resources are allowed and network bypasses the host broker. " +
-                    "VBScript is allowed when JavaScript is enabled; the JS runtime still exposes no .NET file/process API, and the worker remains separately process-isolated. 32 MiB image ceiling.";
+                    "JavaScript, VBScript, and Java applet availability are controlled independently in Advanced. Scripts expose no .NET file/process API, and the worker remains separately process-isolated. 32 MiB image ceiling.";
                 break;
         }
         _hostImageCheck.Checked = mode == TrustMode.High || _hostImageCheck.Checked;
         _hostImageCheck.Enabled = mode != TrustMode.High;
         _scriptWindows.Enabled = mode != TrustMode.High;
+        _javaApplets.Enabled = mode != TrustMode.High;
     }
 
     private TabPage NewTab(string text) => new(text) { Padding = new Padding(14), AutoScroll = true };

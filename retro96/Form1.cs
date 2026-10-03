@@ -305,6 +305,7 @@ public partial class Form1 : Form
         BrowserRuntime.Apply(_settings);
         InitializeComponent();
         InitializeBrowser();
+        _canvas.ZoomFactor = _settings.DefaultPageZoomPercent / 100f;
         InitializeBuiltInFeatures();
         _pluginManager = new PluginManager(this);
         _httpClient.PluginRuleEvaluator = _pluginManager.EvaluateNetworkRules;
@@ -623,8 +624,11 @@ public partial class Form1 : Form
         _settings.ForcedBackgroundColor = updated.ForcedBackgroundColor;
         _settings.LoadImages = updated.LoadImages;
         _settings.EnableJavaScript = updated.EnableJavaScript;
+        _settings.EnableVBScript = updated.EnableVBScript;
+        _settings.EnableJavaApplets = updated.EnableJavaApplets;
         _settings.AllowScriptedWindows = updated.AllowScriptedWindows;
         _settings.HighDpiScaleMode = updated.HighDpiScaleMode;
+        _settings.DefaultPageZoomPercent = updated.DefaultPageZoomPercent;
         _settings.LoadStylesheets = updated.LoadStylesheets;
         _settings.LoadFrames = updated.LoadFrames;
         _settings.AllowFormSubmissions = updated.AllowFormSubmissions;
@@ -643,6 +647,7 @@ public partial class Form1 : Form
         _settings.PluginDevMode = updated.PluginDevMode;
         _settings.Save();
         BrowserRuntime.Apply(_settings);
+        _canvas.ZoomFactor = _settings.DefaultPageZoomPercent / 100f;
 
         // Preferences are live for the current page where possible.  A reload
         // is required for navigator/User-Agent, scripting and newly tightened
@@ -776,9 +781,9 @@ public partial class Form1 : Form
                         "<html><head><title>About Retro96</title></head>" +
                         "<body bgcolor=\"#c0c0c0\">" +
                         "<center><h2>Retro96 Browser</h2>" +
-                        "<p>Netscape Navigator 3.0-compatible rendering engine.</p>" +
-                        "<p><font size=\"-1\" color=\"#606060\">HTTP/1.0 · HTML 3.2 · " +
-                        "CSS1 · JavaScript 1.1/1.2 · GIF/JPEG/XBM</font></p>" +
+                        "<p>A retro browser for the web as it was in 1996, with extra compatibility for later throwback sites.</p>" +
+                        "<p><font size=\"-1\" color=\"#606060\">HTML 3.2 · CSS1 · ES3 JavaScript · " +
+                        "VBScript 1.0 · Java applets</font></p>" +
                         "</center></body></html>",
                         rawUrl, replaceHistory, myGeneration);
                     return;
@@ -1366,10 +1371,10 @@ public partial class Form1 : Form
         _jsInterpreter.RegisterRuntimeBuiltins();
 
         var document = HtmlParser.Parse(html, url, _cookieStore,
-            BrowserRuntime.JavaScriptEnabled
-                ? (doc, src) => RunInlineScript(doc, src, _jsInterpreter!, _jsState!)
+            BrowserRuntime.ScriptingEnabled
+                ? (doc, src, isVbScript) => RunInlineScript(doc, src, isVbScript, _jsInterpreter!, _jsState!)
                 : null,
-            BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+            BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
 
         return (document, _jsInterpreter, _jsState);
     }
@@ -1391,11 +1396,16 @@ public partial class Form1 : Form
         catch { return null; }
     }
 
-    private string RunInlineScript(DomDocument document, string scriptSource,
+    private string RunInlineScript(DomDocument document, string scriptSource, bool isVbScript,
                                   JsInterpreter interpreter,
                                   DocumentBindingsState state)
     {
         state.Document = document;
+        if (isVbScript)
+            return BrowserRuntime.VbScriptEnabled
+                ? _canvas.RunVbsScript(document, scriptSource, interpreter)
+                : "";
+        if (!BrowserRuntime.JavaScriptEnabled) return "";
 
         // Full DOM-0 bindings at PARSE time. The old minimal document
         // (write/writeln/title/URL only, no navigator!) meant the very
@@ -1776,10 +1786,10 @@ public partial class Form1 : Form
                     baseUrl, src,
                     (int)frameBox.Width, (int)frameBox.Height,
                     _httpClient, _cookieStore, frameCts.Token,
-                    BrowserRuntime.JavaScriptEnabled
-                        ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, frameInterpreter, frameState)
+                    BrowserRuntime.ScriptingEnabled
+                        ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, frameInterpreter, frameState)
                         : null,
-                    BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+                    BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
                 if (gen != _navGeneration) return;
 
                 if (content != null)
@@ -1864,11 +1874,15 @@ public partial class Form1 : Form
     /// above it), document.write routed to the shared state buffer the
     /// parser splices.
     /// </summary>
-    private string RunFrameScript(DomDocument document, string scriptSource,
+    private string RunFrameScript(DomDocument document, string scriptSource, bool isVbScript,
                                   JsInterpreter interpreter,
                                   DocumentBindingsState state)
     {
         state.Document = document;
+        if (isVbScript)
+            return BrowserRuntime.VbScriptEnabled
+                ? _canvas.RunVbsScript(document, scriptSource, interpreter)
+                : "";
         if (!BrowserRuntime.JavaScriptEnabled) return "";
         DomBindings.RegisterAll((JsScope)interpreter.GlobalScope!, document,
             new NavigationHistory(), _canvas, state);
@@ -2068,10 +2082,10 @@ public partial class Form1 : Form
                 content = await FrameLoader.LoadAsync(
                     baseUrl, url, frameW, frameH,
                     _httpClient, _cookieStore, frameCts.Token,
-                    BrowserRuntime.JavaScriptEnabled
-                        ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+                    BrowserRuntime.ScriptingEnabled
+                        ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                         : null,
-                    BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+                    BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
             }
             else
             {
@@ -2084,10 +2098,10 @@ public partial class Form1 : Form
                 {
                     string html = DecodeBody(s);
                     var doc = HtmlParser.Parse(html, parsed, _cookieStore,
-                        BrowserRuntime.JavaScriptEnabled
-                            ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+                        BrowserRuntime.ScriptingEnabled
+                            ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                             : null,
-                        BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+                        BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
                     if (BrowserRuntime.StylesheetsEnabled)
                         await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
                     doc.VisitedUrls.UnionWith(_visitedUrls);
@@ -2554,10 +2568,10 @@ public partial class Form1 : Form
 
         string html = DecodeBody(response);
         var doc = HtmlParser.Parse(html, responseUrl, _cookieStore,
-            BrowserRuntime.JavaScriptEnabled
-                ? (fdoc, scriptSrc) => RunFrameScript(fdoc, scriptSrc, interpreter, state)
+            BrowserRuntime.ScriptingEnabled
+                ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                 : null,
-            BrowserRuntime.JavaScriptEnabled ? LoadExternalScript : null);
+            BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
         if (BrowserRuntime.StylesheetsEnabled)
             await FetchStylesheetsAsync(doc, responseUrl, ct);
 
@@ -3072,10 +3086,10 @@ code {
 
     <p>
         Almost everything is hand-written C#. The HTML tokenizer and parser, CSS parser,
-        selector engine, style resolver, layout engine, ES3 lexer and interpreter, DOM bindings,
-        a full JDK 1.0/1.1 bytecode interpreter with hand-written java.* natives and AWT,
-        networking, the plugin sandbox &mdash; all of it. The one external dependency is SkiaSharp,
-        and that's only for putting pixels on screen.
+        selector engine, style resolver, layout engine, ES3 JavaScript and VBScript 1.0
+        interpreters, DOM bindings, a Java applet interpreter with hand-written
+        java.* natives and AWT, networking, and the plugin sandbox. SkiaSharp provides the
+        rendering surface.
     </p>
 
     <h2>What it does</h2>
@@ -3085,9 +3099,10 @@ code {
         <li>CSS1 parser, selector engine, and style resolver</li>
         <li>Block, inline, and table layout &mdash; period-accurate, no silent fixes</li>
         <li>ES3 JavaScript with DOM-0 scripting (<code>document.formName.fieldName</code>, <code>window.status</code>, live clocks)</li>
+        <li>A separate native VBScript 1.0 engine for classic VBScript blocks and event procedures</li>
         <li>Frames and nested iframes that actually load and run correctly</li>
         <li><code>&lt;blink&gt;</code>, <code>text-decoration: blink</code>, and <code>String.prototype.blink()</code></li>
-        <li>Java applets via a from-scratch JDK 1.0/1.1 bytecode interpreter &mdash; no JRE needed</li>
+        <li>Java applets via a built-in interpreter: period-correct Java 1.0/1.1 bytecode plus selected later runtime APIs for retro compatibility &mdash; no JRE needed</li>
         <li>Plugin system with sandboxed, permission-gated <code>.r96p</code> packages</li>
     </ul>
 
@@ -3095,7 +3110,7 @@ code {
 
     <ul>
         <li>HTML 4, CSS2, ES5, or anything past the late 1990s</li>
-        <li>Java 1.2+ bytecode, Swing, or the collections framework</li>
+        <li>Java 1.2+ bytecode, Swing, or the collections framework (selected later runtime APIs are supported separately)</li>
         <li>Applet sound, LiveConnect, or applet-to-applet communication</li>
         <li>macOS or Linux &mdash; see the Windows notice above</li>
     </ul>
@@ -3103,9 +3118,10 @@ code {
     <h2>Status</h2>
 
     <p>
-        There's a real regression suite: 183 xUnit tests, 29 live JS contract checks against
-        real pages, 41 hand-authored QA HTML files, and a pixel-diff harness that runs pages
-        side-by-side against Chromium. It loads actual 1996 sites. It's a side project built
+        The test sources define 255 xUnit cases across the main and focused VBScript suites
+        (226 facts, 6 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract
+        assertions and 54 hand-authored QA HTML files. There is also a layout lab and a
+        Chromium pixel-diff harness. Retro96 loads actual 1996 sites. It's a side project built
         for fun, and that's what it'll stay.
     </p>
 
