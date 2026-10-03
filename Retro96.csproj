@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Retro96</AssemblyName>
+    <RootNamespace>Retro96</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <WarningLevel>5</WarningLevel>
+  </PropertyGroup>
+  <!-- Zero NuGet packages. All functionality from BCL + System.Drawing + WinForms. -->
+</Project>
