@@ -326,6 +326,26 @@ public class JsLexer
                             _column += 3;
                             break;
                         }
+                    case >= '1' and <= '7':
+                        {
+                            // Octal escape (\1..\7, up to three digits) — valid
+                            // era JS; the old code fell through to the unknown
+                            // escape branch and emitted the bare digit.
+                            int val = esc - '0';
+                            int digits = 1;
+                            while (digits < 3 && _pos + 1 < _source.Length &&
+                                   _source[_pos + 1] >= '0' && _source[_pos + 1] <= '7')
+                            {
+                                _pos++;
+                                _column++;
+                                val = val * 8 + (_source[_pos] - '0');
+                                digits++;
+                            }
+                            sb.Append((char)val);
+                            _pos++;
+                            _column++;
+                            break;
+                        }
                     default:
                         // Unknown escape — the character itself (\q → q)
                         sb.Append(esc);
@@ -577,6 +597,9 @@ public class JsLexer
 
         return _previousToken switch
         {
+            // VALUE keywords are values — a following '/' is division.
+            // `this / 2` / `true / 2` used to be mis-lexed as regex literals.
+            JsKeywordToken { Keyword: "this" or "true" or "false" or "null" } => false,
             JsKeywordToken => true,   // return /rx/, typeof /rx/, etc.
             JsIdentifierToken or JsNumberToken or JsStringToken or JsRegexLiteralToken => false,
             JsPunctuatorToken pt => pt.Punctuator is
@@ -584,7 +607,8 @@ public class JsLexer
                 "+" or "-" or "*" or "/" or "%" or "=" or "==" or "!=" or
                 "===" or "!==" or "<" or ">" or "<=" or ">=" or
                 "&&" or "||" or "&" or "|" or "^" or "?" or ":" or
-                "<<" or ">>" or ">>>" or "+=" or "-=" or "*=" or "/=" or "%=",
+                "<<" or ">>" or ">>>" or "+=" or "-=" or "*=" or "/=" or "%=" or
+                "<<=" or ">>=" or ">>>=" or "&=" or "|=" or "^=",
             _ => false
         };
     }

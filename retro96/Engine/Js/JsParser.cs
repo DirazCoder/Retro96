@@ -50,7 +50,9 @@ public class JsParser
     // Token helpers
     // ─────────────────────────────────────────────────────────────────────
 
-    private JsToken Peek() => _tokens[Math.Min(_position, _tokens.Count - 1)];
+    private JsToken Peek() => _tokens.Count == 0
+        ? new JsEofToken(0, 1, 1, false)
+        : _tokens[Math.Min(_position, _tokens.Count - 1)];
     private JsToken? PeekNext()
     {
         int n = _position + 1;
@@ -623,7 +625,10 @@ public class JsParser
                 left = new BinaryExpr(pt.Punctuator, left, ParseShift());
                 continue;
             }
-            if (allowIn && CheckKeyword("instanceof"))
+            // The for-init noIn flag restricts ONLY the 'in' operator —
+            // `for (a instanceof B; …)` used to fail parsing because
+            // instanceof was gated by allowIn too.
+            if (CheckKeyword("instanceof"))
             {
                 Advance();
                 left = new InstanceofExpr(left, ParseShift());
@@ -760,30 +765,14 @@ public class JsParser
     /// <summary>
     /// new a.b.C(x, y) — parse the constructor as a member chain (dots
     /// only, no calls), then the argument list.  `new Date` without
-    /// parentheses is also legal.
+    /// parentheses is also legal.  The callee may itself be another new
+    /// expression (`new new Foo()` used to be a parse error).
     /// </summary>
     private Expr ParseNew()
     {
         ExpectKeyword("new");
 
-        Expr callee = ParsePrimary();
-        while (true)
-        {
-            if (CheckPunct("."))
-            {
-                Advance();
-                var id = ExpectIdentifier("identifier after '.'");
-                callee = new MemberExpr(callee, id, Computed: false);
-            }
-            else if (CheckPunct("["))
-            {
-                Advance();
-                var property = ParseExpression();
-                ExpectPunct("]");
-                callee = new MemberExpr(callee, property, Computed: true);
-            }
-            else break;
-        }
+        Expr callee = ParseNewCallee();
 
         var args = new List<Expr>();
         if (CheckPunct("("))
@@ -803,6 +792,34 @@ public class JsParser
 
         // The result is a value: calls and member access chain onto it
         return ParseCallMemberTail(newExpr);
+    }
+
+    /// <summary>Callee of a new-expression: a member chain, or ANOTHER
+    /// new expression (new new Foo()).</summary>
+    private Expr ParseNewCallee()
+    {
+        if (CheckKeyword("new"))
+            return ParseNew();
+
+        Expr callee = ParsePrimary();
+        while (true)
+        {
+            if (CheckPunct("."))
+            {
+                Advance();
+                var id = ExpectIdentifier("identifier after '.'");
+                callee = new MemberExpr(callee, id, Computed: false);
+            }
+            else if (CheckPunct("["))
+            {
+                Advance();
+                var property = ParseExpression();
+                ExpectPunct("]");
+                callee = new MemberExpr(callee, property, Computed: true);
+            }
+            else break;
+        }
+        return callee;
     }
 
     private Expr ParsePrimary()

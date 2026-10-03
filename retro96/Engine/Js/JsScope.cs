@@ -32,6 +32,10 @@ public class JsScope
     /// Get a variable by walking up the scope chain.  Unresolved names
     /// consult the root's global fallback (window) before giving up —
     /// period scripts probe for optional globals and call alert() bare.
+    /// The fallback is checked BEFORE the root's own dictionary so a direct
+    /// window.foo write (which bypasses the scope) stays authoritative for
+    /// both bare and window-qualified reads; scope writes keep the two in
+    /// sync anyway (see Set/Define).
     /// </summary>
     public JsValue Get(string name)
     {
@@ -99,7 +103,7 @@ public class JsScope
             if (scope._vars.ContainsKey(name))
                 return true;
             if (scope.Parent == null)
-                return scope._vars.ContainsKey(name) || (scope.GlobalFallback != null && scope.GlobalFallback.Has(name));
+                return scope.GlobalFallback != null && scope.GlobalFallback.Has(name);
             scope = scope.Parent;
         }
         return false;

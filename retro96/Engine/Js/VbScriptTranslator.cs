@@ -9,25 +9,31 @@ namespace Retro96.Engine.Js;
 /// Small, deterministic VBScript-to-JavaScript 1.2 compatibility bridge for
 /// the browser's 1996-era scripting surface.  It intentionally implements the
 /// syntax used by legacy web pages (Dim/Const, Sub/Function, If/Else,
-/// For/While, Call, Set, common string/conversion functions, MsgBox/InputBox,
-/// and VB boolean/string operators) and emits only syntax understood by the
-/// existing in-process JS interpreter.
+/// For/While/Do, Select Case, Call, Set, common string/conversion functions,
+/// MsgBox/InputBox, and VB boolean/string operators) and emits only syntax
+/// understood by the existing in-process JS interpreter.
 /// </summary>
 public static class VbScriptTranslator
 {
     private static readonly Regex ReComment = new("^\\s*(?:Rem(?:\\s|$)|')", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex ReDim = new("^\\s*(?:Dim|Private\\s+Dim|Public\\s+Dim)\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex ReConst = new("^\\s*(?:Const|Private\\s+Const|Public\\s+Const)\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReDim = new("^\\s*(?:Dim|(?:Private|Public)\\s+Dim|(?:Private|Public))\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReConst = new("^\\s*(?:Const|(?:Private|Public)\\s+Const)\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReReDimStatement = new("^\\s*ReDim\\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReSub = new("^\\s*(?:Public\\s+|Private\\s+|Friend\\s+)?Sub\\s+([A-Za-z_$][\\w$]*)\\s*(?:\\(([^)]*)\\))?\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReFunction = new("^\\s*(?:Public\\s+|Private\\s+|Friend\\s+)?Function\\s+([A-Za-z_$][\\w$]*)\\s*(?:\\(([^)]*)\\))?\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReIfBlock = new("^\\s*If\\s+(.+?)\\s+Then\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReElseIf = new("^\\s*ElseIf\\s+(.+?)\\s+Then\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReWhile = new("^\\s*While\\s+(.+?)\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReFor = new("^\\s*For\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(.+?)\\s+To\\s+(.+?)(?:\\s+Step\\s+(.+))?\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReForEach = new("^\\s*For\\s+Each\\s+([A-Za-z_$][\\w$]*)\\s+In\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReDoWhile = new("^\\s*Do\\s+While\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReDoUntil = new("^\\s*Do\\s+Until\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReLoopWhile = new("^\\s*Loop\\s+While\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReLoopUntil = new("^\\s*Loop\\s+Until\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReSelectCase = new("^\\s*Select\\s+Case\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReCase = new("^\\s*Case\\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ReAssignment = new("^\\s*(?:Set\\s+)?([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*|\\([^)]*\\))*)\\s*=\\s*(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ReModifierSkip = new("^(?:Public\\s+|Private\\s+|Friend\\s+)?(?:Class\\s|Property\\s)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly string Prologue = @"
 function __vbsLen(v){return String(v).length;}
@@ -57,6 +63,9 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
         var output = new StringBuilder(Prologue.Length + source.Length + 64);
         output.Append(Prologue);
         var scopes = new Stack<FunctionScope>();
+        var selectStack = new Stack<(string Var, bool HasCase)>();
+        int selectCounter = 0;
+        int forEachCounter = 0;
         var logicalLines = JoinLineContinuations(source);
 
         foreach (string raw in logicalLines)
@@ -68,27 +77,61 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
                 line.Equals("On Error GoTo 0", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            if (line.StartsWith("'", StringComparison.Ordinal)) continue;
-            if (line.StartsWith("Rem ", StringComparison.OrdinalIgnoreCase)) continue;
+            EmitLine(line);
+        }
+
+        while (scopes.Count > 0) { output.Append("}\n"); scopes.Pop(); }
+        return output.ToString();
+
+        // ── per-line dispatch ────────────────────────────────────────────
+
+        void EmitLine(string line)
+        {
+            // Single-line If must be handled BEFORE colon-splitting: VB runs
+            // every colon-separated statement in the Then/Else arm
+            // conditionally, so the arms must stay attached to the condition.
+            if (TrySingleLineIf(line, out var condition, out var thenArm, out var elseArm))
+            {
+                output.Append("if (").Append(RewriteExpression(condition, true)).Append(") { ");
+                AppendArm(thenArm);
+                output.Append(" }");
+                if (elseArm != null)
+                {
+                    output.Append(" else { ");
+                    AppendArm(elseArm);
+                    output.Append(" }");
+                }
+                output.Append('\n');
+                return;
+            }
+
+            // Colon-separated statement lists: a = 1: b = 2
+            if (IndexOfTopLevel(line, ':') > 0)
+            {
+                foreach (var part in SplitTopLevel(line, ':'))
+                {
+                    var p = part.Trim();
+                    if (p.Length > 0) EmitLine(p);
+                }
+                return;
+            }
 
             var mSub = ReSub.Match(line);
             if (mSub.Success)
             {
-                string name = mSub.Groups[1].Value;
-                string args = NormalizeArgs(mSub.Groups[2].Value);
-                output.Append("function ").Append(name).Append('(').Append(args).Append(") {\n");
-                scopes.Push(new FunctionScope(name, false));
-                continue;
+                output.Append("function ").Append(mSub.Groups[1].Value)
+                      .Append('(').Append(NormalizeArgs(mSub.Groups[2].Value)).Append(") {\n");
+                scopes.Push(new FunctionScope(mSub.Groups[1].Value, false));
+                return;
             }
 
             var mFn = ReFunction.Match(line);
             if (mFn.Success)
             {
-                string name = mFn.Groups[1].Value;
-                string args = NormalizeArgs(mFn.Groups[2].Value);
-                output.Append("function ").Append(name).Append('(').Append(args).Append(") {\n");
-                scopes.Push(new FunctionScope(name, true));
-                continue;
+                output.Append("function ").Append(mFn.Groups[1].Value)
+                      .Append('(').Append(NormalizeArgs(mFn.Groups[2].Value)).Append(") {\n");
+                scopes.Push(new FunctionScope(mFn.Groups[1].Value, true));
+                return;
             }
 
             if (line.Equals("End Sub", StringComparison.OrdinalIgnoreCase) ||
@@ -96,55 +139,151 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
             {
                 output.Append("}\n");
                 if (scopes.Count > 0) scopes.Pop();
-                continue;
+                return;
             }
 
             if (line.Equals("Exit Sub", StringComparison.OrdinalIgnoreCase) ||
                 line.Equals("Exit Function", StringComparison.OrdinalIgnoreCase))
             {
                 output.Append("return;\n");
-                continue;
+                return;
             }
 
-            if (line.Equals("End If", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); continue; }
-            if (line.Equals("Wend", StringComparison.OrdinalIgnoreCase) || line.Equals("Loop", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); continue; }
-            if (line.Equals("Next", StringComparison.OrdinalIgnoreCase) || line.StartsWith("Next ", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); continue; }
+            if (line.Equals("Exit Do", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("Exit For", StringComparison.OrdinalIgnoreCase))
+            {
+                output.Append("break;\n");
+                return;
+            }
+
+            if (line.Equals("End If", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); return; }
+            if (line.Equals("Wend", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("Loop", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); return; }
+            if (line.Equals("Next", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Next ", StringComparison.OrdinalIgnoreCase)) { output.Append("}\n"); return; }
 
             var mElseIf = ReElseIf.Match(line);
             if (mElseIf.Success)
             {
-                output.Append("} else if (").Append(RewriteExpression(mElseIf.Groups[1].Value, condition: true)).Append(") {\n");
-                continue;
+                output.Append("} else if (")
+                      .Append(RewriteExpression(mElseIf.Groups[1].Value, condition: true))
+                      .Append(") {\n");
+                return;
             }
-            if (line.Equals("Else", StringComparison.OrdinalIgnoreCase)) { output.Append("} else {\n"); continue; }
+            if (line.Equals("Else", StringComparison.OrdinalIgnoreCase)) { output.Append("} else {\n"); return; }
 
             var mIf = ReIfBlock.Match(line);
             if (mIf.Success)
             {
-                output.Append("if (").Append(RewriteExpression(mIf.Groups[1].Value, condition: true)).Append(") {\n");
-                continue;
+                output.Append("if (")
+                      .Append(RewriteExpression(mIf.Groups[1].Value, condition: true))
+                      .Append(") {\n");
+                return;
             }
 
-            if (line.StartsWith("If ", StringComparison.OrdinalIgnoreCase) && line.IndexOf(" Then ", StringComparison.OrdinalIgnoreCase) > 0)
+            var mWhile = ReWhile.Match(line);
+            if (mWhile.Success)
             {
-                int thenAt = line.IndexOf(" Then ", StringComparison.OrdinalIgnoreCase);
-                string condition = line[3..thenAt];
-                string statement = line[(thenAt + 6)..].Trim();
-                output.Append("if (").Append(RewriteExpression(condition, true)).Append(") { ");
-                output.Append(TranslateStatement(statement, scopes.Count > 0 ? scopes.Peek() : null));
-                output.Append(" }\n");
-                continue;
+                output.Append("while (")
+                      .Append(RewriteExpression(mWhile.Groups[1].Value, condition: true))
+                      .Append(") {\n");
+                return;
+            }
+
+            // Bare "Do ... Loop" — a real do-while loop, not garbage.
+            if (line.Equals("Do", StringComparison.OrdinalIgnoreCase)) { output.Append("do {\n"); return; }
+
+            var mDoWhile = ReDoWhile.Match(line);
+            if (mDoWhile.Success)
+            {
+                output.Append("while (")
+                      .Append(RewriteExpression(mDoWhile.Groups[1].Value, true))
+                      .Append(") {\n");
+                return;
+            }
+            var mDoUntil = ReDoUntil.Match(line);
+            if (mDoUntil.Success)
+            {
+                output.Append("while (!(")
+                      .Append(RewriteExpression(mDoUntil.Groups[1].Value, true))
+                      .Append(")) {\n");
+                return;
+            }
+            var mLoopWhile = ReLoopWhile.Match(line);
+            if (mLoopWhile.Success)
+            {
+                output.Append("} while (")
+                      .Append(RewriteExpression(mLoopWhile.Groups[1].Value, true))
+                      .Append(");\n");
+                return;
+            }
+            var mLoopUntil = ReLoopUntil.Match(line);
+            if (mLoopUntil.Success)
+            {
+                output.Append("} while (!(")
+                      .Append(RewriteExpression(mLoopUntil.Groups[1].Value, true))
+                      .Append("));\n");
+                return;
+            }
+
+            var mSelect = ReSelectCase.Match(line);
+            if (mSelect.Success)
+            {
+                selectCounter++;
+                string var = "__vbs_sel_" + selectCounter;
+                output.Append("var ").Append(var).Append(" = ")
+                      .Append(RewriteExpression(mSelect.Groups[1].Value, false)).Append(";\n");
+                selectStack.Push((var, false));
+                return;
+            }
+
+            if (line.Equals("End Select", StringComparison.OrdinalIgnoreCase))
+            {
+                output.Append("}\n");
+                if (selectStack.Count > 0) selectStack.Pop();
+                return;
+            }
+
+            var mCase = ReCase.Match(line);
+            if (mCase.Success && selectStack.Count > 0)
+            {
+                string value = mCase.Groups[1].Value.Trim();
+                var (var, hasCase) = selectStack.Pop();
+                selectStack.Push((var, true));
+
+                if (value.Equals("Else", StringComparison.OrdinalIgnoreCase))
+                {
+                    output.Append(hasCase ? "} else {" : "if (true) {").Append('\n');
+                    return;
+                }
+
+                var conditions = new List<string>();
+                foreach (var item in SplitTopLevel(value, ','))
+                {
+                    var c = CaseCondition(item, var);
+                    if (c.Length > 0) conditions.Add(c);
+                }
+                if (conditions.Count == 0) conditions.Add(var + " == " + var);
+
+                output.Append(hasCase ? "} else if (" : "if (")
+                      .Append(string.Join(" || ", conditions))
+                      .Append(") {\n");
+                return;
             }
 
             var mForEach = ReForEach.Match(line);
             if (mForEach.Success)
             {
+                // Unique counter per loop: nested For Each used to share one
+                // __vbs_i and the inner loop clobbered the outer's index.
+                forEachCounter++;
+                string iter = "__vbs_i_" + forEachCounter;
                 string variable = mForEach.Groups[1].Value;
                 string collection = RewriteExpression(mForEach.Groups[2].Value, false);
-                output.Append("for (var __vbs_i = 0; __vbs_i < (" ).Append(collection)
-                    .Append(").length; __vbs_i++) { var ").Append(variable)
-                    .Append(" = (").Append(collection).Append(")[__vbs_i];\n");
-                continue;
+                output.Append("for (var ").Append(iter).Append(" = 0; ").Append(iter)
+                      .Append(" < (").Append(collection).Append(").length; ").Append(iter).Append("++) { var ")
+                      .Append(variable).Append(" = (").Append(collection).Append(")[").Append(iter).Append("];\n");
+                return;
             }
 
             var mFor = ReFor.Match(line);
@@ -155,62 +294,119 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
                 string end = RewriteExpression(mFor.Groups[3].Value, false);
                 string stepText = mFor.Groups[4].Success ? RewriteExpression(mFor.Groups[4].Value, false) : "1";
                 output.Append("for (var ").Append(variable).Append(" = ").Append(start)
-                    .Append("; (").Append(stepText).Append(") >= 0 ? ")
-                    .Append(variable).Append(" <= ").Append(end).Append(" : ")
-                    .Append(variable).Append(" >= ").Append(end).Append("; ")
-                    .Append(variable).Append(" += (").Append(stepText).Append(")) {\n");
-                continue;
+                      .Append("; (").Append(stepText).Append(") >= 0 ? ")
+                      .Append(variable).Append(" <= ").Append(end).Append(" : ")
+                      .Append(variable).Append(" >= ").Append(end).Append("; ")
+                      .Append(variable).Append(" += (").Append(stepText).Append(")) {\n");
+                return;
             }
 
-            var mDoWhile = ReDoWhile.Match(line);
-            if (mDoWhile.Success)
+            // Const before Dim: the extended Dim pattern also matches
+            // "Private Const …" and must not swallow it.
+            var mConst = ReConst.Match(line);
+            if (mConst.Success)
             {
-                output.Append("while (").Append(RewriteExpression(mDoWhile.Groups[1].Value, true)).Append(") {\n");
-                continue;
+                output.Append("var ").Append(NormalizeConstList(mConst.Groups[1].Value)).Append(";\n");
+                return;
             }
-            var mDoUntil = ReDoUntil.Match(line);
-            if (mDoUntil.Success)
-            {
-                output.Append("while (!(").Append(RewriteExpression(mDoUntil.Groups[1].Value, true)).Append(")) {\n");
-                continue;
-            }
-            var mLoopUntil = ReLoopUntil.Match(line);
-            if (mLoopUntil.Success)
-            {
-                // JavaScript has no do/loop counterpart in this bridge; keep
-                // the loop body valid and apply the terminating condition.
-                output.Append("if (").Append(RewriteExpression(mLoopUntil.Groups[1].Value, true)).Append(") break; }\n");
-                continue;
-            }
+
+            // ReDim/ReDim Preserve — array re-sizing is not modelled by the
+            // bridge; skipping keeps existing bindings intact (unlike a
+            // re-declaration, which would wipe the Preserve'd contents).
+            if (ReReDimStatement.IsMatch(line)) return;
 
             var mDim = ReDim.Match(line);
             if (mDim.Success)
             {
                 output.Append("var ").Append(NormalizeDimList(mDim.Groups[1].Value)).Append(";\n");
-                continue;
+                return;
             }
 
-            var mConst = ReConst.Match(line);
-            if (mConst.Success)
-            {
-                output.Append("var ").Append(NormalizeConstList(mConst.Groups[1].Value)).Append(";\n");
-                continue;
-            }
-
-            if (line.StartsWith("Class ", StringComparison.OrdinalIgnoreCase) ||
+            if (ReModifierSkip.IsMatch(line) ||
                 line.Equals("End Class", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("Property ", StringComparison.OrdinalIgnoreCase))
-                continue;
+                line.Equals("End Property", StringComparison.OrdinalIgnoreCase))
+                return;
 
-            if (line.StartsWith("On Error ", StringComparison.OrdinalIgnoreCase)) continue;
+            if (line.StartsWith("On Error ", StringComparison.OrdinalIgnoreCase)) return;
 
             string translated = TranslateStatement(line, scopes.Count > 0 ? scopes.Peek() : null);
             if (translated.Length > 0)
                 output.Append(translated).Append('\n');
         }
 
-        while (scopes.Count > 0) { output.Append("}\n"); scopes.Pop(); }
-        return output.ToString();
+        void AppendArm(string arm)
+        {
+            foreach (var part in SplitTopLevel(arm, ':'))
+            {
+                var p = part.Trim();
+                if (p.Length == 0) continue;
+                var translated = TranslateStatement(p, scopes.Count > 0 ? scopes.Peek() : null);
+                if (translated.Length > 0) output.Append(translated).Append(' ');
+            }
+        }
+    }
+
+    /// <summary>Detects the single-line If form: If cond Then stmt [: stmts]
+    /// [Else stmt [: stmts]].  Block form ("If … Then" at end of line) is
+    /// rejected so it falls through to the block-If handler.</summary>
+    private static bool TrySingleLineIf(string line, out string condition,
+                                        out string thenArm, out string? elseArm)
+    {
+        condition = ""; thenArm = ""; elseArm = null;
+        if (!line.StartsWith("If ", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (ReIfBlock.IsMatch(line))
+            return false;                       // block form
+        // Quote-aware: " Then " inside a string literal used to split early.
+        int thenAt = IndexOfUnquoted(line, " Then ");
+        if (thenAt < 0)
+            return false;
+        condition = line[3..thenAt].Trim();
+        string rest = line[(thenAt + 6)..].Trim();
+        int elseAt = IndexOfUnquotedKeyword(rest, "Else");
+        if (elseAt >= 0)
+        {
+            thenArm = rest[..elseAt].Trim();
+            elseArm = rest[(elseAt + 4)..].Trim();
+        }
+        else
+        {
+            thenArm = rest;
+        }
+        return thenArm.Length > 0 || elseArm != null;
+    }
+
+    /// <summary>One Case item → a JS condition on the select variable.
+    /// Supports plain values, comma lists (joined by the caller),
+    /// "Is &lt;op&gt; value" and "low To high" range forms.</summary>
+    private static string CaseCondition(string item, string selectVar)
+    {
+        item = item.Trim();
+        if (item.Length == 0) return "";
+
+        var mIs = Regex.Match(item, "^Is\\s*(=|<>|<=|>=|<|>)\\s*(.+)$", RegexOptions.IgnoreCase);
+        if (mIs.Success)
+        {
+            string op = mIs.Groups[1].Value.ToLowerInvariant() switch
+            {
+                "=" => "==",
+                "<>" => "!=",
+                _ => mIs.Groups[1].Value
+            };
+            return selectVar + " " + op + " " + RewriteExpression(mIs.Groups[2].Value, false);
+        }
+
+        int toAt = IndexOfUnquotedKeyword(item, "To");
+        if (toAt > 0)
+        {
+            string lo = item[..toAt].Trim();
+            string hi = item[(toAt + 2)..].Trim();
+            if (lo.Length > 0 && hi.Length > 0)
+                return selectVar + " >= " + RewriteExpression(lo, false) +
+                       " && " + selectVar + " <= " + RewriteExpression(hi, false);
+        }
+
+        return selectVar + " == " + RewriteExpression(item, false);
     }
 
     private static List<string> JoinLineContinuations(string source)
@@ -249,20 +445,23 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
             return NormalizeCall(call) + ";";
         }
 
-        if (line.StartsWith("MsgBox ", StringComparison.OrdinalIgnoreCase))
-        {
-            return "alert(" + RewriteExpression(line[7..].Trim(), false) + ");";
-        }
+        // Both "MsgBox x" and "MsgBox(x)" forms — the parenthesised no-space
+        // form used to fall through and emit an undefined MsgBox identifier.
+        string? args = CallArguments(line, "MsgBox");
+        if (args != null)
+            return "alert(" + RewriteExpression(args, false) + ");";
 
-        if (line.StartsWith("InputBox ", StringComparison.OrdinalIgnoreCase))
-        {
-            return "prompt(" + RewriteExpression(line[9..].Trim(), false) + ");";
-        }
+        args = CallArguments(line, "InputBox");
+        if (args != null)
+            return "prompt(" + RewriteExpression(args, false) + ");";
 
-        if (line.StartsWith("document.write ", StringComparison.OrdinalIgnoreCase))
-            return "document.write(" + RewriteExpression(line[15..].Trim(), false) + ");";
-        if (line.StartsWith("document.writeln ", StringComparison.OrdinalIgnoreCase))
-            return "document.write(" + RewriteExpression(line[17..].Trim(), false) + "+'\\n');";
+        args = CallArguments(line, "document.writeln");
+        if (args != null)
+            return "document.write(" + RewriteExpression(args, false) + "+'\\n');";
+
+        args = CallArguments(line, "document.write");
+        if (args != null)
+            return "document.write(" + RewriteExpression(args, false) + ");";
 
         if (line.StartsWith("Set ", StringComparison.OrdinalIgnoreCase))
             line = line[4..].Trim();
@@ -282,16 +481,38 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
         {
             int space = IndexOfUnquotedWhitespace(line);
             string name = line[..space].Trim();
-            string args = line[(space + 1)..].Trim();
-            return name + "(" + RewriteCommaArguments(args) + ");";
+            string callArgs = line[(space + 1)..].Trim();
+            return name + "(" + RewriteCommaArguments(callArgs) + ");";
         }
 
         return RewriteExpression(line, false) + (line.EndsWith(";", StringComparison.Ordinal) ? "" : ";");
     }
 
+    /// <summary>Extracts the argument text of `name args` / `name(args)`,
+    /// or null when the line is not that call form.</summary>
+    private static string? CallArguments(string line, string name)
+    {
+        if (!line.StartsWith(name, StringComparison.OrdinalIgnoreCase))
+            return null;
+        int rest = name.Length;
+        if (rest >= line.Length) return string.Empty;   // bare keyword — no-arg call
+        char next = line[rest];
+        if (next != ' ' && next != '(') return null;    // longer identifier (MsgBoxFoo)
+        string tail = line[rest..].Trim();
+        if (tail.StartsWith('('))
+        {
+            tail = tail[1..];
+            if (tail.EndsWith(')')) tail = tail[..^1];
+        }
+        return tail;
+    }
+
     private static bool LooksLikeBareCall(string line)
     {
-        if (line.Contains('=') || line.EndsWith("Then", StringComparison.OrdinalIgnoreCase)) return false;
+        // Quote/paren-aware '=' check — a '=' inside a string literal
+        // ("foo ""a=b""") used to veto legitimate bare calls.
+        if (IndexOfTopLevel(line, '=') >= 0) return false;
+        if (line.EndsWith("Then", StringComparison.OrdinalIgnoreCase)) return false;
         int space = IndexOfUnquotedWhitespace(line);
         if (space <= 0) return false;
         string first = line[..space];
@@ -319,6 +540,56 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
         return -1;
     }
 
+    /// <summary>Case-insensitive literal search outside string literals.</summary>
+    private static int IndexOfUnquoted(string text, string needle)
+    {
+        char quote = '\0';
+        for (int i = 0; i + needle.Length <= text.Length; i++)
+        {
+            char c = text[i];
+            if (quote != '\0')
+            {
+                if (c == quote)
+                {
+                    if (i + 1 < text.Length && text[i + 1] == quote) { i++; continue; }
+                    quote = '\0';
+                }
+                continue;
+            }
+            if (c == '"') { quote = c; continue; }
+            if (string.Compare(text, i, needle, 0, needle.Length, StringComparison.OrdinalIgnoreCase) == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Keyword search outside string literals at word boundaries.</summary>
+    private static int IndexOfUnquotedKeyword(string text, string keyword)
+    {
+        char quote = '\0';
+        for (int i = 0; i + keyword.Length <= text.Length; i++)
+        {
+            char c = text[i];
+            if (quote != '\0')
+            {
+                if (c == quote)
+                {
+                    if (i + 1 < text.Length && text[i + 1] == quote) { i++; continue; }
+                    quote = '\0';
+                }
+                continue;
+            }
+            if (c == '"') { quote = c; continue; }
+            if (string.Compare(text, i, keyword, 0, keyword.Length, StringComparison.OrdinalIgnoreCase) != 0)
+                continue;
+            bool leftOk = i == 0 || !(char.IsLetterOrDigit(text[i - 1]) || text[i - 1] == '_');
+            int end = i + keyword.Length;
+            bool rightOk = end >= text.Length || !(char.IsLetterOrDigit(text[end]) || text[end] == '_');
+            if (leftOk && rightOk) return i;
+        }
+        return -1;
+    }
+
     private static string NormalizeCall(string call)
     {
         if (call.Length == 0) return string.Empty;
@@ -342,7 +613,8 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
         foreach (var part in parts)
         {
             string p = part.Trim();
-            p = Regex.Replace(p, "^(?:ByVal|ByRef|Optional|ParamArray)\\s+", "", RegexOptions.IgnoreCase);
+            // Loop the modifier strip: "Optional ByVal x" left "ByVal x".
+            p = Regex.Replace(p, "^(?:(?:ByVal|ByRef|Optional|ParamArray)\\s+)+", "", RegexOptions.IgnoreCase);
             p = Regex.Replace(p, "\\s+As\\s+.+$", "", RegexOptions.IgnoreCase);
             p = p.Trim();
             if (Regex.IsMatch(p, "^[A-Za-z_$][\\w$]*$")) names.Add(p);
@@ -412,7 +684,9 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
             s = Regex.Replace(s, @"\bNow\b", "new Date()", RegexOptions.IgnoreCase);
             s = Regex.Replace(s, @"\bInputBox\s*\(", "prompt(", RegexOptions.IgnoreCase);
             s = Regex.Replace(s, @"\bMsgBox\s*\(", "alert(", RegexOptions.IgnoreCase);
-            s = s.Replace(" & ", " + ");
+            // & concatenation — any spacing, but NOT &H/&O literals and not
+            // the && this rewrite itself may have produced from And.
+            s = Regex.Replace(s, @"(?<!&)&(?![&HhOo])", "+");
             return s;
         });
         return rewritten.Trim();
@@ -438,7 +712,11 @@ function __vbsSgn(v){var n=Number(v)||0;return n<0?-1:(n>0?1:0);}
             {
                 if (i + 1 < text.Length && text[i + 1] == quote)
                 {
-                    output.Append(text[start..(i + 1)]).Append(quote);
+                    // VB doubled quote ("") is an ESCAPED quote in the emitted
+                    // JS — it used to be copied verbatim and produced
+                    // adjacent string literals ("a""b") → syntax error.
+                    output.Append(text[start..i]);
+                    output.Append('\\').Append(quote);
                     i++;
                     start = i + 1;
                     continue;

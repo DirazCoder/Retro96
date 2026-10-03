@@ -175,10 +175,6 @@ public class JsValue
         return false;   // two unrelated object references
     }
 
-    private static bool IsPrimitive(JsType t) =>
-        t is JsType.Undefined or JsType.Null or JsType.Boolean
-              or JsType.Number or JsType.String;
-
     private static bool IsObjectLike(JsType t) =>
         t is JsType.Object or JsType.Function;
 
@@ -379,7 +375,12 @@ public class JsObject
 
     public virtual bool Delete(string name) => Properties.Remove(name);
 
-    public IEnumerable<string> OwnEnumerableKeys() => Properties.Keys;
+    /// <summary>
+    /// Snapshot of the own enumerable keys — for-in bodies may DELETE
+    /// properties while iterating, which threw InvalidOperationException
+    /// when this was a live Dictionary view.
+    /// </summary>
+    public IEnumerable<string> OwnEnumerableKeys() => Properties.Keys.ToArray();
 }
 
 /// <summary>A JavaScript function — either native C# or interpreted AST.</summary>

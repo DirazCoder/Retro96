@@ -424,7 +424,8 @@ public static class DomBindings
         d.Set("images", JsValue.FromObject(BuildElementCollection(scope, doc.Images, state)));
         d.Set("links", JsValue.FromObject(BuildElementCollection(scope, doc.Links, state)));
         d.Set("anchors", JsValue.FromObject(BuildElementCollection(scope, doc.Anchors, state)));
-        d.Set("embeds", JsValue.FromObject(BuildElementCollection(scope, doc.ElementDescendants().Where(e => e.TagName == "embed"), state)));
+        d.Set("embeds", JsValue.FromObject(BuildElementCollection(scope,
+            doc.ElementDescendants().Where(e => e.TagName.Equals("embed", StringComparison.OrdinalIgnoreCase)), state)));
 
         // IE4-era selection host.  The range is live against the browser
         // selection state rather than being a detached fake object.
@@ -498,9 +499,12 @@ public static class DomBindings
             string tagName = args.Length > 0 ? args[0].ToJsString() : "";
             if (string.IsNullOrEmpty(tagName)) return JsValue.FromObject(NewArray(scope));
 
+            // Consult the live document, not the registration-time snapshot —
+            // post-parse document.write replaces the DOM underneath.
+            var liveDoc = state.Document ?? doc;
             IEnumerable<DomElement> matches = tagName == "*"
-                ? doc.ElementDescendants()
-                : doc.ElementDescendants().Where(e => string.Equals(
+                ? liveDoc.ElementDescendants()
+                : liveDoc.ElementDescendants().Where(e => string.Equals(
                     e.TagName, tagName, StringComparison.OrdinalIgnoreCase));
 
             return JsValue.FromObject(BuildElementCollection(scope, matches, state));
@@ -511,9 +515,10 @@ public static class DomBindings
             d.Set("getElementsByName", Fn(scope, "getElementsByName", (self, args) =>
         {
             string nm = args.Length > 0 ? args[0].ToJsString() : "";
+            var liveDoc = state.Document ?? doc;
             var arr = NewArray(scope);
             int i = 0;
-            foreach (var e in doc.ElementDescendants()
+            foreach (var e in liveDoc.ElementDescendants()
                 .Where(e => string.Equals(e.GetAttr("name"), nm,
                     StringComparison.Ordinal)))
             {
@@ -598,7 +603,10 @@ public static class DomBindings
 
     private static JsObject NewArray(JsScope scope)
     {
-        var arr = new JsObject { Class = "Array" };
+        // Chain to Array.prototype so host-built arrays and collections
+        // actually expose join/push/etc.; they used to be prototype-less
+        // and silently lost every Array method.
+        var arr = new JsObject { Class = "Array", Prototype = JsInterpreter.ArrayPrototype };
         arr.Set("length", JsValue.From(0));
         return arr;
     }
@@ -610,7 +618,11 @@ public static class DomBindings
     private static JsObject BuildElementCollection(
         JsScope scope, IEnumerable<DomElement> elements, DocumentBindingsState state)
     {
-        var collection = new JsObject();
+        var collection = new JsObject
+        {
+            Class = "Array",
+            Prototype = JsInterpreter.ArrayPrototype
+        };
         int i = 0;
         foreach (var elem in elements)
         {
@@ -852,13 +864,25 @@ public static class DomBindings
                     try { return JsValue.From(_doc.Cookies.Get(BaseUrlOrBlank)); }
                     catch { return JsValue.From(""); }
                 case "all" when BrowserRuntime.SupportsInternetExplorerLegacy:
-                    return _state == null
-                        ? JsValue.Undefined
-                        : JsValue.FromFunction(CreateLegacyElementCollection(
+                    if (_state == null) return JsValue.Undefined;
+                    // One stable collection object per document so
+                    // document.all === document.all holds.
+                    if (!Properties.TryGetValue("all", out var cachedAll))
+                    {
+                        cachedAll = JsValue.FromFunction(CreateLegacyElementCollection(
                             _state, () => _doc.ElementDescendants(),
                             "all", supportsTags: true));
+                        Properties["all"] = cachedAll;
+                    }
+                    return cachedAll;
                 case "layers" when BrowserRuntime.SupportsNetscapeLegacy:
-                    return JsValue.FromObject(NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope()));
+                    if (!Properties.TryGetValue("layers", out var layers))
+                    {
+                        layers = JsValue.FromObject(
+                            NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope()));
+                        Properties["layers"] = layers;
+                    }
+                    return layers;
                 case "bgColor": return JsValue.From(Body?.GetAttr("bgcolor") ?? "#c0c0c0");
                 case "fgColor": return JsValue.From(_doc.BodyTextColor);
                 case "linkColor": return JsValue.From(_doc.BodyLinkColor);
@@ -938,8 +962,7 @@ public static class DomBindings
         }
     }
 
-    /// <summary>Minimal text-node wrapper for firstChild/lastChild/
-    /// childNodes/siblings: {nodeType, nodeName, nodeValue, data, length}.</summary>
+    /// <summary>Host bridge for legacy &lt;embed&gt; script objects.</summary>
     private sealed class EmbeddedScriptObject : JsObject
     {
         private readonly DomElement _element;
@@ -951,7 +974,9 @@ public static class DomBindings
 
         public override JsValue Get(string name)
         {
-            if ((_methods.Count != 0 && !_methods.Contains(name)) || _state.EmbeddedScriptCall == null)
+            if ((_methods.Count != 0 && !_methods.Contains(name)) ||
+                _state.EmbeddedScriptCall == null ||
+                _state.Interpreter == null || _state.Canvas == null)
                 return base.Get(name);
             return JsValue.FromFunction(new JsFunction((self, args) =>
             {
@@ -987,8 +1012,8 @@ public static class DomBindings
             if (name is not ("then" or "catch")) return base.Get(name);
             return JsValue.FromFunction(new JsFunction((self, args) =>
             {
-                JsFunction? callback = args.Length > 0 && args[0].Type == JsType.Function ? args[0].GetFunction() : null;
-                if (callback != null)
+                JsFunction? Callback = args.Length > 0 && args[0].Type == JsType.Function ? args[0].GetFunction() : null;
+                if (Callback != null)
                 {
                     _ = _task.ContinueWith(_ =>
                     {
@@ -996,12 +1021,12 @@ public static class DomBindings
                         {
                             var engineValue = PluginJsValueCodec.ToEngine(_task.GetAwaiter().GetResult());
                             if (_canvas.IsHandleCreated && !_canvas.IsDisposed)
-                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(callback, JsValue.Undefined, new[] { engineValue })));
+                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(Callback, JsValue.Undefined, new[] { engineValue })));
                         }
                         catch (Exception ex)
                         {
                             if (name == "catch" && _canvas.IsHandleCreated && !_canvas.IsDisposed)
-                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(callback, JsValue.Undefined, new[] { JsValue.From(ex.Message) })));
+                                _canvas.BeginInvoke((Action)(() => _interpreter.CallFunction(Callback, JsValue.Undefined, new[] { JsValue.From(ex.Message) })));
                         }
                     }, TaskScheduler.Default);
                 }
@@ -1372,15 +1397,15 @@ public static class DomBindings
         private static string OptionValue(DomElement opt) =>
             opt.GetAttr("value") ?? (opt.InnerText ?? "").Trim();
 
-        /// <summary>Wraps a DOM node: elements get the full ElementWrapper,
-        /// text nodes get a minimal {nodeType:3, nodeValue/data} object,
-        /// comments get {nodeType:8}.</summary>
+        /// <summary>Wraps a DOM node: elements get the CACHED ElementWrapper
+        /// (stable identity across accesses), text nodes get a minimal
+        /// {nodeType:3, nodeValue/data} object, comments get {nodeType:8}.</summary>
         private JsObject WrapNode(DomNode node)
         {
             if (node is DomElement el)
             {
-                var w = new ElementWrapper(el, _canvas, _scope, _state);
-                return w;
+                if (_state != null) return WrapElement(el, _state);
+                return new ElementWrapper(el, _canvas, _scope);
             }
             if (node is DomText tx)
                 return new TextNodeObject(tx.Data);
@@ -1527,9 +1552,17 @@ public static class DomBindings
                 return JsValue.Undefined;
             }, _scope, "insertAdjacentHTML"));
 
+        /// <summary>Wraps a child element for a mutation-method return value,
+        /// tolerating a null state instead of crashing.</summary>
+        private JsValue WrapChildValue(DomElement child) =>
+            _state != null
+                ? JsValue.FromObject(WrapElement(child, _state))
+                : JsValue.FromObject(new ElementWrapper(child, _canvas, _scope));
+
         public override JsValue Get(string name)
         {
-            if (_element.TagName == "embed" && _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
+            if (_element.TagName.Equals("embed", StringComparison.OrdinalIgnoreCase) &&
+                _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
                 scriptInfo.ScriptName.Length > 0 && string.Equals(name, scriptInfo.ScriptName, StringComparison.Ordinal))
             {
                 return JsValue.FromObject(new EmbeddedScriptObject(_element, _state, scriptInfo.Methods));
@@ -1543,7 +1576,10 @@ public static class DomBindings
                 return MakeSetAttributeFunction();
             if (string.Equals(name, "getAttribute", StringComparison.OrdinalIgnoreCase))
                 return MakeGetAttributeFunction();
-            if (string.Equals(name, "insertAdjacentHTML", StringComparison.OrdinalIgnoreCase))
+            // insertAdjacentHTML is an IE4-era surface — expose it only on
+            // IE-compatible profiles so typeof checks don't lie in NN mode.
+            if (string.Equals(name, "insertAdjacentHTML", StringComparison.OrdinalIgnoreCase) &&
+                BrowserRuntime.SupportsInternetExplorerLegacy)
                 return MakeInsertAdjacentHtmlFunction();
 
             if (string.Equals(name, "createTextRange", StringComparison.OrdinalIgnoreCase) &&
@@ -1611,6 +1647,7 @@ public static class DomBindings
                     }
                 case "innerText":
                 case "text":
+                case "outerText":
                     return JsValue.From(_element.InnerText);
                 case "outerHTML":
                     {
@@ -1641,7 +1678,7 @@ public static class DomBindings
                     return WrapSibling(_element, -1);
                 case "childNodes":
                     {
-                        var arr = new JsObject { Class = "Array" };
+                        var arr = new JsObject { Class = "Array", Prototype = JsInterpreter.ArrayPrototype };
                         int i = 0;
                         foreach (var child in _element.Children)
                         {
@@ -1740,21 +1777,29 @@ public static class DomBindings
                     case "selectedIndex":
                         {
                             int i = 0;
+                            bool hasOptions = false;
                             foreach (var o in OptionsOf(_element))
                             {
                                 if (o.HasAttr("selected")) return JsValue.From(i);
                                 i++;
+                                hasOptions = true;
                             }
-                            return JsValue.From(-1);
+                            // No explicit selection: the renderer and .value
+                            // treat the first option as implicitly selected —
+                            // selectedIndex must agree (used to return -1).
+                            return JsValue.From(hasOptions ? 0 : -1);
                         }
                     case "options":
                         {
-                            var arr = new JsObject { Class = "Array" };
+                            var arr = new JsObject { Class = "Array", Prototype = JsInterpreter.ArrayPrototype };
                             int i = 0;
                             foreach (var o in OptionsOf(_element))
                             {
-                                arr.Set(i.ToString(),
-                                    JsValue.FromObject(new ElementWrapper(o, _canvas, _scope)));
+                                // Cached wrappers (with state!) so option
+                                // identity is stable and handlers survive.
+                                arr.Set(i.ToString(), JsValue.FromObject(
+                                    _state != null ? WrapElement(o, _state)
+                                                   : new ElementWrapper(o, _canvas, _scope)));
                                 i++;
                             }
                             arr.Set("length", JsValue.From(i));
@@ -1765,21 +1810,18 @@ public static class DomBindings
                 }
             }
 
-            if (name == "text")
-                return JsValue.From(_element.InnerText);
-
             if (name == "value" && _element.TagName == "textarea")
                 return JsValue.From(_element.InnerText);
 
             if (RoutedAttrs.Contains(name))
             {
                 var attr = _element.GetAttr(name);
-                if (attr == null) return JsValue.From("");
                 if (name == "checked")
-                    // Boolean HTML attributes are true by presence. A checked
-                    // control is represented internally as checked="" as well
-                    // as checked="checked", so testing string length is wrong.
+                    // Boolean HTML attribute: presence = true, absence = false.
+                    // (The old code returned "" for absence and then tested
+                    // `attr != null` after a null-guard return — always true.)
                     return JsValue.From(attr != null);
+                if (attr == null) return JsValue.From("");
                 if (name == "width" || name == "height" || name == "size" ||
                     name == "maxlength" || name == "cols" || name == "rows")
                     return JsValue.From(JsValue.StringToNumber(attr));
@@ -1796,11 +1838,12 @@ public static class DomBindings
 
             if (name == "elements" && _element.TagName == "form")
             {
-                var arr = new JsObject { Class = "Array" };
+                var arr = new JsObject { Class = "Array", Prototype = JsInterpreter.ArrayPrototype };
                 int i = 0;
                 foreach (var control in ControlsOf(_element))
                 {
-                    var wrapper = new ElementWrapper(control, _canvas, _scope);
+                    var wrapper = _state != null ? WrapElement(control, _state)
+                                                 : new ElementWrapper(control, _canvas, _scope);
                     arr.Set(i.ToString(), JsValue.FromObject(wrapper));
                     var cname = control.GetAttr("name");
                     if (!string.IsNullOrEmpty(cname) && !arr.HasOwn(cname))
@@ -1834,7 +1877,7 @@ public static class DomBindings
                     var child = childWrapper.Element;
                     _element.AppendChild(child);
                     _canvas?.ReflowDocument();
-                    return JsValue.FromObject(WrapElement(child, _state!));
+                    return WrapChildValue(child);
                 }, _scope, "appendChild"));
 
             if (name == "insertBefore")
@@ -1854,7 +1897,7 @@ public static class DomBindings
 
                     _element.InsertBefore(child, reference);
                     _canvas?.ReflowDocument();
-                    return JsValue.FromObject(WrapElement(child, _state!));
+                    return WrapChildValue(child);
                 }, _scope, "insertBefore"));
 
             if (name == "removeChild")
@@ -1869,7 +1912,7 @@ public static class DomBindings
                     var child = childWrapper.Element;
                     _element.RemoveChild(child);
                     _canvas?.ReflowDocument();
-                    return JsValue.FromObject(WrapElement(child, _state!));
+                    return WrapChildValue(child);
                 }, _scope, "removeChild"));
 
             // DOM-0 NAMED CONTROL ACCESS — form.digits (the era's field
@@ -1878,7 +1921,7 @@ public static class DomBindings
             // form.elements; without this the field read came back
             // undefined and clock/validator writes went nowhere.
             if (_state != null && _element.TagName == "form" &&
-                !char.IsDigit(name[0]) && name != "style" &&
+                name.Length > 0 && !char.IsDigit(name[0]) && name != "style" &&
                 !name.StartsWith("on", StringComparison.OrdinalIgnoreCase))
             {
                 foreach (var control in ControlsOf(_element))
@@ -1894,7 +1937,7 @@ public static class DomBindings
         {
             // Keep IE3's DOM intentionally old in both reads and writes.
             if (BrowserRuntime.IsInternetExplorer3 &&
-                name is "innerHTML" or "innerText" or "outerHTML")
+                name is "innerHTML" or "innerText" or "outerHTML" or "outerText")
                 return;
 
             if (name == "innerHTML")
@@ -1907,12 +1950,13 @@ public static class DomBindings
                     var fragment = HtmlParser.Parse(value.ToJsString(),
                         doc.BaseUrl ?? ParsedUrl.Parse("about:blank"), doc.Cookies);
                     var body = fragment.ElementDescendants()
-                        .FirstOrDefault(e => e.TagName == "body");
-                    if (body != null)
-                    {
-                        foreach (var child in body.Children.ToList())
-                            _element.AppendChild(child);
-                    }
+                        .FirstOrDefault(e => e.TagName.Equals("body", StringComparison.OrdinalIgnoreCase));
+                    // Fall back to the fragment's own children when the parser
+                    // did not synthesise a <body> — the old code appended
+                    // NOTHING in that case, silently discarding the markup.
+                    var source = body != null ? body.Children : fragment.Children;
+                    foreach (var child in source.ToList())
+                        _element.AppendChild(child);
                 }
                 _canvas?.ReflowDocument();
                 return;
@@ -1947,6 +1991,26 @@ public static class DomBindings
                         _element.RemoveChild(oldChild);
                     _element.AppendChild(new DomText { Data = text });
                 }
+                _canvas?.ReflowDocument();
+                return;
+            }
+
+            // outerHTML — replace this element in its parent with the parsed
+            // replacement markup. Used to be silently dropped into Properties.
+            if (name == "outerHTML")
+            {
+                var doc = _element.OwnerDocument();
+                var parent = _element.Parent as DomElement;
+                if (doc == null || parent == null)
+                    return;   // detached element — nothing to replace in the tree
+                var fragment = HtmlParser.Parse(value.ToJsString(),
+                    doc.BaseUrl ?? ParsedUrl.Parse("about:blank"), doc.Cookies);
+                var body = fragment.ElementDescendants()
+                    .FirstOrDefault(e => e.TagName.Equals("body", StringComparison.OrdinalIgnoreCase));
+                var nodes = (body?.Children ?? fragment.Children).ToList();
+                foreach (var node in nodes)
+                    parent.InsertBefore(node, _element);
+                parent.RemoveChild(_element);
                 _canvas?.ReflowDocument();
                 return;
             }
@@ -2044,13 +2108,21 @@ public static class DomBindings
             // idiom) own controls that live in the table cells, NOT inside
             // the form element — form.elements, form.length and DOM-0
             // named access must see them too, exactly like period
-            // browsers' form-element-pointer association.
+            // browsers' form-element-pointer association. Skip duplicates
+            // for controls that are already descendants of the form.
             var doc = form.OwnerDocument();
             if (doc != null)
             {
                 foreach (var e in doc.ElementDescendants())
-                    if (e.FormOwner != null && ReferenceEquals(e.FormOwner, form))
+                {
+                    if (e.FormOwner == null || !ReferenceEquals(e.FormOwner, form))
+                        continue;
+                    bool isDescendant = false;
+                    for (var p = e.Parent; p != null && !isDescendant; p = p.Parent)
+                        if (ReferenceEquals(p, form)) isDescendant = true;
+                    if (!isDescendant)
                         yield return e;
+                }
             }
         }
 
@@ -2096,6 +2168,20 @@ public static class DomBindings
             return decls;
         }
 
+        /// <summary>Normalizes both "backgroundColor" and "background-color"
+        /// spellings to the hyphenated CSS form — era scripts used both.</summary>
+        private static string NormalizeStyleKey(string name)
+        {
+            if (name.IndexOf('-') >= 0) return name.ToLowerInvariant();
+            var sb = new System.Text.StringBuilder(name.Length + 4);
+            foreach (char c in name)
+            {
+                if (char.IsUpper(c) && sb.Length > 0) sb.Append('-');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            return sb.ToString();
+        }
+
         public override JsValue Get(string name)
         {
             // cssText — the whole attribute as source text
@@ -2103,9 +2189,11 @@ public static class DomBindings
                 return JsValue.From(_element.GetAttr("style") ?? "");
 
             var decls = ParseCurrent();
-            return decls.TryGetValue(name.ToLowerInvariant(), out string? v)
-                ? JsValue.From(v)
-                : JsValue.From("");
+            if (decls.TryGetValue(name.ToLowerInvariant(), out string? v))
+                return JsValue.From(v);
+            if (decls.TryGetValue(NormalizeStyleKey(name), out v))
+                return JsValue.From(v);
+            return JsValue.From("");
         }
 
         public override void Set(string name, JsValue value)
@@ -2119,7 +2207,7 @@ public static class DomBindings
 
             string v = value.ToJsString().Trim();
             var decls = ParseCurrent();
-            string key = name.ToLowerInvariant();
+            string key = NormalizeStyleKey(name);
             if (v.Length == 0 || v.Equals("null", StringComparison.OrdinalIgnoreCase) ||
                 v.Equals("undefined", StringComparison.OrdinalIgnoreCase))
                 decls.Remove(key);

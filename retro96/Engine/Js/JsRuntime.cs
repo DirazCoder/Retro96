@@ -58,6 +58,20 @@ public static class JsRuntime
         self.GetObjectOrFunction().Get("length") is { Type: JsType.Number } l
             ? (int)l.GetNumber() : 0;
 
+    /// <summary>
+    /// Clamps a JS number to a safe int before casting — out-of-range
+    /// doubles used to flow through an unspecified (int) conversion and
+    /// leave the bounds logic resting on accident.
+    /// </summary>
+    private static int ToIntSafe(JsValue v)
+    {
+        double d = v.ToNumber();
+        if (double.IsNaN(d)) return 0;
+        if (d >= int.MaxValue) return int.MaxValue;
+        if (d <= int.MinValue) return int.MinValue;
+        return (int)d;
+    }
+
     private static JsObject NewArray(JsScope scope)
     {
         var arr = new JsObject { Class = "Array" };
@@ -218,8 +232,8 @@ public static class JsRuntime
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
-            int start = args.Length > 0 && !double.IsNaN(args[0].ToNumber()) ? (int)args[0].ToNumber() : 0;
-            int end   = args.Length > 1 && !double.IsNaN(args[1].ToNumber()) ? (int)args[1].ToNumber() : length;
+            int start = args.Length > 0 ? ToIntSafe(args[0]) : 0;
+            int end   = args.Length > 1 ? ToIntSafe(args[1]) : length;
 
             if (start < 0) start = Math.Max(length + start, 0);
             if (end < 0)   end   = Math.Max(length + end, 0);
@@ -271,12 +285,12 @@ public static class JsRuntime
             if (args.Length == 0)
                 return JsValue.FromObject(NewArray(scope));
 
-            int start = (int)args[0].ToNumber();
+            int start = ToIntSafe(args[0]);
             if (start < 0) start = Math.Max(length + start, 0);
             start = Math.Min(start, length);
 
             int deleteCount = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
-                ? (int)args[1].ToNumber() : length - start;
+                ? ToIntSafe(args[1]) : length - start;
             deleteCount = Math.Clamp(deleteCount, 0, length - start);
 
             var removed = NewArray(scope);
@@ -307,7 +321,7 @@ public static class JsRuntime
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
             int from = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
-                ? Math.Max((int)args[1].ToNumber(), 0) : 0;
+                ? Math.Max(ToIntSafe(args[1]), 0) : 0;
 
             for (int i = from; i < length; i++)
                 if (arr.Get(i.ToString()).AbstractEquals(args[0]))
@@ -602,12 +616,18 @@ public static class JsRuntime
         var stringCtor = new JsFunction((self, args) =>
         {
             string text = args.Length > 0 ? args[0].ToJsString() : "";
-            if (self.Type is (JsType.Object or JsType.Function))
+            // Only a genuine `new String(...)` mutates `self`. A plain
+            // String("x") call used to receive the GLOBAL object as this
+            // and write value/length/Prototype onto it — corrupting every
+            // later window conversion. Detection: ExecuteNew chains the
+            // fresh object to this constructor's prototype BEFORE the call.
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                ReferenceEquals(self.GetObjectOrFunction().Prototype, strProto))
             {
                 var strObj = self.GetObjectOrFunction();
+                strObj.Class = "String";
                 strObj.Set("value", JsValue.From(text));
                 strObj.Set("length", JsValue.From(text.Length));
-                strObj.Prototype = strProto;
                 return self;
             }
             return JsValue.From(text);
@@ -686,11 +706,14 @@ public static class JsRuntime
         var numberCtor = new JsFunction((self, args) =>
         {
             double value = args.Length > 0 ? args[0].ToNumber() : 0;
-            if (self.Type is (JsType.Object or JsType.Function))
+            // Genuine `new Number(5)` only — plain Number("5") must return
+            // the primitive and never touch the global object.
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                ReferenceEquals(self.GetObjectOrFunction().Prototype, numProto))
             {
                 var numObj = self.GetObjectOrFunction();
+                numObj.Class = "Number";
                 numObj.Set("value", JsValue.From(value));
-                numObj.Prototype = numProto;
                 return self;
             }
             return JsValue.From(value);
@@ -767,11 +790,14 @@ public static class JsRuntime
         var boolCtor = new JsFunction((self, args) =>
         {
             bool value = args.Length > 0 && args[0].ToBoolean();
-            if (self.Type is (JsType.Object or JsType.Function))
+            // Genuine `new Boolean(...)` only — plain Boolean(x) returns the
+            // primitive and never writes value/Class onto the global object.
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                ReferenceEquals(self.GetObjectOrFunction().Prototype, boolProto))
             {
                 var boolObj = self.GetObjectOrFunction();
+                boolObj.Class = "Boolean";
                 boolObj.Set("value", JsValue.From(value));
-                boolObj.Prototype = boolProto;
                 return self;
             }
             return JsValue.From(value);
@@ -957,15 +983,24 @@ public static class JsRuntime
                 catch { ms = double.NaN; }
             }
 
-            JsObject dateObj = self.Type is (JsType.Object or JsType.Function)
-                ? self.GetObjectOrFunction()
-                : new JsObject { Class = "Date", Prototype = dateProto };
-            dateObj.Set("value", JsValue.From(ms));
-            dateObj.Prototype = dateProto;
-            dateObj.Class = "Date";
-            return self.Type is (JsType.Object or JsType.Function)
-                ? self
-                : JsValue.FromObject(dateObj);
+            // Genuine `new Date(...)` only mutates self. A plain Date() call
+            // receives the GLOBAL object as this and used to write
+            // value/Prototype/Class onto it — after one Date() the window
+            // stringified as a Date. Per spec, plain Date() returns the
+            // current date/time as a STRING and ignores all arguments.
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                ReferenceEquals(self.GetObjectOrFunction().Prototype, dateProto))
+            {
+                var dateObj = self.GetObjectOrFunction();
+                dateObj.Class = "Date";
+                dateObj.Set("value", JsValue.From(ms));
+                return self;
+            }
+
+            var now = (DateTime.UtcNow - Epoch).TotalMilliseconds;
+            return JsValue.From(
+                Epoch.AddMilliseconds(now).ToLocalTime().ToString(
+                    "ddd MMM dd HH:mm:ss yyyy", CultureInfo.InvariantCulture));
         }, scope, "Date");
 
         dateCtor.Set("prototype", JsValue.FromObject(dateProto));
@@ -1079,19 +1114,28 @@ public static class JsRuntime
                 valid.Append(c);
             }
 
-            JsObject regexObj = self.Type is (JsType.Object or JsType.Function)
-                ? self.GetObjectOrFunction()
-                : new JsObject { Class = "RegExp", Prototype = regexProto };
-            regexObj.Set("source", JsValue.From(pattern));
-            regexObj.Set("flags", JsValue.From(valid.ToString()));
-            regexObj.Set("global", JsValue.From(valid.ToString().Contains('g')));
-            regexObj.Set("ignoreCase", JsValue.From(valid.ToString().Contains('i')));
-            regexObj.Set("lastIndex", JsValue.From(0));
-            regexObj.Prototype = regexProto;
-            regexObj.Class = "RegExp";
-            return self.Type is (JsType.Object or JsType.Function)
-                ? self
-                : JsValue.FromObject(regexObj);
+            JsObject Build(JsObject regexObj)
+            {
+                regexObj.Class = "RegExp";
+                regexObj.Set("source", JsValue.From(pattern));
+                regexObj.Set("flags", JsValue.From(valid.ToString()));
+                regexObj.Set("global", JsValue.From(valid.ToString().Contains('g')));
+                regexObj.Set("ignoreCase", JsValue.From(valid.ToString().Contains('i')));
+                regexObj.Set("multiline", JsValue.From(valid.ToString().Contains('m')));
+                regexObj.Set("lastIndex", JsValue.From(0));
+                regexObj.Prototype = regexProto;
+                return regexObj;
+            }
+
+            // Genuine `new RegExp(...)` only — a plain RegExp("x") call
+            // returns a NEW regexp (spec) and never touches the global.
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                ReferenceEquals(self.GetObjectOrFunction().Prototype, regexProto))
+            {
+                Build(self.GetObjectOrFunction());
+                return self;
+            }
+            return JsValue.FromObject(Build(new JsObject()));
         }, scope, "RegExp");
         regexpCtor.Set("prototype", JsValue.FromObject(regexProto));
         scope.Define("RegExp", JsValue.FromFunction(regexpCtor));
@@ -1105,24 +1149,35 @@ public static class JsRuntime
     {
         JsValue MakeErrorCtor(string name)
         {
+            var proto = new JsObject { Class = "Error", Prototype = objectProto };
+            proto.Set("toString", Fn(scope, "toString", (self, args) =>
+            {
+                var target = self.GetObjectOrFunction();
+                string n = target.Get("name") is { Type: JsType.String } nv ? nv.GetString() : "Error";
+                string m = target.Get("message") is { Type: JsType.String } mv ? mv.GetString() : "";
+                return JsValue.From(m.Length > 0 ? $"{n}: {m}" : n);
+            }));
+
             var fn = new JsFunction((self, args) =>
             {
-                JsObject err = self.Type is (JsType.Object or JsType.Function)
-                    ? self.GetObjectOrFunction()
-                    : new JsObject { Class = "Error" };
-                err.Class = "Error";
-                err.Set("name", JsValue.From(name));
-                err.Set("message", JsValue.From(args.Length > 0 ? args[0].ToJsString() : ""));
-                err.Prototype = objectProto;
-                return self.Type is (JsType.Object or JsType.Function)
-                    ? self
-                    : JsValue.FromObject(err);
+                // Genuine `new Error(...)` only — a plain Error("x") call
+                // returns a NEW error (spec) instead of writing name/message
+                // onto the global object.
+                if (self.Type is (JsType.Object or JsType.Function) &&
+                    ReferenceEquals(self.GetObjectOrFunction().Prototype, proto))
+                {
+                    var err = self.GetObjectOrFunction();
+                    err.Class = "Error";
+                    err.Set("name", JsValue.From(name));
+                    err.Set("message", JsValue.From(args.Length > 0 ? args[0].ToJsString() : ""));
+                    return self;
+                }
+                var plain = new JsObject { Class = "Error", Prototype = proto };
+                plain.Set("name", JsValue.From(name));
+                plain.Set("message", JsValue.From(args.Length > 0 ? args[0].ToJsString() : ""));
+                return JsValue.FromObject(plain);
             }, scope, name);
-            fn.Set("prototype", JsValue.FromObject(new JsObject
-            {
-                Class = "Error",
-                Prototype = objectProto
-            }));
+            fn.Set("prototype", JsValue.FromObject(proto));
             return JsValue.FromFunction(fn);
         }
 

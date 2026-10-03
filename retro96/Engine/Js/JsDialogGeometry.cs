@@ -5,7 +5,8 @@
 // touches WinForms.
 //
 // Contract under test (Bug_JsPromptDialogSquashed):
-//   • prompt input field: at least 200px wide and 20px tall
+//   • prompt input field: at least 420px wide and 34px tall — comfortably
+//     past the original 200x20 minimum that defined the bug
 //   • dialog stays tall enough for label + input + buttons
 //   • alert()/confirm() use the OS-native MessageBox — geometry is
 //     OS-rendered, so their legibility is not layout-dependent.
@@ -41,12 +42,17 @@ public static class JsDialogGeometry
     /// dialog font (historical Segoe UI 8.25pt-era average metrics).
     /// The shell may pass a real measured width via <paramref name="measure"/>
     /// when it has a live Graphics; null falls back to this estimate.
+    /// <paramref name="defaultValue"/> is intentionally unused by the
+    /// geometry (the pre-filled text does not change the input rect) but is
+    /// kept so shells can pass their full prompt description in one call.
     /// </summary>
     public static PromptDialogLayout PromptLayout(
         string message,
         string? defaultValue = null,
         Func<string, float>? measure = null)
     {
+        message ??= string.Empty;
+
         float labelWidth = measure != null
             ? measure(message)
             : message.Length * 7f;

@@ -936,7 +936,21 @@ public class JsInterpreter
         }
         else
         {
-            keys = obj.OwnEnumerableKeys();
+            // JS 1.1 for-in enumerated INHERITED enumerable properties too —
+            // walk the prototype chain, outermost first, deduplicating names.
+            // Object.prototype is skipped: its members were never enumerable
+            // in a real engine, and this implementation stores them as plain
+            // own properties of the prototype object.
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var names = new List<string>();
+            for (var current = obj; current != null; current = current.Prototype)
+            {
+                if (ReferenceEquals(current, ObjectPrototype)) continue;
+                foreach (var k in current.OwnEnumerableKeys())
+                    if (seen.Add(k))
+                        names.Add(k);
+            }
+            keys = names;
         }
 
         foreach (var key in keys)
@@ -1027,6 +1041,11 @@ public class JsInterpreter
 
     private JsValue ExecuteTry(TryStatement tr)
     {
+        // JS semantics: try/finally WITHOUT a catch still propagates the
+        // exception after the finalizer runs. The old code swallowed the
+        // exception whenever a finalizer existed — `try { throw x } finally
+        // {}` silently continued as if nothing had been thrown.
+        Exception? pending = null;
         try
         {
             ExecuteStatement(tr.Block);
@@ -1034,23 +1053,9 @@ public class JsInterpreter
         catch (JsThrownException thrown)
         {
             if (tr.Handler != null)
-            {
-                var old = _currentScope;
-                _currentScope = _currentScope.NewChild();
-                try
-                {
-                    _currentScope.Define(tr.Handler.Param.Name, thrown.Value);
-                    ExecuteStatement(tr.Handler.Body);
-                }
-                finally
-                {
-                    _currentScope = old;
-                }
-            }
-            else if (tr.Finalizer == null)
-            {
-                throw;   // no handler, no finally — propagate
-            }
+                RunCatchHandler(tr.Handler, thrown.Value);
+            else
+                pending = thrown;
         }
         catch (JsInterpreterException ex)
         {
@@ -1060,29 +1065,34 @@ public class JsInterpreter
                 var err = new JsObject { Class = "Error" };
                 err.Set("name", JsValue.From("Error"));
                 err.Set("message", JsValue.From(ex.Message));
-                var old = _currentScope;
-                _currentScope = _currentScope.NewChild();
-                try
-                {
-                    _currentScope.Define(tr.Handler.Param.Name, JsValue.FromObject(err));
-                    ExecuteStatement(tr.Handler.Body);
-                }
-                finally
-                {
-                    _currentScope = old;
-                }
+                RunCatchHandler(tr.Handler, JsValue.FromObject(err));
             }
-            else if (tr.Finalizer == null)
-            {
-                throw;
-            }
+            else
+                pending = ex;
         }
         finally
         {
             if (tr.Finalizer != null)
                 ExecuteStatement(tr.Finalizer);
         }
+        if (pending != null)
+            throw pending;
         return JsValue.Undefined;
+    }
+
+    private void RunCatchHandler(CatchClause handler, JsValue bound)
+    {
+        var old = _currentScope;
+        _currentScope = _currentScope.NewChild();
+        try
+        {
+            _currentScope.Define(handler.Param.Name, bound);
+            ExecuteStatement(handler.Body);
+        }
+        finally
+        {
+            _currentScope = old;
+        }
     }
 
     private JsValue ExecuteWith(WithStatement with)
@@ -1186,7 +1196,7 @@ public class JsInterpreter
             // used to land in the scope DICTIONARY as a plain string:
             // the LocationObject.href setter never fired, so every button
             // built on it did nothing. Route string assignments to bare
-            // `location` (and window/document.location in the member path
+            // `location` (and window/document/self/location in the member path
             // below) through the shell's navigate hook.
             if (ident.Name == "location" && newValue.Type == JsType.String)
             {
@@ -1395,10 +1405,12 @@ public class JsInterpreter
         var constructor = callee.GetFunction();
         var newObj = new JsObject();
         // Constructors without a prototype property still chain to
-        // Object.prototype — {}.toString() used to be undefined.
+        // Object.prototype — {}.toString() used to be undefined. Resolve the
+        // realm's prototype rather than the shared static field so frames
+        // don't chain to a foreign page's Object.prototype.
         newObj.Prototype = constructor.Get("prototype") is { Type: JsType.Object } proto
             ? proto.GetObject()
-            : ObjectPrototype;
+            : GetRealmObjectPrototype();
 
         var result = CallFunction(constructor, JsValue.FromObject(newObj), args);
         return result.Type is JsType.Object or JsType.Function
@@ -1490,7 +1502,7 @@ public class JsInterpreter
         return JsValue.From(Typeof(ExecuteExpression(t.Argument)));
     }
 
-    private JsValue ExecuteDelete(DeleteExpr d)
+        private JsValue ExecuteDelete(DeleteExpr d)
     {
         if (d.Argument is Identifier)
             return JsValue.From(false);   // JS 1.1: cannot delete variables
@@ -1500,8 +1512,10 @@ public class JsInterpreter
             JsValue objVal = ExecuteExpression(member.Object);
             if (objVal.Type is not (JsType.Object or JsType.Function))
                 return JsValue.From(false);
-            return JsValue.From(objVal.GetObjectOrFunction().Properties
-                .Remove(GetMemberPropertyName(member)));
+            // Route through the VIRTUAL Delete so host objects can
+            // intercept removal exactly like Get/Set.
+            return JsValue.From(objVal.GetObjectOrFunction().Delete(
+                GetMemberPropertyName(member)));
         }
 
         return JsValue.From(true);
@@ -1760,7 +1774,8 @@ public class JsInterpreter
     /// <summary>
     /// Object stringifier for "" + obj / String(obj):
     /// arrays join with ',' (null/undefined → empty), dates print in
-    /// Navigator's format, errors print name: message.
+    /// Navigator's format, errors print name: message, primitive wrappers
+    /// print their wrapped value, functions print a source stub.
     /// </summary>
     private static string StringifyObject(JsObject obj)
     {
@@ -1784,7 +1799,9 @@ public class JsInterpreter
                 {
                     double ms = obj.Get("value") is { Type: JsType.Number } v ? v.GetNumber() : double.NaN;
                     if (double.IsNaN(ms)) return "Invalid Date";
-                    var d = DateTime1970 + TimeSpan.FromMilliseconds(ms);
+                    // LOCAL time — Date.prototype.toString() prints local, and
+                    // "" + date must agree with it (this used to print UTC).
+                    var d = (DateTime1970 + TimeSpan.FromMilliseconds(ms)).ToLocalTime();
                     return d.ToString("ddd MMM dd HH:mm:ss yyyy",
                         System.Globalization.CultureInfo.InvariantCulture);
                 }
@@ -1796,7 +1813,24 @@ public class JsInterpreter
                     return msg.Length > 0 ? $"{name}: {msg}" : name;
                 }
 
+            case "String":
+                // Primitive wrapper: "" + new String("hi") must be "hi".
+                return obj.Get("value").ToJsString();
+
+            case "Number":
+                {
+                    var v = obj.Get("value");
+                    return v.Type == JsType.Number ? JsValue.NumberToString(v.GetNumber()) : "NaN";
+                }
+
+            case "Boolean":
+                return obj.Get("value").ToBoolean() ? "true" : "false";
+
             default:
+                if (obj is JsFunction fn)
+                    return fn.Name is { Length: > 0 }
+                        ? $"function {fn.Name}() {{ ... }}"
+                        : "function() { ... }}";
                 return "[object Object]";
         }
     }
@@ -1889,13 +1923,6 @@ public class JsInterpreter
     // Interpreter-aware builtins (eval / call / apply / timers / callbacks)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Install the builtins that need a live interpreter: eval,
-    /// Function.prototype.call/apply, setTimeout/setInterval/clearTimeout/
-    /// clearInterval on window and the global scope, and the array methods
-    /// that invoke script callbacks (sort/forEach/filter/map).  Call after
-    /// JsRuntime.PopulateGlobalScope and DomBindings.RegisterAll.
-    /// </summary>
     private void PublishConsole(string level, string message)
     {
         ConsoleMessage?.Invoke(new ConsoleEntry(level, message, DateTime.Now));
@@ -2092,7 +2119,7 @@ public class JsInterpreter
             if (mode == "map")
                 mapped!.Set(i.ToString(), r);
             else if (mode == "filter" && r.ToBoolean())
-                AppendToArray(mapped ??= new JsObject { Class = "Array", Prototype = ArrayPrototype }, item);
+                AppendToArray(mapped!, item);
         }
 
         if (mapped != null)
