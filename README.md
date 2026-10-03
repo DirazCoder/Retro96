@@ -6,7 +6,7 @@ Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This project alone is around 80K lines (entire codebase repo if you count every file) — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), a JDK 1.1 bytecode interpreter for Java applets, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This project alone is around 88K lines (entire codebase repo if you count every file) — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, a full ES3 engine (lexer, parser, interpreter, DOM bindings), a JDK 1.1 bytecode interpreter for Java applets, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -125,11 +125,11 @@ here's what actually happened under the hood:
 
 **layout engine** — the Rust version had one function that did everything. every element, regardless of what it was, got stacked vertically with a hardcoded `current_y += height + 10.0`. that's it. that's the layout engine. ten pixels. between everything. always. framesets returned an empty node. inline layout didn't exist as a concept. Retro96 has `InlineLayout.cs`, `TableLayout.cs`, `LayoutEngine.cs` — actual separate layout passes, actual inline text flow, actual table column width resolution
 
-**CSS parser** — the Rust one had about 11 property matches across 657 lines. Retro96 has a 807-line parser, a 1063-line computed style system, a 707-line style resolver, and a 391-line selector engine. these are different things that do different things
+**CSS parser** — the Rust one had about 11 property matches across 657 lines. Retro96 has an 837-line parser, a 1,294-line computed style system, an 847-line style resolver, and a 411-line selector engine. these are different things that do different things
 
-**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is one 2442-line file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, scope — 7149 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is 1669 lines on its own
+**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is one 2,442-line file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, scope — 7,331 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is 2,141 lines on its own
 
-**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 has 183 xUnit facts, 29 live JS contract checks against real pages, 41 hand-authored QA HTML files, a layout lab, and a Playwright visual diff harness that renders pages side-by-side against Chromium and diffs them pixel by pixel. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
+**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 has 204 xUnit facts, 30 live JS contract checks against real pages, 54 hand-authored QA HTML files, a layout lab, and a Playwright visual diff harness that renders pages side-by-side against Chromium and diffs them pixel by pixel. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
 
 **real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
 
@@ -153,11 +153,11 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project is roughly 29k lines. Retro96 is roughly 80k. one of them works
+the Rust project is roughly 29k lines. Retro96 is roughly 88k. one of them works
 
 ## Status
 
-Side project built for fun, not production software. The engine has a full regression suite (183 xUnit facts, 29 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium).
+Side project built for fun, not production software. The engine has a full regression suite (204 xUnit facts, 30 live JS contract checks, a layout lab, and a pixel-diff harness that runs 37 real pages against Chromium).
 
 ## Rendering stack
 
