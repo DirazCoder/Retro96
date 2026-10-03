@@ -1000,6 +1000,7 @@ public class Renderer
         }
 
         // Background image
+        if (!BrowserRuntime.ImagesEnabled) return;
         string? bgCss = style.BackgroundImage;
         if (string.IsNullOrEmpty(bgCss) || bgCss == "none") return;
 
@@ -1915,6 +1916,8 @@ public class Renderer
 
     private void PaintImage(SkiaRenderContext g, LayoutBox box, ImageCache images)
     {
+        if (!BrowserRuntime.ImagesEnabled) return;
+
         var elem = box.Element!;
         var rect = box.ContentRect;
         string? src = elem.GetAttr("src");
@@ -1965,6 +1968,12 @@ public class Renderer
 
     private bool TryGetFrame(ImageCache images, string absoluteUrl, out Bitmap? frame)
     {
+        if (!BrowserRuntime.ImagesEnabled)
+        {
+            frame = null;
+            return false;
+        }
+
         try
         {
             // The high-refresh animated-image path calls PaintImage every

@@ -94,6 +94,11 @@ public partial class Form1 : Form
     private readonly ToolStripButton _btnReload = new("⟳");
     private readonly ToolStripButton _btnStop = new("■");
     private readonly ToolStripButton _btnPrint = new("Print");
+    private float _textSizeScale = 1f;
+    private readonly ToolStripMenuItem _textOnlyModeMenuItem = new("Text-Only mode")
+    {
+        CheckOnClick = true
+    };
     private readonly ToolStripTextBox _txtUrl = new();
     private readonly ToolStripButton _btnGo = new("Go");
     private readonly BrowserCanvas _canvas = new();
@@ -375,6 +380,51 @@ public partial class Form1 : Form
         _btnFile.DropDownItems.Add("Open Local HTML\u2026").Click += (s, e) => OpenHtmlFile();
         _btnFile.DropDownItems.Add("Open New Window").Click += (s, e) => OpenNewBrowserWindow("about:blank");
         _btnFile.DropDownItems.Add("Preferences\u2026").Click += (s, e) => ShowPreferencesDialog();
+        _btnFile.DropDownItems.Add(new ToolStripSeparator());
+        _btnFile.DropDownItems.Add("Save As\u2026").Click += (s, e) => SaveCurrentPageAs();
+        _btnFile.DropDownItems.Add("Send Page\u2026").Click += (s, e) => SendCurrentPage();
+        _btnFile.DropDownItems.Add(new ToolStripSeparator());
+        var textSizeMenu = new ToolStripMenuItem("Text Size");
+        foreach (var (label, zoom) in new[]
+        {
+            ("Smallest", 0.75f),
+            ("Small", 0.875f),
+            ("Medium", 1f),
+            ("Large", 1.25f),
+            ("Largest", 1.5f)
+        })
+        {
+            var item = new ToolStripMenuItem(label)
+            {
+                Tag = zoom,
+                Checked = zoom == _textSizeScale,
+                CheckOnClick = true
+            };
+            item.Click += (_, _) =>
+            {
+                _textSizeScale = (float)item.Tag;
+                foreach (ToolStripMenuItem option in textSizeMenu.DropDownItems)
+                    option.Checked = ReferenceEquals(option, item);
+                if (_currentPageUrl != null)
+                    Reload();
+            };
+            textSizeMenu.DropDownItems.Add(item);
+        }
+        _btnFile.DropDownItems.Add(textSizeMenu);
+        _textOnlyModeMenuItem.Checked = !_settings.LoadImages;
+        _textOnlyModeMenuItem.CheckedChanged += (_, _) =>
+        {
+            bool loadImages = !_textOnlyModeMenuItem.Checked;
+            if (_settings.LoadImages == loadImages) return;
+            _settings.LoadImages = loadImages;
+            _settings.Save();
+            BrowserRuntime.Apply(_settings);
+            if (_currentPageUrl != null)
+                Reload();
+        };
+        _btnFile.DropDownItems.Add(_textOnlyModeMenuItem);
+        _btnFile.DropDownItems.Add(new ToolStripSeparator());
+        _btnFile.DropDownItems.Add("Exit").Click += (s, e) => Application.Exit();
         _pluginCommandsMenu = new ToolStripMenuItem("Plugin Commands");
         _pluginCommandsMenu.Visible = false;
         _btnFile.DropDownItems.Add(_pluginCommandsMenu);
@@ -670,6 +720,7 @@ public partial class Form1 : Form
         _settings.PluginDevMode = updated.PluginDevMode;
         _settings.Save();
         BrowserRuntime.Apply(_settings);
+        _textOnlyModeMenuItem.Checked = !_settings.LoadImages;
         _canvas.ZoomFactor = _settings.DefaultPageZoomPercent / 100f;
 
         // Preferences are live for the current page where possible.  A reload
@@ -686,6 +737,12 @@ public partial class Form1 : Form
                 "High-DPI scale mode has been saved. Restart Retro96 for the new Windows DPI awareness mode to take effect.",
                 "Retro96", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
+    }
+
+    private void ResolveDocumentStyles(DomDocument document, float viewportWidth = 800f)
+    {
+        document.TextSizeScale = _textSizeScale;
+        StyleResolver.Resolve(document, viewportWidth);
     }
 
     private static string EscapeHtmlText(string? s) =>
@@ -800,15 +857,7 @@ public partial class Form1 : Form
                         await RenderHtmlAsync(Retro96HomePageHtml(), rawUrl, replaceHistory, myGeneration);
                         return;
                     }
-                    await RenderHtmlAsync(
-                        "<html><head><title>About Retro96</title></head>" +
-                        "<body bgcolor=\"#c0c0c0\">" +
-                        "<center><h2>Retro96 Browser</h2>" +
-                        "<p>A retro browser for the web as it was in 1996, with extra compatibility for later throwback sites.</p>" +
-                        "<p><font size=\"-1\" color=\"#606060\">HTML 3.2 · CSS1 · ES3 JavaScript · " +
-                        "VBScript 1.0 · Java applets</font></p>" +
-                        "</center></body></html>",
-                        rawUrl, replaceHistory, myGeneration);
+                    await RenderHtmlAsync(Retro96AboutPageHtml(), rawUrl, replaceHistory, myGeneration);
                     return;
 
                 case "mailto":
@@ -1185,7 +1234,7 @@ public partial class Form1 : Form
         _visitedUrls.Add(url.ToAbsolute());
         document.VisitedUrls.UnionWith(_visitedUrls);
         Size canvasSize = GetCanvasSize();
-        StyleResolver.Resolve(document, canvasSize.Width);
+        ResolveDocumentStyles(document, canvasSize.Width);
         _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.9);
 
         var rootBox = LayoutEngineApi.BuildLayoutTree(
@@ -1734,8 +1783,8 @@ public partial class Form1 : Form
             _ => BrowserCanvas.FrameScrollMode.Auto
         };
 
-    private static FrameContent ApplyFramePresentation(DomElement frameElem, FrameContent content,
-                                                        int frameW, int frameH)
+    private FrameContent ApplyFramePresentation(DomElement frameElem, FrameContent content,
+                                                int frameW, int frameH)
     {
         var body = content.Document.ElementDescendants().FirstOrDefault(e => e.TagName == "body");
         if (body != null)
@@ -1746,7 +1795,7 @@ public partial class Form1 : Form
             if (mh >= 0) body.SetAttr("marginheight", mh.ToString());
         }
 
-        StyleResolver.Resolve(content.Document, Math.Max(1, frameW));
+        ResolveDocumentStyles(content.Document, Math.Max(1, frameW));
         var root = LayoutEngineApi.BuildLayoutTree(content.Document,
             Math.Max(1, frameW), Math.Max(1, frameH));
         return new FrameContent(content.Document, root, content.AbsoluteUrl);
@@ -2144,7 +2193,7 @@ public partial class Form1 : Form
                     if (BrowserRuntime.StylesheetsEnabled)
                         await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
                     doc.VisitedUrls.UnionWith(_visitedUrls);
-                    StyleResolver.Resolve(doc, Math.Max(1, frameW));
+                    ResolveDocumentStyles(doc, Math.Max(1, frameW));
                     var root = LayoutEngineApi.BuildLayoutTree(doc, frameW, frameH);
                     content = new FrameContent(doc, root, s.EffectiveUrl.Length > 0 ? s.EffectiveUrl : url);
                 }
@@ -2223,6 +2272,121 @@ public partial class Form1 : Form
     private void OnFrameNavigationRequested(
         (BrowserCanvas Canvas, BrowserCanvas.FrameView Frame, string Url) nav)
         => _ = LoadFrameAsync(nav.Frame, nav.Url);
+
+    private void SaveCurrentPageAs()
+    {
+        DomDocument? document = _canvas.PageDocument;
+        if (document == null)
+        {
+            MessageBox.Show(this, "There is no page to save.", "Save As",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string suggestedName = string.IsNullOrWhiteSpace(document.Title)
+            ? "webpage"
+            : document.Title;
+        foreach (char invalid in Path.GetInvalidFileNameChars())
+            suggestedName = suggestedName.Replace(invalid, '_');
+
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Save Page As",
+            FileName = suggestedName + ".html",
+            DefaultExt = "html",
+            AddExtension = true,
+            Filter = "HTML document (*.html;*.htm)|*.html;*.htm|All files (*.*)|*.*",
+            OverwritePrompt = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        try
+        {
+            var html = new StringBuilder();
+            foreach (DomNode child in document.Children)
+                AppendSavedHtml(child, html);
+            File.WriteAllText(dialog.FileName, html.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            _statusLabel.Text = "Page saved";
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException("Save current page", ex);
+            MessageBox.Show(this, $"The page could not be saved:\n{ex.Message}", "Save As",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void SendCurrentPage()
+    {
+        string? pageUrl = _currentPageUrl;
+        if (string.IsNullOrWhiteSpace(pageUrl))
+        {
+            MessageBox.Show(this, "There is no page to send.", "Send Page",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string title = _canvas.PageDocument?.Title ?? "";
+        string target = "?subject=" + Uri.EscapeDataString(title.Length == 0 ? pageUrl : title)
+            + "&body=" + Uri.EscapeDataString(pageUrl);
+        if (!TryBuildMailtoUri(target, out string mailUri))
+        {
+            MessageBox.Show(this, "The page address is too long to send by email.", "Send Page",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(mailUri) { UseShellExecute = true })?.Dispose();
+            _statusLabel.Text = "Opened email composer";
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException("Send current page", ex);
+            MessageBox.Show(this, $"Retro96 couldn't open an email program:\n{ex.Message}", "Send Page",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static void AppendSavedHtml(DomNode node, StringBuilder html)
+    {
+        switch (node)
+        {
+            case DomDoctype doctype:
+                html.Append('<').Append(doctype.RawText).Append('>');
+                break;
+            case DomComment comment:
+                html.Append("<!--").Append(comment.Text).Append("-->");
+                break;
+            case DomText text:
+                html.Append(EscapeHtmlText(text.Data));
+                break;
+            case DomElement element:
+                html.Append('<').Append(element.TagName);
+                foreach (var attribute in element.Attrs)
+                    html.Append(' ').Append(attribute.Key).Append("=\"")
+                        .Append(EscapeHtmlAttribute(attribute.Value)).Append('"');
+                html.Append('>');
+                if (element.TagName is "area" or "base" or "basefont" or "br" or "col" or "frame"
+                    or "hr" or "img" or "input" or "isindex" or "link" or "meta" or "param")
+                    return;
+                foreach (DomNode child in element.Children)
+                    AppendSavedHtml(child, html);
+                html.Append("</").Append(element.TagName).Append('>');
+                break;
+            default:
+                foreach (DomNode child in node.Children)
+                    AppendSavedHtml(child, html);
+                break;
+        }
+    }
+
+    private static string EscapeHtmlAttribute(string value) =>
+        value.Replace("&", "&amp;").Replace("\"", "&quot;")
+             .Replace("<", "&lt;").Replace(">", "&gt;");
 
     // ─────────────────────────────────────────────────────────────────────
     // Page display / history
@@ -2386,7 +2550,7 @@ public partial class Form1 : Form
             // empty history on local/file pages, even after a link had been
             // followed and the page reloaded.
             document.VisitedUrls.UnionWith(_visitedUrls);
-            StyleResolver.Resolve(document);
+            ResolveDocumentStyles(document);
 
             Size sz = GetCanvasSize();
             var root = LayoutEngineApi.BuildLayoutTree(document, sz.Width, sz.Height);
@@ -2977,6 +3141,25 @@ public partial class Form1 : Form
 </CENTER>
 </BODY>
 </HTML>";
+    }
+
+    private static string Retro96AboutPageHtml()
+    {
+        using Stream? logoStream = typeof(Form1).Assembly.GetManifestResourceStream("Retro96.assets.logo.png");
+        if (logoStream == null)
+            throw new FileNotFoundException("The embedded Retro96 logo resource was not found.");
+
+        using var logoData = new MemoryStream();
+        logoStream.CopyTo(logoData);
+        string logoUri = "data:image/png;base64," + Convert.ToBase64String(logoData.ToArray());
+
+        return "<html><head><title>About Retro96</title></head>" +
+            "<body bgcolor=\"#c0c0c0\">" +
+            "<center><img src=\"" + logoUri + "\" alt=\"Retro96 logo\"><h2>Retro96 Browser</h2>" +
+            "<p>A retro browser for the web as it was in 1996, with extra compatibility for later throwback sites.</p>" +
+            "<p><font size=\"-1\" color=\"#606060\">HTML 3.2 · CSS1 · ES3 JavaScript · " +
+            "VBScript 1.0 · Java applets</font></p>" +
+            "</center></body></html>";
     }
 
         private static string Retro96WelcomePageHtml() => """

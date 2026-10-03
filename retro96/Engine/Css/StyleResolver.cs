@@ -101,6 +101,16 @@ public static class StyleResolver
 
         int activeBaseFontSize = doc.BaseFontSize;
         ResolveNode(doc, null, authorRules, doc, viewportWidth, ref activeBaseFontSize);
+
+        float textSizeScale = float.IsFinite(doc.TextSizeScale)
+            ? Math.Clamp(doc.TextSizeScale, 0.5f, 3f)
+            : 1f;
+        if (textSizeScale != 1f)
+        {
+            foreach (var element in doc.ElementDescendants())
+                if (element.Style != null)
+                    element.Style.FontSize *= textSizeScale;
+        }
     }
 
     private static void ResolveNode(DomNode node, ComputedStyle? parentStyle,

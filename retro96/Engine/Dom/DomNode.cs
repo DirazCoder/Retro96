@@ -150,6 +150,7 @@ public class DomDocument : DomNode
 {
     public string       Title        { get; set; } = "";
     public ParsedUrl?   BaseUrl      { get; set; }
+    public float        TextSizeScale { get; set; } = 1f;
     public string       BaseTarget   { get; set; } = "";
     public string       Charset      { get; set; } = "iso-8859-1";
     public string       QuirksMode   { get; set; } = "html32";
