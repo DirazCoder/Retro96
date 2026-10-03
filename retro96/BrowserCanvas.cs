@@ -93,6 +93,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private long _animationNextDueTicks;
     private int _animationRefreshRate = 60;
     private string _animationDisplayDevice = string.Empty;
+    private bool _vsyncConfigured;
     private readonly Timer _blinkTimer = new() { Interval = 500 };
     private readonly Timer _jsTimer = new() { Interval = 16 };
     private readonly Timer _resizeReflowTimer = new() { Interval = 150 };
@@ -421,6 +422,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        _vsyncConfigured = false;
         UpdateAnimationRefreshRate();
     }
 
@@ -458,7 +460,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             }
         }
 
-        if (refresh < 24 || refresh > 360)
+        if (refresh < 24 || refresh > 1000)
             refresh = 60; // Safe fallback when the display driver cannot report VREFRESH.
 
         _animationDisplayDevice = displayDevice;
@@ -2042,6 +2044,20 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     protected override void OnPaintSurface(SKPaintGLSurfaceEventArgs e)
     {
         base.OnPaintSurface(e);
+
+        if (!_vsyncConfigured)
+        {
+            try
+            {
+                Context.SwapInterval = 1;
+                _vsyncConfigured = true;
+            }
+            catch (Exception ex)
+            {
+                _vsyncConfigured = true;
+                Retro96.DebugLog.WriteException("Enable browser canvas VSync", ex);
+            }
+        }
 
         var canvas = e.Surface.Canvas;
         var currentGpuContext = GRContext;
@@ -10376,6 +10392,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
         if (BrowserRuntime.BlinkEnabled && hasBlink)
         {
+            _blinkTimer.Interval = BrowserRuntime.BlinkIntervalMilliseconds;
             if (!_blinkTimer.Enabled) _blinkTimer.Start();
         }
         else if (_blinkTimer.Enabled) _blinkTimer.Stop();

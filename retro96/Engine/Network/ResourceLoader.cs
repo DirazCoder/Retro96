@@ -11,7 +11,8 @@ public class ResourceLoader : IDisposable
     public sealed record FetchRecord(string Url, string Status, int? StatusCode, DateTime StartedUtc, DateTime CompletedUtc);
 
     private readonly HttpClient _httpClient;
-    private readonly SemaphoreSlim _semaphore = new(8, 8);   // 8 concurrent fetches
+    private const int ConcurrencyPermits = 32;
+    private readonly SemaphoreSlim _semaphore = new(ConcurrencyPermits, ConcurrencyPermits);
     private readonly ConcurrentDictionary<string, Lazy<Task<HttpResult>>> _inFlight = new();
     private readonly CookieStore _defaultCookies;
 
@@ -21,10 +22,7 @@ public class ResourceLoader : IDisposable
     private readonly List<FetchRecord> _history = new();
     private readonly object _historyLock = new();
 
-    // The budget is shared by the top document and all nested frames. The
-    // Old Net alone references roughly 187 images before its archived frame
-    // assets are fetched, so 200 incorrectly starved later frame GIFs.
-    private const int MaxFetchesPerPage = 1000;
+    // The budget is shared by the top document and all nested frames.
     private static readonly TimeSpan PageIdleReset = TimeSpan.FromSeconds(15);
 
     public ResourceLoader(CookieStore defaultCookies, HttpClient? httpClient = null)
@@ -42,8 +40,8 @@ public class ResourceLoader : IDisposable
 
         MaybeResetAfterIdle();
 
-        if (Volatile.Read(ref _fetchCount) >= MaxFetchesPerPage)
-            return new HttpError($"Too many asset fetches (limit {MaxFetchesPerPage} per page)");
+        if (Volatile.Read(ref _fetchCount) >= BrowserRuntime.MaxResourceFetchesPerPage)
+            return new HttpError($"Too many asset fetches (limit {BrowserRuntime.MaxResourceFetchesPerPage} per page)");
 
         // Resolve relative URL
         ParsedUrl resolvedUrl;
@@ -152,10 +150,26 @@ public class ResourceLoader : IDisposable
 
     private async Task<HttpResult> FetchInternalAsync(ParsedUrl url, CookieStore cookies)
     {
-        Interlocked.Increment(ref _fetchCount);
+        int fetchCount = Interlocked.Increment(ref _fetchCount);
+        if (fetchCount > BrowserRuntime.MaxResourceFetchesPerPage)
+        {
+            Interlocked.Decrement(ref _fetchCount);
+            return new HttpError($"Too many asset fetches (limit {BrowserRuntime.MaxResourceFetchesPerPage} per page)");
+        }
+
         CancellationToken ct = _pageCts.Token;
 
-        await _semaphore.WaitAsync(ct);
+        int permits = ConcurrencyPermits / BrowserRuntime.MaxConcurrentResourceFetches;
+        try
+        {
+            await _semaphore.WaitAsync(permits, ct);
+        }
+        catch
+        {
+            Interlocked.Decrement(ref _fetchCount);
+            throw;
+        }
+
         try
         {
             return await _httpClient.GetAsync(url, cookies, ct);
@@ -164,7 +178,7 @@ public class ResourceLoader : IDisposable
         {
             // Guarded — Dispose() during shutdown must not throw through
             // in-flight releases.
-            try { _semaphore.Release(); }
+            try { _semaphore.Release(permits); }
             catch (ObjectDisposedException) { /* shutting down */ }
         }
     }

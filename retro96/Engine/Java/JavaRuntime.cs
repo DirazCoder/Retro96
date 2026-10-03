@@ -423,8 +423,6 @@ public sealed partial class JavaVm
     // Guard against runaway recursion turning into a host StackOverflow,
     // which cannot be caught; applets can still catch the JVM-level error.
     [ThreadStatic] private static int _invocationDepth;
-    private const int MaxInvocationDepth = 400;
-
     public JValue Invoke(JClass owner, JMethod method, JValue receiver, JValue[] args)
     {
         // Frames (and natives) resolve against the DECLARING class so
@@ -437,7 +435,7 @@ public sealed partial class JavaVm
             monitor = method.IsStatic ? declaring : receiver.AsReference() ?? new object();
             System.Threading.Monitor.Enter(monitor);
         }
-        if (_invocationDepth >= MaxInvocationDepth)
+        if (_invocationDepth >= BrowserRuntime.JavaMaxCallDepth)
         {
             var overflow = new JvmException(CreateExceptionObject("java.lang.StackOverflowError"), 0);
             if (monitor != null) System.Threading.Monitor.Exit(monitor);

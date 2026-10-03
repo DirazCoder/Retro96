@@ -34,26 +34,43 @@ internal sealed class PreferencesDialog : Form
     private readonly PluginManager? _pluginManager;
     private readonly Dictionary<string, Control> _pluginSettingControls = new(StringComparer.OrdinalIgnoreCase);
     private readonly CheckBox _pluginDevMode = new();
+    private readonly ToolTip _advancedToolTips = new();
 
-    // Advanced engine feature switches. Kept in one long, scrollable list
-    // so the Advanced tab acts as the low-level control panel.
+    // Advanced engine feature switches.
     private readonly CheckBox _loadStylesheets = new();
     private readonly CheckBox _loadFrames = new();
     private readonly CheckBox _allowForms = new();
+    private readonly CheckBox _externalScripts = new();
+    private readonly CheckBox _javascriptEval = new();
     private readonly CheckBox _jsTimers = new();
     private readonly CheckBox _jsDialogs = new();
     private readonly CheckBox _followRedirects = new();
+    private readonly CheckBox _compressedResponses = new();
     private readonly CheckBox _metaRefresh = new();
     private readonly CheckBox _cookies = new();
     private readonly CheckBox _referrer = new();
     private readonly CheckBox _animateImages = new();
     private readonly CheckBox _blink = new();
     private readonly CheckBox _marquee = new();
+    private readonly NumericUpDown _jsExecutionSeconds = new();
+    private readonly NumericUpDown _jsMemoryLimitMb = new();
+    private readonly NumericUpDown _jsMaxCallDepth = new();
+    private readonly NumericUpDown _scriptSpliceTokens = new();
+    private readonly NumericUpDown _javaMaxCallDepth = new();
+    private readonly NumericUpDown _maxRedirects = new();
+    private readonly NumericUpDown _connectTimeoutSeconds = new();
+    private readonly NumericUpDown _responseTimeoutSeconds = new();
+    private readonly NumericUpDown _maxConcurrentFetches = new();
+    private readonly NumericUpDown _maxFetchesPerPage = new();
+    private readonly NumericUpDown _gifSpeedPercent = new();
+    private readonly NumericUpDown _blinkIntervalMs = new();
+    private readonly NumericUpDown _marqueeSpeedPercent = new();
 
     public PreferencesDialog(UserSettings source, PluginManager? pluginManager = null)
     {
         _settings = source.Clone();
         _pluginManager = pluginManager;
+        FormClosed += (_, _) => _advancedToolTips.Dispose();
 
         Text = "Retro96 — Preferences";
         StartPosition = FormStartPosition.CenterParent;
@@ -182,14 +199,14 @@ internal sealed class PreferencesDialog : Form
             new Label
             {
                 Text = "Sets the starting zoom for web pages. Use the toolbar or View menu to adjust the current page; the selected default is used again after restarting Retro96.",
-                AutoSize = false, Width = 690, Height = 38,
+                AutoSize = true, MaximumSize = new Size(690, 0),
                 ForeColor = Color.FromArgb(90, 96, 104)
             },
             _highDpiScaleMode,
             new Label
             {
                 Text = "Per-Monitor V2 follows Windows display scaling when moving Retro96 between monitors. Changing this Windows DPI-awareness mode requires restarting Retro96.",
-                AutoSize = false, Width = 690, Height = 38,
+                AutoSize = true, MaximumSize = new Size(690, 0),
                 ForeColor = Color.FromArgb(90, 96, 104)
             }
         }));
@@ -390,37 +407,72 @@ internal sealed class PreferencesDialog : Form
     private TabPage BuildAdvancedTab()
     {
         var page = NewTab("Advanced");
-        var panel = StackPanel();
+        page.AutoScroll = false;
 
-        panel.Controls.Add(Group("Page loading", new Control[]
+        var settingsBox = new SettingsGroupBox
+        {
+            Text = "Settings",
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12, 18, 12, 10)
+        };
+
+        var scrollPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(8, 4, 8, 4)
+        };
+        var list = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Padding = new Padding(0),
+            Margin = new Padding(0),
+            Width = 680
+        };
+
+        list.Controls.Add(AdvancedCategory("Page loading", new Control[]
         {
             AdvancedToggle(_loadStylesheets, "Load external CSS stylesheets",
                 "Disable to ignore <link rel=stylesheet> resources."),
             AdvancedToggle(_loadFrames, "Load frames and IFRAMEs",
                 "Disable to leave frame boxes in place without fetching their documents."),
             AdvancedToggle(_allowForms, "Allow HTML form submissions",
-                "Disable to keep form controls usable but block GET/POST submission."),
+                "Disable to keep form controls usable but block GET/POST submission.")
         }));
-
-        panel.Controls.Add(Group("Scripting", new Control[]
+        list.Controls.Add(AdvancedCategory("Scripting", new Control[]
         {
             AdvancedToggle(_javascript, "Enable JavaScript",
                 "Controls JavaScript script blocks. VBScript can be enabled independently with the setting below."),
             AdvancedToggle(_vbscript, "Enable VBScript",
                 "Disable to prevent VBScript blocks and event procedures from running. High trust mode always blocks VBScript."),
+            AdvancedToggle(_externalScripts, "Run external scripts",
+                "Disable to skip scripts loaded from a script element's src attribute while keeping inline scripts available."),
+            AdvancedToggle(_javascriptEval, "Allow JavaScript eval()",
+                "Disable to remove the eval() function without disabling other JavaScript features."),
             AdvancedToggle(_jsTimers, "Run JavaScript timers (setTimeout / setInterval)",
                 "Disable to keep JavaScript enabled while stopping scheduled script callbacks."),
             AdvancedToggle(_jsDialogs, "Allow script dialogs (JavaScript alert / confirm / prompt; VBScript MsgBox / InputBox)",
                 "Disable to suppress modal dialogs requested by either scripting engine."),
+            AdvancedNumber(_jsExecutionSeconds, "JavaScript execution timeout (seconds)", 1, 60,
+                "Maximum wall-clock time allowed for a single script execution."),
+            AdvancedNumber(_jsMemoryLimitMb, "JavaScript memory limit (MiB)", 1, 512,
+                "Approximate allocation budget for one JavaScript execution."),
+            AdvancedNumber(_jsMaxCallDepth, "JavaScript maximum call depth", 32, 2000,
+                "Maximum nested JavaScript function calls."),
+            AdvancedNumber(_scriptSpliceTokens, "document.write script-splice token limit", 1000, 2000000,
+                "Maximum token count accepted when document.write inserts markup during parsing.")
         }));
-
-        panel.Controls.Add(Group("Java", new Control[]
+        list.Controls.Add(AdvancedCategory("Java", new Control[]
         {
             AdvancedToggle(_javaApplets, "Enable Java applets",
                 "Runs Java 1.0/1.1 bytecode plus selected later runtime APIs in Retro96's built-in interpreter (no external JRE). High trust mode always blocks applets."),
+            AdvancedNumber(_javaMaxCallDepth, "Java maximum call depth", 32, 2000,
+                "Maximum nested method calls in the built-in Java interpreter.")
         }));
-
-        panel.Controls.Add(Group("Networking", new Control[]
+        list.Controls.Add(AdvancedCategory("Networking", new Control[]
         {
             AdvancedToggle(_followRedirects, "Follow HTTP redirects",
                 "Disable to stop after the first 301/302/303/307/308 response."),
@@ -430,52 +482,142 @@ internal sealed class PreferencesDialog : Form
                 "Controls both Cookie/Set-Cookie handling and document.cookie."),
             AdvancedToggle(_referrer, "Send the Referer request header",
                 "Disable to omit the previous page URL from outgoing requests."),
+            AdvancedToggle(_compressedResponses, "Request gzip-compressed responses",
+                "Advertises gzip support to servers; gzip responses are decoded before page content is processed."),
+            AdvancedNumber(_maxRedirects, "Maximum HTTP redirects", 0, 20,
+                "Maximum number of redirects followed for one request."),
+            AdvancedNumber(_connectTimeoutSeconds, "Connection timeout (seconds)", 1, 120,
+                "Maximum time to establish a network connection."),
+            AdvancedNumber(_responseTimeoutSeconds, "Response timeout (seconds)", 1, 300,
+                "Maximum time to wait for a response after connecting."),
+            AdvancedNumber(_maxConcurrentFetches, "Concurrent resource requests", 1, 32,
+                "Maximum number of simultaneous page-resource requests."),
+            AdvancedNumber(_maxFetchesPerPage, "Maximum resource requests per page", 1, 10000,
+                "Page-wide limit shared with nested frames.")
         }));
-
-        panel.Controls.Add(Group("Legacy rendering", new Control[]
+        list.Controls.Add(AdvancedCategory("Legacy rendering", new Control[]
         {
             AdvancedToggle(_animateImages, "Animate GIF images",
                 "Disable to freeze animated images on their current frame."),
+            AdvancedNumber(_gifSpeedPercent, "Animated GIF speed (%)", 25, 400,
+                "Playback speed relative to each GIF's encoded frame delays."),
             AdvancedToggle(_blink, "Animate <blink> text",
                 "Disable to keep blinking text permanently visible."),
+            AdvancedNumber(_blinkIntervalMs, "Blink interval (milliseconds)", 100, 2000,
+                "Time between visibility changes for legacy blinking text."),
             AdvancedToggle(_marquee, "Animate <marquee> text",
                 "Disable to stop the legacy marquee repaint loop."),
+            AdvancedNumber(_marqueeSpeedPercent, "Marquee speed (%)", 25, 400,
+                "Speed multiplier applied to legacy marquee motion.")
         }));
 
-        panel.Controls.Add(Group("Advanced notes", new Control[]
+        scrollPanel.Controls.Add(list);
+        settingsBox.Controls.Add(scrollPanel);
+
+        var note = new Label
         {
-            new Label
-            {
-                Text = "These switches expose lower-level Retro96 engine behaviour. Security mode still wins over compatibility settings where the two conflict; disabling a safeguard here cannot grant a page access that the selected trust level forbids.",
-                AutoSize = false, Width = 690, Height = 78,
-                ForeColor = Color.FromArgb(75, 84, 96)
-            }
-        }));
-
-        page.Controls.Add(panel);
+            Text = "Security mode takes precedence over conflicting compatibility settings. Disabling a setting here cannot grant a page access that the selected trust level forbids.",
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ForeColor = Color.FromArgb(75, 84, 96),
+            Margin = new Padding(4, 8, 4, 0)
+        };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(0)
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.Controls.Add(settingsBox, 0, 0);
+        layout.Controls.Add(note, 0, 1);
+        page.Controls.Add(layout);
         return page;
     }
 
-    private static Control AdvancedToggle(CheckBox box, string text, string description)
+    private Control AdvancedCategory(string title, Control[] options)
+    {
+        var section = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Padding = new Padding(0),
+            Margin = new Padding(0, 0, 0, 5),
+            Width = 660
+        };
+        var header = new Button
+        {
+            Text = "\u25bc  " + title,
+            TextAlign = ContentAlignment.MiddleLeft,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = SystemColors.Window,
+            UseVisualStyleBackColor = false,
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Width = 640,
+            Height = 34,
+            Margin = new Padding(0, 1, 0, 2),
+            Padding = new Padding(6, 0, 0, 0)
+        };
+        header.FlatAppearance.BorderSize = 0;
+        var content = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Padding = new Padding(0),
+            Margin = new Padding(0, 0, 0, 0),
+            Width = 640
+        };
+        foreach (Control option in options)
+            content.Controls.Add(option);
+        header.Click += (_, _) =>
+        {
+            content.Visible = !content.Visible;
+            header.Text = (content.Visible ? "\u25bc  " : "\u25b6  ") + title;
+        };
+        section.Controls.Add(header);
+        section.Controls.Add(content);
+        return section;
+    }
+
+    private Control AdvancedToggle(CheckBox box, string text, string description)
     {
         ConfigureCheckBox(box, text);
-        var wrapper = new Panel
+        box.Margin = new Padding(20, 0, 0, 1);
+        _advancedToolTips.SetToolTip(box, description);
+        return box;
+    }
+
+    private Control AdvancedNumber(NumericUpDown input, string label, int minimum, int maximum, string description)
+    {
+        input.Minimum = minimum;
+        input.Maximum = maximum;
+        input.Width = 90;
+        input.Margin = new Padding(0, 0, 0, 1);
+        var row = new FlowLayoutPanel
         {
-            Width = 690, AutoSize = true, Margin = new Padding(0)
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(20, 2, 0, 3),
+            Width = 620
         };
-        box.Location = new Point(0, 0);
-        wrapper.Controls.Add(box);
-        int boxHeight = Math.Max(box.PreferredSize.Height, box.MinimumSize.Height);
-        var hint = new Label
+        row.Controls.Add(new Label
         {
-            Text = description,
-            AutoSize = true, MaximumSize = new Size(666, 0),
-            Location = new Point(24, boxHeight + 4),
-            ForeColor = Color.FromArgb(110, 116, 124),
-            Padding = new Padding(0)
-        };
-        wrapper.Controls.Add(hint);
-        return wrapper;
+            Text = label,
+            AutoSize = false,
+            Width = 440,
+            Height = 25,
+            TextAlign = ContentAlignment.MiddleLeft
+        });
+        row.Controls.Add(input);
+        _advancedToolTips.SetToolTip(input, description);
+        _advancedToolTips.SetToolTip(row, description);
+        return row;
     }
 
     private TabPage BuildPluginSettingsTab()
@@ -583,15 +725,31 @@ internal sealed class PreferencesDialog : Form
         _loadStylesheets.Checked = _settings.LoadStylesheets;
         _loadFrames.Checked = _settings.LoadFrames;
         _allowForms.Checked = _settings.AllowFormSubmissions;
+        _externalScripts.Checked = _settings.EnableExternalScripts;
+        _javascriptEval.Checked = _settings.EnableJavaScriptEval;
         _jsTimers.Checked = _settings.EnableJavaScriptTimers;
         _jsDialogs.Checked = _settings.EnableJavaScriptDialogs;
         _followRedirects.Checked = _settings.FollowHttpRedirects;
+        _compressedResponses.Checked = _settings.RequestCompressedResponses;
         _metaRefresh.Checked = _settings.FollowMetaRefresh;
         _cookies.Checked = _settings.EnableCookies;
         _referrer.Checked = _settings.SendReferrer;
         _animateImages.Checked = _settings.AnimateImages;
         _blink.Checked = _settings.BlinkText;
         _marquee.Checked = _settings.MarqueeText;
+        _jsExecutionSeconds.Value = _settings.JavaScriptMaxExecutionSeconds;
+        _jsMemoryLimitMb.Value = _settings.JavaScriptMemoryLimitMb;
+        _jsMaxCallDepth.Value = _settings.JavaScriptMaxCallDepth;
+        _scriptSpliceTokens.Value = _settings.MaxScriptSpliceTokens;
+        _javaMaxCallDepth.Value = _settings.JavaMaxCallDepth;
+        _maxRedirects.Value = _settings.MaxHttpRedirects;
+        _connectTimeoutSeconds.Value = _settings.HttpConnectTimeoutSeconds;
+        _responseTimeoutSeconds.Value = _settings.HttpResponseTimeoutSeconds;
+        _maxConcurrentFetches.Value = _settings.MaxConcurrentResourceFetches;
+        _maxFetchesPerPage.Value = _settings.MaxResourceFetchesPerPage;
+        _gifSpeedPercent.Value = _settings.AnimatedGifSpeedPercent;
+        _blinkIntervalMs.Value = _settings.BlinkIntervalMilliseconds;
+        _marqueeSpeedPercent.Value = _settings.MarqueeSpeedPercent;
         UpdateUserAgentHint();
         UpdateUaEnabled();
         UpdateBgEnabled();
@@ -626,15 +784,31 @@ internal sealed class PreferencesDialog : Form
         target.LoadStylesheets = _loadStylesheets.Checked;
         target.LoadFrames = _loadFrames.Checked;
         target.AllowFormSubmissions = _allowForms.Checked;
+        target.EnableExternalScripts = _externalScripts.Checked;
+        target.EnableJavaScriptEval = _javascriptEval.Checked;
         target.EnableJavaScriptTimers = _jsTimers.Checked;
         target.EnableJavaScriptDialogs = _jsDialogs.Checked;
         target.FollowHttpRedirects = _followRedirects.Checked;
+        target.RequestCompressedResponses = _compressedResponses.Checked;
         target.FollowMetaRefresh = _metaRefresh.Checked;
         target.EnableCookies = _cookies.Checked;
         target.SendReferrer = _referrer.Checked;
         target.AnimateImages = _animateImages.Checked;
         target.BlinkText = _blink.Checked;
         target.MarqueeText = _marquee.Checked;
+        target.JavaScriptMaxExecutionSeconds = decimal.ToInt32(_jsExecutionSeconds.Value);
+        target.JavaScriptMemoryLimitMb = decimal.ToInt32(_jsMemoryLimitMb.Value);
+        target.JavaScriptMaxCallDepth = decimal.ToInt32(_jsMaxCallDepth.Value);
+        target.MaxScriptSpliceTokens = decimal.ToInt32(_scriptSpliceTokens.Value);
+        target.JavaMaxCallDepth = decimal.ToInt32(_javaMaxCallDepth.Value);
+        target.MaxHttpRedirects = decimal.ToInt32(_maxRedirects.Value);
+        target.HttpConnectTimeoutSeconds = decimal.ToInt32(_connectTimeoutSeconds.Value);
+        target.HttpResponseTimeoutSeconds = decimal.ToInt32(_responseTimeoutSeconds.Value);
+        target.MaxConcurrentResourceFetches = decimal.ToInt32(_maxConcurrentFetches.Value);
+        target.MaxResourceFetchesPerPage = decimal.ToInt32(_maxFetchesPerPage.Value);
+        target.AnimatedGifSpeedPercent = decimal.ToInt32(_gifSpeedPercent.Value);
+        target.BlinkIntervalMilliseconds = decimal.ToInt32(_blinkIntervalMs.Value);
+        target.MarqueeSpeedPercent = decimal.ToInt32(_marqueeSpeedPercent.Value);
 
         if (_pluginManager != null)
         {
@@ -718,6 +892,37 @@ internal sealed class PreferencesDialog : Form
         box.MinimumSize = new Size(0, 24);
         box.MaximumSize = new Size(680, 0);
         box.Padding = new Padding(0, 2, 0, 2);
+    }
+
+    private sealed class SettingsGroupBox : GroupBox
+    {
+        public SettingsGroupBox()
+        {
+            FlatStyle = FlatStyle.Flat;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            Size titleSize = TextRenderer.MeasureText(e.Graphics, Text, Font, Size.Empty, TextFormatFlags.NoPadding);
+            int top = Math.Max(8, Font.Height / 2);
+            int titleStart = 12;
+            int titleEnd = titleStart + titleSize.Width + 8;
+            int right = ClientSize.Width - 2;
+            int bottom = ClientSize.Height - 2;
+
+            using var border = new Pen(Color.FromArgb(75, 75, 75), 2f);
+            e.Graphics.DrawLine(border, 1, top, titleStart - 4, top);
+            e.Graphics.DrawLine(border, titleEnd, top, right, top);
+            e.Graphics.DrawLine(border, 1, top, 1, bottom);
+            e.Graphics.DrawLine(border, right, top, right, bottom);
+            e.Graphics.DrawLine(border, 1, bottom, right, bottom);
+
+            var titleBounds = new Rectangle(titleStart, 0, titleSize.Width + 4, Font.Height);
+            TextRenderer.DrawText(e.Graphics, Text, Font, titleBounds, ForeColor,
+                BackColor, TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter);
+        }
     }
 
     private static GroupBox Group(string title, Control[] controls)

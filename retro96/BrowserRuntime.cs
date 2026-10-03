@@ -56,8 +56,15 @@ public static class BrowserRuntime
     public static bool ImagesEnabled => Settings.LoadImages;
     public static bool JavaScriptEnabled => Settings.EnableJavaScript;
     public static bool ScriptingEnabled => JavaScriptEnabled || VbScriptEnabled;
+    public static bool ExternalScriptsEnabled => Settings.EnableExternalScripts;
+    public static bool JavaScriptEvalEnabled => JavaScriptEnabled && Settings.EnableJavaScriptEval;
     public static bool JavaScriptTimersEnabled => Settings.EnableJavaScript && Settings.EnableJavaScriptTimers;
     public static bool JavaScriptDialogsEnabled => ScriptingEnabled && Settings.EnableJavaScriptDialogs;
+    public static int JavaScriptMaxExecutionMilliseconds => Settings.JavaScriptMaxExecutionSeconds * 1000;
+    public static int JavaScriptMemoryLimitBytes => Settings.JavaScriptMemoryLimitMb * 1024 * 1024;
+    public static int JavaScriptMaxCallDepth => Settings.JavaScriptMaxCallDepth;
+    public static int JavaMaxCallDepth => Settings.JavaMaxCallDepth;
+    public static int MaxScriptSpliceTokens => Settings.MaxScriptSpliceTokens;
     /// <summary>
     /// VBScript is a legacy execution surface. It is completely disabled in
     /// High trust mode and available in Medium/Low when scripting itself is
@@ -71,12 +78,21 @@ public static class BrowserRuntime
     public static bool CookiesEnabled => Settings.EnableCookies;
     public static bool ReferrerEnabled => Settings.SendReferrer;
     public static bool RedirectsEnabled => Settings.FollowHttpRedirects;
+    public static int MaxHttpRedirects => Settings.MaxHttpRedirects;
+    public static int HttpConnectTimeoutSeconds => Settings.HttpConnectTimeoutSeconds;
+    public static int HttpResponseTimeoutSeconds => Settings.HttpResponseTimeoutSeconds;
+    public static int MaxConcurrentResourceFetches => Settings.MaxConcurrentResourceFetches;
+    public static int MaxResourceFetchesPerPage => Settings.MaxResourceFetchesPerPage;
+    public static bool RequestCompressedResponses => Settings.RequestCompressedResponses;
     public static bool MetaRefreshEnabled => Settings.FollowMetaRefresh;
     public static bool StylesheetsEnabled => Settings.LoadStylesheets;
     public static bool FramesEnabled => Settings.LoadFrames;
     public static bool FormSubmissionsEnabled => Settings.AllowFormSubmissions;
     public static bool AnimatedImagesEnabled => Settings.AnimateImages;
     public static bool BlinkEnabled => Settings.BlinkText;
+    public static int BlinkIntervalMilliseconds => Settings.BlinkIntervalMilliseconds;
+    public static int AnimatedGifSpeedPercent => Settings.AnimatedGifSpeedPercent;
+    public static int MarqueeSpeedPercent => Settings.MarqueeSpeedPercent;
     public static bool MarqueeEnabled => Settings.MarqueeText;
 
     public static bool ScriptedWindowsAllowed

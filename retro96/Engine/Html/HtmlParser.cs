@@ -41,7 +41,6 @@ public static class HtmlParser
     // cap of 50 silently dropped the output of the 51st script on a
     // write-heavy page); 200k tokens is far beyond any real page and
     // still stops an infinite chain in well under a second.
-    private const int MaxScriptSpliceTokens = 200_000;
 
     // Start tags that imply the end of an open <p> (HTML 3.2: P contains %inline).
     private static readonly HashSet<string> ClosesP =
@@ -163,7 +162,7 @@ public static class HtmlParser
                         {
                             var spliced = HtmlTokenizer.Tokenize(written).ToList();
                             if (spliced.Count > 0 &&
-                                splicedTokens + spliced.Count <= MaxScriptSpliceTokens)
+                                splicedTokens + spliced.Count <= BrowserRuntime.MaxScriptSpliceTokens)
                             {
                                 splicedTokens += spliced.Count;
                                 tokens.InsertRange(i + 1, spliced);

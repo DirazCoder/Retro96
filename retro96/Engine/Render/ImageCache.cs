@@ -181,10 +181,11 @@ public class ImageCache : IDisposable
         int guard = 0;
         while (guard++ < 1000)
         {
-            int delayMs = state.FrameIndex < decoded.DelaysMs.Count
+            int frameDelayMs = state.FrameIndex < decoded.DelaysMs.Count
                 ? decoded.DelaysMs[state.FrameIndex]
                 : 100;
-            if (delayMs <= 0) delayMs = 100;
+            if (frameDelayMs <= 0) frameDelayMs = 100;
+            double delayMs = frameDelayMs * 100d / BrowserRuntime.AnimatedGifSpeedPercent;
 
             var elapsed = (now - state.FrameStartedAt).TotalMilliseconds;
             if (elapsed < delayMs) break;

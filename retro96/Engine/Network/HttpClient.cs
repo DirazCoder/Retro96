@@ -58,10 +58,7 @@ public class HttpClient
 
     internal Func<string, IReadOnlyDictionary<string, string>, PluginNetworkRuleDecision>? PluginRuleEvaluator { get; set; }
 
-    private const int MaxRedirects = 5;
     private const int MaxBodySize = 8 * 1024 * 1024;    // 8 MB is generous for 1996 pages
-    private const int ConnectTimeoutMs = 10_000;
-    private const int ReadTimeoutMs = 30_000;
 
     // Basic-auth credentials the shell installs after a 401 challenge
     public string? BasicAuthHeader { get; set; }
@@ -138,7 +135,7 @@ public class HttpClient
         CancellationToken ct, int redirectCount = 0, string? contentType = null, ResourceKind resourceKind = ResourceKind.Document,
         IReadOnlyDictionary<string, string>? extraHeaders = null, int ruleRedirectCount = 0)
     {
-        if (redirectCount > MaxRedirects)
+        if (redirectCount > BrowserRuntime.MaxHttpRedirects)
             return new TooManyRedirects();
 
         if (!url.IsHttp)
@@ -307,6 +304,8 @@ public class HttpClient
         sb.Append("User-Agent: ").Append(UserAgentOverride ?? BrowserRuntime.UserAgent).Append("\r\n");
         sb.Append("Accept: text/html, image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, */*\r\n");
         sb.Append("Accept-Charset: iso-8859-1,*,utf-8\r\n");
+        if (BrowserRuntime.RequestCompressedResponses)
+            sb.Append("Accept-Encoding: gzip\r\n");
 
         if (!string.IsNullOrEmpty(cookieValues))
             sb.Append("Cookie: ").Append(cookieValues).Append("\r\n");
@@ -394,7 +393,7 @@ public class HttpClient
             var connectTask = connectAddress == null
                 ? tcpClient.ConnectAsync(url.Host, url.Port, ct).AsTask()
                 : tcpClient.ConnectAsync(connectAddress, url.Port, ct).AsTask();
-            var timeoutTask = Task.Delay(ConnectTimeoutMs, ct);
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(BrowserRuntime.HttpConnectTimeoutSeconds), ct);
             var completed = await Task.WhenAny(connectTask, timeoutTask);
 
             if (completed != connectTask)
@@ -409,8 +408,9 @@ public class HttpClient
             }
 
             Stream stream = tcpClient.GetStream();
-            stream.ReadTimeout = ReadTimeoutMs;
-            stream.WriteTimeout = ReadTimeoutMs;
+            int responseTimeoutMs = checked(BrowserRuntime.HttpResponseTimeoutSeconds * 1000);
+            stream.ReadTimeout = responseTimeoutMs;
+            stream.WriteTimeout = responseTimeoutMs;
 
             if (url.Scheme == "https")
             {
@@ -433,7 +433,7 @@ public class HttpClient
             // Overall read deadline — a server that never closes the
             // connection must not hang the browser
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            readCts.CancelAfter(ReadTimeoutMs);
+            readCts.CancelAfter(responseTimeoutMs);
 
             return await ReadResponseAsync(stream, url, readCts.Token, maxResponseBytes);
         }

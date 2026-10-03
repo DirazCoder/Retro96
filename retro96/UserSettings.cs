@@ -65,15 +65,31 @@ public sealed class UserSettings
     public bool LoadStylesheets { get; set; } = true;
     public bool LoadFrames { get; set; } = true;
     public bool AllowFormSubmissions { get; set; } = true;
+    public bool EnableExternalScripts { get; set; } = true;
+    public bool EnableJavaScriptEval { get; set; } = true;
     public bool EnableJavaScriptTimers { get; set; } = true;
     public bool EnableJavaScriptDialogs { get; set; } = true;
+    public int JavaScriptMaxExecutionSeconds { get; set; } = 5;
+    public int JavaScriptMemoryLimitMb { get; set; } = 10;
+    public int JavaScriptMaxCallDepth { get; set; } = 400;
+    public int MaxScriptSpliceTokens { get; set; } = 200000;
+    public int JavaMaxCallDepth { get; set; } = 400;
     public bool FollowHttpRedirects { get; set; } = true;
+    public bool RequestCompressedResponses { get; set; } = true;
+    public int MaxHttpRedirects { get; set; } = 5;
+    public int HttpConnectTimeoutSeconds { get; set; } = 10;
+    public int HttpResponseTimeoutSeconds { get; set; } = 30;
+    public int MaxConcurrentResourceFetches { get; set; } = 8;
+    public int MaxResourceFetchesPerPage { get; set; } = 1000;
     public bool FollowMetaRefresh { get; set; } = true;
     public bool EnableCookies { get; set; } = true;
     public bool SendReferrer { get; set; } = true;
     public bool AnimateImages { get; set; } = true;
+    public int AnimatedGifSpeedPercent { get; set; } = 100;
     public bool BlinkText { get; set; } = true;
+    public int BlinkIntervalMilliseconds { get; set; } = 500;
     public bool MarqueeText { get; set; } = true;
+    public int MarqueeSpeedPercent { get; set; } = 100;
     public TrustMode TrustMode { get; set; } = TrustMode.Medium;
     public bool HostCheckImages { get; set; } = true;
     public bool DiscardPageStateOnClose { get; set; } = true;
@@ -117,15 +133,31 @@ public sealed class UserSettings
         LoadStylesheets = LoadStylesheets,
         LoadFrames = LoadFrames,
         AllowFormSubmissions = AllowFormSubmissions,
+        EnableExternalScripts = EnableExternalScripts,
+        EnableJavaScriptEval = EnableJavaScriptEval,
         EnableJavaScriptTimers = EnableJavaScriptTimers,
         EnableJavaScriptDialogs = EnableJavaScriptDialogs,
+        JavaScriptMaxExecutionSeconds = JavaScriptMaxExecutionSeconds,
+        JavaScriptMemoryLimitMb = JavaScriptMemoryLimitMb,
+        JavaScriptMaxCallDepth = JavaScriptMaxCallDepth,
+        MaxScriptSpliceTokens = MaxScriptSpliceTokens,
+        JavaMaxCallDepth = JavaMaxCallDepth,
         FollowHttpRedirects = FollowHttpRedirects,
+        RequestCompressedResponses = RequestCompressedResponses,
+        MaxHttpRedirects = MaxHttpRedirects,
+        HttpConnectTimeoutSeconds = HttpConnectTimeoutSeconds,
+        HttpResponseTimeoutSeconds = HttpResponseTimeoutSeconds,
+        MaxConcurrentResourceFetches = MaxConcurrentResourceFetches,
+        MaxResourceFetchesPerPage = MaxResourceFetchesPerPage,
         FollowMetaRefresh = FollowMetaRefresh,
         EnableCookies = EnableCookies,
         SendReferrer = SendReferrer,
         AnimateImages = AnimateImages,
+        AnimatedGifSpeedPercent = AnimatedGifSpeedPercent,
         BlinkText = BlinkText,
+        BlinkIntervalMilliseconds = BlinkIntervalMilliseconds,
         MarqueeText = MarqueeText,
+        MarqueeSpeedPercent = MarqueeSpeedPercent,
         TrustMode = TrustMode,
         HostCheckImages = HostCheckImages,
         DiscardPageStateOnClose = DiscardPageStateOnClose,
@@ -228,14 +260,63 @@ public sealed class UserSettings
                     case "forms.enabled":
                         s.AllowFormSubmissions = ParseBool(value, s.AllowFormSubmissions);
                         break;
+                    case "scripts.external":
+                        s.EnableExternalScripts = ParseBool(value, s.EnableExternalScripts);
+                        break;
+                    case "javascript.eval":
+                        s.EnableJavaScriptEval = ParseBool(value, s.EnableJavaScriptEval);
+                        break;
                     case "javascript.timers":
                         s.EnableJavaScriptTimers = ParseBool(value, s.EnableJavaScriptTimers);
                         break;
                     case "javascript.dialogs":
                         s.EnableJavaScriptDialogs = ParseBool(value, s.EnableJavaScriptDialogs);
                         break;
+                    case "javascript.maxexecutionseconds":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int jsExecutionSeconds))
+                            s.JavaScriptMaxExecutionSeconds = jsExecutionSeconds;
+                        break;
+                    case "javascript.memorylimitmb":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int jsMemoryLimitMb))
+                            s.JavaScriptMemoryLimitMb = jsMemoryLimitMb;
+                        break;
+                    case "javascript.maxcalldepth":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int jsMaxCallDepth))
+                            s.JavaScriptMaxCallDepth = jsMaxCallDepth;
+                        break;
+                    case "html.maxscriptsplicetokens":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxScriptSpliceTokens))
+                            s.MaxScriptSpliceTokens = maxScriptSpliceTokens;
+                        break;
+                    case "java.maxcalldepth":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int javaMaxCallDepth))
+                            s.JavaMaxCallDepth = javaMaxCallDepth;
+                        break;
                     case "network.redirects":
                         s.FollowHttpRedirects = ParseBool(value, s.FollowHttpRedirects);
+                        break;
+                    case "network.compressedresponses":
+                        s.RequestCompressedResponses = ParseBool(value, s.RequestCompressedResponses);
+                        break;
+                    case "network.maxredirects":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxRedirects))
+                            s.MaxHttpRedirects = maxRedirects;
+                        break;
+                    case "network.connecttimeoutseconds":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int connectTimeout))
+                            s.HttpConnectTimeoutSeconds = connectTimeout;
+                        break;
+                    case "network.responsetimeoutseconds":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int responseTimeout))
+                            s.HttpResponseTimeoutSeconds = responseTimeout;
+                        break;
+                    case "network.maxconcurrentresourcefetches":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxConcurrentFetches))
+                            s.MaxConcurrentResourceFetches = maxConcurrentFetches;
+                        break;
+                    case "network.maxresourcefetchesperpage":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxResourceFetches))
+                            s.MaxResourceFetchesPerPage = maxResourceFetches;
                         break;
                     case "network.metarefresh":
                         s.FollowMetaRefresh = ParseBool(value, s.FollowMetaRefresh);
@@ -249,11 +330,23 @@ public sealed class UserSettings
                     case "render.animation":
                         s.AnimateImages = ParseBool(value, s.AnimateImages);
                         break;
+                    case "render.animationspeedpercent":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int gifSpeed))
+                            s.AnimatedGifSpeedPercent = gifSpeed;
+                        break;
                     case "render.blink":
                         s.BlinkText = ParseBool(value, s.BlinkText);
                         break;
+                    case "render.blinkintervalmilliseconds":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int blinkInterval))
+                            s.BlinkIntervalMilliseconds = blinkInterval;
+                        break;
                     case "render.marquee":
                         s.MarqueeText = ParseBool(value, s.MarqueeText);
+                        break;
+                    case "render.marqueespeedpercent":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int marqueeSpeed))
+                            s.MarqueeSpeedPercent = marqueeSpeed;
                         break;
                     case "security.mode":
                         if (Enum.TryParse<TrustMode>(value, true, out var trust))
@@ -300,15 +393,31 @@ public sealed class UserSettings
         sb.AppendLine("Stylesheets.Enabled=" + BoolText(LoadStylesheets));
         sb.AppendLine("Frames.Enabled=" + BoolText(LoadFrames));
         sb.AppendLine("Forms.Enabled=" + BoolText(AllowFormSubmissions));
+        sb.AppendLine("Scripts.External=" + BoolText(EnableExternalScripts));
+        sb.AppendLine("JavaScript.Eval=" + BoolText(EnableJavaScriptEval));
         sb.AppendLine("JavaScript.Timers=" + BoolText(EnableJavaScriptTimers));
         sb.AppendLine("JavaScript.Dialogs=" + BoolText(EnableJavaScriptDialogs));
+        sb.AppendLine("JavaScript.MaxExecutionSeconds=" + JavaScriptMaxExecutionSeconds.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("JavaScript.MemoryLimitMb=" + JavaScriptMemoryLimitMb.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("JavaScript.MaxCallDepth=" + JavaScriptMaxCallDepth.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Html.MaxScriptSpliceTokens=" + MaxScriptSpliceTokens.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Java.MaxCallDepth=" + JavaMaxCallDepth.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Network.Redirects=" + BoolText(FollowHttpRedirects));
+        sb.AppendLine("Network.CompressedResponses=" + BoolText(RequestCompressedResponses));
+        sb.AppendLine("Network.MaxRedirects=" + MaxHttpRedirects.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Network.ConnectTimeoutSeconds=" + HttpConnectTimeoutSeconds.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Network.ResponseTimeoutSeconds=" + HttpResponseTimeoutSeconds.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Network.MaxConcurrentResourceFetches=" + MaxConcurrentResourceFetches.ToString(CultureInfo.InvariantCulture));
+        sb.AppendLine("Network.MaxResourceFetchesPerPage=" + MaxResourceFetchesPerPage.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Network.MetaRefresh=" + BoolText(FollowMetaRefresh));
         sb.AppendLine("Network.Cookies=" + BoolText(EnableCookies));
         sb.AppendLine("Network.Referrer=" + BoolText(SendReferrer));
         sb.AppendLine("Render.Animation=" + BoolText(AnimateImages));
+        sb.AppendLine("Render.AnimationSpeedPercent=" + AnimatedGifSpeedPercent.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Render.Blink=" + BoolText(BlinkText));
+        sb.AppendLine("Render.BlinkIntervalMilliseconds=" + BlinkIntervalMilliseconds.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Render.Marquee=" + BoolText(MarqueeText));
+        sb.AppendLine("Render.MarqueeSpeedPercent=" + MarqueeSpeedPercent.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Security.Mode=" + TrustMode);
         sb.AppendLine("Security.HostImageCheck=" + BoolText(HostCheckImages));
         sb.AppendLine("Security.DiscardState=" + BoolText(DiscardPageStateOnClose));
@@ -395,6 +504,19 @@ public sealed class UserSettings
             s.ForcedBackgroundColor = DefaultBackgroundColor;
         if (s.DefaultPageZoomPercent is not (100 or 125 or 150 or 200))
             s.DefaultPageZoomPercent = 100;
+        s.JavaScriptMaxExecutionSeconds = Math.Clamp(s.JavaScriptMaxExecutionSeconds, 1, 60);
+        s.JavaScriptMemoryLimitMb = Math.Clamp(s.JavaScriptMemoryLimitMb, 1, 512);
+        s.JavaScriptMaxCallDepth = Math.Clamp(s.JavaScriptMaxCallDepth, 32, 2000);
+        s.MaxScriptSpliceTokens = Math.Clamp(s.MaxScriptSpliceTokens, 1000, 2_000_000);
+        s.JavaMaxCallDepth = Math.Clamp(s.JavaMaxCallDepth, 32, 2000);
+        s.MaxHttpRedirects = Math.Clamp(s.MaxHttpRedirects, 0, 20);
+        s.HttpConnectTimeoutSeconds = Math.Clamp(s.HttpConnectTimeoutSeconds, 1, 120);
+        s.HttpResponseTimeoutSeconds = Math.Clamp(s.HttpResponseTimeoutSeconds, 1, 300);
+        s.MaxConcurrentResourceFetches = Math.Clamp(s.MaxConcurrentResourceFetches, 1, 32);
+        s.MaxResourceFetchesPerPage = Math.Clamp(s.MaxResourceFetchesPerPage, 1, 10000);
+        s.AnimatedGifSpeedPercent = Math.Clamp(s.AnimatedGifSpeedPercent, 25, 400);
+        s.BlinkIntervalMilliseconds = Math.Clamp(s.BlinkIntervalMilliseconds, 100, 2000);
+        s.MarqueeSpeedPercent = Math.Clamp(s.MarqueeSpeedPercent, 25, 400);
     }
 
     private static bool IsHtmlColor(string value)

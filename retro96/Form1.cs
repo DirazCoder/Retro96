@@ -462,6 +462,13 @@ public partial class Form1 : Form
         _btnGo.Click += (s, e) => NavigateOrSearch(_txtUrl.Text);
         KeyDown += (_, e) =>
         {
+            if (e.Control && e.KeyCode == Keys.D)
+            {
+                AddCurrentPageBookmark();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
             if (_pluginShortcuts.TryGetValue(e.KeyData, out var shortcut)) { try { shortcut.Callback(); } catch (Exception ex) { DebugLog.WriteException($"Plugin shortcut '{shortcut.PluginId}'", ex); } e.Handled = true; e.SuppressKeyPress = true; }
         };
 
@@ -632,15 +639,31 @@ public partial class Form1 : Form
         _settings.LoadStylesheets = updated.LoadStylesheets;
         _settings.LoadFrames = updated.LoadFrames;
         _settings.AllowFormSubmissions = updated.AllowFormSubmissions;
+        _settings.EnableExternalScripts = updated.EnableExternalScripts;
+        _settings.EnableJavaScriptEval = updated.EnableJavaScriptEval;
         _settings.EnableJavaScriptTimers = updated.EnableJavaScriptTimers;
         _settings.EnableJavaScriptDialogs = updated.EnableJavaScriptDialogs;
+        _settings.JavaScriptMaxExecutionSeconds = updated.JavaScriptMaxExecutionSeconds;
+        _settings.JavaScriptMemoryLimitMb = updated.JavaScriptMemoryLimitMb;
+        _settings.JavaScriptMaxCallDepth = updated.JavaScriptMaxCallDepth;
+        _settings.MaxScriptSpliceTokens = updated.MaxScriptSpliceTokens;
+        _settings.JavaMaxCallDepth = updated.JavaMaxCallDepth;
         _settings.FollowHttpRedirects = updated.FollowHttpRedirects;
+        _settings.RequestCompressedResponses = updated.RequestCompressedResponses;
+        _settings.MaxHttpRedirects = updated.MaxHttpRedirects;
+        _settings.HttpConnectTimeoutSeconds = updated.HttpConnectTimeoutSeconds;
+        _settings.HttpResponseTimeoutSeconds = updated.HttpResponseTimeoutSeconds;
+        _settings.MaxConcurrentResourceFetches = updated.MaxConcurrentResourceFetches;
+        _settings.MaxResourceFetchesPerPage = updated.MaxResourceFetchesPerPage;
         _settings.FollowMetaRefresh = updated.FollowMetaRefresh;
         _settings.EnableCookies = updated.EnableCookies;
         _settings.SendReferrer = updated.SendReferrer;
         _settings.AnimateImages = updated.AnimateImages;
+        _settings.AnimatedGifSpeedPercent = updated.AnimatedGifSpeedPercent;
         _settings.BlinkText = updated.BlinkText;
+        _settings.BlinkIntervalMilliseconds = updated.BlinkIntervalMilliseconds;
         _settings.MarqueeText = updated.MarqueeText;
+        _settings.MarqueeSpeedPercent = updated.MarqueeSpeedPercent;
         _settings.TrustMode = updated.TrustMode;
         _settings.HostCheckImages = updated.HostCheckImages;
         _settings.DiscardPageStateOnClose = updated.DiscardPageStateOnClose;
@@ -1346,7 +1369,10 @@ public partial class Form1 : Form
             _globalScope,
             null,
             navUrl => BeginInvoke(() => NavigateTo(navUrl)),
-            msg => BeginInvoke(() => _statusLabel.Text = msg));
+            msg => BeginInvoke(() => _statusLabel.Text = msg),
+            BrowserRuntime.JavaScriptMaxExecutionMilliseconds,
+            BrowserRuntime.JavaScriptMemoryLimitBytes,
+            BrowserRuntime.JavaScriptMaxCallDepth);
 
         _jsInterpreter.ConsoleMessage += entry =>
             PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);
@@ -1374,7 +1400,8 @@ public partial class Form1 : Form
             BrowserRuntime.ScriptingEnabled
                 ? (doc, src, isVbScript) => RunInlineScript(doc, src, isVbScript, _jsInterpreter!, _jsState!)
                 : null,
-            BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
+            BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
+                ? LoadExternalScript : null);
 
         return (document, _jsInterpreter, _jsState);
     }
@@ -1789,7 +1816,8 @@ public partial class Form1 : Form
                     BrowserRuntime.ScriptingEnabled
                         ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, frameInterpreter, frameState)
                         : null,
-                    BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
+                    BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
+                        ? LoadExternalScript : null);
                 if (gen != _navGeneration) return;
 
                 if (content != null)
@@ -1847,7 +1875,10 @@ public partial class Form1 : Form
             frameScope,
             null,
             navUrl => BeginInvoke(() => _ = LoadFrameAsync(view, navUrl)),
-            msg => BeginInvoke(() => _statusLabel.Text = msg));
+            msg => BeginInvoke(() => _statusLabel.Text = msg),
+            BrowserRuntime.JavaScriptMaxExecutionMilliseconds,
+            BrowserRuntime.JavaScriptMemoryLimitBytes,
+            BrowserRuntime.JavaScriptMaxCallDepth);
 
         interpreter.ConsoleMessage += entry =>
             PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);
@@ -2085,7 +2116,8 @@ public partial class Form1 : Form
                     BrowserRuntime.ScriptingEnabled
                         ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                         : null,
-                    BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
+                    BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
+                        ? LoadExternalScript : null);
             }
             else
             {
@@ -2101,7 +2133,8 @@ public partial class Form1 : Form
                         BrowserRuntime.ScriptingEnabled
                             ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                             : null,
-                        BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
+                        BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
+                            ? LoadExternalScript : null);
                     if (BrowserRuntime.StylesheetsEnabled)
                         await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
                     doc.VisitedUrls.UnionWith(_visitedUrls);
@@ -2571,7 +2604,8 @@ public partial class Form1 : Form
             BrowserRuntime.ScriptingEnabled
                 ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                 : null,
-            BrowserRuntime.ScriptingEnabled ? LoadExternalScript : null);
+            BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
+                ? LoadExternalScript : null);
         if (BrowserRuntime.StylesheetsEnabled)
             await FetchStylesheetsAsync(doc, responseUrl, ct);
 

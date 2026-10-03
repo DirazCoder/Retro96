@@ -759,7 +759,8 @@ public class Renderer
         int scrollDelay = Math.Clamp(elem.GetAttrInt("scrolldelay", 85), 1, 60_000);
         string behavior = elem.GetAttrOrDefault("behavior", "scroll").Trim().ToLowerInvariant();
         bool rightward = elem.GetAttrOrDefault("direction", "left").Trim().ToLowerInvariant() == "right";
-        float pxPerMs = scrollAmount / (float)scrollDelay;
+        float pxPerMs = scrollAmount / (float)scrollDelay *
+            BrowserRuntime.MarqueeSpeedPercent / 100f;
         long elapsedMs = GetMarqueeElapsedMs(elem, now);
 
         switch (behavior)

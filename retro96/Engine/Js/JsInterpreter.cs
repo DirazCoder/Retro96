@@ -69,7 +69,7 @@ public class JsInterpreter
     private readonly Stopwatch _stopwatch = new();
 
     private int _callDepth;
-    private const int MaxCallDepth = 400;
+    private readonly int _maxCallDepth;
 
     // Guards against re-entering the interpreter while a call is already
     // in progress on this instance. This isn't multi-threading — WinForms
@@ -119,7 +119,8 @@ public class JsInterpreter
 
     public JsInterpreter(JsScope globalScope, DomDocument? document,
                          Action<string> onNavigate, Action<string> setStatus,
-                         int timeLimitMs = 5000, int heapLimitBytes = 10_485_760)
+                         int timeLimitMs = 5000, int heapLimitBytes = 10_485_760,
+                         int maxCallDepth = 400)
     {
         _globalScope = globalScope ?? throw new ArgumentNullException(nameof(globalScope));
         _currentScope = globalScope;
@@ -127,6 +128,7 @@ public class JsInterpreter
         _setStatus = setStatus ?? (_ => { });
         _timeLimitMs = timeLimitMs;
         _heapLimitBytes = heapLimitBytes;
+        _maxCallDepth = Math.Clamp(maxCallDepth, 50, 2000);
 
         // Object stringification (array join, date toString) for "" + obj
         JsObject.Stringifier = StringifyObject;
@@ -1572,7 +1574,7 @@ public class JsInterpreter
         if (func.Native != null)
             return func.Native(thisValue, args);
 
-        if (++_callDepth > MaxCallDepth)
+        if (++_callDepth > _maxCallDepth)
         {
             _callDepth--;
             throw new JsInterpreterException("Maximum call depth exceeded");
@@ -1949,12 +1951,15 @@ public class JsInterpreter
             WindowObject?.Set("console", JsValue.FromObject(console));
         }
 
-        Native((self, args) =>
+        if (BrowserRuntime.JavaScriptEvalEnabled)
         {
-            if (args.Length == 0) return JsValue.Undefined;
-            if (args[0].Type != JsType.String) return args[0];
-            return EvalString(args[0].GetString(), _currentScope);
-        }, "eval", global: true);
+            Native((self, args) =>
+            {
+                if (args.Length == 0) return JsValue.Undefined;
+                if (args[0].Type != JsType.String) return args[0];
+                return EvalString(args[0].GetString(), _currentScope);
+            }, "eval", global: true);
+        }
 
         // Function.prototype.call / apply are hidden only in strict IE3 mode;
         // Retro96 retains the broader compatibility runtime.

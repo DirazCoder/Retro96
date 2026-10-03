@@ -38,6 +38,29 @@ public partial class Form1
         _bookmarksMenu.DropDownItems.Add("Manage Bookmarks…").Click += (_, _) => OpenBookmarksManager();
     }
 
+    private void AddCurrentPageBookmark()
+    {
+        if (string.IsNullOrWhiteSpace(_currentPageUrl))
+        {
+            MessageBox.Show(this, "There is no page to bookmark.", "Bookmarks",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (_bookmarkStore.Contains(_currentPageUrl))
+        {
+            MessageBox.Show(this, "This page is already bookmarked.", "Bookmarks",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string title = PluginCurrentTitle;
+        _bookmarkStore.Toggle(title, _currentPageUrl);
+        BuildBookmarksMenu();
+        MessageBox.Show(this, $"Bookmark added for {title}.", "Bookmarks",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private void BuildHistoryMenu()
     {
         _historyMenu.DropDownItems.Clear();
