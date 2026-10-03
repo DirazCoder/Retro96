@@ -38,7 +38,7 @@ public static class TextareaOverlay
             if (end <= start) continue;
             float drawY = y + (line - scrollLine) * lineHeight;
             if (drawY + lineHeight < y - lineHeight) continue;
-            g.DrawString(text[start..end], font, brush,
+            g.DrawStringWithoutLegacyStrokeBoost(text[start..end], font, brush,
                 new RectangleF(x, drawY, Math.Max(1f, width), lineHeight), format);
         }
     }

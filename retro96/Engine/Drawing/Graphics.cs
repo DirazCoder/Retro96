@@ -350,7 +350,7 @@ public sealed class Graphics : IDisposable
 
     private readonly record struct TextRenderState(SKFontEdging Edging, bool Embolden, bool Subpixel, bool BaselineSnap);
 
-    private TextRenderState ApplyTextRendering(Font font)
+    private TextRenderState ApplyTextRendering(Font font, bool useLegacyStrokeBoost = true)
     {
         // Font objects are cached/shared by the renderer. SKFont rendering
         // state is mutable, so every draw must restore exactly what it found.
@@ -373,7 +373,8 @@ public sealed class Graphics : IDisposable
         // Preserve legacy small-text stem strength at paint time only.
         // Measurement remains unchanged because emboldening does not alter
         // advance widths, so layout and painting continue to agree.
-        font.SkFont.Embolden = previous.Embolden || font.LegacyStrokeBoost;
+        font.SkFont.Embolden = previous.Embolden ||
+            (useLegacyStrokeBoost && font.LegacyStrokeBoost);
         if (Retro96.BrowserRuntime.SupportsInternetExplorerLegacy)
         {
             font.SkFont.Subpixel = true;
@@ -456,13 +457,28 @@ public sealed class Graphics : IDisposable
 
     /// <summary>Rect draw with alignment, wrapping, clipping and ellipsis.</summary>
     public void DrawString(string? text, Font font, Brush brush, RectangleF layoutRect, StringFormat? format)
+        => DrawStringRectCore(text, font, brush, layoutRect, format, useLegacyStrokeBoost: true);
+
+    /// <summary>
+    /// Draws a control-overlay text run without Graphics' legacy small-text
+    /// embolden boost, keeping overlay repainting consistent with direct Skia
+    /// control rendering.
+    /// </summary>
+    internal void DrawStringWithoutLegacyStrokeBoost(string? text, Font font,
+                                                      Brush brush, RectangleF layoutRect,
+                                                      StringFormat? format)
+        => DrawStringRectCore(text, font, brush, layoutRect, format, useLegacyStrokeBoost: false);
+
+    private void DrawStringRectCore(string? text, Font font, Brush brush,
+                                    RectangleF layoutRect, StringFormat? format,
+                                    bool useLegacyStrokeBoost)
     {
         if (string.IsNullOrEmpty(text) || font == null || brush is not SolidBrush sb) return;
         if (layoutRect.Width <= 0f || layoutRect.Height <= 0f) return;
 
         var sf = format ?? new StringFormat();
         bool noWrap = (sf.FormatFlags & StringFormatFlags.NoWrap) != 0;
-        var previousTextState = ApplyTextRendering(font);
+        var previousTextState = ApplyTextRendering(font, useLegacyStrokeBoost);
 
         try
         {

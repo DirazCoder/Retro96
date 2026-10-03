@@ -3531,28 +3531,54 @@ public class BrowserCanvas : SKGLControl
         g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
     }
 
+    private readonly record struct TextareaScrollbarMetrics(
+        float TrackY, float TrackHeight, float ThumbHeight, float Travel,
+        float ThumbTop, int MaxScrollLine);
+
+    private static bool TryGetTextareaScrollbarMetrics(
+        RectangleF face, int lineCount, float lineHeight, int scrollLine,
+        out TextareaScrollbarMetrics metrics)
+    {
+        metrics = default;
+        if (lineCount <= 0 || face.Width < 16 || face.Height < 8 || lineHeight <= 0f)
+            return false;
+
+        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4f) / lineHeight));
+        if (lineCount <= visibleLines) return false;
+
+        float trackY = face.Top + 1f;
+        float trackHeight = Math.Max(1f, face.Height - 2f);
+        float rawThumbHeight = trackHeight * visibleLines / Math.Max(1f, lineCount);
+        float maxThumbHeight = Math.Max(2f, trackHeight - 2f);
+        float thumbHeight = Math.Min(maxThumbHeight, Math.Max(10f, rawThumbHeight));
+        float travel = Math.Max(0f, trackHeight - 2f - thumbHeight);
+        int maxScrollLine = Math.Max(0, lineCount - visibleLines);
+        int clampedScrollLine = Math.Clamp(scrollLine, 0, maxScrollLine);
+        float thumbTop = trackY + 1f + travel *
+            clampedScrollLine / (float)Math.Max(1, maxScrollLine);
+
+        metrics = new TextareaScrollbarMetrics(
+            trackY, trackHeight, thumbHeight, travel, thumbTop, maxScrollLine);
+        return true;
+    }
+
+    private static RectangleF GetTextareaScrollbarRect(RectangleF face) =>
+        new(face.Right - 14f, face.Top, 14f, face.Height);
+
     private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
                                                int lineCount, float lineHeight,
                                                int scrollLine = 0)
     {
-        int visibleLines = Math.Max(1, (int)Math.Floor((face.Height - 4) / lineHeight));
-        if (lineCount <= visibleLines || face.Width < 16 || face.Height < 8) return;
+        if (!TryGetTextareaScrollbarMetrics(face, lineCount, lineHeight,
+                scrollLine, out var metrics)) return;
 
         const float barWidth = 14f;
         float trackX = face.Right - barWidth + 1f;
-        float trackY = face.Top + 1f;
-        float trackHeight = Math.Max(1f, face.Height - 2f);
         using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
         using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
-        g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
-        float thumbHeight = Math.Clamp(
-            trackHeight * visibleLines / Math.Max(1f, lineCount), 10f, trackHeight - 2f);
-        float travel = Math.Max(0f, trackHeight - 2f - thumbHeight);
-        int maxLine = Math.Max(0, lineCount - visibleLines);
-        float thumbY = trackY + 1f +
-            travel * Math.Clamp(scrollLine / (float)Math.Max(1, maxLine), 0f, 1f);
-        g.FillRectangle(thumb, trackX + 1f, thumbY,
-            Math.Max(1f, barWidth - 3f), thumbHeight);
+        g.FillRectangle(track, trackX, metrics.TrackY, barWidth - 1f, metrics.TrackHeight);
+        g.FillRectangle(thumb, trackX + 1f, metrics.ThumbTop,
+            Math.Max(1f, barWidth - 3f), metrics.ThumbHeight);
     }
 
     private void PaintTextareaFieldOverlay(Graphics g)
@@ -6008,32 +6034,42 @@ public class BrowserCanvas : SKGLControl
                 out float scrollbarX, out float scrollbarY))
         {
             var geo = GetTextareaGeometry(_focusedInput, scrollbarBox, _focusedInputFrame);
-            if (geo != null && geo.NeedsVerticalScrollbar)
+            if (geo != null && TryGetTextareaScrollbarMetrics(
+                    scrollbarBox.ContentRect, geo.Lines.Count,
+                    geo.Font.GetHeight(MeasureGraphics), _textareaScrollLine,
+                    out var metrics))
             {
-                float trackY = scrollbarBox.ContentRect.Top + 1f;
-                float trackHeight = Math.Max(1f, scrollbarBox.ContentRect.Height - 2f);
-                float thumbHeight = Math.Max(10f, trackHeight * geo.VisibleLines /
-                    Math.Max(1, geo.Lines.Count));
-                float travel = Math.Max(1f, trackHeight - thumbHeight);
-                int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
-                float thumbTop = trackY + travel * _textareaScrollLine /
-                    Math.Max(1, maxLine);
+                // The scrollbar owns this gesture. A prior field drag can still
+                // be marked active if the mouse crossed the textarea edge before
+                // the button release reached the canvas; never let that stale
+                // state reposition the text caret during scrollbar use.
+                _fieldDragging = false;
+                _fieldDragPointerFrame = null;
+                _fieldDragAutoScrollTimer.Stop();
+                _lastFieldClickElement = null;
+                _lastFieldClickFrame = null;
+                _fieldClickCount = 0;
 
-                if (scrollbarY < thumbTop || scrollbarY > thumbTop + thumbHeight)
+                if (scrollbarY < metrics.ThumbTop ||
+                    scrollbarY > metrics.ThumbTop + metrics.ThumbHeight)
                 {
-                    float desiredTop = Math.Clamp(scrollbarY - thumbHeight / 2f,
-                        trackY, trackY + travel);
+                    float desiredTop = Math.Clamp(
+                        scrollbarY - metrics.ThumbHeight / 2f,
+                        metrics.TrackY + 1f,
+                        metrics.TrackY + 1f + metrics.Travel);
                     _textareaScrollLine = Math.Clamp(
-                        (int)Math.Round((desiredTop - trackY) / travel * maxLine),
-                        0, maxLine);
-                    thumbTop = trackY + travel * _textareaScrollLine /
-                        Math.Max(1, maxLine);
-                    _textareaScrollbarGrabOffset = thumbHeight / 2f;
+                        metrics.MaxScrollLine <= 0 || metrics.Travel <= 0.01f
+                            ? 0
+                            : (int)Math.Round(
+                                (desiredTop - (metrics.TrackY + 1f)) /
+                                metrics.Travel * metrics.MaxScrollLine),
+                        0, metrics.MaxScrollLine);
+                    _textareaScrollbarGrabOffset = metrics.ThumbHeight / 2f;
                 }
                 else
                 {
                     _textareaScrollbarGrabOffset = Math.Clamp(
-                        scrollbarY - thumbTop, 0f, thumbHeight);
+                        scrollbarY - metrics.ThumbTop, 0f, metrics.ThumbHeight);
                 }
 
                 PersistFocusedTextareaScrollState();
@@ -6599,19 +6635,23 @@ public class BrowserCanvas : SKGLControl
                 if (box != null)
                 {
                     var geo = GetTextareaGeometry(_focusedInput, box, _textareaScrollbarDragFrame);
-                    if (geo != null && geo.NeedsVerticalScrollbar)
+                    if (geo != null && TryGetTextareaScrollbarMetrics(
+                            box.ContentRect, geo.Lines.Count,
+                            geo.Font.GetHeight(MeasureGraphics), _textareaScrollLine,
+                            out var metrics))
                     {
-                        float trackY = box.ContentRect.Top + 1f;
-                        float trackHeight = Math.Max(1f, box.ContentRect.Height - 2f);
-                        float thumbHeight = Math.Max(10f, trackHeight * geo.VisibleLines /
-                            Math.Max(1, geo.Lines.Count));
-                        float travel = Math.Max(1f, trackHeight - thumbHeight);
-                        float thumbTop = Math.Clamp(localY - _textareaScrollbarGrabOffset,
-                            trackY, trackY + travel);
-                        int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
-                        _textareaScrollLine = Math.Clamp(
-                            (int)Math.Round((thumbTop - trackY) / travel * maxLine),
-                            0, maxLine);
+                        float thumbTop = Math.Clamp(
+                            localY - _textareaScrollbarGrabOffset,
+                            metrics.TrackY + 1f,
+                            metrics.TrackY + 1f + metrics.Travel);
+                        _textareaScrollLine = metrics.MaxScrollLine <= 0 ||
+                            metrics.Travel <= 0.01f
+                            ? 0
+                            : Math.Clamp(
+                                (int)Math.Round(
+                                    (thumbTop - (metrics.TrackY + 1f)) /
+                                    metrics.Travel * metrics.MaxScrollLine),
+                                0, metrics.MaxScrollLine);
                         PersistFocusedTextareaScrollState();
                         Invalidate();
                     }
@@ -6676,6 +6716,19 @@ public class BrowserCanvas : SKGLControl
         {
             float canvasX = e.X / EffectiveZoom + PaintScrollX;
             float canvasY = e.Y / EffectiveZoom + PaintScrollY;
+
+            // A textarea's scrollbar overlays the same layout face as its text.
+            // Once the pointer reaches that gutter, the scrollbar—not text
+            // selection—owns the pointer. Otherwise the live field-drag path
+            // keeps converting the pointer into a new caret position while the
+            // user is trying to grab or move the scrollbar.
+            if (_focusedInput.TagName == "textarea" &&
+                TryGetFocusedTextareaScrollbarPoint(canvasX, canvasY,
+                    out _, out _, out _))
+            {
+                _fieldDragAutoScrollTimer.Stop();
+                return;
+            }
 
             if (_focusedInputFrame != null)
             {
@@ -8814,8 +8867,7 @@ public class BrowserCanvas : SKGLControl
         if (geo == null || !geo.NeedsVerticalScrollbar) return false;
 
         var face = box.ContentRect;
-        return new RectangleF(face.Right - 14f, face.Top, 14f, face.Height)
-            .Contains(localX, localY);
+        return GetTextareaScrollbarRect(face).Contains(localX, localY);
     }
 
     private static LayoutBox? FindBoxForElement(LayoutBox root, DomElement element) =>
