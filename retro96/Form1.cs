@@ -1384,7 +1384,9 @@ public partial class Form1 : Form
             LastModified = "",
             Referrer = "",
             EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
-            EmbeddedScriptCall = _canvas.EmbeddedScriptCall
+            EmbeddedScriptCall = _canvas.EmbeddedScriptCall,
+            JavaAppletScriptMemberResolver = _canvas.ResolveJavaAppletScriptMember,
+            JavaAppletScriptMemberSetter = _canvas.SetJavaAppletScriptMember
         };
         _jsInterpreter.ElementWrapperHook =
             e => DomBindings.WrapElement(e, _jsState);
@@ -1890,7 +1892,9 @@ public partial class Form1 : Form
             LastModified = "",
             Referrer = "",
             EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
-            EmbeddedScriptCall = _canvas.EmbeddedScriptCall
+            EmbeddedScriptCall = _canvas.EmbeddedScriptCall,
+            JavaAppletScriptMemberResolver = _canvas.ResolveJavaAppletScriptMember,
+            JavaAppletScriptMemberSetter = _canvas.SetJavaAppletScriptMember
         };
         interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, state);
         interpreter.RegisterRuntimeBuiltins();
@@ -1946,6 +1950,7 @@ public partial class Form1 : Form
         // before the new document is installed so no stale GPU composition
         // survives the navigation.
         _canvas.ClearChildFrames(view);
+        _canvas.StopJavaAppletsForDocument(view.Document);
         view.Document = content.Document;
         view.RootBox = content.RootBox;
         view.Url = content.AbsoluteUrl;
@@ -1959,6 +1964,7 @@ public partial class Form1 : Form
         // Timers scheduled by frame scripts are driven by the canvas's
         // JS timer tick.
         view.Interpreter = frameInterpreter;
+        _canvas.PrepareJavaAppletsAsync(content.Document, frameInterpreter);
 
         // window.onload + element onload.
         try
@@ -3136,7 +3142,9 @@ code {
         <li>A separate native VBScript 1.0 engine for classic VBScript blocks and event procedures</li>
         <li>Frames and nested iframes that actually load and run correctly</li>
         <li><code>&lt;blink&gt;</code>, <code>text-decoration: blink</code>, and <code>String.prototype.blink()</code></li>
-        <li>Java applets via a built-in interpreter: period-correct Java 1.0/1.1 bytecode plus selected later runtime APIs for retro compatibility &mdash; no JRE needed</li>
+        <li>Java applets via a built-in interpreter: Java 1.0/1.1 bytecode, lifecycle and AWT support, with no JRE needed</li>
+        <li>Applet audio for WAVE, AU, AIFF/AIFC, and Standard MIDI; MIDI playback uses Windows MCI</li>
+        <li>LiveConnect through named applets, supported public members, and <code>netscape.javascript.JSObject</code>; applets can find and call one another across page frames</li>
         <li>Plugin system with sandboxed, permission-gated <code>.r96p</code> packages</li>
     </ul>
 
@@ -3145,15 +3153,15 @@ code {
     <ul>
         <li>HTML 4, CSS2, ES5, or anything past the late 1990s</li>
         <li>Java 1.2+ bytecode, Swing, or the collections framework (selected later runtime APIs are supported separately)</li>
-        <li>Applet sound, LiveConnect, or applet-to-applet communication</li>
+        <li>Every historical JVM class, browser-plugin quirk, audio codec, or LiveConnect conversion; support focuses on common Java 1.0/1.1 applets and the documented bridge</li>
         <li>macOS or Linux &mdash; see the Windows notice above</li>
     </ul>
 
     <h2>Status</h2>
 
     <p>
-        The test sources define 255 xUnit cases across the main and focused VBScript suites
-        (226 facts, 6 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract
+        The test sources define 261 xUnit cases across the main and focused VBScript suites
+        (229 facts, 9 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract
         assertions and 54 hand-authored QA HTML files. There is also a layout lab and a
         Chromium pixel-diff harness. Retro96 loads actual 1996 sites. It's a side project built
         for fun, and that's what it'll stay.

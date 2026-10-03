@@ -285,33 +285,30 @@ public record ParsedUrl(string Scheme, string Host, int Port, string Path, strin
     {
         if (string.IsNullOrEmpty(path)) return "/";
 
-        bool trailingSlash = path.EndsWith('/');
+        bool trailingSlash = path.EndsWith('/') ||
+                             path.EndsWith("/.", StringComparison.Ordinal) ||
+                             path.EndsWith("/..", StringComparison.Ordinal);
         string[] segments = path.Split('/');
         var normalized = new List<string>();
         bool absolute = path.StartsWith('/');
 
         foreach (string segment in segments)
         {
-            if (segment == ".")
+            if (segment.Length == 0 || segment == ".")
                 continue;
-            if (segment.Length == 0)
-            {
-                if (normalized.Count == 0 || normalized[^1].Length == 0)
-                    continue;
-                normalized.Add("");
-                continue;
-            }
             if (segment == "..")
             {
                 if (normalized.Count > 0)
                     normalized.RemoveAt(normalized.Count - 1);
+                else if (!absolute)
+                    normalized.Add("..");
                 continue;
             }
             normalized.Add(segment);
         }
 
         string result = (absolute ? "/" : "") + string.Join("/", normalized);
-        if (result.Length == 0) result = "/";
+        if (result.Length == 0) result = absolute ? "/" : ".";
         if (trailingSlash && result != "/")
             result += "/";
 

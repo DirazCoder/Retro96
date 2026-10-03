@@ -64,7 +64,8 @@ public class JsEngineTests
     public void JavaScriptBasicPage_DOM0MethodsAndDynamicHandlersWork()
     {
         var page = new PageHarness();
-        page.LoadFile(Path.Combine(TestPaths.Testdata, "..", "tests", "html-websites", "javascript-basic.html"));
+        page.LoadFile(Path.GetFullPath(Path.Combine(
+            TestPaths.Testdata, "..", "tests", "html-websites", "javascript", "javascript-basic.html")));
 
         Check.That(page.ScriptErrors.Count == 0,
             "javascript-basic.html parse scripts run without fatal errors",
@@ -206,8 +207,8 @@ public class JsEngineTests
             "independent page/iframe realms have distinct Object.prototype objects");
         Check.That(ReferenceEquals(evt.Prototype, frameObjectProto),
             "CreateMouseEvent uses the owning interpreter's Object.prototype");
-        Check.That(outer.Interpreter.EvalString("typeof Object") == "function" &&
-                   frame.Interpreter.EvalString("typeof Object") == "function",
+        Check.That(outer.Interpreter.EvalString("typeof Object", outer.Interpreter.GlobalScope).ToJsString() == "function" &&
+                   frame.Interpreter.EvalString("typeof Object", frame.Interpreter.GlobalScope).ToJsString() == "function",
             "both realms expose their own Object constructor");
         Check.Done();
     }

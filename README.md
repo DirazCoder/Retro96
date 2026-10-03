@@ -6,7 +6,7 @@ Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** The repository currently contains about 84K tracked text lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** The entire repo currently contains about 96k lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -89,7 +89,10 @@ What works:
 - **`java.util`.** `Vector`, `Stack`, `Hashtable`, `Enumeration`, `Random`, `Date`. `Random` uses the JDK's own linear congruential generator, so seeded sequences are meant to match.
 - **`java.awt`.** `Graphics` (drawing, clipping, XOR mode, translation), `Color`, `Font`/`FontMetrics`, `Image` and `MediaTracker`, offscreen buffers, `Polygon`, and the geometry classes. Widgets too: `Button`, `Label`, `TextField`, `TextArea`, `Checkbox`, `Choice`, `List`, `Scrollbar`, laid out by `FlowLayout`, `BorderLayout` and `GridLayout`. They're drawn plainly, rectangles and text with no 3D bevels, so don't expect them to look like Windows 95 buttons.
 - **The 1.1 event model.** `MouseListener`, `MouseMotionListener`, `KeyListener`, `ActionListener`, `ItemListener`, `FocusListener`. The 1.0 `Event` constants are still there for older applets.
-- **`java.applet`.** The full `init` / `start` / `stop` / `destroy` lifecycle, `AppletStub`, `AppletContext`, `showStatus`, `showDocument`, and `getImage`, which does load real images.
+- **`java.applet`.** The `init` / `start` / `stop` / `destroy` lifecycle, document-and-frame-shared `AppletContext` lookup/enumeration, `showStatus`, `showDocument`, `getImage`, and asynchronous `AudioClip` play/loop/stop.
+- **Applet audio.** WAVE PCM/float, AU encodings 1–6, AIFF/AIFC (`NONE`, `twos`, `sowt`, `ulaw`, `fl32`/`FL32`, `fl64`), and Standard MIDI playback. MIDI uses Windows MCI; playback still depends on the Windows MIDI services/device being available.
+- **LiveConnect.** Page scripts can access named applets and supported public Java fields/methods. Applets can use `netscape.javascript.JSObject` for window/member/slot access, calls, and evaluation, with Java/JavaScript object and array proxies for supported values.
+- **Applet-to-applet calls.** Applets across the top document and its frames share host lookup/enumeration; `getApplet()` / `getApplets()` return live instances, and virtual calls dispatch to the owning applet VM. Stopping a document cleans up only that document's applets.
 
 Applets are painted into the page like any other replaced element, and mouse and keyboard input reaches them through the same hit-testing as the rest of the browser.
 
@@ -98,13 +101,11 @@ Applets are painted into the page like any other replaced element, and mouse and
 Some of this is unfinished. Some is on purpose. Better to know up front.
 
 - **No 1.2+ bytecode.** Covered above. Selected later runtime APIs are provided for compatibility, but Java 1.2+ class-file formats, Swing, and the collections framework are not supported.
-- **No sound.** `getAudioClip()` hands back an object and `AudioClip.play()` returns without playing anything. The methods exist so applets that call them don't crash. They're just silent.
-- **No JavaScript-to-applet scripting.** No LiveConnect. `document.myApplet.someMethod()` from a page script can't reach into the applet. DOM-0 named access covers forms and images, not applets.
-- **No applet-to-applet talking.** `AppletContext.getApplet()` returns null and `getApplets()` returns an empty enumeration, so applets on the same page can't find each other.
+- **Not a complete historical JVM or browser plugin.** The implementation targets common Java 1.0/1.1 applets, not every JDK class, browser-specific LiveConnect conversion, plugin quirk, audio codec, or applet lifecycle edge case. LiveConnect only bridges the supported Java and JavaScript value/member shapes; this is not a promise of full Netscape/IE-era compatibility.
 - **Barely any `java.io` or `java.net`.** `URL`, `PrintStream` and the common exceptions exist. No streams, no sockets. An applet that phones home over a raw socket won't work.
 - **`SecurityManager` is a stub.** `checkPermission` does nothing. The actual protection is elsewhere: an applet from a remote page can never touch the local disk, and `file:` resources are only reachable when the page itself was loaded from `file:`.
 
-The Java side has dedicated tests in `tests/RetroTests/JavaEngineTests.cs`, covering class-file parsing, opcode behavior, the `java.*` natives, `Graphics` pixel output, and full click-to-`paint()` input dispatch. Hand-compiled `.class` fixtures live in `tests/html-websites/java/` and `retro96/assets/java-fixtures/`. `tests/html-websites/java/applet-test.html` is the page to load first.
+The Java side has dedicated tests in `tests/RetroTests/JavaEngineTests.cs`, covering class-file parsing, opcode behavior, the `java.*` natives, applet audio conversion/playback, shared applet contexts and LiveConnect, `Graphics` pixel output, and full click-to-`paint()` input dispatch. Hand-compiled `.class` fixtures live in `tests/html-websites/java/` and `retro96/assets/java-fixtures/`. `tests/html-websites/java/applet-test.html` is the page to load first.
 
 VBScript has a separate focused regression suite in `tests/VbsTests/`. It can be disabled independently in Preferences and is disabled in High trust mode.
 
@@ -157,11 +158,11 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project was much smaller. Retro96 currently has about 84K tracked text lines. one of them works
+the Rust project was much smaller i think it was about 28.9k total. Retro96 currently has about 96k lines. one of them works
 
 ## Status
 
-Side project built for fun, not production software. The test sources currently define 255 xUnit cases across the main and focused VBScript suites (226 facts, 6 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract assertions. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for the selected pages in `tests/html-websites/` and `testdata/`.
+Side project built for fun, not production software. The test sources currently define 261 xUnit cases across the main and focused VBScript suites (229 facts, 9 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract assertions. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for the selected pages in `tests/html-websites/` and `testdata/`.
 
 ## Rendering stack
 

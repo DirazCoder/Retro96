@@ -54,6 +54,8 @@ public sealed class DocumentBindingsState
     /// <summary>Host-managed legacy &lt;embed&gt; script bridge. The JS engine only sees typed values and async promise facades.</summary>
     public Func<DomElement, (string ScriptName, IReadOnlyList<string> Methods)?>? EmbeddedScriptInfoResolver;
     public Func<DomElement, string, IReadOnlyList<Retro96.Plugins.JsValue>, Task<Retro96.Plugins.JsValue>>? EmbeddedScriptCall;
+    public Func<DomElement, string, JsInterpreter, JsValue?>? JavaAppletScriptMemberResolver;
+    public Func<DomElement, string, JsInterpreter, JsValue, bool>? JavaAppletScriptMemberSetter;
 }
 
 /// <summary>
@@ -120,6 +122,13 @@ public static class DomBindings
             string? nm = img.GetAttr("name");
             if (!string.IsNullOrEmpty(nm) && !windowObj.HasOwn(nm))
                 windowObj.Set(nm, JsValue.FromObject(WrapElement(img, state)));
+        }
+        foreach (var applet in document.ElementDescendants().Where(Retro96.Engine.Java.JavaAppletHost.IsJavaElement))
+        {
+            string? nm = applet.GetAttr("name");
+            nm = !string.IsNullOrEmpty(nm) ? nm : applet.GetAttr("id");
+            if (!string.IsNullOrEmpty(nm) && !windowObj.HasOwn(nm))
+                windowObj.Set(nm, JsValue.FromObject(WrapElement(applet, state)));
         }
 
         if (BrowserRuntime.SupportsInternetExplorerLegacy)
@@ -208,6 +217,13 @@ public static class DomBindings
         {
             w = new JsObject();
             if (state != null) state.WindowObject = w;
+        }
+        if (w.Prototype == null &&
+            scope.Get("Object") is { Type: JsType.Function } objectConstructor)
+        {
+            var prototype = objectConstructor.GetObjectOrFunction().Get("prototype");
+            if (prototype.Type == JsType.Object)
+                w.Prototype = prototype.GetObject();
         }
 
         w.Set("alert", Fn(scope, "alert", (self, args) =>
@@ -313,9 +329,6 @@ public static class DomBindings
             w.Set("ScriptEngineBuildVersion", Fn(scope, "ScriptEngineBuildVersion", (self, args) =>
                 JsValue.From(0)));
         }
-
-        if (!w.Has("event"))
-            w.Set("event", JsValue.Undefined);
 
         scope.Define("window", JsValue.FromObject(w));
     }
@@ -898,6 +911,13 @@ public static class DomBindings
                     // read its form fields as undefined.
                     if (_state != null)
                     {
+                        var applet = _doc.ElementDescendants()
+                            .FirstOrDefault(e => Retro96.Engine.Java.JavaAppletHost.IsJavaElement(e) &&
+                                (string.Equals(e.GetAttr("name"), name, StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(e.GetAttr("id"), name, StringComparison.OrdinalIgnoreCase)));
+                        if (applet != null)
+                            return JsValue.FromObject(WrapElement(applet, _state));
+
                         if (BrowserRuntime.SupportsInternetExplorerLegacy)
                         {
                             foreach (var element in _doc.ElementDescendants())
@@ -1561,6 +1581,11 @@ public static class DomBindings
 
         public override JsValue Get(string name)
         {
+            if (Retro96.Engine.Java.JavaAppletHost.IsJavaElement(_element) &&
+                _state?.Interpreter is { } interpreter &&
+                _state.JavaAppletScriptMemberResolver?.Invoke(_element, name, interpreter) is { } appletMember)
+                return appletMember;
+
             if (_element.TagName.Equals("embed", StringComparison.OrdinalIgnoreCase) &&
                 _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
                 scriptInfo.ScriptName.Length > 0 && string.Equals(name, scriptInfo.ScriptName, StringComparison.Ordinal))
@@ -1738,11 +1763,11 @@ public static class DomBindings
                 if (_element.EventHandlers.TryGetValue(eventName, out var source) &&
                     source != "__js_handler__")
                 {
-                    var interpreter = _state?.Interpreter;
-                    if (interpreter != null)
+                    var eventInterpreter = _state?.Interpreter;
+                    if (eventInterpreter != null)
                     {
                         return JsValue.FromFunction(new JsFunction(
-                            (self, args) => interpreter.FireEvent(_element, eventName),
+                            (self, args) => eventInterpreter.FireEvent(_element, eventName),
                             _scope, eventName));
                     }
                 }
@@ -1935,6 +1960,11 @@ public static class DomBindings
 
         public override void Set(string name, JsValue value)
         {
+            if (Retro96.Engine.Java.JavaAppletHost.IsJavaElement(_element) &&
+                _state?.Interpreter is { } interpreter &&
+                _state.JavaAppletScriptMemberSetter?.Invoke(_element, name, interpreter, value) == true)
+                return;
+
             // Keep IE3's DOM intentionally old in both reads and writes.
             if (BrowserRuntime.IsInternetExplorer3 &&
                 name is "innerHTML" or "innerText" or "outerHTML" or "outerText")

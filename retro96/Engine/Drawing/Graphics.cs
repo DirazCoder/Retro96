@@ -249,10 +249,19 @@ public sealed class Graphics : IDisposable
 
     // ── Images ─────────────────────────────────────────────────────────
 
-    private SKSamplingOptions Sampling =>
-        InterpolationMode == InterpolationMode.NearestNeighbor
-            ? new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None)
-            : new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None);
+    private SKSamplingOptions Sampling(float sourceWidth, float sourceHeight,
+                                       float destinationWidth, float destinationHeight)
+    {
+        if (InterpolationMode == InterpolationMode.NearestNeighbor)
+            return new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None);
+
+        var matrix = Canvas.TotalMatrix;
+        float scaleX = Math.Abs(matrix.ScaleX) * destinationWidth / Math.Max(1f, sourceWidth);
+        float scaleY = Math.Abs(matrix.ScaleY) * destinationHeight / Math.Max(1f, sourceHeight);
+        return scaleX > 1f || scaleY > 1f
+            ? new SKSamplingOptions(SKCubicResampler.Mitchell)
+            : new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
+    }
 
     private SKPaint? ImagePaint()
     {
@@ -272,7 +281,7 @@ public sealed class Graphics : IDisposable
         if (image == null || image.Width <= 0 || image.Height <= 0) return;
         Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(x, y, image.Width, image.Height),
-            Sampling, ImagePaint());
+            Sampling(image.Width, image.Height, image.Width, image.Height), ImagePaint());
     }
 
     public void DrawImage(Image image, RectangleF destRect)
@@ -280,14 +289,14 @@ public sealed class Graphics : IDisposable
         if (image == null || destRect.Width <= 0f || destRect.Height <= 0f) return;
         Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
-            Sampling, ImagePaint());
+            Sampling(image.Width, image.Height, destRect.Width, destRect.Height), ImagePaint());
     }
 
     public void DrawImage(Image image, float x, float y, float width, float height)
     {
         if (image == null || width <= 0f || height <= 0f) return;
         Canvas.DrawImage(ImageForDraw(image), SKRect.Create(x, y, width, height),
-            Sampling, ImagePaint());
+            Sampling(image.Width, image.Height, width, height), ImagePaint());
     }
 
     public void DrawImage(Image image, RectangleF destRect, RectangleF srcRect, GraphicsUnit srcUnit)
@@ -297,7 +306,7 @@ public sealed class Graphics : IDisposable
         Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(srcRect.X, srcRect.Y, srcRect.Width, srcRect.Height),
             SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
-            Sampling, ImagePaint());
+            Sampling(srcRect.Width, srcRect.Height, destRect.Width, destRect.Height), ImagePaint());
     }
 
     public void DrawImage(Image image, Rectangle destRect, Rectangle srcRect, GraphicsUnit srcUnit)
@@ -307,7 +316,7 @@ public sealed class Graphics : IDisposable
         Canvas.DrawImage(ImageForDraw(image),
             SKRect.Create(srcRect.X, srcRect.Y, srcRect.Width, srcRect.Height),
             SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
-            Sampling, ImagePaint());
+            Sampling(srcRect.Width, srcRect.Height, destRect.Width, destRect.Height), ImagePaint());
     }
 
     // ── Text ───────────────────────────────────────────────────────────

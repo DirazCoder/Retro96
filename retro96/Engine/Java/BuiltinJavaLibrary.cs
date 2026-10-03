@@ -27,6 +27,7 @@ internal static class BuiltinJavaLibrary
         "java.net.MalformedURLException","java.net.UnknownHostException",
         // net / applet
         "java.net.URL","java.applet.Applet","java.applet.AppletStub","java.applet.AppletContext","java.applet.AudioClip",
+        "netscape.javascript.JSObject",
         // awt core
         "java.awt.Graphics","java.awt.Image","java.awt.Cursor","java.awt.Color","java.awt.Font","java.awt.FontMetrics",
         "java.awt.Component","java.awt.Container","java.awt.Panel","java.awt.Canvas","java.awt.Button","java.awt.Label",
@@ -109,7 +110,7 @@ internal static readonly HashSet<string> InterfaceNames = new(StringComparer.Ord
                 or "java.lang.Float" or "java.lang.Double" or "java.lang.Boolean" or "java.lang.Byte" or "java.lang.Short"
                 or "java.lang.Math" or "java.lang.System" or "java.lang.PrintStream" or "java.io.PrintStream"
                 or "java.lang.Thread" or "java.lang.Class" => "java.lang.Object",
-            "java.net.URL" => "java.lang.Object",
+            "java.net.URL" or "netscape.javascript.JSObject" => "java.lang.Object",
             "java.applet.Applet" => "java.awt.Panel",
             "java.util.Random" or "java.util.Date" or "java.util.Hashtable" or "java.util.Vector" => "java.lang.Object",
             "java.util.Stack" => "java.util.Vector",

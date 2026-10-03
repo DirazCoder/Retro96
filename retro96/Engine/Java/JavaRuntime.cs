@@ -35,6 +35,7 @@ public readonly struct JValue
 public sealed class JObject
 {
     public required JClass Class { get; init; }
+    internal JavaVm? OwnerVm { get; set; }
     // Field storage is shared between the applet thread(s) and the render
     // thread, so every read/write takes this lock.
     public readonly Dictionary<JFieldKey, JValue> Fields = new();
@@ -338,7 +339,7 @@ public sealed partial class JavaVm
     public JObject NewObject(JClass cls)
     {
         EnsureInitialized(cls);
-        var o = new JObject { Class = cls };
+        var o = new JObject { Class = cls, OwnerVm = this };
         for (JClass? c = cls; c != null; c = c.SuperClass)
             foreach (var fld in c.Fields.Values)
             {
@@ -403,6 +404,8 @@ public sealed partial class JavaVm
 
     public JValue InvokeVirtual(JObject receiver, string name, string desc, params JValue[] args)
     {
+        if (receiver.OwnerVm is { } owner && !ReferenceEquals(owner, this))
+            return owner.InvokeVirtual(receiver, name, desc, args);
         if (!receiver.Class.Initialized || receiver.Class.Failed) EnsureInitialized(receiver.Class);
         var method = ResolveVirtual(receiver, name, desc)
             ?? throw new JvmException(CreateExceptionObject("java.lang.NoSuchMethodError", receiver.Class.Name + "." + name + desc), 0);
@@ -615,7 +618,7 @@ public sealed partial class JavaVm
     public JObject CreateString(string value)
     {
         var cls = LoadClass("java.lang.String");
-        return new JObject { Class = cls, NativeState = value ?? "" };
+        return new JObject { Class = cls, NativeState = value ?? "", OwnerVm = this };
     }
 
     // String literals and intern() share one object per value so reference
@@ -623,7 +626,12 @@ public sealed partial class JavaVm
     public JObject InternString(string value)
     {
         value ??= "";
-        return _internedStrings.GetOrAdd(value, v => new JObject { Class = LoadClass("java.lang.String"), NativeState = v });
+        return _internedStrings.GetOrAdd(value, v => new JObject
+        {
+            Class = LoadClass("java.lang.String"),
+            NativeState = v,
+            OwnerVm = this
+        });
     }
 
     public string StringValue(JValue value) => value.AsObject()?.NativeState as string ?? "null";

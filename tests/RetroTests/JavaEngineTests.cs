@@ -5,6 +5,7 @@
 // java.applet (S7) and the AWT surface (S8-S13). The end-to-end facts run
 // real .class bytecode (MyApplet + fixtures in html-websites/java).
 using Retro96.Engine.Java;
+using Retro96.Engine.Js;
 using Xunit;
 
 namespace RetroTests;
@@ -507,6 +508,326 @@ public sealed class JavaAppletApiTests
         JavaAssert.NoThrow("loop", () => vm.InvokeVirtual(clip, "loop", "()V"));
         JavaAssert.NoThrow("stop", () => vm.InvokeVirtual(clip, "stop", "()V"));
     }
+
+    [Fact]
+    public void AppletContextFindsAndEnumeratesAppletsAcrossVmInstances()
+    {
+        var appletVm = JavaEngineFixture.CreateVm();
+        var applet = appletVm.Construct(appletVm.LoadClass("java.applet.Applet"));
+        var appletState = (JavaAppletNativeState)applet.NativeState!;
+        appletState.Stub = new JavaAppletStubState
+        {
+            DocumentBase = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/page.html"),
+            CodeBase = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/"),
+            Parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["answer"] = "42" },
+            Name = "target"
+        };
+
+        var callerVm = JavaEngineFixture.CreateVm();
+        var contextState = new JavaAppletContextState
+        {
+            AppletLookup = name => string.Equals(name, "target", StringComparison.OrdinalIgnoreCase) ? applet : null,
+            AppletSnapshot = () => new[] { applet }
+        };
+        var context = callerVm.NewObject(callerVm.LoadClass("java.applet.AppletContext"));
+        context.NativeState = contextState;
+
+        var found = callerVm.InvokeVirtual(context, "getApplet",
+            "(Ljava/lang/String;)Ljava/applet/Applet;",
+            JValue.Ref(JavaEngineFixture.Str(callerVm, "TARGET"))).AsObject();
+        Assert.Same(applet, found);
+        JavaAssert.Eq("remote applet method dispatch",
+            callerVm.StringValue(callerVm.InvokeVirtual(found!, "getParameter",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                JValue.Ref(JavaEngineFixture.Str(callerVm, "answer")))),
+            "42");
+
+        var enumeration = callerVm.InvokeVirtual(context, "getApplets",
+            "()Ljava/util/Enumeration;").AsObject()!;
+        JavaAssert.Eq("enumeration contains one applet",
+            callerVm.InvokeVirtual(enumeration, "hasMoreElements", "()Z").AsInt(), 1);
+        Assert.Same(applet, callerVm.InvokeVirtual(enumeration, "nextElement", "()Ljava/lang/Object;").AsObject());
+        JavaAssert.Eq("enumeration is exhausted",
+            callerVm.InvokeVirtual(enumeration, "hasMoreElements", "()Z").AsInt(), 0);
+    }
+
+    [Fact]
+    public void LiveConnectJavaScriptObjectReadsWritesCallsAndEvaluates()
+    {
+        var vm = JavaEngineFixture.CreateVm();
+        var window = new JsObject();
+        var scope = new JsScope { GlobalFallback = window };
+        scope.Set("window", JsValue.FromObject(window));
+        var interpreter = new JsInterpreter(scope, null, _ => { }, _ => { });
+        interpreter.ExecuteString("var value = 7; function add(x) { return x + 1; }");
+
+        var applet = vm.Construct(vm.LoadClass("java.applet.Applet"));
+        var state = (JavaAppletNativeState)applet.NativeState!;
+        state.Stub = new JavaAppletStubState
+        {
+            DocumentBase = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/"),
+            CodeBase = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/"),
+            Context = new JavaAppletContextState { ScriptInterpreter = interpreter }
+        };
+        var jsWindow = vm.InvokeStatic("netscape.javascript.JSObject", "getWindow",
+            "(Ljava/applet/Applet;)Lnetscape/javascript/JSObject;", JValue.Ref(applet)).AsObject()!;
+
+        var value = vm.InvokeVirtual(jsWindow, "getMember", "(Ljava/lang/String;)Ljava/lang/Object;",
+            JValue.Ref(JavaEngineFixture.Str(vm, "value"))).AsObject()!;
+        JavaAssert.Eq("window.value", vm.InvokeVirtual(value, "doubleValue", "()D").AsDouble(), 7d);
+
+        var args = vm.NewArray("Ljava/lang/Object;", 1);
+        args.Elements[0] = JValue.Ref(vm.Construct(vm.LoadClass("java.lang.Integer"), "(I)V", JValue.Int(4)));
+        var sum = vm.InvokeVirtual(jsWindow, "call",
+            "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",
+            JValue.Ref(JavaEngineFixture.Str(vm, "add")), JValue.Ref(args)).AsObject()!;
+        JavaAssert.Eq("window.add(4)", vm.InvokeVirtual(sum, "doubleValue", "()D").AsDouble(), 5d);
+
+        vm.InvokeVirtual(jsWindow, "setMember",
+            "(Ljava/lang/String;Ljava/lang/Object;)V",
+            JValue.Ref(JavaEngineFixture.Str(vm, "value")),
+            JValue.Ref(vm.Construct(vm.LoadClass("java.lang.Integer"), "(I)V", JValue.Int(9))));
+        var evaluated = vm.InvokeVirtual(jsWindow, "eval", "(Ljava/lang/String;)Ljava/lang/Object;",
+            JValue.Ref(JavaEngineFixture.Str(vm, "value + 2"))).AsObject()!;
+        JavaAssert.Eq("eval result", vm.InvokeVirtual(evaluated, "doubleValue", "()D").AsDouble(), 11d);
+
+        var slotObject = new JsObject { Class = "Array" };
+        slotObject.Set("0", JsValue.From("slot-value"));
+        var jsArray = vm.Construct(vm.LoadClass("netscape.javascript.JSObject"));
+        jsArray.NativeState = new JavaScriptObjectState(interpreter, slotObject);
+        var slot = vm.InvokeVirtual(jsArray, "getSlot", "(I)Ljava/lang/Object;", JValue.Int(0)).AsObject();
+        JavaAssert.Eq("JSObject.getSlot", vm.StringValue(JValue.Ref(slot)), "slot-value");
+
+        vm.InvokeVirtual(jsWindow, "removeMember", "(Ljava/lang/String;)V",
+            JValue.Ref(JavaEngineFixture.Str(vm, "value")));
+        JavaAssert.True("JSObject.removeMember", !window.HasOwn("value"));
+    }
+
+    [Fact]
+    public async Task AudioClipDispatchesStandardMidiWithoutPassingItToWaveDecoder()
+    {
+        var player = new TestAppletAudioPlayer();
+        var vm = JavaEngineFixture.CreateVm();
+        var contextState = new JavaAppletContextState
+        {
+            AudioLoader = (_, _) => Task.FromResult<byte[]?>(MinimalMidiFile()),
+            AudioPlayerFactory = () => player
+        };
+        var context = vm.NewObject(vm.LoadClass("java.applet.AppletContext"));
+        context.NativeState = contextState;
+        var url = vm.NewObject(vm.LoadClass("java.net.URL"));
+        url.NativeState = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/tone.mid");
+        var clip = vm.InvokeVirtual(context, "getAudioClip",
+            "(Ljava/net/URL;)Ljava/applet/AudioClip;", JValue.Ref(url)).AsObject()!;
+
+        vm.InvokeVirtual(clip, "loop", "()V");
+        await player.WaitForPlayAsync();
+        Assert.True(player.LastLoop);
+        Assert.Equal(MinimalMidiFile(), player.LastMidi);
+        Assert.Null(player.LastWave);
+        contextState.StopAudioClips();
+        Assert.True(player.Disposed);
+    }
+
+    [Fact]
+    public async Task AudioClipLoadsPlaysLoopsAndStopsThroughAppletContext()
+    {
+        var player = new TestAppletAudioPlayer();
+        var vm = JavaEngineFixture.CreateVm();
+        var contextState = new JavaAppletContextState
+        {
+            AudioLoader = (_, _) => Task.FromResult<byte[]?>(ValidWave()),
+            AudioPlayerFactory = () => player
+        };
+        var context = vm.NewObject(vm.LoadClass("java.applet.AppletContext"));
+        context.NativeState = contextState;
+        var url = vm.NewObject(vm.LoadClass("java.net.URL"));
+        url.NativeState = Retro96.Engine.Network.ParsedUrl.Parse("https://example.test/tone.wav");
+        var clip = vm.InvokeVirtual(context, "getAudioClip",
+            "(Ljava/net/URL;)Ljava/applet/AudioClip;", JValue.Ref(url)).AsObject()!;
+
+        vm.InvokeVirtual(clip, "play", "()V");
+        await player.WaitForPlayAsync();
+        Assert.False(player.LastLoop);
+        Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(player.LastWave!, 0, 4));
+
+        player.ResetSignal();
+        vm.InvokeVirtual(clip, "loop", "()V");
+        await player.WaitForPlayAsync();
+        Assert.True(player.LastLoop);
+
+        vm.InvokeVirtual(clip, "stop", "()V");
+        Assert.True(player.StopCount > 0);
+        contextState.StopAudioClips();
+        Assert.True(player.Disposed);
+    }
+
+    [Theory]
+    [InlineData(1, new byte[] { 0xFF }, 0)]
+    [InlineData(2, new byte[] { 0x80 }, 0)]
+    [InlineData(3, new byte[] { 0x12, 0x34 }, 0x34)]
+    public void SunAuAudioConvertsIntoPcmWave(int encoding, byte[] sample, int expectedLowByte)
+    {
+        byte[] au = new byte[24 + sample.Length];
+        System.Text.Encoding.ASCII.GetBytes(".snd").CopyTo(au, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(4, 4), 24);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(8, 4), (uint)sample.Length);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(12, 4), (uint)encoding);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(16, 4), 8000);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(20, 4), 1);
+        sample.CopyTo(au, 24);
+
+        byte[] wave = JavaAudioClipState.NormalizeToWave(au);
+        Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(wave, 0, 4));
+        Assert.Equal("WAVE", System.Text.Encoding.ASCII.GetString(wave, 8, 4));
+        Assert.Equal(expectedLowByte, wave[44]);
+    }
+
+    [Theory]
+    [InlineData(4, new byte[] { 0x7F, 0xFF, 0xFF })]
+    [InlineData(5, new byte[] { 0x7F, 0xFF, 0xFF, 0xFF })]
+    [InlineData(6, new byte[] { 0x3F, 0x80, 0x00, 0x00 })]
+    public void SunAuExtendedPcmAndFloatEncodingsConvert(int encoding, byte[] sample)
+    {
+        byte[] au = CreateAu(encoding, sample);
+        byte[] wave = JavaAudioClipState.NormalizeToWave(au);
+        Assert.Equal(0xFF, wave[44]);
+        Assert.Equal(0x7F, wave[45]);
+    }
+
+    [Fact]
+    public void AiffAndPcmWaveNormalizeToSafeSignedPcm16()
+    {
+        byte[] wave8 = ValidPcmWave(8, new byte[] { 0xFF });
+        byte[] normalizedWave = JavaAudioClipState.NormalizeToWave(wave8);
+        Assert.Equal(0x00, normalizedWave[44]);
+        Assert.Equal(0x7F, normalizedWave[45]);
+
+        byte[] aiff = MinimalAiff8Bit();
+        byte[] normalizedAiff = JavaAudioClipState.NormalizeToWave(aiff);
+        Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(normalizedAiff, 0, 4));
+        Assert.Equal(0x00, normalizedAiff[44]);
+        Assert.Equal(0x7F, normalizedAiff[45]);
+    }
+
+    [Fact]
+    public void RejectsTruncatedAndPartialAudioData()
+    {
+        byte[] truncatedAu = CreateAu(3, new byte[] { 0, 1 });
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(truncatedAu.AsSpan(8, 4), 8);
+        Assert.Throws<InvalidDataException>(() => JavaAudioClipState.NormalizeToWave(truncatedAu));
+
+        byte[] partialWave = ValidPcmWave(16, new byte[] { 1 });
+        Assert.Throws<InvalidDataException>(() => JavaAudioClipState.NormalizeToWave(partialWave));
+    }
+
+    private static byte[] ValidWave()
+    {
+        byte[] wave = new byte[46];
+        System.Text.Encoding.ASCII.GetBytes("RIFF").CopyTo(wave, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(4, 4), wave.Length - 8);
+        System.Text.Encoding.ASCII.GetBytes("WAVEfmt ").CopyTo(wave, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(16, 4), 16);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(20, 2), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(22, 2), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(24, 4), 8000);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(28, 4), 16000);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(32, 2), 2);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(34, 2), 16);
+        System.Text.Encoding.ASCII.GetBytes("data").CopyTo(wave, 36);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(40, 4), 2);
+        return wave;
+    }
+
+    private static byte[] CreateAu(int encoding, byte[] sample)
+    {
+        byte[] au = new byte[24 + sample.Length];
+        System.Text.Encoding.ASCII.GetBytes(".snd").CopyTo(au, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(4, 4), 24);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(8, 4), (uint)sample.Length);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(12, 4), (uint)encoding);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(16, 4), 8000);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(au.AsSpan(20, 4), 1);
+        sample.CopyTo(au, 24);
+        return au;
+    }
+
+    private static byte[] ValidPcmWave(int bits, byte[] sample)
+    {
+        int bytesPerSample = bits / 8;
+        byte[] wave = new byte[44 + sample.Length + (sample.Length & 1)];
+        "RIFF"u8.CopyTo(wave);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(4, 4), wave.Length - 8);
+        "WAVEfmt "u8.CopyTo(wave.AsSpan(8));
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(16, 4), 16);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(20, 2), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(22, 2), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(24, 4), 8000);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(28, 4), 8000 * bytesPerSample);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(32, 2), (ushort)bytesPerSample);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(wave.AsSpan(34, 2), (ushort)bits);
+        "data"u8.CopyTo(wave.AsSpan(36));
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(wave.AsSpan(40, 4), sample.Length);
+        sample.CopyTo(wave, 44);
+        return wave;
+    }
+
+    private static byte[] MinimalAiff8Bit()
+    {
+        byte[] aiff = new byte[56];
+        "FORM"u8.CopyTo(aiff);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(aiff.AsSpan(4), (uint)(aiff.Length - 8));
+        "AIFF"u8.CopyTo(aiff.AsSpan(8));
+        "COMM"u8.CopyTo(aiff.AsSpan(12));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(aiff.AsSpan(16), 18);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(aiff.AsSpan(20), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(aiff.AsSpan(22), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(aiff.AsSpan(26), 8);
+        // 8000 Hz as IEEE 754 extended precision.
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(aiff.AsSpan(28), 0x400B);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(aiff.AsSpan(30), 0xFA00000000000000);
+        "SSND"u8.CopyTo(aiff.AsSpan(38));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(aiff.AsSpan(42), 9);
+        aiff[54] = 0x7F;
+        return aiff;
+    }
+
+    private static byte[] MinimalMidiFile() =>
+    [
+        (byte)'M', (byte)'T', (byte)'h', (byte)'d', 0, 0, 0, 6, 0, 0, 0, 1, 0, 96,
+        (byte)'M', (byte)'T', (byte)'r', (byte)'k', 0, 0, 0, 4, 0, 0xFF, 0x2F, 0
+    ];
+
+    private sealed class TestAppletAudioPlayer : IJavaAudioClipPlayer
+    {
+        private TaskCompletionSource _played = NewSignal();
+        public byte[]? LastWave { get; private set; }
+        public byte[]? LastMidi { get; private set; }
+        public bool LastLoop { get; private set; }
+        public int StopCount { get; private set; }
+        public bool Disposed { get; private set; }
+
+        public void Play(byte[] waveData, bool loop)
+        {
+            LastWave = waveData;
+            LastLoop = loop;
+            _played.TrySetResult();
+        }
+
+        public void PlayMidi(byte[] midiData, bool loop)
+        {
+            LastMidi = midiData;
+            LastLoop = loop;
+            _played.TrySetResult();
+        }
+
+        public void Stop() => StopCount++;
+        public void Dispose() => Disposed = true;
+        public Task WaitForPlayAsync() => _played.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        public void ResetSignal() => _played = NewSignal();
+        private static TaskCompletionSource NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 }
 
 // ---------- S9/S10/S13. Color, Font, support types ----------
@@ -646,7 +967,8 @@ public sealed class JavaAwtBehaviorTests
         var px = bmp.Bitmap.GetPixel(10, 10);
         JavaAssert.Eq("fillRect pixel", $"R={px.R},G={px.G},B={px.B}", "R=255,G=0,B=0");
         vm.InvokeVirtual(g, "clearRect", "(IIII)V", JValue.Int(0), JValue.Int(0), JValue.Int(20), JValue.Int(20));
-        Assert.True(bmp.Bitmap.GetPixel(10, 10).R != 255, "clearRect clears");
+        var cleared = bmp.Bitmap.GetPixel(10, 10);
+        Assert.True(cleared.R != 255, $"clearRect clears (got R={cleared.R}, G={cleared.G}, B={cleared.B}, A={cleared.A})");
         vm.InvokeVirtual(g, "drawLine", "(IIII)V", JValue.Int(0), JValue.Int(25), JValue.Int(39), JValue.Int(25));
         JavaAssert.Eq("drawLine pixel", $"R={bmp.Bitmap.GetPixel(20, 25).R}", "R=255");
         vm.InvokeVirtual(g, "translate", "(II)V", JValue.Int(10), JValue.Int(0));

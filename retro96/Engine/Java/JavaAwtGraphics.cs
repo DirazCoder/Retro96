@@ -195,6 +195,7 @@ internal static class JavaAwtGraphics
             var s = State(i);
             if (s == null || s.Disposed) return JValue.Void;
             using var paint = FillPaint(s, s.Background);
+            paint.BlendMode = SKBlendMode.Src;
             s.Graphics.Canvas.DrawRect(SKRect.Create(i.Arguments[0].AsInt(), i.Arguments[1].AsInt(), i.Arguments[2].AsInt(), i.Arguments[3].AsInt()), paint);
             return JValue.Void;
         });

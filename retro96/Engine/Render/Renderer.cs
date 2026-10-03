@@ -112,7 +112,9 @@ public class Renderer
     {
         private const char LegacyBulletMarker = '\uE000';
         private static readonly SKSamplingOptions LinearSampling =
-            new(SKFilterMode.Linear, SKMipmapMode.None);
+            new(SKFilterMode.Linear, SKMipmapMode.Linear);
+        private static readonly SKSamplingOptions CubicSampling =
+            new(SKCubicResampler.Mitchell);
 
         public SKCanvas Canvas { get; }
         private readonly GRContext? _gpuContext;
@@ -175,7 +177,7 @@ public class Renderer
             if (image == null || destRect.Width <= 0f || destRect.Height <= 0f) return;
             Canvas.DrawImage(image.GetGpuImage(_gpuContext),
                 SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
-                sampling ?? LinearSampling);
+                sampling ?? GetImageSampling(image.Width, image.Height, destRect.Width, destRect.Height));
         }
 
         public void DrawImage(Image image, float x, float y, float width, float height,
@@ -183,7 +185,17 @@ public class Renderer
         {
             if (image == null || width <= 0f || height <= 0f) return;
             Canvas.DrawImage(image.GetGpuImage(_gpuContext),
-                SKRect.Create(x, y, width, height), sampling ?? LinearSampling);
+                SKRect.Create(x, y, width, height),
+                sampling ?? GetImageSampling(image.Width, image.Height, width, height));
+        }
+
+        private SKSamplingOptions GetImageSampling(float sourceWidth, float sourceHeight,
+                                                   float destinationWidth, float destinationHeight)
+        {
+            var matrix = Canvas.TotalMatrix;
+            float scaleX = Math.Abs(matrix.ScaleX) * destinationWidth / Math.Max(1f, sourceWidth);
+            float scaleY = Math.Abs(matrix.ScaleY) * destinationHeight / Math.Max(1f, sourceHeight);
+            return scaleX > 1f || scaleY > 1f ? CubicSampling : LinearSampling;
         }
 
         public void DrawImageNearest(Image image, float x, float y, float width, float height) =>

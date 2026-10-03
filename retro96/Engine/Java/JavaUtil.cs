@@ -369,7 +369,7 @@ internal static class JavaUtil
     internal static JObject MakeEnumeration(JavaVm vm, List<JValue> items)
     {
         var cls = vm.LoadClass("java.util.Enumeration");
-        return new JObject { Class = cls, NativeState = new JavaEnumerationState(items) };
+        return new JObject { Class = cls, NativeState = new JavaEnumerationState(items), OwnerVm = vm };
     }
 
     private static void RegisterEnumeration(JavaVm vm, JClass c)

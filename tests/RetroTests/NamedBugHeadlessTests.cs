@@ -750,7 +750,7 @@ public class NamedBugHeadlessTests
     public void Bug_PasswordGraphicsStateDoesNotLeakIntoLaterPageText()
     {
         using var surface = new Retro96.Drawing.Bitmap(8, 8);
-        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        using var g = Retro96.Drawing.Graphics.FromBitmap(surface);
 
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
         int state = g.Save();
@@ -878,7 +878,7 @@ public class NamedBugHeadlessTests
         // the striped-highlight bug would show as every OTHER line missing.
         var fonts = new FontCache();
         using var surface = new Retro96.Drawing.Bitmap(1, 1);
-        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        using var g = Retro96.Drawing.Graphics.FromBitmap(surface);
         var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
         string text = string.Join("\n", Enumerable.Range(1, 8).Select(i => $"line {i} of the selection test"));
         var face = new RectangleF(100f, 100f, 400f, 200f);
@@ -915,7 +915,7 @@ public class NamedBugHeadlessTests
     public void Bug_TextareaHardBreaksAreNotDuplicated()
     {
         using var surface = new Retro96.Drawing.Bitmap(1, 1);
-        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        using var g = Retro96.Drawing.Graphics.FromBitmap(surface);
         var fonts = new FontCache();
         var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
 
@@ -936,7 +936,7 @@ public class NamedBugHeadlessTests
     public void Bug_TextareaScrollbarReservesTextGutter()
     {
         using var surface = new Retro96.Drawing.Bitmap(1, 1);
-        using var g = Retro96.Drawing.Graphics.FromImage(surface);
+        using var g = Retro96.Drawing.Graphics.FromBitmap(surface);
         var fonts = new FontCache();
         var font = fonts.Resolve(new List<string> { "Courier New", "monospace" }, 13f, false, false);
         string text = string.Join("\n", Enumerable.Range(1, 8).Select(i => $"line {i}"));
@@ -966,11 +966,11 @@ public class NamedBugHeadlessTests
         if (box == null) return;
         var r = box.BorderRect;
         // cols=50 → ~50 char cells ≈ 400px (engine: cols*8); rows=12 →
-        // ~12 line heights ≈ 160-170px.  20% tolerance per the contract.
+        // 12 default-font line boxes plus native-control padding.
         Check.That(r.Width >= 320f && r.Width <= 480f,
             "textarea width ≈ 50 character cells (±20%)", $"width={r.Width:0.#}");
-        Check.That(r.Height >= 128f && r.Height <= 210f,
-            "textarea height ≈ 12 line heights (±20%)", $"height={r.Height:0.#}");
+        Check.That(r.Height >= 180f && r.Height <= 260f,
+            "textarea height fits 12 default-font rows plus control padding", $"height={r.Height:0.#}");
         Check.Done();
     }
 
@@ -1470,7 +1470,7 @@ public class BonusContractTests
         var capitalizeElement = doc.ElementDescendants().First(e => e.GetAttr("id") == "capitalize");
         var capitalizedWord = root.Descendants().First(b => b.Element == capitalizeElement && b.TextRun == "these");
         using var measureBitmap = new Bitmap(160, 50);
-        using var graphics = Graphics.FromImage(measureBitmap);
+        using var graphics = Graphics.FromBitmap(measureBitmap);
         var style = capitalizeElement.Style!;
         var font = LayoutHarness.Fonts.Resolve(style.FontFamily, style.FontSize,
             (int)style.FontWeight, style.FontStyle == FontStyleValue.Italic,

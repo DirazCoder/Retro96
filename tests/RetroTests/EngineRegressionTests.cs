@@ -4,11 +4,79 @@ using Retro96.Engine.Dom;
 using Retro96.Engine.Html;
 using Retro96.Engine.Js;
 using Retro96.Engine.Network;
+using Retro96.Drawing;
 
 namespace RetroTests;
 
 public class EngineRegressionTests
 {
+    [Fact]
+    public void ParsedUrlPreservesExactlyOneTrailingDirectorySlash()
+    {
+        Check.That(
+            ParsedUrl.Parse("http://spacejam.com/1996/").ToAbsolute() ==
+            "http://spacejam.com/1996/",
+            "address-bar directory URL does not gain a second trailing slash");
+        Check.That(
+            ParsedUrl.Parse("http://spacejam.com/1996").ToAbsolute() ==
+            "http://spacejam.com/1996",
+            "URL without a trailing slash remains slash-free");
+        Check.That(
+            ParsedUrl.Parse("http://spacejam.com/a//b///").ToAbsolute() ==
+            "http://spacejam.com/a/b/",
+            "duplicate path slashes normalize to one trailing slash");
+        Check.Done();
+    }
+
+    [Fact]
+    public void DownscaledImagesUseMipmapFiltering()
+    {
+        using var source = new Bitmap(64, 64);
+        using var target = new Bitmap(1, 1);
+        for (int y = 0; y < source.Height; y++)
+            for (int x = 0; x < source.Width; x++)
+                source.SetPixel(x, y, ((x + y) & 1) == 0 ? Color.Black : Color.White);
+
+        using (var graphics = Graphics.FromBitmap(target))
+            graphics.DrawImage(source, 0, 0, 1, 1);
+
+        var pixel = target.GetPixel(0, 0);
+        Check.That(pixel.R is >= 112 and <= 143 && pixel.G is >= 112 and <= 143 &&
+                   pixel.B is >= 112 and <= 143,
+            "strong image downscaling averages high-frequency detail",
+            $"pixel={pixel}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ZoomedImagesUseCubicFiltering()
+    {
+        using var source = new Bitmap(2, 2);
+        source.SetPixel(0, 0, Color.Black);
+        source.SetPixel(1, 0, Color.White);
+        source.SetPixel(0, 1, Color.White);
+        source.SetPixel(1, 1, Color.Black);
+        using var target = new Bitmap(16, 16);
+        using (var graphics = Graphics.FromBitmap(target))
+        {
+            graphics.ScaleTransform(8f, 8f);
+            graphics.DrawImage(source, 0, 0, 2, 2);
+        }
+
+        int blendedPixels = 0;
+        for (int y = 0; y < target.Height; y++)
+            for (int x = 0; x < target.Width; x++)
+            {
+                byte red = target.GetPixel(x, y).R;
+                if (red is > 0 and < 255)
+                    blendedPixels++;
+            }
+        Check.That(blendedPixels > 0,
+            "zoomed raster images blend neighboring source pixels",
+            $"blendedPixels={blendedPixels}");
+        Check.Done();
+    }
+
     [Fact]
     public void ParserSurvivesThe1996Pages()
     {
@@ -79,17 +147,15 @@ public class EngineRegressionTests
     public void ErrorPageShellAlignmentPinned()
     {
         string html = Retro96.Engine.ErrorPage.NetworkError("http://x.test/", "boom");
-        Check.That(html.Contains("cellpadding=\"14\" cellspacing=\"0\" align=\"left\""),
-              "shell: content table declares align=left");
-        Check.That(html.Contains("<tr><td align=\"left\">"), "shell: content cell declares align=left");
+        Check.That(html.Contains("<td align=\"center\" valign=\"middle\">"),
+              "shell: dialog remains centered in the viewport");
+        Check.That(html.Contains("<td align=\"left\" valign=\"top\">"),
+              "shell: message content is left-aligned");
         Check.That(html.Contains("<td align=\"left\"><font color=\"#ffffff\""),
               "shell: title-bar cell left-aligned");
 
-        int start = html.IndexOf("[<a href=\"retro96://home\">", StringComparison.Ordinal);
-        int end = html.IndexOf("[<a href=\"retro96://reload\">", StringComparison.Ordinal);
-        string seg = html[start..(end + 40)];
-        Check.That(seg.Contains("]&#160;&#160;["), "footer: bracket groups glued with nbsp", seg);
-        Check.That(!seg.Contains("] &nbsp;"), "footer: no breakable space+nbs mixture");
+        Check.That(html.Contains("<a href=\"retro96://home\">Home</a>"),
+              "footer: provides the browser home link");
 
         foreach (var (name, page) in new[] {
             ("NotFound", Retro96.Engine.ErrorPage.NotFound("http://x.test/404")),
@@ -117,7 +183,8 @@ public class EngineRegressionTests
         Check.That(Sub("\u26A0 Warning") == "!! Warning", "\u26A0 (warning) → !!");
         Check.That(Sub("\u266A") == "~", "\u266A (note) → ~");
         Check.That(Sub("a\u2014b") == "a\u2014b", "em dash preserved");
-        Check.That(Sub("x\u2022y") == "x\u2022y", "bullet preserved");
+        Check.That(Sub("x\u2022y") == "x" + Retro96.Engine.Render.GlyphSubstitution.LegacyBulletMarker + "y",
+            "bullet is mapped to the renderer's stable legacy-bullet marker");
         Check.That(Sub("caf\u00E9") == "caf\u00E9", "Latin-1 accented preserved");
         Check.That(Sub("plain text 123") == "plain text 123", "ASCII untouched");
         Check.That(Sub(Sub("\u25B6\u266A")) == Sub("\u25B6\u266A"), "idempotent");

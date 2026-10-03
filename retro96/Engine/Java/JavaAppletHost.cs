@@ -4,6 +4,7 @@ using Retro96.Drawing;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
+using Retro96.Engine.Js;
 using SkiaSharp;
 
 namespace Retro96.Engine.Java;
@@ -21,6 +22,7 @@ public sealed class JavaAppletHost : IDisposable
         public required JObject Object;
         public required JavaVm Vm;
         public required JavaAppletNativeState State;
+        public required DomDocument Document;
         public Bitmap? LastFrame;
         public bool Initialized;
         public bool Started;
@@ -28,27 +30,349 @@ public sealed class JavaAppletHost : IDisposable
 
     private readonly Dictionary<DomElement, Instance> _instances = new();
     private readonly object _gate = new();
-    private ParsedUrl? _pageBase;
-    private CookieStore? _cookies;
-    private ResourceLoader? _resources;
+    private readonly Dictionary<DomDocument, JavaAppletContextState> _contexts = new();
+    private JsInterpreter? _scriptInterpreter;
     private bool _disposed;
     public Action? RepaintRequested { get; set; }
     public Action<string>? NavigateRequested { get; set; }
     public Action<string>? StatusChanged { get; set; }
 
-    public async Task PreparePageAsync(DomDocument document, ResourceLoader resources, CancellationToken ct = default)
+    public void SetScriptInterpreter(JsInterpreter interpreter)
+    {
+        _scriptInterpreter = interpreter ?? throw new ArgumentNullException(nameof(interpreter));
+    }
+
+    internal JsValue? ResolveScriptMember(DomElement element, string name, JsInterpreter interpreter)
+    {
+        Instance? instance;
+        lock (_gate) _instances.TryGetValue(element, out instance);
+        if (instance == null || !instance.Initialized) return null;
+        return ResolveJavaObjectMember(instance.Vm, instance.Object, name, interpreter);
+    }
+
+    internal bool SetScriptMember(DomElement element, string name, JsInterpreter interpreter, JsValue value)
+    {
+        Instance? instance;
+        lock (_gate) _instances.TryGetValue(element, out instance);
+        if (instance == null || !instance.Initialized) return false;
+        return SetJavaObjectMember(instance.Vm, instance.Object, name, interpreter, value);
+    }
+
+    private static bool SetJavaObjectMember(
+        JavaVm vm, JObject target, string name, JsInterpreter interpreter, JsValue value)
+    {
+        for (JClass? cls = target.Class; cls != null; cls = cls.SuperClass)
+        {
+            var field = cls.Fields.Values.FirstOrDefault(f =>
+                f.Name == name && (f.AccessFlags & JAccess.Public) != 0 &&
+                (f.AccessFlags & JAccess.Final) == 0 && !f.IsStatic);
+            if (field == null) continue;
+            if (!TryConvertArgument(vm, interpreter, field.Descriptor, value, out var converted))
+                throw new InvalidOperationException($"Java field '{name}' does not accept this JavaScript value.");
+            vm.SetField(target, cls, field.Name, field.Descriptor, converted);
+            return true;
+        }
+        return false;
+    }
+
+    private static JsValue? ResolveJavaObjectMember(
+        JavaVm vm, JObject target, string name, JsInterpreter interpreter)
+    {
+        for (JClass? cls = target.Class; cls != null; cls = cls.SuperClass)
+        {
+            var field = cls.Fields.Values.FirstOrDefault(f =>
+                f.Name == name && (f.AccessFlags & JAccess.Public) != 0 && !f.IsStatic);
+            if (field != null)
+                return ToJavaScript(vm, vm.GetField(target, cls, field.Name, field.Descriptor),
+                    interpreter, field.Descriptor);
+        }
+
+        var methods = new List<JMethod>();
+        for (JClass? cls = target.Class; cls != null; cls = cls.SuperClass)
+        {
+            methods.AddRange(cls.Methods.Values.Where(m =>
+                m.Name == name && !m.IsStatic && !m.IsPrivate &&
+                (m.AccessFlags & JAccess.Public) != 0));
+        }
+        if (methods.Count == 0) return null;
+
+        return JsValue.FromFunction(new JsFunction((_, args) =>
+        {
+            var candidates = methods
+                .Select(method => TryConvertArguments(vm, interpreter, method, args, out var converted)
+                    ? (Method: method, Arguments: converted, Score: ArgumentMatchScore(method, args))
+                    : default)
+                .Where(candidate => candidate.Method != null)
+                .OrderBy(candidate => candidate.Score)
+                .ToArray();
+            if (candidates.Length == 0)
+                throw new InvalidOperationException($"No public Java overload '{name}' accepts {args.Length} argument(s).");
+
+            try
+            {
+                var result = vm.InvokeVirtual(target, name, candidates[0].Method!.Descriptor, candidates[0].Arguments!);
+                return ToJavaScript(vm, result, interpreter, ReturnDescriptor(candidates[0].Method.Descriptor));
+            }
+            catch (JvmException ex)
+            {
+                throw new InvalidOperationException($"Java call {name} threw {ex.Object.Class.Name}.");
+            }
+        }, interpreter.GlobalScope, name));
+    }
+
+    private static int ArgumentMatchScore(JMethod method, JsValue[] args)
+    {
+        var descriptors = JavaDescriptor.Parse(method.Descriptor);
+        int score = 0;
+        for (int i = 0; i < descriptors.Count && i < args.Length; i++)
+        {
+            string descriptor = descriptors[i];
+            if (descriptor == "Ljava/lang/String;" && args[i].Type == JsType.String) score -= 4;
+            else if (descriptor == "Z" && args[i].Type == JsType.Boolean) score -= 3;
+            else if (descriptor is "I" or "J" or "F" or "D" && args[i].Type == JsType.Number) score -= 2;
+        }
+        return score;
+    }
+
+    private static bool TryConvertArguments(
+        JavaVm vm, JsInterpreter interpreter, JMethod method, JsValue[] args, out JValue[] converted)
+    {
+        var descriptors = JavaDescriptor.Parse(method.Descriptor);
+        converted = Array.Empty<JValue>();
+        if (descriptors.Count != args.Length) return false;
+
+        var result = new JValue[args.Length];
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (!TryConvertArgument(vm, interpreter, descriptors[i], args[i], out result[i]))
+                return false;
+        }
+        converted = result;
+        return true;
+    }
+
+    private static bool TryConvertArgument(
+        JavaVm vm, JsInterpreter interpreter, string descriptor, JsValue arg, out JValue result)
+    {
+        if (descriptor[0] == '[')
+        {
+            if (arg.Type is JsType.Null or JsType.Undefined)
+            {
+                result = JValue.Ref(null);
+                return true;
+            }
+            if (arg.Type is not (JsType.Object or JsType.Function))
+            {
+                result = JValue.Void;
+                return false;
+            }
+
+            var jsArray = arg.GetObjectOrFunction();
+            if (jsArray is JavaScriptArrayProxy arrayProxy)
+            {
+                result = JValue.Ref(arrayProxy.Value);
+                return true;
+            }
+            if (!int.TryParse(jsArray.Get("length").ToJsString(),
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int length) ||
+                length is < 0 or > 100_000)
+            {
+                result = JValue.Void;
+                return false;
+            }
+            string component = descriptor[1..];
+            var javaArray = vm.NewArray(component, length);
+            for (int i = 0; i < length; i++)
+            {
+                if (!TryConvertArgument(vm, interpreter, component,
+                        jsArray.Get(i.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                        out javaArray.Elements[i]))
+                {
+                    result = JValue.Void;
+                    return false;
+                }
+            }
+            result = JValue.Ref(javaArray);
+            return true;
+        }
+
+        if (descriptor[0] == 'L')
+        {
+            if (arg.Type is JsType.Null or JsType.Undefined)
+                result = JValue.Ref(null);
+            else if (descriptor == "Ljava/lang/String;")
+                result = JValue.Ref(vm.CreateString(arg.ToJsString()));
+            else if ((arg.Type is JsType.Object or JsType.Function) &&
+                     arg.GetObjectOrFunction() is JavaScriptObjectProxy proxy)
+                result = JValue.Ref(proxy.Value);
+            else if ((arg.Type is JsType.Object or JsType.Function) &&
+                     descriptor == "Lnetscape/javascript/JSObject;")
+            {
+                result = JValue.Ref(new JObject
+                {
+                    Class = vm.LoadClass("netscape.javascript.JSObject"),
+                    NativeState = new JavaScriptObjectState(interpreter, arg.GetObjectOrFunction()),
+                    OwnerVm = vm
+                });
+            }
+            else
+            {
+                result = JValue.Void;
+                return false;
+            }
+            return true;
+        }
+
+        if (descriptor == "Z")
+        {
+            result = JValue.Int(arg.ToBoolean() ? 1 : 0);
+            return true;
+        }
+        if (descriptor == "C")
+        {
+            string text = arg.ToJsString();
+            result = JValue.Int(text.Length == 0 ? 0 : text[0]);
+            return true;
+        }
+
+        double number = arg.ToNumber();
+        if (double.IsNaN(number) || double.IsInfinity(number)) number = 0;
+        result = descriptor switch
+        {
+            "B" => JValue.Int(unchecked((sbyte)(int)number)),
+            "S" => JValue.Int(unchecked((short)(int)number)),
+            "I" => JValue.Int(unchecked((int)number)),
+            "J" => JValue.Long(unchecked((long)number)),
+            "F" => JValue.Float((float)number),
+            "D" => JValue.Double(number),
+            _ => JValue.Void
+        };
+        return result.Tag != JTag.Void;
+    }
+
+    private static string ReturnDescriptor(string methodDescriptor) =>
+        methodDescriptor[(methodDescriptor.IndexOf(')') + 1)..];
+
+    private static JsValue ToJavaScript(
+        JavaVm vm, JValue value, JsInterpreter interpreter, string? descriptor = null)
+    {
+        if (descriptor == "Z") return JsValue.From(value.AsInt() != 0);
+        if (descriptor == "C") return JsValue.From(((char)value.AsInt()).ToString());
+        return value.Tag switch
+        {
+            JTag.Int => JsValue.From(value.AsInt()),
+            JTag.Long => JsValue.From((double)value.AsLong()),
+            JTag.Float => JsValue.From(value.AsFloat()),
+            JTag.Double => JsValue.From(value.AsDouble()),
+            JTag.Void => JsValue.Undefined,
+            JTag.Reference => ToJavaScriptReference(vm, value.AsReference(), interpreter),
+            _ => JsValue.Undefined
+        };
+    }
+
+    private static JsValue ToJavaScriptReference(JavaVm vm, object? reference, JsInterpreter interpreter)
+        => WrapJavaReference(vm, interpreter, reference);
+
+    internal static JsValue WrapJavaReference(JavaVm vm, JsInterpreter interpreter, object? reference)
+    {
+        if (reference == null) return JsValue.Null;
+        if (reference is JArray array)
+            return JsValue.FromObject(new JavaScriptArrayProxy(vm, array, interpreter));
+        if (reference is JObject javaObject)
+        {
+            if (javaObject.Class.Name == "java.lang.String")
+                return JsValue.From(vm.StringValue(javaObject));
+            if (javaObject.NativeState is JavaScriptObjectState jsObject)
+                return JsValue.FromObject(jsObject.Target);
+            if (javaObject.NativeState is bool boolean) return JsValue.From(boolean);
+            if (javaObject.NativeState is sbyte byteValue) return JsValue.From((int)byteValue);
+            if (javaObject.NativeState is byte unsignedByte) return JsValue.From((int)unsignedByte);
+            if (javaObject.NativeState is short shortValue) return JsValue.From((int)shortValue);
+            if (javaObject.NativeState is ushort unsignedShort) return JsValue.From((int)unsignedShort);
+            if (javaObject.NativeState is char character) return JsValue.From(character.ToString());
+            if (javaObject.NativeState is int intValue) return JsValue.From(intValue);
+            if (javaObject.NativeState is long longValue) return JsValue.From((double)longValue);
+            if (javaObject.NativeState is float floatValue) return JsValue.From(floatValue);
+            if (javaObject.NativeState is double doubleValue) return JsValue.From(doubleValue);
+            return JsValue.FromObject(new JavaScriptObjectProxy(vm, javaObject, interpreter));
+        }
+        return JsValue.Null;
+    }
+
+    private sealed class JavaScriptObjectProxy(JavaVm vm, JObject value, JsInterpreter interpreter) : JsObject
+    {
+        public JObject Value { get; } = value;
+
+        public override JsValue Get(string name) =>
+            ResolveJavaObjectMember(vm, Value, name, interpreter) ?? base.Get(name);
+
+        public override void Set(string name, JsValue propertyValue)
+        {
+            if (SetJavaObjectMember(vm, Value, name, interpreter, propertyValue)) return;
+            base.Set(name, propertyValue);
+        }
+    }
+
+    private sealed class JavaScriptArrayProxy(JavaVm vm, JArray value, JsInterpreter interpreter) : JsObject
+    {
+        public JArray Value { get; } = value;
+
+        public override JsValue Get(string name)
+        {
+            if (name == "length") return JsValue.From(Value.Elements.Length);
+            if (int.TryParse(name, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int index) &&
+                (uint)index < (uint)Value.Elements.Length)
+                return ToJavaScript(vm, Value.Elements[index], interpreter, Value.ComponentDescriptor);
+            return base.Get(name);
+        }
+
+        public override void Set(string name, JsValue propertyValue)
+        {
+            if (int.TryParse(name, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int index) &&
+                (uint)index < (uint)Value.Elements.Length &&
+                TryConvertArgument(vm, interpreter, Value.ComponentDescriptor, propertyValue, out var converted))
+            {
+                Value.Elements[index] = converted;
+                return;
+            }
+            base.Set(name, propertyValue);
+        }
+    }
+
+    public async Task PreparePageAsync(
+        DomDocument document, ResourceLoader resources, CancellationToken ct = default,
+        bool resetAllDocuments = true, JsInterpreter? scriptInterpreter = null)
     {
         if (_disposed) return;
-        StopPage();
-        _pageBase = document.BaseUrl;
-        _cookies = document.Cookies;
-        _resources = resources;
-        if (_pageBase == null) return;
+        if (resetAllDocuments) StopPage();
+        else StopDocument(document);
+        ParsedUrl? pageBase = document.BaseUrl;
+        bool localPage = pageBase?.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase) == true;
+        var context = new JavaAppletContextState
+        {
+            Status = StatusChanged,
+            Navigate = NavigateRequested,
+            AppletLookup = FindAppletByName,
+            AppletSnapshot = SnapshotApplets,
+            ScriptInterpreter = scriptInterpreter ?? _scriptInterpreter,
+            AudioLoader = (url, token) => LoadAudioBytesAsync(url, resources, document.Cookies, localPage, token)
+        };
+        lock (_gate) _contexts[document] = context;
+        if (pageBase == null) return;
 
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, context.LifetimeToken);
+        CancellationToken pageToken = lifetime.Token;
         foreach (var element in CollectAppletElements(document))
         {
-            try { await Task.Run(() => PrepareAppletAsync(element, _pageBase, resources, document.Cookies, ct), ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            try
+            {
+                await Task.Run(() => PrepareAppletAsync(element, document, pageBase, resources,
+                    document.Cookies, context, context.ScriptInterpreter, pageToken), pageToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (pageToken.IsCancellationRequested) { return; }
             catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.prepare", ex); }
         }
         RepaintRequested?.Invoke();
@@ -226,8 +550,35 @@ public sealed class JavaAppletHost : IDisposable
     public void StopPage()
     {
         Instance[] old;
-        lock (_gate) { old = _instances.Values.ToArray(); _instances.Clear(); }
-        foreach (var i in old)
+        JavaAppletContextState[] contexts;
+        lock (_gate)
+        {
+            old = _instances.Values.ToArray();
+            contexts = _contexts.Values.ToArray();
+            _instances.Clear();
+            _contexts.Clear();
+        }
+        foreach (var context in contexts) context.StopAudioClips();
+        StopInstances(old);
+    }
+
+    public void StopDocument(DomDocument document)
+    {
+        Instance[] old;
+        JavaAppletContextState? context;
+        lock (_gate)
+        {
+            old = _instances.Values.Where(instance => ReferenceEquals(instance.Document, document)).ToArray();
+            foreach (var instance in old) _instances.Remove(instance.Element);
+            _contexts.Remove(document, out context);
+        }
+        context?.StopAudioClips();
+        StopInstances(old);
+    }
+
+    private static void StopInstances(IEnumerable<Instance> instances)
+    {
+        foreach (var i in instances)
         {
             try
             {
@@ -241,6 +592,42 @@ public sealed class JavaAppletHost : IDisposable
             i.LastFrame?.Dispose();
             i.LastFrame = null;
         }
+    }
+
+    private JObject? FindAppletByName(string name)
+    {
+        lock (_gate)
+        {
+            return _instances.Values
+                .FirstOrDefault(i => string.Equals(i.State.Stub?.Name, name, StringComparison.OrdinalIgnoreCase))
+                ?.Object;
+        }
+    }
+
+    private IReadOnlyList<JObject> SnapshotApplets()
+    {
+        lock (_gate) return _instances.Values.Select(i => i.Object).ToArray();
+    }
+
+    private static async Task<byte[]?> LoadAudioBytesAsync(
+        ParsedUrl url, ResourceLoader resources, CookieStore cookies, bool localPage, CancellationToken ct)
+    {
+        if (url.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!localPage) return null;
+            string? path = FileUrls.LocalPathFromFileUrl(url);
+            if (path == null || !File.Exists(path)) return null;
+            var info = new FileInfo(path);
+            if (info.Length > 16L * 1024 * 1024)
+                throw new InvalidDataException("Applet audio resource exceeds the 16 MiB limit.");
+            return await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+        }
+
+        var response = await resources.FetchAsync(url.ToAbsolute(), url, cookies).ConfigureAwait(false);
+        if (response is not HttpSuccess success) return null;
+        if (success.Body.Length > 16 * 1024 * 1024)
+            throw new InvalidDataException("Applet audio resource exceeds the 16 MiB limit.");
+        return success.Body;
     }
 
     // stop() is the signal for animation threads to exit; give them a
@@ -257,8 +644,12 @@ public sealed class JavaAppletHost : IDisposable
         }
     }
 
-    private async Task PrepareAppletAsync(DomElement element, ParsedUrl pageBase, ResourceLoader resources, CookieStore cookies, CancellationToken ct)
+    private async Task PrepareAppletAsync(
+        DomElement element, DomDocument document, ParsedUrl pageBase, ResourceLoader resources,
+        CookieStore cookies, JavaAppletContextState context, JsInterpreter? scriptInterpreter,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         string code = (element.GetAttr("code") ?? element.GetAttr("classid") ?? "").Trim();
         if (code.StartsWith("java:", StringComparison.OrdinalIgnoreCase)) code = code[5..].Trim();
         if (code.Length == 0) return;
@@ -273,6 +664,7 @@ public sealed class JavaAppletHost : IDisposable
         string[] archives = (element.GetAttr("archive") ?? "").Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         foreach (string archive in archives)
         {
+            ct.ThrowIfCancellationRequested();
             try
             {
                 var bytes = await FetchBytesAsync(codeBase.Resolve(archive), resources, cookies, ct).ConfigureAwait(false);
@@ -280,6 +672,7 @@ public sealed class JavaAppletHost : IDisposable
             }
             catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.archive", ex); }
         }
+        ct.ThrowIfCancellationRequested();
 
         string codePath = code.Replace('\\', '/').TrimStart('/');
         if (codePath.EndsWith(".class", StringComparison.OrdinalIgnoreCase)) codePath = codePath[..^6];
@@ -291,6 +684,7 @@ public sealed class JavaAppletHost : IDisposable
             await FetchBytesAsync(codeBase.Resolve(codePath.Replace('/', '/') + ".class"), resources, cookies, ct).ConfigureAwait(false)
             ?? await FetchBytesAsync(codeBase.Resolve(codePath), resources, cookies, ct).ConfigureAwait(false);
         if (mainBytes == null) return;
+        ct.ThrowIfCancellationRequested();
 
         var stub = new JavaAppletStubState
         {
@@ -298,7 +692,8 @@ public sealed class JavaAppletHost : IDisposable
             CodeBase = codeBase,
             Parameters = parameters,
             Name = element.GetAttr("name") ?? "",
-            Context = new JavaAppletContextState { Status = StatusChanged, Navigate = NavigateRequested }
+            Context = context,
+            ScriptInterpreter = scriptInterpreter
         };
 
         var classCache = new ConcurrentDictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
@@ -382,6 +777,8 @@ public sealed class JavaAppletHost : IDisposable
 
         var klass = vm.LoadClassBytes(mainBytes);
         var obj = vm.Construct(klass);
+        ct.ThrowIfCancellationRequested();
+        obj.OwnerVm = vm;
         if (obj.NativeState is not JavaAppletNativeState) obj.NativeState = new JavaAppletNativeState();
         var state = (JavaAppletNativeState)obj.NativeState!;
         state.Stub = stub;
@@ -393,7 +790,7 @@ public sealed class JavaAppletHost : IDisposable
             state.Component.Height = state.Height;
             RepaintRequested?.Invoke();
         };
-        var stubObject = new JObject { Class = vm.LoadClass("java.applet.AppletStub"), NativeState = stub };
+        var stubObject = new JObject { Class = vm.LoadClass("java.applet.AppletStub"), NativeState = stub, OwnerVm = vm };
         state.JavaStubObject = stubObject;
         state.Active = false;
         state.Width = Math.Max(1, element.GetAttrInt("width", 300));
@@ -402,7 +799,10 @@ public sealed class JavaAppletHost : IDisposable
         state.Component.Height = state.Height;
         vm.InvokeVirtual(obj, "setStub", "(Ljava/applet/AppletStub;)V", JValue.Ref(stubObject));
 
-        lock (_gate) _instances[element] = new Instance { Element = element, Class = klass, Object = obj, Vm = vm, State = state };
+        lock (_gate) _instances[element] = new Instance
+        {
+            Element = element, Class = klass, Object = obj, Vm = vm, State = state, Document = document
+        };
         try { vm.InvokeVirtual(obj, "init", "()V"); }
         catch (Exception ex) { Retro96.DebugLog.WriteException("JavaApplet.init", ex); return; }
 

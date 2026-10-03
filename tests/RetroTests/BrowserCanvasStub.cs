@@ -38,7 +38,7 @@ public class BrowserCanvas
     public Size GetViewportSize() => new(800, 600);
     public void SubmitForm(DomElement? form, object? clickCoords, bool dispatchSubmitEvent = true)
     {
-        FormSubmitDispatchFlags.Add(dispatchSubmitEvent);
+        Log.FormSubmitDispatchFlags.Add(dispatchSubmitEvent);
     }
     public void UpdateDocumentTitle(string title) { }
     // WinForms affinity members referenced by DomBindings callbacks; in the
@@ -60,6 +60,8 @@ public class BrowserCanvas
     public void RequestRerender() { Log.Rerenders++; }
     public void ReflowDocument() { Log.Reflows++; }
     public void PrefetchImage(string url) { Log.PrefetchedImages.Add(url); }
+    public void ClearPageSelection() { }
+    public string? GetDomSelectionText() => null;
 
     // ── headless shell-service overrides (era defaults) ──
     public virtual void ShowAlert(string message) { Log.Alerts.Add(message); }

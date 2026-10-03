@@ -328,6 +328,17 @@ internal static class BuiltinJavaDeclarations
             case "java.applet.AudioClip":
                 Method(c, "play", "()V"); Method(c, "loop", "()V"); Method(c, "stop", "()V");
                 break;
+            case "netscape.javascript.JSObject":
+                StaticMethod(c, "getWindow", "(Ljava/applet/Applet;)Lnetscape/javascript/JSObject;");
+                Method(c, "call", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;");
+                Method(c, "eval", "(Ljava/lang/String;)Ljava/lang/Object;");
+                Method(c, "getMember", "(Ljava/lang/String;)Ljava/lang/Object;");
+                Method(c, "getSlot", "(I)Ljava/lang/Object;");
+                Method(c, "removeMember", "(Ljava/lang/String;)V");
+                Method(c, "setMember", "(Ljava/lang/String;Ljava/lang/Object;)V");
+                Method(c, "setSlot", "(ILjava/lang/Object;)V");
+                Method(c, "toString", "()Ljava/lang/String;");
+                break;
             case "java.awt.Toolkit":
                 StaticMethod(c, "getDefaultToolkit", "()Ljava/awt/Toolkit;");
                 Method(c, "getImage", "(Ljava/net/URL;)Ljava/awt/Image;");

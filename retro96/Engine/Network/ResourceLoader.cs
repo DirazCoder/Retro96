@@ -159,13 +159,21 @@ public class ResourceLoader : IDisposable
 
         CancellationToken ct = _pageCts.Token;
 
-        int permits = ConcurrencyPermits / BrowserRuntime.MaxConcurrentResourceFetches;
+        int maxConcurrent = Math.Clamp(BrowserRuntime.MaxConcurrentResourceFetches, 1, ConcurrencyPermits);
+        int permits = Math.Max(1, (ConcurrencyPermits + maxConcurrent - 1) / maxConcurrent);
+        int acquiredPermits = 0;
         try
         {
-            await _semaphore.WaitAsync(permits, ct);
+            for (; acquiredPermits < permits; acquiredPermits++)
+                await _semaphore.WaitAsync(ct);
         }
         catch
         {
+            if (acquiredPermits > 0)
+            {
+                try { _semaphore.Release(acquiredPermits); }
+                catch (ObjectDisposedException) { /* shutting down */ }
+            }
             Interlocked.Decrement(ref _fetchCount);
             throw;
         }

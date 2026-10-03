@@ -337,6 +337,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     public bool ShowBoxOutlines => _showBoxOutlines;
     public ResourceLoader? ResourceLoader => _resourceLoader;
 
+    internal Retro96.Engine.Js.JsValue? ResolveJavaAppletScriptMember(
+        DomElement element, string name, Retro96.Engine.Js.JsInterpreter interpreter) =>
+        _javaApplets.ResolveScriptMember(element, name, interpreter);
+
+    internal bool SetJavaAppletScriptMember(
+        DomElement element, string name, Retro96.Engine.Js.JsInterpreter interpreter,
+        Retro96.Engine.Js.JsValue value) =>
+        _javaApplets.SetScriptMember(element, name, interpreter, value);
+
     public enum FrameScrollMode { Auto, Yes, No }
 
     private readonly record struct FindMatchSegment(
@@ -763,6 +772,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _document = doc;
         _rootBox = rootBox;
         _jsInterpreter = js;
+        _javaApplets.SetScriptInterpreter(js);
         _fontCache = fontCache;
         BindImageCache(images);
         _imageCache = images;
@@ -788,7 +798,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
         _lastStatus = "";
         if (BrowserRuntime.JavaAppletsEnabled)
-            _ = _javaApplets.PreparePageAsync(doc, _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"));
+            _ = _javaApplets.PreparePageAsync(doc,
+                _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"),
+                resetAllDocuments: true, scriptInterpreter: js);
         else
             _javaApplets.StopPage();
         PageChanged?.Invoke();
@@ -1718,7 +1730,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         return EmbeddedCanvasResolver?.Invoke(canvas, element, box, printRendering) == true;
     }
 
-    internal void PrepareJavaAppletsAsync(DomDocument document)
+    internal void PrepareJavaAppletsAsync(DomDocument document, JsInterpreter? interpreter = null)
     {
         if (!BrowserRuntime.JavaAppletsEnabled)
         {
@@ -1726,8 +1738,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             return;
         }
         if (_resourceLoader == null) return;
-        _ = _javaApplets.PreparePageAsync(document, _resourceLoader);
+        _ = _javaApplets.PreparePageAsync(document, _resourceLoader,
+            resetAllDocuments: false, scriptInterpreter: interpreter);
     }
+
+    internal void StopJavaAppletsForDocument(DomDocument document) =>
+        _javaApplets.StopDocument(document);
 
     public void ReRenderPage(FontCache fontCache, ImageCache imageCache,
                              ResourceLoader resourceLoader)
@@ -1948,7 +1964,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private void PaintDynamicEmbeddedContent(SKCanvas canvas, IReadOnlyList<LayoutBox> boxes)
     {
         if (boxes.Count == 0) return;
-        foreach (var box in boxes)
+        // Rendering an embedded element can re-enter layout/cache invalidation
+        // and mutate the backing list. Paint the frame's captured set instead.
+        foreach (var box in boxes.ToArray())
         {
             if (box.Element == null || box.Width <= 0f || box.Height <= 0f)
                 continue;
@@ -2049,7 +2067,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         {
             try
             {
-                Context.SwapInterval = 1;
+                var context = Context;
+                if (context != null)
+                    context.SwapInterval = 1;
                 _vsyncConfigured = true;
             }
             catch (Exception ex)
@@ -10515,11 +10535,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     }
 
     /// <summary>Disposes a frame view and its nested child views.</summary>
-    private static void DisposeFrameView(FrameView view)
+    private void DisposeFrameView(FrameView view)
     {
         foreach (var (_, child) in view.ChildFrames)
             DisposeFrameView(child);
         view.ChildFrames.Clear();
+        _javaApplets.StopDocument(view.Document);
     }
 
     private static void CollectFrameViews(FrameView view, List<FrameView> result)

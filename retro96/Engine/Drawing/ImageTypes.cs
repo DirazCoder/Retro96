@@ -253,9 +253,15 @@ public sealed class Bitmap : Image
         if (x < 0 || y < 0 || x >= Width || y >= Height)
             return Color.Empty;
 
-        using var bitmap = SKBitmap.FromImage(GetSkImage());
-        if (bitmap == null) return Color.Empty;
-        var c = bitmap.GetPixel(x, y);
+        if (Sk is { } writableBitmap)
+        {
+            var current = writableBitmap.GetPixel(x, y);
+            return Color.FromArgb(current.Alpha, current.Red, current.Green, current.Blue);
+        }
+
+        using var snapshot = SKBitmap.FromImage(GetSkImage());
+        if (snapshot == null) return Color.Empty;
+        var c = snapshot.GetPixel(x, y);
         return Color.FromArgb(c.Alpha, c.Red, c.Green, c.Blue);
     }
 

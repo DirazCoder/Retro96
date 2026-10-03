@@ -559,6 +559,13 @@ public sealed partial class JavaVm
             // Null receivers fault before method resolution.
             if (receiver.AsReference() == null)
                 throw new JvmException(GetExceptionObject("java.lang.NullPointerException"), f.LastOpcodePc);
+            if (!special && receiver.AsObject()?.OwnerVm is { } receiverVm &&
+                !ReferenceEquals(receiverVm, this))
+            {
+                var remoteResult = receiverVm.InvokeVirtual(receiver.AsObject()!, name, desc, args);
+                if (remoteResult.Tag != JTag.Void) f.Push(remoteResult);
+                return;
+            }
         }
         var target = LoadClass(owner);
         EnsureInitialized(target);
