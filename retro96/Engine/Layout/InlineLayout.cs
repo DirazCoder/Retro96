@@ -1007,7 +1007,8 @@ public static class InlineLayout
             //    line pass can never disagree about a control's size.
             if (el != null && ControlNaturalSize(el, el.Style, out float nw, out float nh))
             {
-                if (nw > 0f && !el.HasAttr("width")) box.Width = cw = Math.Max(cw, nw);
+                if (nw > 0f && !el.HasAttr("width") && !box.ShrinkToFitCell)
+                    box.Width = cw = Math.Max(cw, nw);
                 if (nh > 0f && !el.HasAttr("height")) box.Height = ch = Math.Max(ch, nh);
             }
 

@@ -253,6 +253,44 @@ public class NamedBugHeadlessTests
         Check.Done();
     }
 
+    [Fact]
+    public async Task LargeImageBatchesDrainBeyondTheConcurrencyLimit()
+    {
+        string baseUrl = TestOrigin.Base;
+        const int total = 80;
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        var settings = previousSettings.Clone();
+        settings.MaxConcurrentResourceFetches = 8;
+        settings.MaxResourceFetchesPerPage = 1000;
+        BrowserRuntime.Apply(settings);
+
+        using var cache = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        try
+        {
+            for (int i = 1; i <= total; i++)
+                TestOrigin.MapOk($"/batch{i:00}.gif");
+
+            await Parallel.ForEachAsync(
+                Enumerable.Range(1, total),
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = BrowserRuntime.MaxConcurrentResourceFetches
+                },
+                async (i, ct) =>
+                    await cache.GetAsync($"{baseUrl}/batch{i:00}.gif", loader, ct));
+
+            int loaded = Enumerable.Range(1, total)
+                .Count(i => cache.IsLoaded($"{baseUrl}/batch{i:00}.gif") &&
+                            !cache.IsBroken($"{baseUrl}/batch{i:00}.gif"));
+            Assert.Equal(total, loaded);
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
+    }
+
     // 4 ───────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_NestedTableLinkRowDoubleHeight()
@@ -277,6 +315,30 @@ public class NamedBugHeadlessTests
         Check.That(strides.All(s => s is > 8f and < 34f),
             "row stride stays a single line height", string.Join(",", strides.Select(s => s.ToString("0.#"))));
         Check.Done();
+    }
+
+    [Fact]
+    public void AutoSizedButtonsShrinkToFitNarrowTableCells()
+    {
+        const int viewportWidth = 140;
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table border='1'><tr><td>" +
+            "<button>Very long button label that should shrink to its cell</button>" +
+            "</td></tr></table></body></html>",
+            viewportWidth);
+
+        var table = doc.FirstTag("table");
+        var button = doc.FirstTag("button");
+        var tableBox = table == null ? null : LayoutHarness.BoxOf(root, table);
+        var buttonBox = button == null ? null : LayoutHarness.BoxOf(root, button);
+        Assert.NotNull(tableBox);
+        Assert.NotNull(buttonBox);
+        Assert.True(tableBox!.BorderRect.Width <= viewportWidth + 1f,
+            $"table width {tableBox.BorderRect.Width:0.#} should fit viewport {viewportWidth}");
+        Assert.True(buttonBox!.BorderRect.Right <= tableBox.BorderRect.Right + 1f,
+            $"button right edge {buttonBox.BorderRect.Right:0.#} escaped table right edge {tableBox.BorderRect.Right:0.#}");
+        Assert.True(buttonBox.BorderRect.Width < 200f,
+            $"auto-sized button should shrink from its natural width, got {buttonBox.BorderRect.Width:0.#}");
     }
 
     // 5 ───────────────────────────────────────────────────────────────

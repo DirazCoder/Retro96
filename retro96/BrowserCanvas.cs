@@ -1508,11 +1508,24 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     public void SetFrame(LayoutBox frameBox, FrameView view)
     {
         if (_frames.TryGetValue(frameBox, out var old) && !ReferenceEquals(old, view))
+        {
+            InvalidateFrameDisplayList(old);
             DisposeFrameView(old);
+        }
+        InvalidateFrameDisplayList(view);
         _frames[frameBox] = view;
         UpdateFrameMetrics(frameBox, view);
         CheckAndStartTimers();
         Invalidate();
+    }
+
+    private void InvalidateFrameDisplayList(FrameView view)
+    {
+        if (_frameDisplayLists.Remove(view, out var picture))
+            picture.Dispose();
+        _frameDynamicEmbeds.Remove(view);
+        _frameAnimatedSubtrees.Remove(view);
+        _frameAnimatedImages.Remove(view);
     }
 
     public bool HasFrames => _frames.Count > 0;
@@ -1684,8 +1697,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
     public void ClearForNavigation()
     {
-        InvalidateDisplayLists();
-        _scrollbarVisibilityDirty = true;
+        // Keep the currently committed page and its scroll position visible
+        // while the next document is being parsed, styled, and laid out.
+        // SetPage invalidates these display lists when the replacement is
+        // ready to be installed.
         _focusedInput = null;
         _focusedInputFrame = null;
         _fieldDragging = false;
@@ -1710,7 +1725,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _hoveredJavaAppletElement = null;
         ClearFindState();
         _javaApplets.StopPage();
-        _scrollOffset = PointF.Empty;
         UpdateScrollBars();
         Invalidate();
     }
@@ -3776,23 +3790,24 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 int visibleLines = geo.VisibleLines;
                 int maxScrollLine = Math.Max(0, geo.Lines.Count - visibleLines);
                 int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
-                bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
                 float textX = face.X + 3 - _fieldScrollX;
                 float textY = face.Y + 2;
                 using var lineFormat = NewFieldFormat(noWrap: true);
 
-                if (needsTextRepaint)
-                {
-                    var style = el.Style;
-                    Color backgroundColor = style != null && style.OwnBackground &&
-                        style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
-                    Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
-                    using var background = new SolidBrush(backgroundColor);
-                    using var foreground = new SolidBrush(foregroundColor);
+                // The cached page image may still contain the scroll position
+                // captured before the latest wheel/scrollbar gesture. Always
+                // repaint the focused field, including at line zero, so that
+                // returning to the top cannot reveal that stale image.
+                var style = el.Style;
+                Color backgroundColor = style != null && style.OwnBackground &&
+                    style.BackgroundColor != Color.Transparent ? style.BackgroundColor : Color.White;
+                Color foregroundColor = style != null && style.OwnColor ? style.Color : Color.Black;
+                using (var background = new SolidBrush(backgroundColor))
                     g.FillRectangle(background, face);
+                using (var foreground = new SolidBrush(foregroundColor))
                     Engine.Render.TextareaOverlay.DrawLines(g, text, geo.Font, geo.Lines,
-                        foreground, textX, textY, geo.TextWidth, lineHeight, scrollLine);
-                }
+                        foreground, textX, textY, geo.TextWidth, lineHeight, scrollLine,
+                        visibleLines + 1);
 
                 float Measure(int start, int end) => end <= start ? 0f
                     : g.MeasureString(text[start..end], geo.Font, int.MaxValue, lineFormat).Width;
@@ -3823,7 +3838,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     g.DrawLine(caretPen, cx, caretY, cx, caretY + lineHeight);
                 }
 
-                if (needsTextRepaint && geo.NeedsVerticalScrollbar)
+                if (geo.NeedsVerticalScrollbar)
                     PaintTextareaScrollbar(g, new RectangleF(face.X, face.Y, face.Width, face.Height),
                         geo.Lines.Count, lineHeight, scrollLine);
             }
@@ -3982,7 +3997,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         int visibleLines = geo.VisibleLines;
         int maxScrollLine = Math.Max(0, lines.Count - visibleLines);
         int scrollLine = Math.Clamp(_textareaScrollLine, 0, maxScrollLine);
-        bool needsTextRepaint = scrollLine != 0 || _fieldScrollX > 0.01f;
         using var noWrap = NewFieldFormat(noWrap: true);
 
         float Measure(int start, int end) => end <= start ? 0f
@@ -3998,19 +4012,16 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                                  Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2)),
                   CombineMode.Intersect);
 
-        if (needsTextRepaint)
-        {
-            var style = el.Style;
-            Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
-                ? style.BackgroundColor : Color.White;
-            Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
-            using (var background = new SolidBrush(fieldBackground))
-                g.FillRectangle(background, face.X + 1 - scrollX, face.Y + 1 - scrollY,
-                    Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2));
-            using var foreground = new SolidBrush(fieldForeground);
+        var style = el.Style;
+        Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
+            ? style.BackgroundColor : Color.White;
+        Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
+        using (var background = new SolidBrush(fieldBackground))
+            g.FillRectangle(background, face.X + 1 - scrollX, face.Y + 1 - scrollY,
+                Math.Max(1, face.Width - 2), Math.Max(1, face.Height - 2));
+        using (var foreground = new SolidBrush(fieldForeground))
             Engine.Render.TextareaOverlay.DrawLines(g, text, font, lines, foreground,
-                textX, textY, geo.TextWidth, lineHeight, scrollLine);
-        }
+                textX, textY, geo.TextWidth, lineHeight, scrollLine, visibleLines + 1);
 
         if (selEnd > selStart)
         {
@@ -4039,7 +4050,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
         g.Restore(oldClip);
 
-        if (needsTextRepaint && geo.NeedsVerticalScrollbar)
+        if (geo.NeedsVerticalScrollbar)
         {
             var screenFace = new RectangleF(face.X - scrollX, face.Y - scrollY, face.Width, face.Height);
             PaintTextareaScrollbar(g, screenFace, lines.Count, lineHeight, scrollLine);
@@ -4786,9 +4797,33 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // Ordinary wheel scrolling is completely independent of the temporary
         // gesture. In particular, do NOT commit/promote gesture scale here: doing
         // so makes a later toolbar click appear to inherit the gesture zoom.
-        base.OnMouseWheel(e);
         float px = e.X / EffectiveZoom + PaintScrollX;
         float py = e.Y / EffectiveZoom + PaintScrollY;
+        if (TryGetEditableFieldAtPoint(px, py, out var focusedWheelField,
+                out var focusedWheelFieldBox, out var focusedWheelFieldView, out _) &&
+            ReferenceEquals(focusedWheelField, _focusedInput) &&
+            focusedWheelField?.TagName == "textarea" && focusedWheelFieldBox != null)
+        {
+            if ((ModifierKeys & Keys.Shift) == Keys.Shift)
+            {
+                if (ScrollFocusedFieldHorizontally(e.Delta / 120f * 40f, px, py))
+                    return;
+            }
+
+            var geo = GetTextareaGeometry(focusedWheelField, focusedWheelFieldBox,
+                focusedWheelFieldView);
+            if (geo != null)
+            {
+                int maxLine = Math.Max(0, geo.Lines.Count - geo.VisibleLines);
+                int delta = e.Delta > 0 ? -3 : 3;
+                _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
+                PersistFocusedTextareaScrollState();
+                Invalidate();
+                return;
+            }
+        }
+
+        base.OnMouseWheel(e);
         if (_focusedJavaAppletElement != null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var jab) && jab.HitTest(px, py))
         {
             SendJavaAppletInput(_focusedJavaAppletElement, jab, new Retro96.Engine.Java.JavaInput(
@@ -4819,31 +4854,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     GetSelectScrollOffset(wheelSelect) + delta, 0, maxScroll);
                 RerenderNow();
                 return;
-            }
-        }
-
-        if (TryGetEditableFieldAtPoint(x, y, out var wheelField, out var wheelFieldBox, out var wheelFieldView, out _) &&
-            ReferenceEquals(wheelField, _focusedInput) && wheelFieldBox != null)
-        {
-            if ((ModifierKeys & Keys.Shift) == Keys.Shift)
-            {
-                if (ScrollFocusedFieldHorizontally(e.Delta / 120f * 40f, x, y))
-                    return;
-            }
-            if (wheelField!.TagName == "textarea")
-            {
-                var geo = GetTextareaGeometry(wheelField, wheelFieldBox, wheelFieldView);
-                if (geo != null)
-                {
-                    float lineHeight = geo.Font.GetHeight(MeasureGraphics);
-                    int visibleLines = geo.VisibleLines;
-                    int maxLine = Math.Max(0, geo.Lines.Count - visibleLines);
-                    int delta = e.Delta > 0 ? -3 : 3;
-                    _textareaScrollLine = Math.Clamp(_textareaScrollLine + delta, 0, maxLine);
-                    PersistFocusedTextareaScrollState();
-                    Invalidate();
-                    return;
-                }
             }
         }
 
@@ -8868,10 +8878,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         float vTrack = vertical ? Math.Max(1f, viewportH - arrow * 2f) : 0f;
         float hTrack = horizontal ? Math.Max(1f, viewportW - arrow * 2f) : 0f;
         float vThumb = vertical
-            ? Math.Clamp(vTrack * viewportH / Math.Max(viewportH, contentH), 10f, vTrack)
+            ? Math.Clamp(vTrack * viewportH / Math.Max(viewportH, contentH),
+                Math.Min(10f, vTrack), vTrack)
             : 0f;
         float hThumb = horizontal
-            ? Math.Clamp(hTrack * viewportW / Math.Max(viewportW, contentW), 10f, hTrack)
+            ? Math.Clamp(hTrack * viewportW / Math.Max(viewportW, contentW),
+                Math.Min(10f, hTrack), hTrack)
             : 0f;
 
         return new FrameScrollMetrics(vertical, horizontal, viewportW, viewportH,

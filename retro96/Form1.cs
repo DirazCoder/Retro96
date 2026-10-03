@@ -1230,11 +1230,18 @@ public partial class Form1 : Form
             await FetchStylesheetsAsync(document, url, ct);
         ApplyPluginPageStyle(document);
 
-        BeginInvoke(() => _statusLabel.Text = "Laying out…");
         _visitedUrls.Add(url.ToAbsolute());
         document.VisitedUrls.UnionWith(_visitedUrls);
         Size canvasSize = GetCanvasSize();
         ResolveDocumentStyles(document, canvasSize.Width);
+
+        BeginInvoke(() => _statusLabel.Text = "Fetching images…");
+        await PrefetchImagesAsync(document, url, ct,
+            reflowWhenLoaded: false, myGeneration, repaintWhenLoaded: false);
+        if (myGeneration != _navGeneration) return;
+        ApplyLoadedImageDimensions(document, url);
+
+        BeginInvoke(() => _statusLabel.Text = "Laying out…");
         _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.9);
 
         var rootBox = LayoutEngineApi.BuildLayoutTree(
@@ -1253,6 +1260,7 @@ public partial class Form1 : Form
             {
                 UpdatePage(document, rootBox, url.ToAbsolute(),
                     new HistoryEntry(url.ToAbsolute(), postData));
+                DispatchImageLoadEvents(document, url, interpreter);
                 var win = interpreter.WindowObject;
                 if (win != null && win.Get("onload") is { Type: JsType.Function } onload)
                     interpreter.CallHandler(onload, Retro96.Engine.Js.JsValue.FromObject(win));
@@ -1289,11 +1297,6 @@ public partial class Form1 : Form
                                             e.EventHandlers.ContainsKey("onload")))
                         interpreter.FireEvent(elem, "onload");
                 }
-                // Start image loading after the initial page is live. Fast
-                // data-URI images otherwise queued natural-size reflow
-                // against the old page before UpdatePage installed it.
-                _ = PrefetchImagesAsync(document, url, ct,
-                    reflowWhenLoaded: true, myGeneration, interpreter);
                 if (BrowserRuntime.FramesEnabled)
                     _ = LoadFramesAsync(document, rootBox);
             }
@@ -1628,7 +1631,8 @@ public partial class Form1 : Form
 
     private async Task PrefetchImagesAsync(DomDocument doc, ParsedUrl baseUrl,
                                            CancellationToken ct, bool reflowWhenLoaded,
-                                           long myGeneration, JsInterpreter? js = null)
+                                           long myGeneration, JsInterpreter? js = null,
+                                           bool repaintWhenLoaded = true)
     {
         if (!BrowserRuntime.ImagesEnabled) return;
         _imageCache.HostOpenedLocalPage = _hostOpenedLocalDocument;
@@ -1666,72 +1670,23 @@ public partial class Form1 : Form
 
         var distinct = urls.Distinct().ToList();
 
-        // PARALLEL fetching — the old sequential loop let one slow/hung
-        // image block every image after it (the "middle images don't
-        // load" symptom: background + first image arrive, the queue
-        // stalls, everything after shows the broken icon).
-        var fetches = new List<Task>();
-        foreach (var absoluteUrl in distinct)
-            fetches.Add(FetchOneImageAsync(absoluteUrl, ct, myGeneration));
-        await Task.WhenAll(fetches);
-
-        if (js != null)
-        {
-            foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
+        // Keep the prefetch queue bounded to the loader's concurrency. Starting
+        // every image at once leaves large pages with a large backlog of
+        // semaphore waiters; workers instead keep draining the full URL list.
+        await Parallel.ForEachAsync(
+            distinct,
+            new ParallelOptions
             {
-                string? raw = elem.GetAttr("src") ?? elem.GetAttr("lowsrc");
-                if (string.IsNullOrEmpty(raw)) continue;
-                try
-                {
-                    string abs = ImageCache.ResolveUrl(raw, baseUrl.ToAbsolute());
-                    if (_imageCache.TryGetCached(abs, out var image) && image.Frames.Count > 0)
-                        js.FireEvent(elem, "onload");
-                    else
-                        js.FireEvent(elem, "onerror");
-                }
-                catch { js.FireEvent(elem, "onerror"); }
-            }
-        }
+                MaxDegreeOfParallelism = Math.Clamp(
+                    BrowserRuntime.MaxConcurrentResourceFetches, 1, 32),
+                CancellationToken = ct
+            },
+            async (absoluteUrl, token) =>
+                await FetchOneImageAsync(absoluteUrl, token, myGeneration, repaintWhenLoaded));
 
         if (reflowWhenLoaded && distinct.Count > 0)
         {
-            foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
-            {
-                string? src = elem.GetAttr("src");
-                if (string.IsNullOrEmpty(src)) continue;
-                string abs;
-                try { abs = ImageCache.ResolveUrl(src, baseUrl.ToAbsolute()); }
-                catch { continue; }
-
-                if (!elem.HasAttr("width") && !elem.HasAttr("height"))
-                {
-                    try
-                    {
-                        if (_imageCache.IsLoaded(abs) && !_imageCache.IsBroken(abs))
-                        {
-                            var frame = _imageCache.GetCurrentFrame(abs);
-                            if (frame != null)
-                            {
-                                elem.SetAttr("width", frame.Width.ToString());
-                                elem.SetAttr("height", frame.Height.ToString());
-                            }
-                        }
-                        else if (_imageCache.IsLoaded(abs))
-                        {
-                            // Failed to load.  Leaving the 32x32 placeholder in
-                            // place made ONE bad bullet.gif inflate every row of
-                            // a ~150-row link table (802px vs 527px) — the
-                            // "too much space between the links" bug.  Collapse
-                            // to the broken-icon size so layout stays compact;
-                            // the renderer still paints the icon + ALT text.
-                            elem.SetAttr("width", "16");
-                            elem.SetAttr("height", "16");
-                        }
-                    }
-                    catch { }
-                }
-            }
-
+            ApplyLoadedImageDimensions(doc, baseUrl);
             Size canvasSize = GetCanvasSize();
             var newRoot = LayoutEngineApi.BuildLayoutTree(doc, canvasSize.Width, canvasSize.Height);
 
@@ -1743,19 +1698,83 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task FetchOneImageAsync(string absoluteUrl, CancellationToken ct, long myGeneration)
+    private void ApplyLoadedImageDimensions(DomDocument doc, ParsedUrl baseUrl)
+    {
+        foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
+        {
+            string? src = elem.GetAttr("src");
+            if (string.IsNullOrEmpty(src) || elem.HasAttr("width") || elem.HasAttr("height"))
+                continue;
+
+            string abs;
+            try { abs = ImageCache.ResolveUrl(src, baseUrl.ToAbsolute()); }
+            catch { continue; }
+
+            if (!_imageCache.IsLoaded(abs))
+                continue;
+
+            if (!_imageCache.IsBroken(abs))
+            {
+                var frame = _imageCache.GetCurrentFrame(abs);
+                if (frame != null)
+                {
+                    elem.SetAttr("width", frame.Width.ToString());
+                    elem.SetAttr("height", frame.Height.ToString());
+                }
+            }
+            else
+            {
+                // Collapse failed-image placeholders before the first layout;
+                // otherwise a missing bullet image can expand every table row.
+                elem.SetAttr("width", "16");
+                elem.SetAttr("height", "16");
+            }
+        }
+    }
+
+    private void DispatchImageLoadEvents(DomDocument doc, ParsedUrl baseUrl, JsInterpreter? js)
+    {
+        if (js == null) return;
+        foreach (var elem in doc.ElementDescendants().Where(e => e.TagName == "img"))
+        {
+            string? raw = elem.GetAttr("src") ?? elem.GetAttr("lowsrc");
+            if (string.IsNullOrEmpty(raw)) continue;
+            try
+            {
+                string abs = ImageCache.ResolveUrl(raw, baseUrl.ToAbsolute());
+                if (_imageCache.TryGetCached(abs, out var image) && image.Frames.Count > 0)
+                    js.FireEvent(elem, "onload");
+                else
+                    js.FireEvent(elem, "onerror");
+            }
+            catch
+            {
+                js.FireEvent(elem, "onerror");
+            }
+        }
+    }
+
+    private async Task FetchOneImageAsync(string absoluteUrl, CancellationToken ct,
+                                          long myGeneration, bool repaintWhenLoaded = true)
     {
         if (!BrowserRuntime.ImagesEnabled) return;
         try
         {
             await _imageCache.GetAsync(absoluteUrl, _resourceLoader!, ct);
-            BeginInvoke(() =>
-            {
-                if (myGeneration != _navGeneration) return;
-                _canvas.RequestRerender();
-            });
+            if (repaintWhenLoaded)
+                BeginInvoke(() =>
+                {
+                    if (myGeneration != _navGeneration) return;
+                    _canvas.RequestRerender();
+                });
         }
-        catch { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteException($"FetchOneImageAsync '{absoluteUrl}'", ex);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────

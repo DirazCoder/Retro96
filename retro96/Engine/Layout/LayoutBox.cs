@@ -45,6 +45,7 @@ public class LayoutBox
     // Position (border-box origin) and content size
     public float X, Y, Width, Height;
     public ComputedStyle? StyleOverride { get; set; }
+    public bool ShrinkToFitCell { get; set; }
 
     // Spacing (px)
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;

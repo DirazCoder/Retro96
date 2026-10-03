@@ -13,6 +13,7 @@ public class ResourceLoader : IDisposable
     private readonly HttpClient _httpClient;
     private const int ConcurrencyPermits = 32;
     private readonly SemaphoreSlim _semaphore = new(ConcurrencyPermits, ConcurrencyPermits);
+    private readonly SemaphoreSlim _permitAllocation = new(1, 1);
     private readonly ConcurrentDictionary<string, Lazy<Task<HttpResult>>> _inFlight = new();
     private readonly CookieStore _defaultCookies;
 
@@ -164,8 +165,20 @@ public class ResourceLoader : IDisposable
         int acquiredPermits = 0;
         try
         {
-            for (; acquiredPermits < permits; acquiredPermits++)
-                await _semaphore.WaitAsync(ct);
+            await _permitAllocation.WaitAsync(ct);
+            try
+            {
+                // Acquire each request's weighted permits as one allocation.
+                // Letting many requests hold partial allocations can exhaust
+                // the semaphore while every request waits for its next permit.
+                for (; acquiredPermits < permits; acquiredPermits++)
+                    await _semaphore.WaitAsync(ct);
+            }
+            finally
+            {
+                try { _permitAllocation.Release(); }
+                catch (ObjectDisposedException) { /* shutting down */ }
+            }
         }
         catch
         {
@@ -213,6 +226,7 @@ public class ResourceLoader : IDisposable
         _pageCts.Cancel();
         _pageCts.Dispose();
         _inFlight.Clear();
+        _permitAllocation.Dispose();
         _semaphore.Dispose();
     }
 }

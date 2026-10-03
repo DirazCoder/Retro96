@@ -21,7 +21,8 @@ public static class TextareaOverlay
                                  List<(int Start, int End)> lines,
                                  SolidBrush brush, float x, float y,
                                  float width, float lineHeight,
-                                 int scrollLine = 0)
+                                 int scrollLine = 0,
+                                 int visibleLineCount = int.MaxValue)
     {
         using var format = new StringFormat(StringFormat.GenericTypographic)
         {
@@ -32,7 +33,10 @@ public static class TextareaOverlay
         };
 
         int first = Math.Max(0, scrollLine);
-        for (int line = first; line < lines.Count; line++)
+        int last = visibleLineCount == int.MaxValue
+            ? lines.Count
+            : Math.Min(lines.Count, first + Math.Max(0, visibleLineCount));
+        for (int line = first; line < last; line++)
         {
             var (start, end) = lines[line];
             if (end <= start) continue;
@@ -50,10 +54,14 @@ public static class TextareaOverlay
                                    List<(int Start, int End)> lines,
                                    SKPaint paint, float x, float y,
                                    float width, float lineHeight,
-                                   int scrollLine = 0)
+                                   int scrollLine = 0,
+                                   int visibleLineCount = int.MaxValue)
     {
         int first = Math.Max(0, scrollLine);
-        for (int line = first; line < lines.Count; line++)
+        int last = visibleLineCount == int.MaxValue
+            ? lines.Count
+            : Math.Min(lines.Count, first + Math.Max(0, visibleLineCount));
+        for (int line = first; line < last; line++)
         {
             var (start, end) = lines[line];
             if (end <= start) continue;

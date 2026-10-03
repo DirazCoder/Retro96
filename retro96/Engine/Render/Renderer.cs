@@ -53,7 +53,7 @@ public class Renderer
         SKTextAlign.Left, verticalCenter: false, clip: false, ellipsis: false);
 
     private static readonly SkiaTextOptions ButtonText = new(
-        SKTextAlign.Center, verticalCenter: true, clip: false, ellipsis: false);
+        SKTextAlign.Center, verticalCenter: true, clip: true, ellipsis: true);
 
     // Reuse immutable fill/stroke paints for the common CSS colours.
     private static readonly Dictionary<Color, SKPaint> _fillPaints = new();
@@ -639,7 +639,27 @@ public class Renderer
 
     private static IEnumerable<LayoutBox> PaintOrder(LayoutBox box)
     {
-        return box.Children.Select((child, index) => (child, index))
+        var children = box.Children;
+        if (children.Count < 2)
+            return children;
+
+        int previousZIndex = children[0].Element?.Style?.ZIndex ?? 0;
+        bool alreadyOrdered = true;
+        for (int i = 1; i < children.Count; i++)
+        {
+            int zIndex = children[i].Element?.Style?.ZIndex ?? 0;
+            if (zIndex < previousZIndex)
+            {
+                alreadyOrdered = false;
+                break;
+            }
+            previousZIndex = zIndex;
+        }
+
+        if (alreadyOrdered)
+            return children;
+
+        return children.Select((child, index) => (child, index))
             .OrderBy(p => p.child.Element?.Style?.ZIndex ?? 0)
             .ThenBy(p => p.index)
             .Select(p => p.child);
@@ -2688,7 +2708,8 @@ public class Renderer
                 SKClipOperation.Intersect);
             TextareaOverlay.DrawLines(g.Canvas, text, font, layout.Lines, brush,
                 face.X + 3 - scrollX, face.Y + 2,
-                layout.TextWidth, layout.LineHeight, scrollLine);
+                layout.TextWidth, layout.LineHeight, scrollLine,
+                layout.VisibleLines + 1);
         }
         finally
         {

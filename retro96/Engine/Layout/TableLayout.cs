@@ -620,6 +620,21 @@ public static class TableLayout
 
             if (!IsWhitespaceRun(pendingInline))
             {
+                foreach (var inlineBox in pendingInline)
+                {
+                    if (!IsAutoButton(inlineBox)) continue;
+
+                    float maxWidth = Math.Max(0f,
+                        contentW - inlineBox.MarginLeft - inlineBox.MarginRight
+                                 - inlineBox.BorderLeft - inlineBox.BorderRight
+                                 - inlineBox.PaddingLeft - inlineBox.PaddingRight);
+                    if (inlineBox.Width > maxWidth)
+                    {
+                        inlineBox.Width = maxWidth;
+                        inlineBox.ShrinkToFitCell = true;
+                    }
+                }
+
                 float inlineH = InlineLayout.Layout(
                     pendingInline, contentW, contentX, currentY, cellStyle, floats);
                 currentY += inlineH;
@@ -1207,6 +1222,24 @@ public static class TableLayout
         return v;
     }
 
+    private const float MinimumAutoButtonWidth = 32f;
+
+    private static bool IsAutoButton(LayoutBox box)
+    {
+        var element = box.Element;
+        if (element == null || box.BoxType != BoxType.Replaced ||
+            !string.IsNullOrEmpty(element.GetAttr("width")) ||
+            element.Style?.Width.HasValue == true ||
+            element.Style?.WidthPercent.HasValue == true)
+            return false;
+
+        if (element.TagName == "button") return true;
+        if (element.TagName != "input") return false;
+
+        string type = element.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant();
+        return type is "submit" or "reset" or "button";
+    }
+
     private static string TruncD(this string s, int n) =>
         s.Length <= n ? s : s[..n] + "…";
 
@@ -1259,6 +1292,11 @@ public static class TableLayout
                 + box.MarginLeft + box.MarginRight
                 + box.BorderLeft + box.BorderRight
                 + box.PaddingLeft + box.PaddingRight);
+            if (IsAutoButton(box))
+                m = Math.Min(m, MinimumAutoButtonWidth
+                    + box.MarginLeft + box.MarginRight
+                    + box.BorderLeft + box.BorderRight
+                    + box.PaddingLeft + box.PaddingRight);
         }
 
         if (box.BoxType == BoxType.Table)
