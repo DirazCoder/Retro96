@@ -1,3 +1,7 @@
+using Retro96.Engine.Dom;
+using Retro96.Engine.Network;
+using Retro96.Engine.Render;
+
 namespace RetroTests;
 
 public class ScratchDiag

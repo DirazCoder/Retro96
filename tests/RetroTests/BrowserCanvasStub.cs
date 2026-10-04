@@ -7,7 +7,9 @@
 // GetOuterSize / GetScreenMetrics), so the script layer compiles and runs
 // on any framework; the real canvas overrides them with WinForms UI.
 using Retro96.Drawing;
+using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Layout;
 
 namespace Retro96;
 
@@ -59,6 +61,12 @@ public class BrowserCanvas
     }
     public void RequestRerender() { Log.Rerenders++; }
     public void ReflowDocument() { Log.Reflows++; }
+    public void EnsureLayoutForDomRead(DomDocument document)
+    {
+        InlineLayout.SetFontCache(RetroTests.LayoutHarness.Fonts);
+        StyleResolver.Resolve(document, 800);
+        _ = LayoutEngine.BuildLayoutTree(document, 800, 600);
+    }
     public void PrefetchImage(string url) { Log.PrefetchedImages.Add(url); }
     public void ClearPageSelection() { }
     public string? GetDomSelectionText() => null;

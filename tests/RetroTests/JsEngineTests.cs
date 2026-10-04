@@ -3,6 +3,7 @@
 using Retro96;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Js;
+using Retro96.Engine.Network;
 
 namespace RetroTests;
 
@@ -32,6 +33,60 @@ public class JsEngineTests
                       "<script>document.title = \"new title\";</script></body></html>");
         Check.That(page.Document.Title == "new title",
             "document.title = \"new\" changes the title", page.Document.Title);
+        Check.Done();
+    }
+
+    [Fact]
+    public void DocumentLastModifiedNeverDefaultsToEmpty()
+    {
+        var fallback = new DateTime(2026, 10, 4, 19, 41, 31);
+        string fallbackText = DocumentBindingsState.ResolveLastModified(null, null, fallback);
+        string headerText = DocumentBindingsState.ResolveLastModified(
+            ParsedUrl.Parse("https://example.test/"), "Sun, 04 Oct 2026 18:00:00 GMT", fallback);
+
+        Check.That(fallbackText.Length > 0 &&
+                   fallbackText == fallback.ToString("G", System.Globalization.CultureInfo.CurrentCulture),
+            "missing Last-Modified uses a non-empty current-time fallback", fallbackText);
+        Check.That(headerText == "Sun, 04 Oct 2026 18:00:00 GMT",
+            "response Last-Modified header is preserved", headerText);
+
+        string path = Path.GetTempFileName();
+        try
+        {
+            var fileTime = new DateTime(2024, 5, 6, 7, 8, 10);
+            File.SetLastWriteTime(path, fileTime);
+            string fileUrl = Retro96.Engine.Network.FileUrls.CanonicalFileUrl(path);
+            string fileModified = DocumentBindingsState.ResolveLastModified(
+                ParsedUrl.Parse(fileUrl), null, fallback);
+            Check.That(fileModified ==
+                       File.GetLastWriteTime(path).ToString(
+                           "G", System.Globalization.CultureInfo.CurrentCulture),
+                "local file document uses its filesystem modification time",
+                fileModified);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void TextareaKeyUpUpdatesCharacterCounter()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body>" +
+            "<textarea id='message' onkeyup=\"document.getElementById('count').innerHTML=this.value.length\"></textarea>" +
+            "<span id='count'>0</span></body></html>");
+        var message = page.Document.ElementDescendants().First(e => e.GetAttr("id") == "message");
+        page.Interpreter.ExecuteString("document.getElementById('message').value='abc';");
+        page.Interpreter.FireEvent(message, "onkeyup",
+            page.Interpreter.CreateKeyEvent("C", 67));
+
+        Check.That(page.Document.ElementDescendants().First(e => e.GetAttr("id") == "count")
+                .InnerText == "3",
+            "textarea keyup reads its value and updates the counter",
+            page.Document.ElementDescendants().First(e => e.GetAttr("id") == "count").InnerText);
         Check.Done();
     }
 
@@ -801,6 +856,26 @@ public class JsEngineTests
     }
 
     [Fact]
+    public void GeometryAndCurrentStyleFlushDuringParserScript()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><head><style>.probe { padding: 3px; }</style></head><body>" +
+            "<div id='probe'>content</div>" +
+            "<script>var p = document.getElementById('probe');" +
+            "window.geometry = (p.offsetWidth > 0 && p.offsetHeight > 0 && p.clientWidth > 0);" +
+            "window.currentWidth = p.currentStyle.width;</script></body></html>");
+
+        Check.That(page.EvalString("window.geometry") == "true",
+            "parser-time geometry reads synchronously create layout boxes",
+            page.EvalString("window.geometry"));
+        Check.That(page.EvalString("window.currentWidth") == "auto",
+            "currentStyle.width returns auto for an unspecified width",
+            page.EvalString("window.currentWidth"));
+        Check.Done();
+    }
+
+    [Fact]
     public void CurrentStyleReadsResolvedProperties()
     {
         var page = new PageHarness();
@@ -1057,7 +1132,9 @@ public class JsEngineTests
         try
         {
             var page = new PageHarness();
-            page.LoadHtml("<html><body><div id='a' style='position:absolute'>L</div></body></html>");
+            page.LoadHtml(
+                "<html><body><div id='a' style='position:absolute; left:10px; top:20px'>L</div>" +
+                "<a id='target' href='#'>target</a></body></html>");
             Check.That(page.EvalString("typeof document.all") != "undefined",
                 "document.all exists in the Retro96 union persona");
             Check.That(page.EvalString("typeof document.layers") == "object",
@@ -1065,6 +1142,23 @@ public class JsEngineTests
                 page.EvalString("typeof document.layers"));
             Check.That(page.EvalString("typeof document.getElementById") == "function",
                 "getElementById exists in the Retro96 union persona");
+            Check.That(page.EvalString("typeof document.layers['a']") == "object",
+                "document.layers exposes Layer objects in the Retro96 union persona");
+            Check.That(page.EvalString("document.layers['a'].left") == "10",
+                "union Layer object exposes layer geometry");
+            Check.That(page.EvalString("typeof document.layers['a'].moveTo") == "function",
+                "union Layer object exposes layer methods");
+            Check.That(page.EvalString("typeof Event") == "object" &&
+                       page.EvalString("Event.CLICK") == "4",
+                "Event constants are available in the Retro96 union persona");
+            Check.That(page.EvalString("typeof window.captureEvents") == "function",
+                "window.captureEvents is available in the Retro96 union persona");
+
+            page.Eval("window.unionCapture = 0; window.captureEvents(Event.CLICK);" +
+                      "window.onclick = function() { window.unionCapture++; };");
+            page.FireEvent(page.Document.AllTags("a")[0], "onclick");
+            Check.That(page.EvalString("window.unionCapture") == "1",
+                "union captureEvents routes captured clicks");
         }
         finally
         {

@@ -238,7 +238,7 @@ public class ImageCache : IDisposable
                 if (absoluteUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
                 {
                     var dataDecoded = DataUriDecoder.Decode(absoluteUrl);
-                    if (dataDecoded == null || dataDecoded.Frames.Count == 0 ||
+                    if (dataDecoded == null || dataDecoded.IsBroken || dataDecoded.Frames.Count == 0 ||
                         dataDecoded.Frames[0].Width == 0)
                     {
                         if (dataDecoded != null)
@@ -282,7 +282,8 @@ public class ImageCache : IDisposable
                             return MarkBroken(absoluteUrl);
                         byte[] bytes = await System.IO.File.ReadAllBytesAsync(local);
                         fileDecoded = ImageDecoder.Decode(bytes, ContentTypeFromPath(local));
-                        if (fileDecoded.Frames.Count == 0 || fileDecoded.Frames[0].Width == 0)
+                        if (fileDecoded.IsBroken || fileDecoded.Frames.Count == 0 ||
+                            fileDecoded.Frames[0].Width == 0)
                         {
                             foreach (var f in fileDecoded.Frames) f.Dispose();
                             fileDecoded = null;
@@ -346,7 +347,8 @@ public class ImageCache : IDisposable
                         Retro96.DebugLog.Write($"[IMAGE] decoded url='{absoluteUrl}' " +
                             $"frames={decoded.Frames.Count} size={(decoded.Frames.Count > 0
                                 ? $"{decoded.Frames[0].Width}x{decoded.Frames[0].Height}" : "none")}");
-                        if (decoded.Frames.Count == 0 || decoded.Frames[0].Width == 0)
+                        if (decoded.IsBroken || decoded.Frames.Count == 0 ||
+                            decoded.Frames[0].Width == 0)
                         {
                             // Decode produced nothing usable — treat like a failed
                             // fetch so the reflow pass doesn't adopt a phantom size.

@@ -44,6 +44,7 @@ public class LayoutBox
 
     // Position (border-box origin) and content size
     public float X, Y, Width, Height;
+    public float ViewportWidth, ViewportHeight;
     public ComputedStyle? StyleOverride { get; set; }
     public bool ShrinkToFitCell { get; set; }
 
@@ -85,6 +86,8 @@ public class LayoutBox
     public FloatValue FloatSide { get; set; }
 
     public bool IsAbsolutelyPositioned { get; set; }
+    public float ScrollOffsetX { get; set; }
+    public float ScrollOffsetY { get; set; }
 
     // Inline content: text run or image
     public string? TextRun { get; set; }

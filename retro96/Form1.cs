@@ -1237,11 +1237,8 @@ public partial class Form1 : Form
         BeginInvoke(() => _statusLabel.Text = "Parsing…");
 
         _pluginManager?.RaiseLoadProgress(url.ToAbsolute(), 0.8);
-        var (document, interpreter, state) = PrepareScripting(url, html);
-
-        // document.lastModified / document.referrer (checklist)
-        if (success.Headers.TryGetValue("last-modified", out var lastMod))
-            state.LastModified = lastMod;
+        success.Headers.TryGetValue("last-modified", out var lastMod);
+        var (document, interpreter, state) = PrepareScripting(url, html, lastMod);
         state.Referrer = _referrerUrl ?? "";
 
         BeginInvoke(() => _statusLabel.Text = "Fetching stylesheets…");
@@ -1425,7 +1422,7 @@ public partial class Form1 : Form
     // ─────────────────────────────────────────────────────────────────────
 
     private (DomDocument doc, JsInterpreter interp, DocumentBindingsState state)
-        PrepareScripting(ParsedUrl url, string html)
+        PrepareScripting(ParsedUrl url, string html, string? responseLastModified = null)
     {
         _globalScope = new JsScope();
         JsRuntime.PopulateGlobalScope(_globalScope);
@@ -1463,7 +1460,7 @@ public partial class Form1 : Form
         {
             Interpreter = _jsInterpreter,
             Canvas = _canvas,
-            LastModified = "",
+            LastModified = DocumentBindingsState.ResolveLastModified(url, responseLastModified),
             Referrer = "",
             EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
             EmbeddedScriptCall = _canvas.EmbeddedScriptCall,
@@ -2006,7 +2003,7 @@ public partial class Form1 : Form
         {
             Interpreter = interpreter,
             Canvas = _canvas,
-            LastModified = "",
+            LastModified = DocumentBindingsState.ResolveLastModified(view.Document?.BaseUrl),
             Referrer = "",
             EmbeddedScriptInfoResolver = _canvas.EmbeddedScriptInfoResolver,
             EmbeddedScriptCall = _canvas.EmbeddedScriptCall,
@@ -2860,6 +2857,31 @@ public partial class Form1 : Form
             return;
         }
 
+        if (submit.Url.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+        {
+            string target = submit.Url["mailto:".Length..];
+            if (!string.IsNullOrEmpty(submit.Body))
+                target += (target.Contains('?') ? "&" : "?") +
+                          "body=" + Uri.EscapeDataString(submit.Body);
+            if (!TryBuildMailtoUri(target, out string mailUri))
+            {
+                _statusLabel.Text = "The mail form contains an invalid or oversized address.";
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo(mailUri) { UseShellExecute = true })?.Dispose();
+                _statusLabel.Text = "Opened email composer";
+            }
+            catch (Exception ex)
+            {
+                DebugLog.WriteException("mailto form submission", ex);
+                _statusLabel.Text = "Retro96 couldn't open an email program: " + ex.Message;
+            }
+            return;
+        }
+
         if (submit.MultipartFields != null && submit.MultipartFiles != null)
         {
             _ = SubmitMultipartAsync(submit);
@@ -2901,11 +2923,24 @@ public partial class Form1 : Form
         try
         {
             var url = ParsedUrl.Parse(submit.Url);
+            if (!url.IsHttp)
+            {
+                _statusLabel.Text =
+                    "Multipart form submission requires an HTTP/HTTPS server; this action resolves to a local file URL.";
+                return;
+            }
+
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var result = await _httpClient.PostMultipartAsync(url, submit.MultipartFields, submit.MultipartFiles, _cookieStore, cts.Token);
             if (result is not HttpSuccess ok)
             {
-                _statusLabel.Text = "Multipart form submission failed.";
+                _statusLabel.Text = result switch
+                {
+                    HttpError error => "Multipart form submission failed: " + error.Message,
+                    CertError certError => "Multipart form submission failed: " + certError.Message,
+                    TooManyRedirects => "Multipart form submission failed: too many redirects.",
+                    _ => "Multipart form submission failed."
+                };
                 return;
             }
 

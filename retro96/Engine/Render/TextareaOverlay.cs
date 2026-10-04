@@ -14,7 +14,8 @@ public static class TextareaOverlay
         float TextViewportWidth,
         float LineHeight,
         int VisibleLines,
-        bool NeedsVerticalScrollbar);
+        bool NeedsVerticalScrollbar,
+        bool NeedsHorizontalScrollbar);
 
     private const float ScrollbarGutter = 14f;
 
@@ -109,25 +110,25 @@ public static class TextareaOverlay
         text ??= string.Empty;
         float fullViewport = Math.Max(1f, faceWidth - 6f);
         float lineHeight = Math.Max(1f, font.GetHeight());
-        int visibleLines = Math.Max(1, (int)Math.Floor(
-            Math.Max(1f, faceHeight - 4f) / lineHeight));
-
         var fullLines = BreakLinesCoreSkia(text, font, fullViewport, wrapOff);
         float fullTextWidth = MaxLineWidthSkia(text, font, fullLines);
-
+        bool horizontal = wrapOff && fullTextWidth > fullViewport + 0.5f;
+        float availableHeight = Math.Max(1f,
+            faceHeight - 4f - (horizontal ? ScrollbarGutter : 0f));
+        int visibleLines = Math.Max(1, (int)Math.Floor(availableHeight / lineHeight));
         if (fullLines.Count <= visibleLines || faceWidth < 16f)
             return new Layout(fullLines, fullTextWidth, fullViewport,
-                lineHeight, visibleLines, false);
+                lineHeight, visibleLines, false, horizontal);
 
         float reservedViewport = Math.Max(1f, fullViewport - ScrollbarGutter);
         var reservedLines = BreakLinesCoreSkia(text, font, reservedViewport, wrapOff);
         if (reservedLines.Count <= visibleLines)
             return new Layout(fullLines, fullTextWidth, fullViewport,
-                lineHeight, visibleLines, false);
+                lineHeight, visibleLines, false, horizontal);
 
         float reservedTextWidth = MaxLineWidthSkia(text, font, reservedLines);
         return new Layout(reservedLines, reservedTextWidth,
-            reservedViewport, lineHeight, visibleLines, true);
+            reservedViewport, lineHeight, visibleLines, true, horizontal);
     }
 
     private static List<(int Start, int End)> BreakLinesCoreSkia(
@@ -278,17 +279,18 @@ public static class TextareaOverlay
         text ??= string.Empty;
         float fullViewport = Math.Max(1f, faceWidth - 6f);
         float lineHeight = Math.Max(1f, font.GetHeight(g));
-        int visibleLines = Math.Max(1, (int)Math.Floor(
-            Math.Max(1f, faceHeight - 4f) / lineHeight));
-
         var fullLines = BreakLinesCore(g, text, font, fullViewport, wrapOff);
         float fullTextWidth = MaxLineWidth(g, text, font, fullLines);
+        bool horizontal = wrapOff && fullTextWidth > fullViewport + 0.5f;
+        float availableHeight = Math.Max(1f,
+            faceHeight - 4f - (horizontal ? ScrollbarGutter : 0f));
+        int visibleLines = Math.Max(1, (int)Math.Floor(availableHeight / lineHeight));
 
         // No vertical scrollbar is necessary, so use the full text gutter.
         if (fullLines.Count <= visibleLines || faceWidth < 16f)
         {
             return new Layout(fullLines, fullTextWidth, fullViewport,
-                lineHeight, visibleLines, false);
+                lineHeight, visibleLines, false, horizontal);
         }
 
         // Once a bar is needed, reserve its gutter before wrapping. This is
@@ -300,12 +302,12 @@ public static class TextareaOverlay
         if (reservedLines.Count <= visibleLines)
         {
             return new Layout(fullLines, fullTextWidth, fullViewport,
-                lineHeight, visibleLines, false);
+                lineHeight, visibleLines, false, horizontal);
         }
 
         float reservedTextWidth = MaxLineWidth(g, text, font, reservedLines);
         return new Layout(reservedLines, reservedTextWidth,
-            reservedViewport, lineHeight, visibleLines, true);
+            reservedViewport, lineHeight, visibleLines, true, horizontal);
     }
 
     public static List<RectangleF> SelectionRects(

@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Html;
@@ -39,8 +41,24 @@ public sealed class DocumentBindingsState
     /// registration silently discarded them between scripts.</summary>
     public JsObject? WindowObject;
 
-    public string LastModified = "";
+    public string LastModified = DateTime.Now.ToString("G", CultureInfo.CurrentCulture);
     public string Referrer = "";
+
+    public static string ResolveLastModified(
+        ParsedUrl? documentUrl, string? responseLastModified = null, DateTime? fallbackTime = null)
+    {
+        if (!string.IsNullOrWhiteSpace(responseLastModified))
+            return responseLastModified;
+
+        if (documentUrl?.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase) == true &&
+            FileUrls.LocalPathFromFileUrl(documentUrl) is { } localPath &&
+            File.Exists(localPath))
+        {
+            return File.GetLastWriteTime(localPath).ToString("G", CultureInfo.CurrentCulture);
+        }
+
+        return (fallbackTime ?? DateTime.Now).ToString("G", CultureInfo.CurrentCulture);
+    }
 
     /// <summary>IE5 uniqueID registry — one stable "ms__idN" per element
     /// (checklist §10), counted per document/page.</summary>
@@ -2079,6 +2097,13 @@ public static class DomBindings
         // box when one exists and fall back to the authored style — a page
         // that never laid out still reports its inline widths.
 
+        private void EnsureLayoutForGeometryRead()
+        {
+            var document = _element.OwnerDocument();
+            if (document != null)
+                _canvas?.EnsureLayoutForDomRead(document);
+        }
+
         private DomElement? OffsetParent()
         {
             for (var ancestor = _element.Parent as DomElement;
@@ -2121,10 +2146,17 @@ public static class DomBindings
             {
                 double left = parentBox != null ? box.X - parentBox.X : box.X;
                 double top = parentBox != null ? box.Y - parentBox.Y : box.Y;
-                double width = box.Width + box.PaddingLeft + box.PaddingRight +
-                               box.BorderLeft + box.BorderRight;
-                double height = box.Height + box.PaddingTop + box.PaddingBottom +
-                                box.BorderTop + box.BorderBottom;
+                var boxStyle = _element.Style;
+                double width = boxStyle?.Width is { } authoredWidth
+                    ? authoredWidth + boxStyle.PaddingLeft + boxStyle.PaddingRight +
+                      boxStyle.BorderLeftWidth + boxStyle.BorderRightWidth
+                    : box.Width + box.PaddingLeft + box.PaddingRight +
+                      box.BorderLeft + box.BorderRight;
+                double height = boxStyle?.Height is { } authoredHeight
+                    ? authoredHeight + boxStyle.PaddingTop + boxStyle.PaddingBottom +
+                      boxStyle.BorderTopWidth + boxStyle.BorderBottomWidth
+                    : box.Height + box.PaddingTop + box.PaddingBottom +
+                      box.BorderTop + box.BorderBottom;
                 return (left, top, width, height);
             }
 
@@ -2141,8 +2173,16 @@ public static class DomBindings
         {
             var box = _element.Box;
             if (box != null)
-                return (box.Width + box.PaddingLeft + box.PaddingRight,
-                        box.Height + box.PaddingTop + box.PaddingBottom);
+            {
+                var boxStyle = _element.Style;
+                double clientContentWidth = boxStyle?.Width is { } authoredWidth
+                    ? authoredWidth + boxStyle.PaddingLeft + boxStyle.PaddingRight
+                    : box.Width + box.PaddingLeft + box.PaddingRight;
+                double clientContentHeight = boxStyle?.Height is { } authoredHeight
+                    ? authoredHeight + boxStyle.PaddingTop + boxStyle.PaddingBottom
+                    : box.Height + box.PaddingTop + box.PaddingBottom;
+                return (clientContentWidth, clientContentHeight);
+            }
             var style = _element.Style;
             if (style == null) return (0, 0);
             double width = (style.Width ?? 0) + style.PaddingLeft + style.PaddingRight;
@@ -2293,7 +2333,7 @@ public static class DomBindings
                 if (string.Equals(name, "insertAdjacentText", StringComparison.OrdinalIgnoreCase))
                     return MakeInsertAdjacentTextFunction();
                 if (name == "currentStyle" && !Properties.ContainsKey("currentStyle"))
-                    Properties["currentStyle"] = JsValue.FromObject(new CurrentStyleObject(_element));
+                    Properties["currentStyle"] = JsValue.FromObject(new CurrentStyleObject(_element, _canvas));
                 if (name == "uniqueID" && _state != null)
                     return JsValue.From(DomBindings.GetOrCreateUniqueId(_element, _state));
                 if (name == "setActive")
@@ -2316,12 +2356,24 @@ public static class DomBindings
                         return OffsetParent() is { } op && _state != null
                             ? JsValue.FromObject(WrapElement(op, _state))
                             : JsValue.Null;
-                    case "offsetLeft": return JsValue.From(OffsetMetrics().Left);
-                    case "offsetTop": return JsValue.From(OffsetMetrics().Top);
-                    case "offsetWidth": return JsValue.From(OffsetMetrics().Width);
-                    case "offsetHeight": return JsValue.From(OffsetMetrics().Height);
-                    case "clientWidth": return JsValue.From(ClientMetrics().Width);
-                    case "clientHeight": return JsValue.From(ClientMetrics().Height);
+                    case "offsetLeft":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(OffsetMetrics().Left);
+                    case "offsetTop":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(OffsetMetrics().Top);
+                    case "offsetWidth":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(OffsetMetrics().Width);
+                    case "offsetHeight":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(OffsetMetrics().Height);
+                    case "clientWidth":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(ClientMetrics().Width);
+                    case "clientHeight":
+                        EnsureLayoutForGeometryRead();
+                        return JsValue.From(ClientMetrics().Height);
                     case "scrollTop":
                     case "scrollLeft":
                         // Readback of scripted writes (the engine has no
@@ -3195,10 +3247,12 @@ public static class DomBindings
     private sealed class CurrentStyleObject : JsObject
     {
         private readonly DomElement _element;
+        private readonly BrowserCanvas? _canvas;
 
-        public CurrentStyleObject(DomElement element)
+        public CurrentStyleObject(DomElement element, BrowserCanvas? canvas)
         {
             _element = element;
+            _canvas = canvas;
             Class = "CSSCurrentStyle";
         }
 
@@ -3223,8 +3277,13 @@ public static class DomBindings
         public override JsValue Get(string name)
         {
             if (name == "length" || name == "cssText") return base.Get(name);
+            var document = _element.OwnerDocument();
+            if (document != null)
+                _canvas?.EnsureLayoutForDomRead(document);
+
             var style = _element.Style;
-            if (style == null) return JsValue.From("");
+            if (style == null)
+                return JsValue.From(NormalizeKey(name) == "width" ? "auto" : "");
 
             switch (NormalizeKey(name))
             {
@@ -3396,8 +3455,16 @@ public static class DomBindings
             return false;
         }
 
-        private List<DomElement> Layers() =>
-            _doc.ElementDescendants().Where(IsLayerElement).ToList();
+        private List<DomElement> Layers()
+        {
+            // Parser-time scripts can query document.layers before the
+            // browser's normal style/layout pass. Resolve stylesheet-driven
+            // positioning in that case so absolute/relative elements are
+            // represented just like inline-positioned elements.
+            if (!_doc.ParseComplete)
+                _state.Canvas?.EnsureLayoutForDomRead(_doc);
+            return _doc.ElementDescendants().Where(IsLayerElement).ToList();
+        }
 
         public override JsValue Get(string name)
         {

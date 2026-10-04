@@ -123,6 +123,22 @@ public class FormDomTests
         Check.Done();
     }
 
+    [Fact]
+    public void TextPlainPostBuildsMailBody()
+    {
+        var doc = Parse(
+            "<form action='mailto:you@example.com' method='post' enctype='text/plain'>" +
+            "<input type='text' name='visitor' value='Ada Lovelace'>" +
+            "<textarea name='message'>Hello there</textarea></form>");
+        var req = FormSubmitter.BuildRequest(doc.FirstTag("form")!, doc.BaseUrl, null);
+
+        Check.That(req.TextPlainBody ==
+                   "visitor=Ada Lovelace\r\nmessage=Hello there\r\n",
+            "text/plain POST serializes successful controls as an email body",
+            req.TextPlainBody ?? "(null)");
+        Check.Done();
+    }
+
 
     [Fact]
     public void MultipartPreservesRepeatedNamesAndOnlyActivatedSubmitter()
@@ -143,6 +159,25 @@ public class FormDomTests
             "only the activated submit button is included");
         Check.That(req.MultipartFields != null && req.MultipartFields.All(f => f.Name != "go" || f.Value != "One"),
             "inactive submit buttons are excluded");
+        Check.Done();
+    }
+
+    [Fact]
+    public void MultipartImageSubmitIncludesClickCoordinates()
+    {
+        var doc = Parse(
+            "<form method=post enctype='multipart/form-data' action=/upload>" +
+            "<input type=image name=imggo src=pixel.gif></form>");
+        var form = doc.FirstTag("form")!;
+        var image = form.Descendants().OfType<DomElement>()
+            .First(e => e.TagName == "input" && e.GetAttr("type") == "image");
+        var req = FormSubmitter.BuildRequest(form, doc.BaseUrl, null,
+            ("imggo", 12, 6), image);
+
+        Check.That(req.MultipartFields?.Any(f => f.Name == "imggo.x" && f.Value == "12") == true,
+            "multipart image submit includes the clicked x coordinate");
+        Check.That(req.MultipartFields?.Any(f => f.Name == "imggo.y" && f.Value == "6") == true,
+            "multipart image submit includes the clicked y coordinate");
         Check.Done();
     }
 

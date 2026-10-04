@@ -310,7 +310,7 @@ public static class InlineLayout
                  Math.Abs(style.WordSpacing) <= 0.001f)
         {
             var measured = _measureG.MeasureString(text, font, int.MaxValue, _sf);
-            width = Math.Max(0f, (float)Math.Ceiling(measured.Width));
+            width = Math.Max(0f, measured.Width);
         }
         else
         {
@@ -321,7 +321,7 @@ public static class InlineLayout
                 if (i + 1 < text.Length) width += style.LetterSpacing;
                 if (char.IsWhiteSpace(text[i])) width += style.WordSpacing;
             }
-            width = Math.Max(0f, (float)Math.Ceiling(width));
+            width = Math.Max(0f, width);
         }
 
         if (_textWidthCache.Count >= MaxCachedTextWidths)
@@ -364,7 +364,7 @@ public static class InlineLayout
 
         if (text.Length > 1) width += Math.Max(0f, text.Length - 1) * style.LetterSpacing;
         width += text.Count(c => char.IsWhiteSpace(c)) * style.WordSpacing;
-        return Math.Max(0f, (float)Math.Ceiling(width));
+        return Math.Max(0f, width);
     }
 
     private static Font ResolveRunFont(ComputedStyle style)
@@ -448,9 +448,13 @@ public static class InlineLayout
 
             case "button":
                 {
-                    string label = (el.InnerText ?? "").Trim();
-                    if (label.Length == 0) label = el.GetAttr("value") ?? "Button";
-                    width = Math.Max(60f, MeasureTextWidth(label, style) + 24f);
+                    float contentWidth = MeasureButtonContentWidth(el, style);
+                    if (contentWidth <= 0f)
+                    {
+                        string label = el.GetAttr("value") ?? "Button";
+                        contentWidth = MeasureTextWidth(label, style);
+                    }
+                    width = Math.Max(60f, contentWidth + 24f);
                     return true;
                 }
 
@@ -489,6 +493,50 @@ public static class InlineLayout
         }
 
         return false;
+    }
+
+    private static float MeasureButtonContentWidth(DomElement button, ComputedStyle fallbackStyle)
+    {
+        float width = 0f;
+        bool previousWasSpace = true;
+        void Visit(DomNode node, ComputedStyle inheritedStyle)
+        {
+            if (node is DomText textNode)
+            {
+                var normalized = new System.Text.StringBuilder();
+                foreach (char c in textNode.Data)
+                {
+                    if (char.IsWhiteSpace(c))
+                    {
+                        if (!previousWasSpace)
+                        {
+                            normalized.Append(' ');
+                            previousWasSpace = true;
+                        }
+                    }
+                    else
+                    {
+                        normalized.Append(c);
+                        previousWasSpace = false;
+                    }
+                }
+
+                if (normalized.Length > 0)
+                {
+                    string text = Render.GlyphSubstitution.MapGlyphs(normalized.ToString());
+                    width += ResolveRunFont(inheritedStyle).SkFont.MeasureText(text);
+                }
+                return;
+            }
+
+            if (node is DomElement element)
+                inheritedStyle = element.Style ?? inheritedStyle;
+            foreach (var child in node.Children)
+                Visit(child, inheritedStyle);
+        }
+
+        Visit(button, button.Style ?? fallbackStyle);
+        return width;
     }
 
     private enum VAlignMode { Baseline, Top, Middle, Bottom }
@@ -550,6 +598,7 @@ public static class InlineLayout
             $"firstItemText=\"{Truncate(inlineChildren[0].TextRun)}\"");
 
         var source = inlineChildren.ToList();
+        floats ??= new FloatContext();
 
         // ── Fragment + measure, collapsing adjacent spaces across run
         //    boundaries. Line-leading spaces are dropped at wrap time.
@@ -558,6 +607,27 @@ public static class InlineLayout
         foreach (var box in source)
         {
             foreach (var prepared in ApplyFirstLetter(box))
+            {
+                if (prepared.IsFloated)
+                {
+                    MeasureBox(prepared, out float floatWidth, out float floatHeight,
+                        out _, out _, out _, prepared.StyleOverride);
+                    prepared.Width = floatWidth;
+                    prepared.Height = floatHeight;
+                    prepared.Y = startY + prepared.MarginTop;
+
+                    float leftEdge = Math.Max(containerX, floats.GetLeftEdge(prepared.Y));
+                    float rightEdge = floats.GetRightEdge(prepared.Y);
+                    if (rightEdge == float.MaxValue)
+                        rightEdge = containerX + containerWidth;
+                    rightEdge = Math.Min(rightEdge, containerX + containerWidth);
+                    prepared.X = prepared.FloatSide == FloatValue.Right
+                        ? rightEdge - floatWidth - prepared.MarginRight
+                        : leftEdge + prepared.MarginLeft;
+                    floats.AddFloat(prepared);
+                    continue;
+                }
+
                 foreach (var frag in FragmentTextBox(prepared))
                 {
                     bool isSpace = frag.TextRun == " ";
@@ -582,6 +652,53 @@ public static class InlineLayout
                         atomic ? frag.MarginRight : 0f));
                     lastWasSpace = isSpace;
                 }
+            }
+        }
+
+        bool bidiOverride = containerStyle.Direction == DirectionValue.Rtl &&
+            string.Equals(containerStyle.UnicodeBidi, "bidi-override", StringComparison.OrdinalIgnoreCase);
+        if (bidiOverride)
+        {
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                if (item.Box.TextRun is not { Length: > 0 } text)
+                    continue;
+                item.Box.TextRun = ReverseTextElements(text);
+                MeasureBox(item.Box, out float width, out float height, out float ascent,
+                    out float contentHeight, out float leadingTop);
+                items[i] = item with
+                {
+                    W = width,
+                    H = height,
+                    Asc = ascent,
+                    ContentHeight = contentHeight,
+                    LeadingTop = leadingTop
+                };
+            }
+            items.Reverse();
+        }
+
+        // Inline non-replaced elements contribute horizontal margins at
+        // their outer edges, not once per word fragment.
+        for (int i = 0; i < items.Count; i++)
+        {
+            var item = items[i];
+            var element = item.Box.Element;
+            var style = element?.Style;
+            if (item.Atomic || style?.Display != DisplayValue.Inline)
+                continue;
+
+            bool firstFragment = i == 0 || items[i - 1].Box.Element != element;
+            bool lastFragment = i == items.Count - 1 || items[i + 1].Box.Element != element;
+            float marginLeft = firstFragment
+                ? style.MarginLeft + (style.MarginLeftPercent ?? 0f) * containerWidth / 100f
+                : item.MarginL;
+            float marginRight = lastFragment
+                ? style.MarginRight + (style.MarginRightPercent ?? 0f) * containerWidth / 100f
+                : item.MarginR;
+            if (firstFragment || lastFragment)
+                items[i] = item with { MarginL = marginLeft, MarginR = marginRight };
         }
 
         float currentY = startY;
@@ -624,14 +741,10 @@ public static class InlineLayout
         {
             var it = items[i];
             ComputedStyle? firstLineStyle = null;
-            if (firstLine && it.Box.StyleOverride == null &&
-                !string.IsNullOrEmpty(it.Box.TextRun) &&
-                it.Box.Element?.Style is { } elementStyle &&
-                ReferenceEquals(elementStyle, containerStyle))
+            if (firstLine)
             {
-                firstLineStyle = elementStyle.FirstLineStyle;
-                if (firstLineStyle != null)
-                    it = Remeasure(it, firstLineStyle);
+                firstLineStyle = GetFirstLineStyle(it.Box, containerStyle);
+                if (firstLineStyle != null) it = Remeasure(it, firstLineStyle);
             }
 
             // Leading spaces are dropped ONLY while the line is still empty.
@@ -783,6 +896,18 @@ public static class InlineLayout
         return Math.Max(0f, currentY - startY);
     }
 
+    private static string ReverseTextElements(string text)
+    {
+        int[] starts = System.Globalization.StringInfo.ParseCombiningCharacters(text);
+        var result = new System.Text.StringBuilder(text.Length);
+        for (int i = starts.Length - 1; i >= 0; i--)
+        {
+            int end = i + 1 < starts.Length ? starts[i + 1] : text.Length;
+            result.Append(text, starts[i], end - starts[i]);
+        }
+        return result.ToString();
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Fragmentation
     // ─────────────────────────────────────────────────────────────────────
@@ -871,7 +996,8 @@ public static class InlineLayout
                 frags.Add(new LayoutBox(box.Element, BoxType.Inline)
                 {
                     TextRun = text[i..end],
-                    Parent = parent!
+                    Parent = parent!,
+                    StyleOverride = box.StyleOverride
                 });
             }
             if (sp < 0) break;
@@ -879,7 +1005,8 @@ public static class InlineLayout
             frags.Add(new LayoutBox(box.Element, BoxType.Inline)
             {
                 TextRun = " ",
-                Parent = parent!
+                Parent = parent!,
+                StyleOverride = box.StyleOverride
             });
             i = sp + 1;
         }
@@ -951,7 +1078,13 @@ public static class InlineLayout
         float x = leftEdge;
         float extra = 0f;
 
-        switch (containerStyle.TextAlign)
+        TextAlign alignment = containerStyle.TextAlign;
+        if (alignment == TextAlign.Left &&
+            containerStyle.Direction == DirectionValue.Rtl &&
+            string.Equals(containerStyle.UnicodeBidi, "bidi-override", StringComparison.OrdinalIgnoreCase))
+            alignment = TextAlign.Right;
+
+        switch (alignment)
         {
             case TextAlign.Center:
                 x += Math.Max(0f, (rightEdge - leftEdge - lineW) / 2f);
@@ -980,9 +1113,9 @@ public static class InlineLayout
 
             if (i > 0) x += InterItemLetterSpacing(items[i - 1].Box, box);
 
-            if (firstLine && box.Element?.Style?.FirstLineStyle != null &&
-                box.Element == containerStyleElement(box, containerStyle))
-                box.StyleOverride = box.Element.Style.FirstLineStyle;
+            if (firstLine &&
+                GetFirstLineStyle(box, containerStyle) is { } firstLineStyle)
+                box.StyleOverride = firstLineStyle;
 
             box.X = x + it.MarginL;
             if (!it.Atomic)
@@ -1164,10 +1297,36 @@ public static class InlineLayout
         contentHeight = 0f; leadingTop = 0f;
     }
 
-    private static DomElement? containerStyleElement(LayoutBox box, ComputedStyle style)
+    private static ComputedStyle? GetFirstLineStyle(LayoutBox box, ComputedStyle containerStyle)
     {
         var element = box.Element;
-        return element?.Style == style ? element : null;
+        if (box.StyleOverride != null || string.IsNullOrEmpty(box.TextRun) ||
+            element?.Style is not { } elementStyle)
+            return null;
+
+        if (elementStyle.FirstLineStyle is { } ownFirstLineStyle &&
+            (ReferenceEquals(elementStyle, containerStyle) ||
+             ReferenceEquals(box.Parent?.Element, element)))
+            return ownFirstLineStyle;
+
+        // Inline descendants (notably links) keep their own element style,
+        // while their text boxes are parented by the containing block's box.
+        // Apply the block's first-line weight to that inherited inline style
+        // without replacing link-specific color, decoration, or other styles.
+        for (var parent = box.Parent; parent != null; parent = parent.Parent)
+        {
+            if (parent.Element?.Style?.FirstLineStyle is not { } parentFirstLineStyle)
+                continue;
+
+            if (elementStyle.OwnFontWeight)
+                return null;
+
+            var inlineFirstLineStyle = elementStyle.Clone();
+            inlineFirstLineStyle.FontWeight = parentFirstLineStyle.FontWeight;
+            return inlineFirstLineStyle;
+        }
+
+        return null;
     }
 
     private static string TransformText(string text, TextTransform transform) =>
@@ -1202,7 +1361,8 @@ public static class InlineLayout
     {
         var style = box.Element?.Style?.FirstLetterStyle;
         string text = box.TextRun ?? "";
-        if (style == null || text.Length == 0 || box.Parent == null)
+        if (style == null || text.Length == 0 || box.Parent == null ||
+            box.StyleOverride != null)
         {
             yield return box;
             yield break;
@@ -1220,7 +1380,9 @@ public static class InlineLayout
         {
             TextRun = text[first].ToString(),
             Parent = box.Parent,
-            StyleOverride = style
+            StyleOverride = style,
+            IsFloated = style.Float is FloatValue.Left or FloatValue.Right,
+            FloatSide = style.Float
         };
         var rest = text[..first] + text[(first + 1)..];
         var restBox = new LayoutBox(box.Element, BoxType.Inline)
@@ -1314,8 +1476,8 @@ public static class SelectRowModel
         return rows;
     }
 
-    private static string OptionLabel(DomElement opt) =>
-        (opt.InnerText ?? "").Trim();
+    public static string OptionLabel(DomElement opt) =>
+        (opt.GetAttr("label") ?? opt.InnerText ?? "").Trim();
 
     /// <summary>
     /// The optgroup's own text: its DIRECT text children only (an option's

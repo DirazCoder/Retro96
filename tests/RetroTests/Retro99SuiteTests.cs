@@ -403,13 +403,6 @@ public class Retro99SuiteTests
             "dom-ie5 scripts run clean",
             string.Join(" | ", page.ScriptErrors.Take(3)));
 
-        // Layout the page so element boxes exist, then re-run the report —
-        // era scripts read offset geometry AFTER load, never at parse time.
-        InlineLayout.SetFontCache(LayoutHarness.Fonts);
-        StyleResolver.Resolve(page.Document, 800);
-        LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
-        page.Eval("document.all('report2').innerText = ie5Report();");
-
         string report = TextOf(page.Document, "report2") ?? "";
         Check.That(report.Contains("all-count=true"), "document.all collection enumerates");
         Check.That(report.Contains("all(name)=ie5probe"), "all(name) resolves by id/name");
@@ -419,11 +412,14 @@ public class Retro99SuiteTests
         Check.That(report.Contains("innerText=head+ replaced"), "insertAdjacentText lands");
         Check.That(report.Contains("pixelLeft=40"), "style.pixelLeft works");
         Check.That(report.Contains("offsetWidth>0=true"), "offsetWidth is real geometry");
+        Check.That(report.Contains("offsetHeight>0=true"), "offsetHeight is real geometry");
         Check.That(report.Contains("clientWidth="), "clientWidth reads");
         Check.That(report.Contains("currentStyle=ok"), "currentStyle object exists");
-        Check.That(report.Contains("readyState=complete"), "document.readyState is complete");
+        Check.That(report.Contains("currentStyle.width=auto"), "currentStyle.width reports auto");
+        Check.That(report.Contains("readyState=loading"), "parser-time report sees loading readyState");
         Check.That(report.Contains("uniqueID=ok"), "uniqueID is stable");
         Check.That(report.Contains("parentElement=BODY"), "parentElement resolves");
+        Check.That(report.Contains("children=ok"), "body.children reports its child elements");
         Check.Done();
     }
 
@@ -466,6 +462,51 @@ public class Retro99SuiteTests
             Check.That(report.Contains("captureEvents=ok"), "window.captureEvents works");
             Check.That(report.Contains("pageXOffset="), "pageXOffset reads");
             Check.That(report.Contains("innerWidth=ok"), "innerWidth reads");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(new UserSettings());
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void Ns4LayerBatteryAlsoRunsInRetro96UnionPersona()
+    {
+        BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+        try
+        {
+            var page = new PageHarness();
+            LoadScripted(page, "dom", "dom-ns4-layers.html");
+            Check.That(page.ScriptErrors.Count == 0,
+                "layer page scripts run clean in the Retro96 union persona",
+                string.Join(" | ", page.ScriptErrors.Take(3)));
+
+            var layers = page.EvalString("ns4Report()");
+            Check.That(layers.Contains("layers-count=3"),
+                "stylesheet-positioned elements populate union document.layers", layers);
+            Check.That(layers.Contains("layers[name]=ok"),
+                "union document.layers resolves CSS-positioned elements by name", layers);
+            Check.That(layers.Contains("non-positioned-in-layers=no"),
+                "unpositioned elements stay out of union document.layers", layers);
+            Check.That(page.EvalString("document.layers[0].id") == "box1",
+                "union document.layers supports numeric indexing");
+            Check.That(page.EvalString("document.layers['box1'].document === document") == "true",
+                "union Layer.document refers to the owning document");
+            Check.That(layers.Contains("after-moveTo left=120"),
+                "union Layer.moveTo works", layers);
+            Check.That(layers.Contains("after-moveBy left=130"),
+                "union Layer.moveBy works", layers);
+            Check.That(layers.Contains("moveAbove=ok"),
+                "union Layer.moveAbove works", layers);
+            Check.That(layers.Contains("clip-set=100"),
+                "union Layer.clip is writable", layers);
+            Check.That(layers.Contains("bgColor-set=ok"),
+                "union Layer.bgColor is writable", layers);
+            Check.That(layers.Contains("captureEvents=ok"),
+                "union window.captureEvents and Event constants are exposed", layers);
+            Check.That(layers.Contains("Event.CLICK=4"),
+                "union Event.CLICK has the expected mask", layers);
         }
         finally
         {

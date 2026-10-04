@@ -53,7 +53,7 @@ function ie5Report() {
 
   // parentElement / children / contains
   out.push("parentElement=" + t.parentElement.tagName);
-  out.push("children=" + (t.children.length >= 0 ? "ok" : "NULL"));
+  out.push("children=" + (document.body.children.length > 0 ? "ok" : "NULL"));
 
   return out.join(" | ");
 }

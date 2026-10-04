@@ -532,7 +532,8 @@ public class Renderer
                                bool clearBackground = true,
                                GRContext? gpuContext = null,
                                bool skipAnimatedContent = false,
-                               bool skipAnimatedImages = false)
+                               bool skipAnimatedImages = false,
+                               bool skipFixedPositioned = false)
     {
         ArgumentNullException.ThrowIfNull(canvas);
         ArgumentNullException.ThrowIfNull(rootBox);
@@ -566,7 +567,7 @@ public class Renderer
             {
                 canvas.Translate(-_scrollX, -_scrollY);
                 PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement,
-                    skipAnimatedContent, skipAnimatedImages);
+                    skipAnimatedContent, skipAnimatedImages, skipFixedPositioned);
                 if (showBoxOutlines)
                     PaintBoxOutlines(g, rootBox);
             }
@@ -590,6 +591,76 @@ public class Renderer
             canvas.RestoreToCount(state);
         }
     }
+
+    /// <summary>
+    /// Paints fixed-positioned subtrees over the scrolled page layer. The
+    /// caller has already applied the page scroll translation; this method
+    /// cancels it so fixed boxes remain at their viewport-relative layout
+    /// coordinates.
+    /// </summary>
+    public void RenderFixedToCanvas(SKCanvas canvas, LayoutBox rootBox, DomDocument document,
+                                    FontCache fonts, ImageCache images,
+                                    float viewportWidth, float viewportHeight,
+                                    float scrollX, float scrollY,
+                                    DomElement? hoveredElement, bool blinkVisible,
+                                    DomElement? focusedElement = null,
+                                    GRContext? gpuContext = null)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(rootBox);
+        ArgumentNullException.ThrowIfNull(document);
+
+        string? previousBaseUrl = _baseUrl;
+        float previousScrollX = _scrollX;
+        float previousScrollY = _scrollY;
+        float previousViewportWidth = _viewportWidth;
+        float previousViewportHeight = _viewportHeight;
+        _baseUrl = document.BaseUrl?.ToAbsolute();
+        _scrollX = 0f;
+        _scrollY = 0f;
+        _viewportWidth = Math.Max(1f, viewportWidth);
+        _viewportHeight = Math.Max(1f, viewportHeight);
+
+        int state = canvas.Save();
+        try
+        {
+            canvas.Translate(
+                float.IsFinite(scrollX) ? Math.Max(0f, scrollX) : 0f,
+                float.IsFinite(scrollY) ? Math.Max(0f, scrollY) : 0f);
+            using var g = new SkiaRenderContext(canvas, gpuContext);
+            foreach (var box in TopLevelFixedBoxes(rootBox))
+                PaintBox(g, box, fonts, images, hoveredElement, blinkVisible, focusedElement);
+        }
+        finally
+        {
+            canvas.RestoreToCount(state);
+            _baseUrl = previousBaseUrl;
+            _scrollX = previousScrollX;
+            _scrollY = previousScrollY;
+            _viewportWidth = previousViewportWidth;
+            _viewportHeight = previousViewportHeight;
+        }
+    }
+
+    private static IEnumerable<LayoutBox> TopLevelFixedBoxes(LayoutBox root)
+    {
+        foreach (var child in PaintOrder(root))
+        {
+            if (IsFixedPrincipalBox(child))
+            {
+                yield return child;
+                continue;
+            }
+
+            foreach (var nested in TopLevelFixedBoxes(child))
+                yield return nested;
+        }
+    }
+
+    private static bool IsFixedPrincipalBox(LayoutBox box) =>
+        box.Element is { } element &&
+        element.Style?.Position == PositionValue.Fixed &&
+        ReferenceEquals(element.LayoutBox, box);
 
     /// <summary>GPU-local render helper for a frame's content viewport.</summary>
     internal void RenderLocalToCanvas(SKCanvas canvas, LayoutBox rootBox, DomDocument document,
@@ -710,11 +781,64 @@ public class Renderer
     private void PaintBox(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                           ImageCache images, DomElement? hoveredElement,
                           bool blinkVisible, DomElement? focusedElement = null,
-                          bool skipAnimatedContent = false, bool skipAnimatedImages = false)
+                          bool skipAnimatedContent = false, bool skipAnimatedImages = false,
+                          bool skipFixedPositioned = false)
+    {
+        if (box == null) return;
+        var style = box.Element?.Style;
+        bool fixedPosition = IsFixedPrincipalBox(box);
+        if (skipFixedPositioned && fixedPosition)
+            return;
+        int fixedState = fixedPosition ? g.Save() : 0;
+        try
+        {
+            if (fixedPosition)
+                g.Canvas.Translate(_scrollX, _scrollY);
+
+            if (style?.Position == PositionValue.Static || style?.Clip is not { } clip)
+            {
+                PaintBoxCore(g, box, fonts, images, hoveredElement, blinkVisible,
+                    focusedElement, skipAnimatedContent, skipAnimatedImages,
+                    skipFixedPositioned);
+                return;
+            }
+
+            var bounds = box.BorderRect;
+            float left = clip.Left ?? 0f;
+            float top = clip.Top ?? 0f;
+            float right = clip.Right ?? bounds.Width;
+            float bottom = clip.Bottom ?? bounds.Height;
+            int clipState = g.Save();
+            try
+            {
+                g.SetClip(new RectangleF(
+                    bounds.X + left, bounds.Y + top,
+                    Math.Max(0f, right - left), Math.Max(0f, bottom - top)));
+                PaintBoxCore(g, box, fonts, images, hoveredElement, blinkVisible,
+                    focusedElement, skipAnimatedContent, skipAnimatedImages,
+                    skipFixedPositioned);
+            }
+            finally
+            {
+                g.Restore(clipState);
+            }
+        }
+        finally
+        {
+            if (fixedPosition)
+                g.Restore(fixedState);
+        }
+    }
+
+    private void PaintBoxCore(SkiaRenderContext g, LayoutBox box, FontCache fonts,
+                              ImageCache images, DomElement? hoveredElement,
+                              bool blinkVisible, DomElement? focusedElement = null,
+                              bool skipAnimatedContent = false, bool skipAnimatedImages = false,
+                              bool skipFixedPositioned = false)
     {
         if (box == null) return;
 
-        if (box.Element?.Style?.Visibility == VisibilityValue.Hidden)
+        if (box.Element?.Style?.Visibility is VisibilityValue.Hidden or VisibilityValue.Collapse)
             return;
 
         // Animation subtrees are omitted from the cached display list so the
@@ -756,30 +880,53 @@ public class Renderer
             // (never affects layout).
             PaintOutline(g, box);
         }
-        PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
-
         // <marquee> — IE/NN extension: the block lays out normally, but the
         // content is repainted through a horizontal scroll transform clipped
         // to the marquee's border box.
         if (box.Element?.TagName == "marquee" && BrowserRuntime.MarqueeEnabled)
         {
+            PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
             PaintMarqueeContent(g, box, fonts, images, hoveredElement,
                 blinkVisible, focusedElement);
             return;
         }
 
-        var overflow = box.Element?.Style?.Overflow ?? OverflowValue.Visible;
+        // Inline text fragments share their owner's DOM element/style, but
+        // only the element's principal box establishes an overflow container.
+        // Applying scrollbars/clipping to each word fragment paints tracks
+        // over the text and prevents wheel input from reaching the container.
+        var overflow = box.Element is { } element &&
+                       ReferenceEquals(element.LayoutBox, box)
+            ? element.Style?.Overflow ?? OverflowValue.Visible
+            : OverflowValue.Visible;
+        bool hasHorizontalOverflow = overflow == OverflowValue.Scroll &&
+            box.Descendants().Any(child => child.BorderRect.Right > box.PaddingRect.Right + 0.5f);
         int clipState = 0;
         if (overflow != OverflowValue.Visible)
         {
             clipState = g.Save();
+            float clipWidth = box.Width + box.PaddingLeft + box.PaddingRight;
+            float clipHeight = box.Height + box.PaddingTop + box.PaddingBottom;
+            if (overflow == OverflowValue.Scroll)
+            {
+                clipWidth = Math.Max(0f, clipWidth - 14f);
+                if (hasHorizontalOverflow)
+                    clipHeight = Math.Max(0f, clipHeight - 14f);
+            }
             g.SetClip(new RectangleF(
                 box.X + box.BorderLeft,
                 box.Y + box.BorderTop,
-                box.Width + box.PaddingLeft + box.PaddingRight,
-                box.Height + box.PaddingTop + box.PaddingBottom),
+                clipWidth, clipHeight),
                 SKClipOperation.Intersect);
         }
+
+        if (overflow == OverflowValue.Scroll)
+            g.Canvas.Translate(-box.ScrollOffsetX, -box.ScrollOffsetY);
+
+        // Overflow clipping and scrolling apply to the box's own content as
+        // well as its descendants. Painting it before establishing the clip
+        // let text on the scroll container escape onto the page.
+        PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
 
         foreach (var child in PaintOrder(box))
         {
@@ -789,7 +936,7 @@ public class Renderer
             try
             {
                 PaintBox(g, child, fonts, images, hoveredElement, blinkVisible, focusedElement,
-                    skipAnimatedContent, skipAnimatedImages);
+                    skipAnimatedContent, skipAnimatedImages, skipFixedPositioned);
             }
             catch (Exception ex)
             {
@@ -798,7 +945,64 @@ public class Renderer
         }
 
         if (overflow != OverflowValue.Visible)
+        {
             g.Restore(clipState);
+            if (overflow == OverflowValue.Scroll)
+                PaintOverflowScrollbars(g, box, hasHorizontalOverflow);
+        }
+    }
+
+    private static void PaintOverflowScrollbars(
+        SkiaRenderContext g, LayoutBox box, bool hasHorizontalOverflow)
+    {
+        const float size = 14f;
+        var viewport = box.PaddingRect;
+        if (viewport.Width <= size || viewport.Height <= size) return;
+
+        float contentRight = box.Descendants()
+            .Select(child => child.BorderRect.Right)
+            .DefaultIfEmpty(viewport.Right)
+            .Max();
+        float contentBottom = box.Descendants()
+            .Select(child => child.BorderRect.Bottom)
+            .DefaultIfEmpty(viewport.Bottom)
+            .Max();
+        float viewportHeight = viewport.Height - (hasHorizontalOverflow ? size : 0f);
+        var vertical = new RectangleF(viewport.Right - size, viewport.Top,
+            size, viewportHeight);
+        using var track = CreateFillPaint(Color.FromArgb(0xD4, 0xD0, 0xC8));
+        using var edge = CreateStrokePaint(Color.Gray, 1);
+        using var thumb = CreateFillPaint(Color.FromArgb(0xC0, 0xC0, 0xC0));
+        using var thumbEdge = CreateStrokePaint(Color.DarkGray, 1);
+
+        g.FillRectangle(track, vertical);
+        g.DrawRectangle(edge, vertical);
+
+        float horizontalViewportWidth = viewport.Width - size;
+        float contentWidth = Math.Max(viewport.Width, contentRight - viewport.Left);
+        float contentHeight = Math.Max(viewport.Height, contentBottom - viewport.Top);
+        float thumbHeight = Math.Max(8f, vertical.Height * viewportHeight / contentHeight);
+        float thumbY = vertical.Top + (vertical.Height - thumbHeight) *
+            (contentHeight <= viewportHeight ? 0f :
+             box.ScrollOffsetY / (contentHeight - viewportHeight));
+        var verticalThumb = new RectangleF(vertical.Left + 2, thumbY + 2,
+            Math.Max(1f, size - 4), Math.Max(1f, thumbHeight - 4));
+        g.FillRectangle(thumb, verticalThumb);
+        g.DrawRectangle(thumbEdge, verticalThumb);
+
+        if (!hasHorizontalOverflow) return;
+        var horizontal = new RectangleF(viewport.Left, viewport.Bottom - size,
+            horizontalViewportWidth, size);
+        float thumbWidth = Math.Max(8f, horizontal.Width * horizontalViewportWidth / contentWidth);
+        float thumbX = horizontal.Left + (horizontal.Width - thumbWidth) *
+            (contentWidth <= horizontalViewportWidth ? 0f :
+             box.ScrollOffsetX / (contentWidth - horizontalViewportWidth));
+        var horizontalThumb = new RectangleF(thumbX + 2, horizontal.Top + 2,
+            Math.Max(1f, thumbWidth - 4), Math.Max(1f, size - 4));
+        g.FillRectangle(track, horizontal);
+        g.DrawRectangle(edge, horizontal);
+        g.FillRectangle(thumb, horizontalThumb);
+        g.DrawRectangle(thumbEdge, horizontalThumb);
     }
 
     // ── Marquee ─────────────────────────────────────────────────────
@@ -1071,6 +1275,11 @@ public class Renderer
                 rect.X, rect.Y, rect.Width, rect.Height);
             return;
         }
+        // The document canvas paints the body background over the page origin.
+        // Painting it again here would restart repeated tiles at the body's
+        // margin and cover the canvas-origin tiles with the body color.
+        if (box.Element.TagName == "body")
+            return;
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         // Solid colour — bgcolor attribute beats CSS
@@ -1213,7 +1422,10 @@ public class Renderer
 
         // Form controls paint their own 3-D chrome at the layout-reserved
         // border ring — the generic path would duplicate it.
-        if (elem.TagName is "input" or "select" or "textarea" or "button")
+        if (elem.TagName is "select" or "textarea" or "button" ||
+            (elem.TagName == "input" &&
+             !elem.GetAttrOrDefault("type", "text").Trim()
+                 .Equals("image", StringComparison.OrdinalIgnoreCase)))
             return;
 
         // <hr> — the 3-D inset rule of the era
@@ -1223,10 +1435,22 @@ public class Renderer
             return;
         }
 
-        // <table border=N> — outset frame; cells keep simple grey rules.
-        // The width comes from the BOX (layout applies the HTML attribute
-        // there), not from the CSS style.
-        if (elem.TagName == "table" && box.BorderTop > 0)
+        if (elem.TagName == "table" &&
+            style.BorderCollapse == BorderCollapseValue.Collapse &&
+            box.Descendants().Any(cell =>
+                cell.Element?.TagName is "td" or "th" &&
+                (cell.Element.Style?.BorderTopStyle == BorderStyleValue.Hidden ||
+                 cell.Element.Style?.BorderRightStyle == BorderStyleValue.Hidden ||
+                 cell.Element.Style?.BorderBottomStyle == BorderStyleValue.Hidden ||
+                 cell.Element.Style?.BorderLeftStyle == BorderStyleValue.Hidden)))
+        {
+            PaintCollapsedTableOuterBorder(g, box, style);
+            return;
+        }
+
+        // The outset frame belongs to the legacy HTML border attribute;
+        // CSS-authored table borders use their computed style below.
+        if (elem.TagName == "table" && elem.HasAttr("border") && box.BorderTop > 0)
         {
             PaintTableOuterBorder(g, box);
             return;
@@ -1237,23 +1461,43 @@ public class Renderer
 
         // Paint from the box's layout-resolved widths — they include HTML
         // border attributes the CSS style may know nothing about.
+        Color topColor = BorderColorFor(BorderColorOrBlack(style.BorderTopColor), isTableCell, localBackground);
+        Color rightColor = BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell, localBackground);
+        Color bottomColor = BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell, localBackground);
+        Color leftColor = BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell, localBackground);
         PaintBorderSide(g, box.BorderRect, box.BorderTop, style.BorderTopStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderTopColor), isTableCell, localBackground),
-                        BorderSide.Top, localBackground, box.BorderLeft, box.BorderRight,
+                        topColor, BorderSide.Top, localBackground,
+                        SameBorderEdge(box.BorderTop, style.BorderTopStyle, topColor,
+                                       box.BorderLeft, style.BorderLeftStyle, leftColor) ? 0 : box.BorderLeft,
+                        SameBorderEdge(box.BorderTop, style.BorderTopStyle, topColor,
+                                       box.BorderRight, style.BorderRightStyle, rightColor) ? 0 : box.BorderRight,
                         style.OwnBorderTopStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderRight, style.BorderRightStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell, localBackground),
-                        BorderSide.Right, localBackground, box.BorderTop, box.BorderBottom,
+                        rightColor, BorderSide.Right, localBackground,
+                        SameBorderEdge(box.BorderRight, style.BorderRightStyle, rightColor,
+                                       box.BorderTop, style.BorderTopStyle, topColor) ? 0 : box.BorderTop,
+                        SameBorderEdge(box.BorderRight, style.BorderRightStyle, rightColor,
+                                       box.BorderBottom, style.BorderBottomStyle, bottomColor) ? 0 : box.BorderBottom,
                         style.OwnBorderRightStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderBottom, style.BorderBottomStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell, localBackground),
-                        BorderSide.Bottom, localBackground, box.BorderLeft, box.BorderRight,
+                        bottomColor, BorderSide.Bottom, localBackground,
+                        SameBorderEdge(box.BorderBottom, style.BorderBottomStyle, bottomColor,
+                                       box.BorderLeft, style.BorderLeftStyle, leftColor) ? 0 : box.BorderLeft,
+                        SameBorderEdge(box.BorderBottom, style.BorderBottomStyle, bottomColor,
+                                       box.BorderRight, style.BorderRightStyle, rightColor) ? 0 : box.BorderRight,
                         style.OwnBorderBottomStyle);
         PaintBorderSide(g, box.BorderRect, box.BorderLeft, style.BorderLeftStyle,
-                        BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell, localBackground),
-                        BorderSide.Left, localBackground, box.BorderTop, box.BorderBottom,
+                        leftColor, BorderSide.Left, localBackground,
+                        SameBorderEdge(box.BorderLeft, style.BorderLeftStyle, leftColor,
+                                       box.BorderTop, style.BorderTopStyle, topColor) ? 0 : box.BorderTop,
+                        SameBorderEdge(box.BorderLeft, style.BorderLeftStyle, leftColor,
+                                       box.BorderBottom, style.BorderBottomStyle, bottomColor) ? 0 : box.BorderBottom,
                         style.OwnBorderLeftStyle);
     }
+
+    private static bool SameBorderEdge(float widthA, BorderStyleValue styleA, Color colorA,
+        float widthB, BorderStyleValue styleB, Color colorB) =>
+        widthA.Equals(widthB) && styleA == styleB && colorA.Equals(colorB);
 
     /// <summary>Table cell rules were grey (#808080), not text-black.
     /// Keep that default and adapt any authored border that is too close to
@@ -1281,8 +1525,7 @@ public class Renderer
     /// engines used a fixed 2px gap).  The stroke sits OUTSIDE the offset
     /// gap.  <c>outline-color: invert</c> (the CSS2 initial) paints black —
     /// true pixel inversion is out of scope (documented).  Dotted/dashed
-    /// outlines fall back to solid (documented simplification — the era
-    /// raster approximation).
+    /// outlines use round dots and CSS-scaled dashes.
     /// </summary>
     private static void PaintOutline(SkiaRenderContext g, LayoutBox box)
     {
@@ -1305,8 +1548,121 @@ public class Renderer
             ? Color.Black                       // 'invert' → black (documented)
             : BorderColorOrBlack(style.OutlineColor);
 
+        if (style.OutlineStyle == BorderStyleValue.Dotted)
+        {
+            PaintDottedPerimeter(g, x - w / 2f, y - w / 2f,
+                width + w, height + w, w, color);
+            return;
+        }
+
+        float dash = w * 3f;
+        float gap = w * 2f;
+        using var dashEffect = style.OutlineStyle == BorderStyleValue.Dashed
+            ? SKPathEffect.CreateDash([dash, gap], 0f)
+            : null;
         using var pen = CreateStrokePaint(color, w);
+        pen.PathEffect = dashEffect;
         g.DrawRectangle(pen, x, y, width, height);
+    }
+
+    private readonly record struct DottedPathSegment(
+        float Length, PointF Start, PointF End, PointF Center,
+        float Radius, float StartAngle, float SweepAngle, bool IsArc);
+
+    private static void PaintDottedPerimeter(
+        SkiaRenderContext g, float x, float y, float width, float height,
+        float diameter, Color color)
+    {
+        if (width <= 0f || height <= 0f || diameter <= 0f)
+            return;
+
+        float cornerExtent = Math.Min(diameter * 2f, Math.Min(width, height) / 2f);
+        float radius = Math.Max(0f, cornerExtent - diameter / 2f);
+        var segments = new List<DottedPathSegment>(8);
+
+        void AddLine(PointF start, PointF end)
+        {
+            float dx = end.X - start.X;
+            float dy = end.Y - start.Y;
+            float length = MathF.Sqrt(dx * dx + dy * dy);
+            if (length > 0.001f)
+                segments.Add(new DottedPathSegment(
+                    length, start, end, default, 0f, 0f, 0f, false));
+        }
+
+        void AddArc(PointF center, float startAngle, float sweepAngle)
+        {
+            if (radius <= 0.001f)
+                return;
+            float length = radius * MathF.Abs(sweepAngle) * MathF.PI / 180f;
+            float startRadians = startAngle * MathF.PI / 180f;
+            float endRadians = (startAngle + sweepAngle) * MathF.PI / 180f;
+            var start = new PointF(
+                center.X + radius * MathF.Cos(startRadians),
+                center.Y + radius * MathF.Sin(startRadians));
+            var end = new PointF(
+                center.X + radius * MathF.Cos(endRadians),
+                center.Y + radius * MathF.Sin(endRadians));
+            segments.Add(new DottedPathSegment(
+                length, start, end, center, radius, startAngle, sweepAngle, true));
+        }
+
+        float right = x + width;
+        float bottom = y + height;
+        AddLine(new PointF(x + cornerExtent, y + diameter / 2f),
+            new PointF(right - cornerExtent, y + diameter / 2f));
+        AddArc(new PointF(right - cornerExtent, y + cornerExtent), -90f, 90f);
+        AddLine(new PointF(right - diameter / 2f, y + cornerExtent),
+            new PointF(right - diameter / 2f, bottom - cornerExtent));
+        AddArc(new PointF(right - cornerExtent, bottom - cornerExtent), 0f, 90f);
+        AddLine(new PointF(right - cornerExtent, bottom - diameter / 2f),
+            new PointF(x + cornerExtent, bottom - diameter / 2f));
+        AddArc(new PointF(x + cornerExtent, bottom - cornerExtent), 90f, 90f);
+        AddLine(new PointF(x + diameter / 2f, bottom - cornerExtent),
+            new PointF(x + diameter / 2f, y + cornerExtent));
+        AddArc(new PointF(x + cornerExtent, y + cornerExtent), 180f, 90f);
+
+        float perimeter = segments.Sum(segment => segment.Length);
+        if (perimeter <= 0.001f)
+            return;
+
+        int dotCount = Math.Max(1, (int)MathF.Round(perimeter / (diameter * 2f)));
+        float pitch = perimeter / dotCount;
+        using var brush = CreateFillPaint(color);
+
+        for (int i = 0; i < dotCount; i++)
+        {
+            float offset = (i + 0.5f) * pitch;
+            foreach (var segment in segments)
+            {
+                if (offset > segment.Length)
+                {
+                    offset -= segment.Length;
+                    continue;
+                }
+
+                float fraction = offset / segment.Length;
+                float dotX, dotY;
+                if (segment.IsArc)
+                {
+                    float angle = (segment.StartAngle +
+                        segment.SweepAngle * fraction) * MathF.PI / 180f;
+                    dotX = segment.Center.X + segment.Radius * MathF.Cos(angle);
+                    dotY = segment.Center.Y + segment.Radius * MathF.Sin(angle);
+                }
+                else
+                {
+                    dotX = segment.Start.X +
+                        (segment.End.X - segment.Start.X) * fraction;
+                    dotY = segment.Start.Y +
+                        (segment.End.Y - segment.Start.Y) * fraction;
+                }
+
+                g.FillEllipse(brush, dotX - diameter / 2f,
+                    dotY - diameter / 2f, diameter, diameter);
+                break;
+            }
+        }
     }
 
     /// <summary>
@@ -1364,6 +1720,155 @@ public class Renderer
             g.DrawLine(penDark, x0, y1, x1, y1);
             g.DrawLine(penDark, x1, y0, x1, y1);
         }
+    }
+
+    private static void PaintCollapsedTableOuterBorder(
+        SkiaRenderContext g, LayoutBox box, ComputedStyle style)
+    {
+        var rect = box.BorderRect;
+        var cells = box.Descendants()
+            .Where(cell => cell.Element?.TagName is "td" or "th")
+            .OrderBy(cell => cell.BorderRect.Top)
+            .ThenBy(cell => cell.BorderRect.Left)
+            .ToList();
+        if (cells.Count == 0)
+        {
+            PaintCssOuterBorder(g, box, style);
+            return;
+        }
+
+        float topRow = cells.Min(cell => cell.BorderRect.Top);
+        float bottomRow = cells.Max(cell => cell.BorderRect.Bottom);
+        var firstRow = cells.Where(cell => Math.Abs(cell.BorderRect.Top - topRow) < 0.5f).ToList();
+        var lastRow = cells.Where(cell => Math.Abs(cell.BorderRect.Bottom - bottomRow) < 0.5f).ToList();
+        var firstColumn = cells.GroupBy(cell => MathF.Round(cell.BorderRect.Left))
+            .OrderBy(group => group.Key).First().ToList();
+        var lastColumn = cells.GroupBy(cell => MathF.Round(cell.BorderRect.Right))
+            .OrderByDescending(group => group.Key).First().ToList();
+
+        PaintHorizontal(style.BorderTopStyle, style.BorderTopColor, box.BorderTop,
+            BorderSide.Top, style.OwnBorderTopStyle,
+            ExtendHorizontalCorners(firstRow
+                .Where(cell => cell.Element?.Style?.BorderTopStyle != BorderStyleValue.Hidden)
+                .Select(cell => (cell.BorderRect.Left, cell.BorderRect.Right)).ToList(),
+                IsVisibleBorder(firstRow.OrderBy(cell => cell.BorderRect.Left).FirstOrDefault(),
+                    BorderSide.Top),
+                IsVisibleBorder(firstRow.OrderByDescending(cell => cell.BorderRect.Right).FirstOrDefault(),
+                    BorderSide.Top)));
+        PaintHorizontal(style.BorderBottomStyle, style.BorderBottomColor, box.BorderBottom,
+            BorderSide.Bottom, style.OwnBorderBottomStyle,
+            ExtendHorizontalCorners(lastRow
+                .Where(cell => cell.Element?.Style?.BorderBottomStyle != BorderStyleValue.Hidden)
+                .Select(cell => (cell.BorderRect.Left, cell.BorderRect.Right)).ToList(),
+                IsVisibleBorder(lastRow.OrderBy(cell => cell.BorderRect.Left).FirstOrDefault(),
+                    BorderSide.Bottom),
+                IsVisibleBorder(lastRow.OrderByDescending(cell => cell.BorderRect.Right).FirstOrDefault(),
+                    BorderSide.Bottom)));
+        PaintVertical(style.BorderLeftStyle, style.BorderLeftColor, box.BorderLeft,
+            BorderSide.Left, style.OwnBorderLeftStyle,
+            ExtendVerticalCorners(firstColumn
+                .Where(cell => cell.Element?.Style?.BorderLeftStyle != BorderStyleValue.Hidden)
+                .Select(cell => (cell.BorderRect.Top, cell.BorderRect.Bottom)).ToList(),
+                IsVisibleBorder(firstColumn.OrderBy(cell => cell.BorderRect.Top).FirstOrDefault(),
+                    BorderSide.Left),
+                IsVisibleBorder(firstColumn.OrderByDescending(cell => cell.BorderRect.Bottom).FirstOrDefault(),
+                    BorderSide.Left)));
+        PaintVertical(style.BorderRightStyle, style.BorderRightColor, box.BorderRight,
+            BorderSide.Right, style.OwnBorderRightStyle,
+            ExtendVerticalCorners(lastColumn
+                .Where(cell => cell.Element?.Style?.BorderRightStyle != BorderStyleValue.Hidden)
+                .Select(cell => (cell.BorderRect.Top, cell.BorderRect.Bottom)).ToList(),
+                IsVisibleBorder(lastColumn.OrderBy(cell => cell.BorderRect.Top).FirstOrDefault(),
+                    BorderSide.Right),
+                IsVisibleBorder(lastColumn.OrderByDescending(cell => cell.BorderRect.Bottom).FirstOrDefault(),
+                    BorderSide.Right)));
+
+        bool IsVisibleBorder(LayoutBox? cell, BorderSide side) =>
+            cell?.Element?.Style is not { } cellStyle ||
+            (side switch
+            {
+                BorderSide.Top => cellStyle.BorderTopStyle,
+                BorderSide.Right => cellStyle.BorderRightStyle,
+                BorderSide.Bottom => cellStyle.BorderBottomStyle,
+                _ => cellStyle.BorderLeftStyle
+            }) != BorderStyleValue.Hidden;
+
+        List<(float Start, float End)> ExtendHorizontalCorners(
+            List<(float Start, float End)> spans, bool extendStart, bool extendEnd)
+        {
+            if (spans.Count == 0) return spans;
+            spans.Sort((left, right) => left.Start.CompareTo(right.Start));
+            if (extendStart) spans[0] = (rect.Left, spans[0].End);
+            if (extendEnd) spans[^1] = (spans[^1].Start, rect.Right);
+            return spans;
+        }
+
+        List<(float Start, float End)> ExtendVerticalCorners(
+            List<(float Start, float End)> spans, bool extendStart, bool extendEnd)
+        {
+            if (spans.Count == 0) return spans;
+            spans.Sort((top, bottom) => top.Start.CompareTo(bottom.Start));
+            if (extendStart) spans[0] = (rect.Top, spans[0].End);
+            if (extendEnd) spans[^1] = (spans[^1].Start, rect.Bottom);
+            return spans;
+        }
+
+        void PaintHorizontal(BorderStyleValue borderStyle, Color color, float width,
+            BorderSide side, bool explicitlyStyled, IEnumerable<(float Start, float End)> spans)
+        {
+            if (borderStyle == BorderStyleValue.Hidden || width <= 0f) return;
+            foreach (var (start, end) in spans)
+            {
+                var clip = new RectangleF(start, side == BorderSide.Top ? rect.Top : rect.Bottom - width,
+                    Math.Max(0f, end - start), width);
+                PaintClippedSide(clip, borderStyle, color, width, side, explicitlyStyled);
+            }
+        }
+
+        void PaintVertical(BorderStyleValue borderStyle, Color color, float width,
+            BorderSide side, bool explicitlyStyled, IEnumerable<(float Start, float End)> spans)
+        {
+            if (borderStyle == BorderStyleValue.Hidden || width <= 0f) return;
+            foreach (var (start, end) in spans)
+            {
+                var clip = new RectangleF(side == BorderSide.Left ? rect.Left : rect.Right - width,
+                    start, width, Math.Max(0f, end - start));
+                PaintClippedSide(clip, borderStyle, color, width, side, explicitlyStyled);
+            }
+        }
+
+        void PaintClippedSide(RectangleF clip, BorderStyleValue borderStyle, Color color,
+            float width, BorderSide side, bool explicitlyStyled)
+        {
+            int state = g.Save();
+            try
+            {
+                g.SetClip(clip);
+                PaintBorderSide(g, rect, width, borderStyle, BorderColorOrBlack(color),
+                    side, Color.White, 0f, 0f, explicitlyStyled);
+            }
+            finally
+            {
+                g.Restore(state);
+            }
+        }
+    }
+
+    private static void PaintCssOuterBorder(SkiaRenderContext g, LayoutBox box, ComputedStyle style)
+    {
+        var rect = box.BorderRect;
+        PaintBorderSide(g, rect, box.BorderTop, style.BorderTopStyle,
+            BorderColorOrBlack(style.BorderTopColor), BorderSide.Top, Color.White, 0f, 0f,
+            style.OwnBorderTopStyle);
+        PaintBorderSide(g, rect, box.BorderRight, style.BorderRightStyle,
+            BorderColorOrBlack(style.BorderRightColor), BorderSide.Right, Color.White, 0f, 0f,
+            style.OwnBorderRightStyle);
+        PaintBorderSide(g, rect, box.BorderBottom, style.BorderBottomStyle,
+            BorderColorOrBlack(style.BorderBottomColor), BorderSide.Bottom, Color.White, 0f, 0f,
+            style.OwnBorderBottomStyle);
+        PaintBorderSide(g, rect, box.BorderLeft, style.BorderLeftStyle,
+            BorderColorOrBlack(style.BorderLeftColor), BorderSide.Left, Color.White, 0f, 0f,
+            style.OwnBorderLeftStyle);
     }
 
     /// <summary>3-D sunken frame placeholder for frame/iframe boxes.</summary>
@@ -1481,6 +1986,43 @@ public class Renderer
         PaintSimpleSide(g, rect, w, bStyle, color, side, nearCornerWidth, farCornerWidth);
     }
 
+    private static void PaintDottedSide(
+        SkiaRenderContext g, RectangleF rect, int diameter, Color color,
+        BorderSide side, float nearCornerWidth, float farCornerWidth)
+    {
+        bool horizontal = side is BorderSide.Top or BorderSide.Bottom;
+        float axisStart = horizontal ? rect.Left : rect.Top;
+        float axisEnd = horizontal ? rect.Right : rect.Bottom;
+        float crossStart = side switch
+        {
+            BorderSide.Top => rect.Top,
+            BorderSide.Bottom => rect.Bottom - diameter,
+            BorderSide.Left => rect.Left,
+            _ => rect.Right - diameter
+        };
+
+        float span = axisEnd - axisStart;
+        float pitch = diameter * 2f;
+        float inset = Math.Max(diameter,
+            Math.Max(nearCornerWidth, farCornerWidth));
+        float centerSpan = Math.Max(0f, span - 2f * inset);
+        int dotCount = Math.Max(1, (int)MathF.Floor(centerSpan / pitch) + 1);
+        float occupied = (dotCount - 1) * pitch;
+        float firstCenter = axisStart + (span - occupied) / 2f;
+        using var brush = CreateFillPaint(color);
+
+        for (int i = 0; i < dotCount; i++)
+        {
+            float center = firstCenter + i * pitch;
+            if (horizontal)
+                g.FillEllipse(brush, center - diameter / 2f,
+                    crossStart, diameter, diameter);
+            else
+                g.FillEllipse(brush, crossStart, center - diameter / 2f,
+                    diameter, diameter);
+        }
+    }
+
     /// <summary>Draws border scanlines with mitered endpoints and CSS-scaled dash spacing.</summary>
     private static void PaintSimpleSide(SkiaRenderContext g, RectangleF rect, int w,
         BorderStyleValue style, Color color, BorderSide side,
@@ -1492,7 +2034,6 @@ public class Renderer
         using var brush = CreateFillPaint(color);
         float dashLength = Math.Max(3f, w * 3f);
         float dashGap = Math.Max(2f, w * 2f);
-        float dotPitch = w * 2f;
         bool horizontal = side is BorderSide.Top or BorderSide.Bottom;
         float axisStart = horizontal ? rect.Left : rect.Top;
         float axisEnd = horizontal ? rect.Right : rect.Bottom;
@@ -1509,23 +2050,25 @@ public class Renderer
             g.SetClip(clip, SKClipOperation.Intersect);
             if (style == BorderStyleValue.Dotted)
             {
-                for (float position = axisStart; position < axisEnd; position += dotPitch)
-                {
-                    if (horizontal)
-                        g.FillEllipse(brush, position, crossStart, w, w);
-                    else
-                        g.FillEllipse(brush, crossStart, position, w, w);
-                }
+                PaintDottedSide(g, rect, w, color, side,
+                    nearCornerWidth, farCornerWidth);
             }
             else if (style == BorderStyleValue.Dashed)
             {
-                for (float position = axisStart; position < axisEnd; position += dashLength + dashGap)
+                float span = axisEnd - axisStart;
+                int dashCount = Math.Max(1,
+                    (int)MathF.Floor((span + dashGap) / (dashLength + dashGap)));
+                float paintedDashes = Math.Min(dashLength, span / dashCount);
+                float occupied = dashCount * paintedDashes +
+                    (dashCount - 1) * dashGap;
+                float position = axisStart + Math.Max(0f, (span - occupied) / 2f);
+                for (int i = 0; i < dashCount; i++)
                 {
-                    float length = Math.Min(dashLength, axisEnd - position);
                     if (horizontal)
-                        g.FillRectangle(brush, position, crossStart, length, w);
+                        g.FillRectangle(brush, position, crossStart, paintedDashes, w);
                     else
-                        g.FillRectangle(brush, crossStart, position, w, length);
+                        g.FillRectangle(brush, crossStart, position, w, paintedDashes);
+                    position += paintedDashes + dashGap;
                 }
             }
             else if (horizontal)
@@ -1720,6 +2263,15 @@ public class Renderer
                     case "img":
                         PaintImage(g, box, images);
                         return;
+                    case "object":
+                        if (box.Element.GetAttr("type")?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true &&
+                            !string.IsNullOrEmpty(box.Element.GetAttr("data")))
+                        {
+                            PaintObjectImage(g, box, images);
+                            return;
+                        }
+                        PaintFallbackContent(g, box);
+                        return;
                     case "input":
                         PaintInputElement(g, box, fonts, images, box.Element == focusedElement);
                         return;
@@ -1727,21 +2279,21 @@ public class Renderer
                         PaintSelect(g, box, fonts);
                         return;
                     case "textarea":
-                        PaintTextarea(g, box, fonts, box.Element == focusedElement);
+                        PaintTextArea(g, box, fonts, box.Element == focusedElement);
                         return;
                     case "button":
                         {
                             string label = (box.Element.InnerText ?? "").Trim();
                             if (label.Length == 0)
                                 label = box.Element.GetAttr("value") ?? "Button";
-                            PaintButton(g, box, fonts, GlyphSubstitution.MapGlyphs(label));
+                            PaintButton(g, box, fonts, GlyphSubstitution.MapGlyphs(label),
+                                box.Element);
                             return;
                         }
                     case "hr":
                         return;   // painted as border
                     case "applet":
                     case "embed":
-                    case "object":
                         if (SkipEmbeddedContent)
                         {
                             string? deferredSrc = box.Element.GetAttr("src");
@@ -1869,6 +2421,8 @@ public class Renderer
             _ => box.TextRun
         };
 
+        PaintTextShadows(g, contentRect.X, textY, text, font, style, fonts, sf);
+
         if (text.Contains("VISITOR") || text.Contains("COUNT") || text.Contains("0 0 0") || text.Contains("["))
             Retro96.DebugLog.Write($"[paintdbg] text=\"{text}\" box.X={box.X:F1} " +
                 $"contentRect.X={contentRect.X:F1} box.Width={box.Width:F1} " +
@@ -1946,6 +2500,150 @@ public class Renderer
                 advance += style.WordSpacing;
             drawX += advance;
         }
+    }
+
+    private readonly record struct TextShadowSpec(float OffsetX, float OffsetY, float Blur, Color Color);
+
+    private static void PaintTextShadows(SkiaRenderContext g, float x, float y, string text,
+        Font font, ComputedStyle style, FontCache fonts, SkiaTextOptions sf)
+    {
+        if (string.IsNullOrWhiteSpace(style.TextShadow))
+            return;
+
+        var shadows = ParseTextShadows(style.TextShadow, style);
+        for (int i = shadows.Count - 1; i >= 0; i--)
+        {
+            var shadow = shadows[i];
+            using var blur = shadow.Blur > 0f
+                ? SKMaskFilter.CreateBlur(SKBlurStyle.Normal, shadow.Blur)
+                : null;
+            using var paint = CreateFillPaint(shadow.Color);
+            paint.MaskFilter = blur;
+
+            int state = g.Save();
+            try
+            {
+                g.Canvas.Translate(shadow.OffsetX, shadow.OffsetY);
+                if (style.FontVariant == FontVariantValue.SmallCaps)
+                    PaintSmallCapsText(g, x, y, text, style, fonts, shadow.Color, sf);
+                else if (Math.Abs(style.LetterSpacing) > 0.001f ||
+                         Math.Abs(style.WordSpacing) > 0.001f)
+                    PaintSpacedText(g, x, y, text, font, paint, style, sf);
+                else
+                    g.DrawString(text, font, paint, x, y, sf);
+            }
+            finally
+            {
+                g.Restore(state);
+            }
+        }
+    }
+
+    private static List<TextShadowSpec> ParseTextShadows(string value, ComputedStyle style)
+    {
+        var result = new List<TextShadowSpec>();
+        foreach (string layer in SplitShadowLayers(value))
+        {
+            var tokens = SplitShadowTokens(layer);
+            var lengths = new List<float>(3);
+            Color color = style.Color;
+            bool hasColor = false;
+
+            foreach (string token in tokens)
+            {
+                if (TryParseShadowLength(token, style.FontSize, out float length))
+                {
+                    lengths.Add(length);
+                    continue;
+                }
+
+                Color parsed = token.Equals("currentColor", StringComparison.OrdinalIgnoreCase)
+                    ? style.Color
+                    : ComputedStyle.ParseColor(token, Color.Empty);
+                if (parsed == Color.Empty || hasColor)
+                    continue;
+                color = parsed;
+                hasColor = true;
+            }
+
+            if (lengths.Count < 2)
+                continue;
+
+            result.Add(new TextShadowSpec(lengths[0], lengths[1],
+                lengths.Count > 2 ? Math.Max(0f, lengths[2]) : 0f, color));
+        }
+        return result;
+    }
+
+    private static List<string> SplitShadowLayers(string value)
+    {
+        var layers = new List<string>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '(') depth++;
+            else if (value[i] == ')') depth = Math.Max(0, depth - 1);
+            else if (value[i] == ',' && depth == 0)
+            {
+                layers.Add(value[start..i].Trim());
+                start = i + 1;
+            }
+        }
+        layers.Add(value[start..].Trim());
+        return layers;
+    }
+
+    private static List<string> SplitShadowTokens(string value)
+    {
+        var tokens = new List<string>();
+        int depth = 0, start = -1;
+        for (int i = 0; i <= value.Length; i++)
+        {
+            char c = i < value.Length ? value[i] : ' ';
+            if (c == '(')
+            {
+                depth++;
+                if (start < 0) start = i;
+            }
+            else if (c == ')')
+            {
+                depth = Math.Max(0, depth - 1);
+            }
+            else if (char.IsWhiteSpace(c) && depth == 0)
+            {
+                if (start >= 0)
+                {
+                    tokens.Add(value[start..i]);
+                    start = -1;
+                }
+            }
+            else if (start < 0)
+            {
+                start = i;
+            }
+        }
+        return tokens;
+    }
+
+    private static bool TryParseShadowLength(string token, float fontSize, out float value)
+    {
+        value = 0f;
+        int numericEnd = 0;
+        if (token.Length > 0 && token[0] is '+' or '-') numericEnd++;
+        bool hasDigit = false;
+        while (numericEnd < token.Length &&
+               (char.IsDigit(token[numericEnd]) || token[numericEnd] == '.'))
+        {
+            hasDigit |= char.IsDigit(token[numericEnd]);
+            numericEnd++;
+        }
+        if (!hasDigit) return false;
+
+        string unit = token[numericEnd..];
+        if (unit.Length > 0 && unit is not ("px" or "pt" or "pc" or "in" or "cm" or "mm" or "em" or "ex"))
+            return false;
+        value = ComputedStyle.ParseLength(token, fontSize, 0f);
+        return float.IsFinite(value);
     }
 
     /// <summary>True for a text run made only of collapsible whitespace.</summary>
@@ -2056,6 +2754,15 @@ public class Renderer
         return fonts.Resolve(family, size, (int)style.FontWeight, italic, oblique);
     }
 
+    private static Font ResolveFontForText(FontCache fonts, ComputedStyle style, string text)
+    {
+        var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
+        float size = style.FontSize > 0f ? style.FontSize : 16f;
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        return fonts.ResolveForText(family, size, (int)style.FontWeight, italic, oblique, text);
+    }
+
     /// <summary>Unset/transparent text colours render black, not invisible.</summary>
     private static Color EffectiveTextColor(ComputedStyle style)
     {
@@ -2117,6 +2824,20 @@ public class Renderer
         }
     }
 
+    private void PaintObjectImage(SkiaRenderContext g, LayoutBox box, ImageCache images)
+    {
+        if (!BrowserRuntime.ImagesEnabled) return;
+
+        var rect = box.ContentRect;
+        string data = box.Element!.GetAttr("data")!;
+        string absolute = ImageCache.ResolveUrl(data, _baseUrl);
+        if (TryGetFrame(images, absolute, out var frame) && frame != null)
+            g.DrawImage(frame, rect);
+        else
+            DrawBrokenImage(g, box, new RectangleF(rect.X, rect.Y,
+                Math.Max(16f, rect.Width), Math.Max(16f, rect.Height)));
+    }
+
     private bool TryGetFrame(ImageCache images, string absoluteUrl, out Bitmap? frame)
     {
         if (!BrowserRuntime.ImagesEnabled)
@@ -2156,7 +2877,7 @@ public class Renderer
         g.FillRectangle(FillPaintFor(Color.LightGray), br);
         g.DrawRectangle(StrokePaintFor(Color.DarkGray), br.X, br.Y, br.Width - 1, br.Height - 1);
 
-        float iconSize = Math.Min(20f, Math.Max(12f, br.Height - 4f));
+        float iconSize = Math.Min(20f, Math.Max(12f, Math.Min(br.Width, br.Height) - 4f));
         using var p = CreateStrokePaint(Color.Red, 2);
         g.DrawLine(p, br.X + 2, br.Y + 2,
             br.X + iconSize - 2, br.Y + iconSize - 2);
@@ -2166,14 +2887,17 @@ public class Renderer
         // Keep alt text readable beside the broken-image marker instead of
         // drawing it over the marker and losing most of the label.
         string? alt = box.Element?.GetAttr("alt");
-        if (!string.IsNullOrEmpty(alt) && br.Width > iconSize + 8)
+        if (!string.IsNullOrEmpty(alt))
         {
-            var sf = new SkiaTextOptions(
-                SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: true);
             using var font = new Font(FontFamily.GenericSansSerif, 11f, FontStyle.Regular,
                 GraphicsUnit.Pixel);
-            var textRect = new RectangleF(br.X + iconSize + 3, br.Y + 1,
-                br.Width - iconSize - 5, Math.Max(1f, br.Height - 2));
+            float textX = br.X + iconSize + 3;
+            float textWidth = Math.Max(br.Right - textX,
+                font.SkFont.MeasureText(alt) + 1f);
+            var sf = new SkiaTextOptions(
+                SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: false);
+            var textRect = new RectangleF(textX, br.Y + 1,
+                textWidth, Math.Max(1f, br.Height - 2));
             g.DrawString(alt, font, FillPaintFor(Color.DarkGray), textRect, sf);
         }
     }
@@ -2531,6 +3255,7 @@ public class Renderer
         using (var faceBrush = CreateFillPaint(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2, bgColor);
+        PaintAuthoredControlBorder(g, box, style, bgColor);
 
         // Focused fields get a dark ring just inside the bevel — otherwise
         // there is no visual difference between focused and unfocused.
@@ -2742,9 +3467,13 @@ public class Renderer
                             optionFace.X + 1 + r.Indent, rowY,
                             Math.Max(1f, optionFace.Width - 2 - r.Indent), rowH);
 
+                    var optionStyle = opt.Style;
+                    Color optionColor = optionStyle != null
+                        ? EffectiveTextColor(optionStyle)
+                        : Color.Black;
                     using var brush = CreateFillPaint(disabled
-                        ? Color.Gray : selected ? Color.White : Color.Black);
-                    g.DrawString(GlyphSubstitution.MapGlyphs((opt.InnerText ?? "").Trim()), font, brush,
+                        ? Color.Gray : selected ? Color.White : optionColor);
+                    g.DrawString(GlyphSubstitution.MapGlyphs(r.Label), font, brush,
                         optionFace.X + 3 + r.Indent, rowY + 1);
                 }
             }
@@ -2762,10 +3491,13 @@ public class Renderer
         var selectedOpt = options.FirstOrDefault(o => o.HasAttr("selected"))
                        ?? options.FirstOrDefault();
         string text = selectedOpt != null
-            ? GlyphSubstitution.MapGlyphs(selectedOpt.InnerText?.Trim() ?? "")
+            ? GlyphSubstitution.MapGlyphs(SelectRowModel.OptionLabel(selectedOpt))
             : "";
 
-        using var brush2 = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+        Color selectedOptionColor = selectedOpt?.Style is { } selectedStyle
+            ? EffectiveTextColor(selectedStyle)
+            : Color.Black;
+        using var brush2 = CreateFillPaint(disabled ? Color.Gray : selectedOptionColor);
         var sf = new SkiaTextOptions(
             SKTextAlign.Left, verticalCenter: true, clip: true, ellipsis: true);
 
@@ -2809,7 +3541,28 @@ public class Renderer
             Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
-    private void PaintTextarea(SkiaRenderContext g, LayoutBox box, FontCache fonts,
+    private static void PaintAuthoredControlBorder(SkiaRenderContext g, LayoutBox box,
+        ComputedStyle style, Color background)
+    {
+        if (style.OwnBorderTopStyle)
+            PaintBorderSide(g, box.BorderRect, box.BorderTop, style.BorderTopStyle,
+                BorderColorOrBlack(style.BorderTopColor), BorderSide.Top, background,
+                box.BorderLeft, box.BorderRight, authoredStyle: true);
+        if (style.OwnBorderRightStyle)
+            PaintBorderSide(g, box.BorderRect, box.BorderRight, style.BorderRightStyle,
+                BorderColorOrBlack(style.BorderRightColor), BorderSide.Right, background,
+                box.BorderTop, box.BorderBottom, authoredStyle: true);
+        if (style.OwnBorderBottomStyle)
+            PaintBorderSide(g, box.BorderRect, box.BorderBottom, style.BorderBottomStyle,
+                BorderColorOrBlack(style.BorderBottomColor), BorderSide.Bottom, background,
+                box.BorderLeft, box.BorderRight, authoredStyle: true);
+        if (style.OwnBorderLeftStyle)
+            PaintBorderSide(g, box.BorderRect, box.BorderLeft, style.BorderLeftStyle,
+                BorderColorOrBlack(style.BorderLeftColor), BorderSide.Left, background,
+                box.BorderTop, box.BorderBottom, authoredStyle: true);
+    }
+
+    private void PaintTextArea(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                bool isFocused)
     {
         var elem = box.Element!;
@@ -2872,12 +3625,17 @@ public class Renderer
         // wrapping does not jump when focus moves away.
         if (isFocused && layout.NeedsVerticalScrollbar)
             PaintTextareaScrollbar(g, face, layout.Lines.Count,
-                layout.VisibleLines, scrollLine);
+                layout.VisibleLines, scrollLine,
+                authoredBg ? bgColor : Color.FromArgb(0xE0, 0xE0, 0xE0));
+        if (isFocused && layout.NeedsHorizontalScrollbar)
+            PaintTextareaHorizontalScrollbar(g, face, layout.TextWidth,
+                layout.TextViewportWidth, scrollX, layout.NeedsVerticalScrollbar,
+                authoredBg ? bgColor : Color.FromArgb(0xE0, 0xE0, 0xE0));
     }
 
     private static void PaintTextareaScrollbar(SkiaRenderContext g, RectangleF face,
                                                int lineCount, int visibleLines,
-                                               int scrollLine)
+                                               int scrollLine, Color trackColor)
     {
         if (lineCount <= visibleLines || face.Width < 16 || face.Height < 8) return;
 
@@ -2885,7 +3643,7 @@ public class Renderer
         float trackX = face.Right - barWidth + 1f;
         float trackY = face.Top + 1f;
         float trackHeight = Math.Max(1f, face.Height - 2f);
-        using var track = CreateFillPaint(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var track = CreateFillPaint(trackColor);
         using var thumb = CreateFillPaint(Color.FromArgb(0x80, 0x80, 0x80));
         g.FillRectangle(track, trackX, trackY, barWidth - 1f, trackHeight);
 
@@ -2899,7 +3657,31 @@ public class Renderer
             Math.Max(1f, barWidth - 3f), thumbHeight);
     }
 
-    private void PaintButton(SkiaRenderContext g, LayoutBox box, FontCache fonts, string text)
+    private static void PaintTextareaHorizontalScrollbar(
+        SkiaRenderContext g, RectangleF face, float textWidth,
+        float viewportWidth, float scrollX, bool hasVerticalScrollbar,
+        Color trackColor)
+    {
+        const float barHeight = 14f;
+        if (face.Width < 16f || face.Height < barHeight + 8f) return;
+        float trackWidth = Math.Max(1f,
+            face.Width - 2f - (hasVerticalScrollbar ? barHeight : 0f));
+        float trackY = face.Bottom - barHeight + 1f;
+        float thumbWidth = Math.Clamp(
+            trackWidth * viewportWidth / Math.Max(viewportWidth, textWidth),
+            10f, Math.Max(10f, trackWidth - 2f));
+        float travel = Math.Max(0f, trackWidth - 2f - thumbWidth);
+        float maxScroll = Math.Max(0f, textWidth - viewportWidth);
+        float thumbX = face.Left + 1f +
+            travel * Math.Clamp(scrollX / Math.Max(1f, maxScroll), 0f, 1f);
+        using var track = CreateFillPaint(trackColor);
+        using var thumb = CreateFillPaint(Color.FromArgb(0x80, 0x80, 0x80));
+        g.FillRectangle(track, face.Left + 1f, trackY, trackWidth, barHeight - 1f);
+        g.FillRectangle(thumb, thumbX, trackY + 1f, thumbWidth, barHeight - 3f);
+    }
+
+    private void PaintButton(SkiaRenderContext g, LayoutBox box, FontCache fonts,
+                             string text, DomElement? richContent = null)
     {
         var style = box.Element!.Style ?? FallbackStyle(box.Element);
         var rect = box.BorderRect;
@@ -2920,19 +3702,109 @@ public class Renderer
         else
             PaintRaisedRect(g, rect, 2, bevelFace);
 
-        var font = ResolveFont(fonts, style);
-        using var brush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
         // MUST be GenericTypographic like InlineLayout._sf: a plain Skia text options
         // adds ~1/6em of side padding that layout never reserved, which pushed
         // the label past the face and got it ellipsized ("Submit...").
         // Win95 buttons clip, they never ellipsize.
-        var sf = ButtonText;
-
         // Centre on the whole border box (minus the 2px bevel) instead of the
         // content rect, which layout may have shrunk by padding.
         var textRect = RectangleF.Inflate(rect, -2, -2);
         if (pressed) textRect.Offset(1, 1);
-        g.DrawString(text, font, brush, textRect, sf);
+        if (richContent != null)
+            PaintRichButtonContent(g, richContent, fonts, textRect, disabled, text);
+        else
+        {
+            var font = ResolveFont(fonts, style);
+            using var brush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+            g.DrawString(text, font, brush, textRect, ButtonText);
+        }
+    }
+
+    private void PaintRichButtonContent(SkiaRenderContext g, DomElement button,
+                                       FontCache fonts, RectangleF rect, bool disabled,
+                                       string fallbackText)
+    {
+        var runs = new List<(string Text, Font Font, ComputedStyle Style, float Width)>();
+        bool previousWasSpace = true;
+        void Visit(DomNode node, ComputedStyle inherited)
+        {
+            if (node is DomText textNode)
+            {
+                var normalized = new System.Text.StringBuilder();
+                foreach (char c in textNode.Data)
+                {
+                    if (char.IsWhiteSpace(c))
+                    {
+                        if (!previousWasSpace)
+                        {
+                            normalized.Append(' ');
+                            previousWasSpace = true;
+                        }
+                    }
+                    else
+                    {
+                        normalized.Append(c);
+                        previousWasSpace = false;
+                    }
+                }
+                if (normalized.Length > 0)
+                {
+                    string text = GlyphSubstitution.MapGlyphs(normalized.ToString());
+                    var font = ResolveFont(fonts, inherited);
+                    runs.Add((text, font, inherited, font.SkFont.MeasureText(text)));
+                }
+                return;
+            }
+
+            if (node is DomElement element)
+                inherited = element.Style ?? inherited;
+            foreach (var child in node.Children)
+                Visit(child, inherited);
+        }
+
+        var buttonStyle = button.Style ?? FallbackStyle(button);
+        Visit(button, buttonStyle);
+        if (runs.Count > 0 && runs[^1].Text.EndsWith(' '))
+        {
+            var last = runs[^1];
+            string trimmed = last.Text.TrimEnd();
+            runs[^1] = (trimmed, last.Font, last.Style,
+                last.Font.SkFont.MeasureText(trimmed));
+        }
+        if (runs.Count == 0)
+        {
+            var font = ResolveFont(fonts, button.Style ?? FallbackStyle(button));
+            runs.Add((fallbackText, font, button.Style ?? FallbackStyle(button),
+                font.SkFont.MeasureText(fallbackText)));
+        }
+
+        float totalWidth = runs.Sum(run => run.Width);
+        float lineHeight = runs.Max(run => run.Font.GetHeight());
+        float top = rect.Top + Math.Max(0f, (rect.Height - lineHeight) * 0.5f);
+        float x = rect.Left + Math.Max(0f, (rect.Width - totalWidth) * 0.5f);
+        int clipState = g.Save();
+        try
+        {
+            g.SetClip(rect, SKClipOperation.Intersect);
+            foreach (var run in runs)
+            {
+                if (run.Text.Length == 0) continue;
+                Color color = disabled ? Color.Gray : EffectiveTextColor(run.Style);
+                using var brush = CreateFillPaint(color);
+                g.DrawString(run.Text, run.Font, brush, x, top, TypographicText);
+                if (run.Style.TextDecoration.HasFlag(TextDecoration.Underline))
+                {
+                    using var underline = CreateFillPaint(color);
+                    float y = top + run.Font.GetHeight() - 1f;
+                    g.DrawLine(underline, x, y, x + run.Width, y);
+                }
+                x += run.Width;
+            }
+        }
+        finally
+        {
+            g.Restore(clipState);
+        }
     }
 
     // ── List markers ─────────────────────────────────────────────────────
@@ -2957,9 +3829,6 @@ public class Renderer
             listStyle.ListStyleType = parent.Style.ListStyleType;
         if (!style.OwnListStyleImage && parent.Style != null)
             listStyle.ListStyleImage = parent.Style.ListStyleImage;
-        if (listStyle.ListStyleType == ListStyleType.None)
-            return;
-
         var font = ResolveFont(fonts, style);
         Color markerColor = EffectiveTextColor(style);
 
@@ -2970,6 +3839,25 @@ public class Renderer
             markerY = firstContent.Y;
         bool inside = box.ListMarkerInside;
         float insideX = box.X + box.BorderLeft + box.PaddingLeft + 2f;
+
+        if (style.GeneratedBefore is { Display: DisplayValue.Marker } markerStyle)
+        {
+            string markerText = markerStyle.ResolvedGeneratedContentText ??
+                LayoutEngine.GeneratedContentText(markerStyle.Content ?? [], elem);
+            if (markerText.Length > 0)
+            {
+                using var markerFont = ResolveFont(fonts, markerStyle);
+                using var markerBrush = CreateFillPaint(EffectiveTextColor(markerStyle));
+                float markerOffset = Math.Max(0f, markerStyle.MarkerOffset);
+                float markerWidth = g.MeasureString(markerText, markerFont).Width;
+                g.DrawString(markerText, markerFont, markerBrush,
+                    box.X - markerOffset - markerWidth, markerY, TypographicText);
+            }
+            return;
+        }
+
+        if (listStyle.ListStyleType == ListStyleType.None)
+            return;
 
         if (listStyle.ListStyleImage is { Length: > 0 } imageUrl)
         {
@@ -3011,21 +3899,15 @@ public class Renderer
                 "A" => MarkerLetters(index, 'A'),
                 "i" => MarkerRoman(index, lowercase: true),
                 "I" => MarkerRoman(index, lowercase: false),
-                _ => listStyle.ListStyleType switch
-                {
-                    ListStyleType.LowerAlpha => MarkerLetters(index, 'a'),
-                    ListStyleType.UpperAlpha => MarkerLetters(index, 'A'),
-                    ListStyleType.LowerRoman => MarkerRoman(index, lowercase: true),
-                    ListStyleType.UpperRoman => MarkerRoman(index, lowercase: false),
-                    _ => index.ToString()
-                }
+                _ => FormatListMarker(listStyle.ListStyleType, index)
             };
 
             string label = marker + ".";
             var sf = TypographicText;
-            var size = g.MeasureString(label, font);
+            var markerFont = ResolveFontForText(fonts, style, label);
+            var size = g.MeasureString(label, markerFont);
             float markerRight = inside ? insideX + 16f : box.X - 4;
-            g.DrawString(label, font, brush, markerRight - size.Width, markerY, sf);
+            g.DrawString(label, markerFont, brush, markerRight - size.Width, markerY, sf);
             return;
         }
 
@@ -3055,7 +3937,12 @@ public class Renderer
                     ListStyleType.Square => "square",
                     ListStyleType.Disc => "disc",
                     ListStyleType.LowerAlpha or ListStyleType.UpperAlpha or
-                    ListStyleType.LowerRoman or ListStyleType.UpperRoman or ListStyleType.Decimal => "number",
+                    ListStyleType.LowerGreek or ListStyleType.LowerRoman or
+                    ListStyleType.UpperRoman or ListStyleType.Decimal or
+                    ListStyleType.DecimalLeadingZero or ListStyleType.Armenian or
+                    ListStyleType.Georgian or ListStyleType.Hebrew or
+                    ListStyleType.Hiragana or ListStyleType.Katakana or
+                    ListStyleType.HiraganaIroha or ListStyleType.KatakanaIroha => "number",
                     _ => (type ?? "").ToLowerInvariant()
                 };
             }
@@ -3090,17 +3977,11 @@ public class Renderer
                         siblingElement.Style?.Display == DisplayValue.ListItem)
                         index++;
                 }
-                string marker = listStyle.ListStyleType switch
-                {
-                    ListStyleType.LowerAlpha => MarkerLetters(index, 'a'),
-                    ListStyleType.UpperAlpha => MarkerLetters(index, 'A'),
-                    ListStyleType.LowerRoman => MarkerRoman(index, lowercase: true),
-                    ListStyleType.UpperRoman => MarkerRoman(index, lowercase: false),
-                    _ => index.ToString()
-                };
+                string marker = FormatListMarker(listStyle.ListStyleType, index);
                 string label = marker + ".";
-                var size = g.MeasureString(label, font);
-                g.DrawString(label, font, brush, box.X - size.Width - 4f, markerY, TypographicText);
+                var markerFont = ResolveFontForText(fonts, style, label);
+                var size = g.MeasureString(label, markerFont);
+                g.DrawString(label, markerFont, brush, box.X - size.Width - 4f, markerY, TypographicText);
                 return;
             }
 
@@ -3120,6 +4001,109 @@ public class Renderer
         }
     }
 
+    internal static string FormatListMarker(ListStyleType type, int index)
+    {
+        if (type == ListStyleType.DecimalLeadingZero && index is >= 0 and < 10)
+            return "0" + index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        return type switch
+        {
+            ListStyleType.LowerAlpha => MarkerLetters(index, 'a'),
+            ListStyleType.UpperAlpha => MarkerLetters(index, 'A'),
+            ListStyleType.LowerGreek => MarkerGreek(index),
+            ListStyleType.LowerRoman => MarkerRoman(index, lowercase: true),
+            ListStyleType.UpperRoman => MarkerRoman(index, lowercase: false),
+            ListStyleType.Armenian => MarkerAlphabeticNumber(index,
+                ["Ա", "Բ", "Գ", "Դ", "Ե", "Զ", "Է", "Ը", "Թ"],
+                ["Ժ", "Ի", "Լ", "Խ", "Ծ", "Կ", "Հ", "Ձ", "Ղ"],
+                ["Ճ", "Մ", "Յ", "Ն", "Շ", "Ո", "Չ", "Պ", "Ջ"],
+                ["Ռ", "Ս", "Վ", "Տ", "Ր", "Ց", "Ւ", "Փ", "Ք"]),
+            ListStyleType.Georgian => MarkerGeorgian(index),
+            ListStyleType.Hebrew => MarkerHebrew(index),
+            ListStyleType.Hiragana => MarkerSequence(index, "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"),
+            ListStyleType.Katakana => MarkerSequence(index, "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン"),
+            ListStyleType.HiraganaIroha => MarkerSequence(index, "いろはにほへとちりぬるをわかよたれそつねならむうゐのおくやまけふこえてあさきゆめみしゑひもせす"),
+            ListStyleType.KatakanaIroha => MarkerSequence(index, "イロハニホヘトチリヌルヲワカヨタレソツネナラムウヰノオクヤマケフコエテアサキユメミシヱヒモセス"),
+            _ => index.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+    }
+
+    private static string MarkerSequence(int index, string sequence) =>
+        index > 0 && index <= sequence.Length ? sequence[index - 1].ToString() :
+            index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string MarkerAlphabeticNumber(int index, string[] ones, string[] tens,
+        string[] hundreds, string[] thousands)
+    {
+        if (index is < 1 or > 9999)
+            return index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        string[][] places = [ones, tens, hundreds, thousands];
+        var result = new System.Text.StringBuilder();
+        for (int place = 0; index > 0; place++, index /= 10)
+        {
+            int digit = index % 10;
+            if (digit > 0)
+                result.Insert(0, places[place][digit - 1]);
+        }
+        return result.ToString();
+    }
+
+    private static string MarkerGeorgian(int index)
+    {
+        string[] symbols =
+        [
+            "ა","ბ","გ","დ","ე","ვ","ზ","ჱ","თ","ი","კ","ლ","მ","ნ","ჲ","ო","პ","ჟ",
+            "რ","ს","ტ","ჳ","უ","ფ","ქ","ღ","ყ","შ","ჩ","ც","ძ","წ","ჭ","ხ","ჴ","ჯ","ჰ","ჵ"
+        ];
+        int[] values =
+        [
+            1,2,3,4,5,6,7,8,9,10,20,30,40,50,60,70,80,90,
+            100,200,300,400,500,600,700,800,900,
+            1000,2000,3000,4000,5000,6000,7000,8000,9000,10000,10000,10000
+        ];
+        if (index is < 1 or > 19999)
+            return index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var result = new System.Text.StringBuilder();
+        for (int i = values.Length - 1; i >= 0; i--)
+            while (index >= values[i])
+            {
+                result.Append(symbols[i]);
+                index -= values[i];
+            }
+        return result.ToString();
+    }
+
+    private static string MarkerHebrew(int index)
+    {
+        if (index is < 1 or > 9999)
+            return index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        string result = index % 1000 == 0 ? string.Empty : MarkerHebrewUnderThousand(index % 1000);
+        int thousands = index / 1000;
+        while (thousands-- > 0)
+            result = MarkerHebrewUnderThousand(1000) + result;
+        return result;
+    }
+
+    private static string MarkerHebrewUnderThousand(int value)
+    {
+        string[] symbols =
+        [
+            "א","ב","ג","ד","ה","ו","ז","ח","ט","י","כ","ל","מ","נ","ס","ע","פ","צ","ק",
+            "ר","ש","ת"
+        ];
+        int[] values = [1,2,3,4,5,6,7,8,9,10,20,30,40,50,60,70,80,90,100,200,300,400];
+        if (value % 100 == 15) return MarkerHebrewUnderThousand(value - 9) + "ו";
+        if (value % 100 == 16) return MarkerHebrewUnderThousand(value - 9) + "ז";
+        var result = new System.Text.StringBuilder();
+        for (int i = values.Length - 1; i >= 0; i--)
+            while (value >= values[i])
+            {
+                result.Append(symbols[i]);
+                value -= values[i];
+            }
+        return result.ToString();
+    }
+
     private static string MarkerLetters(int index, char startChar)
     {
         // 1→a, 26→z, 27→aa (the era clamped at zz for sanity)
@@ -3132,6 +4116,21 @@ public class Renderer
             index /= 26;
         }
         return sb.ToString();
+    }
+
+    private static string MarkerGreek(int index)
+    {
+        string[] letters = ["α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ",
+                            "ν", "ξ", "ο", "π", "ρ", "σ", "τ", "υ", "φ", "χ", "ψ", "ω"];
+        if (index <= 0) index = 1;
+        var result = new System.Text.StringBuilder();
+        while (index > 0)
+        {
+            index--;
+            result.Insert(0, letters[index % letters.Length]);
+            index /= letters.Length;
+        }
+        return result.ToString();
     }
 
     private static string MarkerRoman(int index, bool lowercase)

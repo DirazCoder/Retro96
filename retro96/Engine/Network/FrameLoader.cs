@@ -541,15 +541,20 @@ public static class FileUrls
 // Byte-body → text decoding (charset sniffing) — shared by Form1's top-level
 // response processing and FrameLoader.  Formerly private inside Form1;
 // identical logic (BOM → strict UTF-8 validity → declared charset →
-// Latin-1 default), plus the meta-charset re-scan the top-level path uses.
+// Windows-1252 fallback), plus the meta-charset re-scan the top-level path uses.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// <summary>Decodes response bodies with era-correct charset behaviour.</summary>
 public static class BodyDecoder
 {
+    static BodyDecoder()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+    }
+
     /// <summary>
     /// Decodes a response body with deterministic precedence: BOM, explicit
-    /// transport/override charset, then a conservative UTF-8/Latin-1 sniff.
+    /// transport/override charset, then a conservative UTF-8/Windows-1252 sniff.
     /// A meta declaration is used only when no stronger external declaration
     /// was supplied, so a page cannot silently reinterpret an explicit
     /// non-UTF-8 HTTP charset.
@@ -559,6 +564,7 @@ public static class BodyDecoder
     {
         string? explicitCharset = (overrideCharset ?? declaredCharset)
             ?.Trim().Trim('"', '\'');
+        explicitCharset = NormalizeCharsetLabel(explicitCharset);
         bool hasExplicitCharset = !string.IsNullOrEmpty(explicitCharset) &&
                                   !explicitCharset.Equals("unknown", StringComparison.OrdinalIgnoreCase);
 
@@ -576,7 +582,7 @@ public static class BodyDecoder
         try { text = Encoding.GetEncoding(charset).GetString(body); }
         catch
         {
-            try { text = Encoding.GetEncoding("iso-8859-1").GetString(body); }
+            try { text = Encoding.GetEncoding("windows-1252").GetString(body); }
             catch { text = Encoding.Latin1.GetString(body); }
         }
 
@@ -585,6 +591,7 @@ public static class BodyDecoder
         if (!hasExplicitCharset && !HasAnyBom(body))
         {
             string? meta = ScanMetaCharset(text);
+            meta = NormalizeCharsetLabel(meta);
             if (meta?.Length > 0 &&
                 !meta.Equals(charset, StringComparison.OrdinalIgnoreCase))
             {
@@ -603,10 +610,22 @@ public static class BodyDecoder
         (body.Length >= 2 && ((body[0] == 0xFF && body[1] == 0xFE) ||
                               (body[0] == 0xFE && body[1] == 0xFF)));
 
+    private static string? NormalizeCharsetLabel(string? charset)
+    {
+        if (charset == null) return null;
+        string label = charset.Trim();
+        return label.ToLowerInvariant() switch
+        {
+            "iso-8859-1" or "iso8859-1" or "latin1" or "latin-1" or
+            "ascii" or "us-ascii" or "ansi_x3.4-1968" => "windows-1252",
+            _ => label
+        };
+    }
+
     /// <summary>
     /// BOM → utf-8/utf-16; else strict UTF-8 validation with a multi-byte
-    /// requirement (pure ASCII sniffs as iso-8859-1 harmlessly — identical
-    /// decoding); else iso-8859-1 (the 1996 default).
+    /// requirement (pure ASCII sniffs as Windows-1252 harmlessly — identical
+    /// decoding); otherwise use the web-compatible Windows-1252 fallback.
     /// </summary>
     public static string SniffCharset(byte[] body)
     {
@@ -617,7 +636,8 @@ public static class BodyDecoder
         if (body.Length >= 2 && body[0] == 0xFE && body[1] == 0xFF)
             return "unicode";
 
-        // Strict UTF-8 walk: any invalid sequence → Latin-1.
+        // Strict UTF-8 walk: any invalid sequence → the web-compatible
+        // Windows-1252 fallback for legacy single-byte content.
         bool sawMultiByte = false;
         int i = 0;
         while (i < body.Length)
@@ -629,19 +649,19 @@ public static class BodyDecoder
             if ((b & 0xE0) == 0xC0) seqLen = 2;
             else if ((b & 0xF0) == 0xE0) seqLen = 3;
             else if ((b & 0xF8) == 0xF0) seqLen = 4;
-            else return "iso-8859-1";                       // stray continuation/invalid lead
+            else return "windows-1252";                       // stray continuation/invalid lead
 
             if (i + seqLen > body.Length)
-                return "iso-8859-1";                        // truncated sequence
+                return "windows-1252";                        // truncated sequence
             for (int k = 1; k < seqLen; k++)
                 if ((body[i + k] & 0xC0) != 0x80)
-                    return "iso-8859-1";
+                    return "windows-1252";
             if (seqLen == 2 && b < 0xC2)
-                return "iso-8859-1";                        // overlong encoding
+                return "windows-1252";                        // overlong encoding
             sawMultiByte = true;
             i += seqLen;
         }
-        return sawMultiByte ? "utf-8" : "iso-8859-1";
+        return sawMultiByte ? "utf-8" : "windows-1252";
     }
 
     /// <summary>

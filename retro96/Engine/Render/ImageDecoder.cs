@@ -18,7 +18,8 @@ namespace Retro96.Engine.Render;
 public record DecodedImage(
     IReadOnlyList<Bitmap> Frames,
     IReadOnlyList<int> DelaysMs,
-    bool IsAnimated);
+    bool IsAnimated,
+    bool IsBroken = false);
 
 /// <summary>
 /// Decodes image bytes into a DecodedImage (single frame or animated).
@@ -66,7 +67,7 @@ public static class ImageDecoder
     }
 
     private static DecodedImage Broken() =>
-        new([BrokenImageIcon.Create()], [0], false);
+        new([BrokenImageIcon.Create()], [0], false, true);
 
     private static bool IsGif(byte[] data) =>
         data.Length >= 6 &&

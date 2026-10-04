@@ -1119,6 +1119,26 @@ public class NamedBugHeadlessTests
     }
 
     [Fact]
+    public void Bug_TextareaWrapOffRequestsHorizontalScrollbar()
+    {
+        using var surface = new Retro96.Drawing.Bitmap(1, 1);
+        using var g = Retro96.Drawing.Graphics.FromBitmap(surface);
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Courier New", "monospace" },
+            13f, false, false);
+        var layout = TextareaOverlay.CalculateLayout(g, new string('x', 60), font,
+            faceWidth: 90f, faceHeight: 38f, wrapOff: true);
+
+        Check.That(layout.NeedsHorizontalScrollbar,
+            "unwrapped text wider than the textarea requests a horizontal scrollbar");
+        Check.That(!layout.NeedsVerticalScrollbar,
+            "a single unwrapped line does not request a vertical scrollbar");
+        Check.That(layout.TextWidth > layout.TextViewportWidth,
+            "horizontal scrolling has a positive content overflow");
+        Check.Done();
+    }
+
+    [Fact]
     public void Bug_EmbedCodeTextareaLayoutBreak()
     {
         var (doc, root) = LayoutHarness.Parse(

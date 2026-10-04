@@ -1401,40 +1401,11 @@ public static class HtmlParser
                     }
             }
 
-            // Normal collapsing.  NBSP (U+00A0) must NOT be collapsed even
-            // though .NET's char.IsWhiteSpace reports it as whitespace.
-            var sb = new StringBuilder(data.Length);
-            bool lastWasWhitespace = false;
-            foreach (char c in data)
-            {
-                if (IsHtmlWhitespace(c))
-                {
-                    if (!lastWasWhitespace)
-                    {
-                        sb.Append(' ');
-                        lastWasWhitespace = true;
-                    }
-                }
-                else
-                {
-                    sb.Append(c);
-                    lastWasWhitespace = false;
-                }
-            }
-
-            string collapsed = sb.ToString();
-            if (collapsed.Length == 0)
-                return;
-
-            // Drop a lone space that is the first child of a common block
-            // container — leading indentation noise.
-            if (collapsed == " " && parent.Children.Count == 0 &&
-                parent.TagName is "p" or "div" or "h1" or "h2" or "h3" or "h4"
-                                 or "h5" or "h6" or "li" or "td" or "th"
-                                 or "blockquote" or "body" or "center" or "form")
-                return;
-
-            parent.AppendChild(new DomText(collapsed));
+            // Keep source whitespace until CSS has been resolved.  white-space
+            // is author-settable on any element, so collapsing here would
+            // irreversibly discard line breaks and indentation for `pre`.
+            // Normal-flow collapsing is performed by layout instead.
+            parent.AppendChild(new DomText(data));
         }
 
         /// <summary>

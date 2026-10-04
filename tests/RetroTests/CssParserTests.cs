@@ -104,6 +104,27 @@ public class CssParserTests
     }
 
     [Fact]
+    public void PaintOnlyHoverRulesDoNotRequireDocumentRelayout()
+    {
+        var doc = ParseAndResolve("<a id='go' href='/x'>go</a>",
+            "a:hover { color: red; background-color: #eeeeee; }");
+        var link = doc.AllTags("a")[0];
+        doc.HoveredElement = link;
+
+        Check.That(StyleResolver.HasMatchingHoverRule(doc),
+            "the hovered link matches its author rule");
+        Check.That(!StyleResolver.HasLayoutAffectingHoverRule(doc),
+            "color and background hover changes can repaint without relayout");
+
+        doc.AllTags("style")[0].Children.OfType<DomText>().First().Data =
+            "a:hover { color: red; padding-left: 8px; }";
+        StyleResolver.Resolve(doc, 800);
+        Check.That(StyleResolver.HasLayoutAffectingHoverRule(doc),
+            "a hover rule that changes padding still requires relayout");
+        Check.Done();
+    }
+
+    [Fact]
     public void IndexedStyleRulesKeepTypeClassIdAndCombinatorMatches()
     {
         var doc = ParseAndResolve(
@@ -482,6 +503,45 @@ public class CssParserTests
     }
 
     [Fact]
+    public void ChildCombinatorOnlyMatchesDirectChildren()
+    {
+        var doc = ParseAndResolve(
+            "<p class='first-demo'><span id='child'>direct</span>" +
+            "<span><span id='grandchild'>nested</span></span></p>",
+            "p.first-demo > span { color: #CC0000; }");
+        var child = doc.AllTags("span").First(e => e.GetAttr("id") == "child");
+        var grandchild = doc.AllTags("span").First(e => e.GetAttr("id") == "grandchild");
+        var selector = CssSelector.ParseSelector("p.first-demo > span")[0];
+
+        Check.That(selector.Matches(child), "child combinator matches the direct span");
+        Check.That(!selector.Matches(grandchild), "child combinator does not match the nested span");
+        Check.That(child.Style!.Color == Color.FromArgb(0xCC, 0, 0),
+            "direct child receives its rule color");
+        // color is inherited normally: a correct child-combinator match on
+        // the parent span also gives its nested span the inherited color.
+        Check.That(grandchild.Style!.Color == Color.FromArgb(0xCC, 0, 0),
+            "nested span inherits color from its direct-span parent");
+        Check.Done();
+    }
+
+    [Fact]
+    public void WhitespaceAttributeSelectorAppliesToOption()
+    {
+        var doc = ParseAndResolve(
+            "<select><option id='beta' value='beta'>beta</option>" +
+            "<option id='other' value='alpha gamma'>other</option></select>",
+            "option[value~='beta'] { color: #808000; }");
+        var beta = doc.AllTags("option").First(e => e.GetAttr("id") == "beta");
+        var other = doc.AllTags("option").First(e => e.GetAttr("id") == "other");
+
+        Check.That(beta.Style!.Color == Color.FromArgb(0x80, 0x80, 0),
+            "~= rule resolves onto matching option");
+        Check.That(other.Style!.Color != Color.FromArgb(0x80, 0x80, 0),
+            "~= rule does not match unrelated option value");
+        Check.Done();
+    }
+
+    [Fact]
     public void LangPseudoClassMatchesOwnAndInheritedLanguage()
     {
         var doc = ParseAndResolve(
@@ -523,6 +583,28 @@ public class CssParserTests
         Check.That(visitedActive.Matches(link), ":visited and :active co-exist once visited");
         Check.That(!linkActive.Matches(link), ":link:active no longer matches after visiting");
         doc.ActiveElement = null;
+        Check.Done();
+    }
+
+    [Fact]
+    public void ActiveLinkRuleChangesComputedColorWhenStateIsResolved()
+    {
+        var doc = ParseAndResolve(
+            "<a id='go' href='/x'>go</a>",
+            "a:link { color: #0000FF; } a:link:active { color: #FF0000; }");
+        var link = doc.AllTags("a")[0];
+        Check.That(link.Style!.Color == Color.FromArgb(0, 0, 0xFF),
+            "unpressed link uses the link color");
+
+        doc.ActiveElement = link;
+        StyleResolver.Resolve(doc, 800);
+        Check.That(link.Style!.Color == Color.FromArgb(0xFF, 0, 0),
+            "active link resolves its active author color");
+
+        doc.ActiveElement = null;
+        StyleResolver.Resolve(doc, 800);
+        Check.That(link.Style!.Color == Color.FromArgb(0, 0, 0xFF),
+            "releasing the pointer restores the link color");
         Check.Done();
     }
 

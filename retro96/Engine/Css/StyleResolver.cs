@@ -28,7 +28,8 @@ namespace Retro96.Engine.Css;
 /// </summary>
 public static class StyleResolver
 {
-    private sealed record HoverRuleEntry(IReadOnlyList<CssSelector> Selectors);
+    private sealed record HoverSelectorEntry(CssSelector Selector, bool RequiresLayout);
+    private sealed record HoverRuleEntry(IReadOnlyList<HoverSelectorEntry> Selectors);
 
     private static readonly ConditionalWeakTable<DomDocument, HoverRuleEntry> HoverRuleCache = new();
     private static readonly object HoverRuleCacheLock = new();
@@ -47,8 +48,31 @@ public static class StyleResolver
 
         foreach (var element in HoveredElementAndAncestors(doc.HoveredElement))
         {
-            foreach (var selector in entry.Selectors)
-                if (selector.Matches(element))
+            foreach (var entrySelector in entry.Selectors)
+                if (entrySelector.Selector.Matches(element))
+                    return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns whether the current hovered element matches a rule that can
+    /// change layout. Paint-only hover changes can update styles and redraw
+    /// without rebuilding the document's layout tree.
+    /// </summary>
+    internal static bool HasLayoutAffectingHoverRule(DomDocument doc)
+    {
+        ArgumentNullException.ThrowIfNull(doc);
+        if (!HoverRuleCache.TryGetValue(doc, out var entry))
+            entry = CacheHoverRules(doc, ReadAuthorRules(doc));
+        if (doc.HoveredElement == null) return false;
+
+        foreach (var element in HoveredElementAndAncestors(doc.HoveredElement))
+        {
+            foreach (var entrySelector in entry.Selectors)
+                if (entrySelector.RequiresLayout &&
+                    entrySelector.Selector.Matches(element))
                     return true;
         }
 
@@ -101,10 +125,14 @@ public static class StyleResolver
 
     private static HoverRuleEntry CacheHoverRules(DomDocument doc, IEnumerable<CssRule> rules)
     {
-        var selectors = rules.SelectMany(rule => rule.Selectors)
-            .Where(selector => selector.Parts.Any(part =>
-                part.Kind == PartType.PseudoClass &&
-                part.Value?.Equals("hover", StringComparison.OrdinalIgnoreCase) == true))
+        var selectors = rules
+            .SelectMany(rule => rule.Selectors
+                .Where(selector => selector.Parts.Any(part =>
+                    part.Kind == PartType.PseudoClass &&
+                    part.Value?.Equals("hover", StringComparison.OrdinalIgnoreCase) == true))
+                .Select(selector => new HoverSelectorEntry(
+                    selector, rule.Declarations.Any(declaration =>
+                        !IsPaintOnlyHoverProperty(declaration.Property)))))
             .ToArray();
         var entry = new HoverRuleEntry(selectors);
         lock (HoverRuleCacheLock)
@@ -114,6 +142,15 @@ public static class StyleResolver
             return entry;
         }
     }
+
+    private static bool IsPaintOnlyHoverProperty(string property) =>
+        property.Trim().ToLowerInvariant() is
+            "color" or "background" or "background-color" or "background-image" or
+            "background-repeat" or "background-position" or "background-attachment" or
+            "text-decoration" or "text-shadow" or "cursor" or "outline" or
+            "outline-color" or "outline-style" or "outline-width" or
+            "border-color" or "border-top-color" or "border-right-color" or
+            "border-bottom-color" or "border-left-color";
 
     // ── Document colour accessors (used by the Renderer) ─────────────────
 
@@ -197,6 +234,9 @@ public static class StyleResolver
         var ruleIndex = new AuthorRuleIndex(authorRules, doc);
         int activeBaseFontSize = doc.BaseFontSize;
         ResolveNode(doc, null, ruleIndex, doc, viewportWidth, ref activeBaseFontSize);
+        int quoteDepth = 0;
+        ResolveGeneratedContent(
+            doc, new Dictionary<string, List<int>>(StringComparer.Ordinal), ref quoteDepth);
 
         float textSizeScale = float.IsFinite(doc.TextSizeScale)
             ? Math.Clamp(doc.TextSizeScale, 0.5f, 3f)
@@ -207,6 +247,174 @@ public static class StyleResolver
                 if (element.Style != null)
                     element.Style.FontSize *= textSizeScale;
         }
+    }
+
+    private static readonly QuotePair[] DefaultQuotes =
+    [
+        new("\u201c", "\u201d"),
+        new("\u2018", "\u2019")
+    ];
+
+    private static void ResolveGeneratedContent(
+        DomNode node, Dictionary<string, List<int>> counters, ref int quoteDepth)
+    {
+        if (node is DomElement element)
+        {
+            var style = element.Style;
+            var resetScopes = new List<string>();
+            ApplyCounterActions(counters, style?.CounterReset, reset: true, resetScopes);
+            ApplyCounterActions(counters, style?.CounterIncrement, reset: false);
+            ResolvePseudoContent(element, style?.GeneratedBefore, counters, ref quoteDepth);
+
+            foreach (var child in element.Children)
+                ResolveGeneratedContent(child, counters, ref quoteDepth);
+
+            ResolvePseudoContent(element, style?.GeneratedAfter, counters, ref quoteDepth);
+            PopCounterScopes(counters, resetScopes);
+            return;
+        }
+
+        foreach (var child in node.Children)
+            ResolveGeneratedContent(child, counters, ref quoteDepth);
+    }
+
+    private static void ResolvePseudoContent(DomElement element, ComputedStyle? pseudo,
+        Dictionary<string, List<int>> counters, ref int quoteDepth)
+    {
+        if (pseudo?.Content == null)
+            return;
+
+        var resetScopes = new List<string>();
+        ApplyCounterActions(counters, pseudo.CounterReset, reset: true, resetScopes);
+        ApplyCounterActions(counters, pseudo.CounterIncrement, reset: false);
+
+        var text = new System.Text.StringBuilder();
+        IReadOnlyList<QuotePair> quotePairs =
+            (pseudo.Quotes ?? element.Style?.Quotes) is { Count: > 0 } authoredQuotes
+            ? authoredQuotes
+            : DefaultQuotes;
+
+        foreach (var token in pseudo.Content)
+        {
+            switch (token.Type)
+            {
+                case "string":
+                    text.Append(token.Text);
+                    break;
+                case "attr":
+                    text.Append(element.GetAttr(token.Text) ?? string.Empty);
+                    break;
+                case "counter":
+                    {
+                        var pieces = token.Text.Split(',', 2);
+                        string name = pieces[0].Trim();
+                        int value = CurrentCounter(counters, name);
+                        string format = pieces.Length > 1 ? pieces[1].Trim() : "decimal";
+                        text.Append(FormatCounter(value, format));
+                        break;
+                    }
+                case "counters":
+                    {
+                        var pieces = token.Text.Split(',', 2);
+                        string name = pieces[0].Trim();
+                        string separator = pieces.Length > 1
+                            ? pieces[1].Trim().Trim('\'', '"')
+                            : string.Empty;
+                        if (counters.TryGetValue(name, out var values))
+                            text.Append(string.Join(separator,
+                                values.Select(value => FormatCounter(value, "decimal"))));
+                        break;
+                    }
+                case "open-quote":
+                    text.Append(quotePairs[Math.Min(quoteDepth, quotePairs.Count - 1)].Open);
+                    quoteDepth++;
+                    break;
+                case "close-quote":
+                    quoteDepth = Math.Max(0, quoteDepth - 1);
+                    text.Append(quotePairs[Math.Min(quoteDepth, quotePairs.Count - 1)].Close);
+                    break;
+                case "no-open-quote":
+                    quoteDepth++;
+                    break;
+                case "no-close-quote":
+                    quoteDepth = Math.Max(0, quoteDepth - 1);
+                    break;
+            }
+        }
+
+        pseudo.ResolvedGeneratedContentText = text.ToString();
+        PopCounterScopes(counters, resetScopes);
+    }
+
+    private static void ApplyCounterActions(
+        Dictionary<string, List<int>> counters, List<CounterAction>? actions,
+        bool reset, List<string>? resetScopes = null)
+    {
+        if (actions == null) return;
+        foreach (var action in actions)
+        {
+            if (reset)
+            {
+                if (!counters.TryGetValue(action.Name, out var values))
+                    counters[action.Name] = values = new List<int>();
+                values.Add(action.Value);
+                resetScopes?.Add(action.Name);
+            }
+            else
+            {
+                if (!counters.TryGetValue(action.Name, out var values) || values.Count == 0)
+                    counters[action.Name] = values = new List<int> { action.Value };
+                else
+                    values[^1] += action.Value;
+            }
+        }
+    }
+
+    private static int CurrentCounter(Dictionary<string, List<int>> counters, string name) =>
+        counters.TryGetValue(name, out var values) && values.Count > 0 ? values[^1] : 0;
+
+    private static void PopCounterScopes(
+        Dictionary<string, List<int>> counters, List<string> resetScopes)
+    {
+        for (int i = resetScopes.Count - 1; i >= 0; i--)
+        {
+            string name = resetScopes[i];
+            if (!counters.TryGetValue(name, out var values) || values.Count == 0)
+                continue;
+            values.RemoveAt(values.Count - 1);
+            if (values.Count == 0)
+                counters.Remove(name);
+        }
+    }
+
+    private static string FormatCounter(int value, string format) =>
+        format.ToLowerInvariant() switch
+        {
+            "upper-roman" => FormatRomanCounter(value, lowercase: false),
+            "lower-roman" => FormatRomanCounter(value, lowercase: true),
+            _ => value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+
+    private static string FormatRomanCounter(int value, bool lowercase)
+    {
+        if (value is < 1 or > 3999)
+            return value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        ReadOnlySpan<(int Value, string Numeral)> numerals =
+        [
+            (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+            (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+            (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")
+        ];
+        var result = new System.Text.StringBuilder();
+        foreach (var (amount, numeral) in numerals)
+            while (value >= amount)
+            {
+                result.Append(numeral);
+                value -= amount;
+            }
+        string text = result.ToString();
+        return lowercase ? text.ToLowerInvariant() : text;
     }
 
     private sealed class AuthorRuleIndex
@@ -507,8 +715,14 @@ public static class StyleResolver
             case "nav":
             case "figure":
             case "figcaption":
+                style.Display = DisplayValue.Block;
+                break;
             case "fieldset":
                 style.Display = DisplayValue.Block;
+                style.BorderTopWidth = style.BorderRightWidth =
+                    style.BorderBottomWidth = style.BorderLeftWidth = 2f;
+                style.BorderTopStyle = style.BorderRightStyle =
+                    style.BorderBottomStyle = style.BorderLeftStyle = BorderStyleValue.Groove;
                 break;
             case "legend":
                 // IE5 renders the legend inset into the fieldset's top
@@ -697,16 +911,14 @@ public static class StyleResolver
                 break;
             case "q":
                 // CSS2 UA stylesheet: Q:before { content: open-quote }
-                // Q:after { content: close-quote }. The quote keywords need
-                // a nesting-depth registry, so the UA default seeds literal
-                // string tokens instead (the era-simple rendering).
+                // Q:after { content: close-quote }.
                 style.GeneratedBefore = new ComputedStyle
                 {
-                    Content = new List<ContentToken> { new ContentToken("string", "\u201c") }
+                    Content = new List<ContentToken> { new ContentToken("open-quote", "") }
                 };
                 style.GeneratedAfter = new ComputedStyle
                 {
-                    Content = new List<ContentToken> { new ContentToken("string", "\u201d") }
+                    Content = new List<ContentToken> { new ContentToken("close-quote", "") }
                 };
                 break;
 
@@ -763,7 +975,11 @@ public static class StyleResolver
             case "input":
             case "button":
             case "select":
+                style.FontFamily = ["Arial", "Helvetica", "sans-serif"];
+                style.Display = DisplayValue.InlineBlock;
+                break;
             case "textarea":
+                style.FontFamily = ["Courier New", "monospace"];
                 style.Display = DisplayValue.InlineBlock;
                 break;
 

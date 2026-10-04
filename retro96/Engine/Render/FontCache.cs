@@ -82,6 +82,27 @@ public class FontCache : IDisposable
         }
     }
 
+    public Font ResolveForText(IEnumerable<string>? familyList, float sizePx, int weight,
+        bool italic, bool oblique, string text)
+    {
+        var font = Resolve(familyList, sizePx, weight, italic, oblique);
+        if (font.SkFont.ContainsGlyphs(text))
+            return font;
+
+        foreach (string fallback in new[]
+        {
+            "Yu Gothic", "MS Gothic", "Meiryo", "Noto Sans CJK JP",
+            "Noto Sans JP", "Arial Unicode MS"
+        })
+        {
+            var candidate = Resolve([fallback], sizePx, weight, italic, oblique);
+            if (candidate.SkFont.ContainsGlyphs(text))
+                return candidate;
+        }
+
+        return font;
+    }
+
     // caller holds _lock
     private FontFamily GetOrCreateFamily(string name)
     {

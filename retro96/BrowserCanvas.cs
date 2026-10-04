@@ -28,8 +28,8 @@ using LayoutEngineApi = Retro96.Engine.Layout.LayoutEngine;
 /// style); Enter/Tab/arrows claimed via IsInputKey so KeyDown fires;
 /// double-click selects a word; text fields support a caret, drag
 /// selection and Ctrl+A/C/V/X; buttons get a Win95 press-in bevel while
-/// held; wheel scrolling is immediate; releasing the mouse OFF a pressed
-/// button cancels activation (browser behaviour).
+/// held; overflow wheel capture activates after a two-second hover; releasing
+/// the mouse OFF a pressed button cancels activation (browser behaviour).
 /// </summary>
 public class BrowserCanvas : SKGLControl, IVbsScriptHost
 {
@@ -149,6 +149,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private bool _blinkVisible = true;
     private DomElement? _lastHoveredElement;
     private FrameView? _lastHoveredFrame;
+    private const long OverflowScrollHoverDelayMs = 1000;
+    private DomElement? _hoveredOverflowScrollElement;
+    private long _overflowScrollHoverStartedAt;
 
     // Focused text field only: editable <input> or <textarea>.
     // Other form controls never enter this text-editing focus mode.
@@ -189,6 +192,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private bool _textareaScrollbarDragging;
     private FrameView? _textareaScrollbarDragFrame;
     private float _textareaScrollbarGrabOffset;
+    private bool _textareaHorizontalScrollbarDragging;
+    private FrameView? _textareaHorizontalScrollbarDragFrame;
+    private float _textareaHorizontalScrollbarGrabOffset;
 
     // Multiple-select listboxes have a real in-control vertical scrollbar.
     // Keep the DOM control's scroll position separate from the page scroll.
@@ -460,6 +466,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         KeyDown += OnDevToolsKeyDown;
         KeyDown += OnEmbeddedKeyDown;
         KeyUp += OnEmbeddedKeyUp;
+        KeyUp += OnCanvasKeyUp;
         KeyPress += OnCanvasKeyPress;
         Enter += (_, _) => SendEmbeddedFocus(true);
         Leave += (_, _) => SendEmbeddedFocus(false);
@@ -560,6 +567,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             _fieldFindScrollXs.Clear();
             _textareaScrollbarDragging = false;
             _textareaScrollbarDragFrame = null;
+            _textareaHorizontalScrollbarDragging = false;
+            _textareaHorizontalScrollbarDragFrame = null;
             _selectScrollOffsets.Clear();
             _selectScrollbarDragging = false;
             _selectScrollbarDragSelect = null;
@@ -586,6 +595,23 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                      or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown)
             return true;
         return base.IsInputKey(keyData);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        // WinForms can route Up/Down through command-key preprocessing before
+        // the normal KeyDown event, even when IsInputKey claims them. Keep
+        // textarea caret navigation ahead of the parent form's scroll/focus
+        // handling; other controls and keys retain the normal route.
+        if (_focusedInput?.TagName == "textarea" &&
+            (keyData & Keys.KeyCode) is Keys.Up or Keys.Down)
+        {
+            var args = new KeyEventArgs(keyData);
+            HandleFieldKey(args);
+            return args.Handled;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     private void DisposeDisplayLists()
@@ -801,6 +827,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _fieldFindScrollXs.Clear();
         _textareaScrollbarDragging = false;
         _textareaScrollbarDragFrame = null;
+        _textareaHorizontalScrollbarDragging = false;
+        _textareaHorizontalScrollbarDragFrame = null;
         _selectScrollOffsets.Clear();
         _selectScrollbarDragging = false;
         _selectScrollbarDragSelect = null;
@@ -891,6 +919,27 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         if (_document == null || _rootBox == null) return;
         ReflowDocumentToStableViewport();
+    }
+
+    /// <summary>
+    /// Forces styles and layout to reflect the supplied document before a
+    /// script reads layout-dependent DOM properties. During parser-time
+    /// scripts this document has not yet been installed as the current page,
+    /// so build its boxes directly without changing the displayed page.
+    /// </summary>
+    public void EnsureLayoutForDomRead(DomDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        if (ReferenceEquals(_document, document) && _rootBox != null)
+        {
+            ReflowDocumentToStableViewport();
+            return;
+        }
+
+        var viewport = GetLayoutViewportSize();
+        Engine.Css.StyleResolver.Resolve(document, viewport.Width);
+        _ = LayoutEngineApi.BuildLayoutTree(document, viewport.Width, viewport.Height);
     }
 
     public bool ApplyEditedSource(string markup)
@@ -1966,7 +2015,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             _fontCache, _imageCache, width, height, 0f, 0f,
             _lastHoveredElement, _blinkVisible, _showBoxOutlines, _focusedInput,
             renderScale: 1f, clearBackground: true, gpuContext: gpuContext,
-            skipAnimatedContent: true, skipAnimatedImages: true);
+            skipAnimatedContent: true, skipAnimatedImages: true,
+            skipFixedPositioned: true);
         return recorder.EndRecording();
     }
 
@@ -1994,7 +2044,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             showBoxOutlines: _showBoxOutlines,
             focusedElement: _focusedInputFrame == view ? _focusedInput : null,
             renderScale: 1f, clearBackground: true, gpuContext: gpuContext,
-            skipAnimatedContent: true, skipAnimatedImages: true);
+            skipAnimatedContent: true, skipAnimatedImages: true,
+            skipFixedPositioned: true);
         return recorder.EndRecording();
     }
 
@@ -2255,6 +2306,28 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     animationRendererForPaint);
             }
 
+            if (_rootBox != null && _document != null && _fontCache != null &&
+                _imageCache != null && _resourceLoader != null)
+            {
+                var fixedRenderer = CreateRenderer();
+                if (fixedRenderer != null)
+                {
+                    int fixedState = canvas.Save();
+                    try
+                    {
+                        canvas.Translate(-scrollX, -scrollY);
+                        fixedRenderer.RenderFixedToCanvas(canvas, _rootBox, _document,
+                            _fontCache, _imageCache, logicalVw, logicalVh,
+                            scrollX, scrollY, _lastHoveredElement, _blinkVisible,
+                            _focusedInput, currentGpuContext);
+                    }
+                    finally
+                    {
+                        canvas.RestoreToCount(fixedState);
+                    }
+                }
+            }
+
             using var g = Graphics.FromCanvas(canvas, GRContext);
             int overlayState = g.Save();
             try
@@ -2338,6 +2411,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             {
                 PaintAnimatedImages(canvas, animationRenderer, animatedImages,
                     view.Document, gpuContext, frameContentViewport);
+            }
+            if (animationRenderer != null && view.RootBox != null)
+            {
+                animationRenderer.RenderFixedToCanvas(canvas, view.RootBox, view.Document,
+                    _fontCache!, _imageCache!, frameBox.Width, frameBox.Height,
+                    view.Scroll.X, view.Scroll.Y,
+                    view.Document.HoveredElement, _blinkVisible,
+                    _focusedInputFrame == view ? _focusedInput : null, gpuContext);
             }
         }
         finally
@@ -2493,7 +2574,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             float offsetX = destRect.X - frameView.Scroll.X;
             float offsetY = destRect.Y - frameView.Scroll.Y;
 
-            var selectedSpans = new List<RectangleF>();
+            var selectedSpans = new List<(LayoutBox Box, RectangleF Span)>();
             for (int i = firstIndex; i <= lastIndex; i++)
             {
                 var box = ordered[i];
@@ -2537,15 +2618,16 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (b <= a) continue;
 
                 foreach (var span in SelectionVisualSpans(g, box, a, b))
-                    selectedSpans.Add(new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height));
+                    selectedSpans.Add((box,
+                        new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height)));
             }
 
-            foreach (var span in selectedSpans)
+            foreach (var (box, span) in selectedSpans)
             {
-                var draw = new RectangleF(span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
-                var clipped = IntersectRect(draw, contentRect);
-                if (clipped.Width > 0.01f && clipped.Height > 0.01f)
-                    g.FillRectangle(selBrush, clipped.X, clipped.Y, clipped.Width, clipped.Height);
+                foreach (var visible in VisibleOverlayRects(
+                             box, span, offsetX, offsetY, contentRect))
+                    g.FillRectangle(selBrush, visible.X, visible.Y,
+                        visible.Width, visible.Height);
             }
         }
         finally
@@ -2702,9 +2784,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 TryGetSelectionAnimationOffset(box, root, out float animatedX))
             {
                 foreach (var span in SelectionVisualSpans(g, box, 0, box.TextRun!.Length))
-                    g.FillRectangle(selBrush,
-                        span.X + offsetX + animatedX, span.Y + offsetY,
-                        span.Width, span.Height);
+                {
+                    foreach (var visible in VisibleOverlayRects(
+                                 box, span, offsetX + animatedX, offsetY))
+                        g.FillRectangle(selBrush, visible.X, visible.Y,
+                            visible.Width, visible.Height);
+                }
             }
 
             if (!includeFields || box.BoxType != BoxType.Replaced ||
@@ -2781,7 +2866,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     float width = g.MeasureString(text[start..end], font, int.MaxValue, lineFormat).Width;
                     float lineY = textY + i * lineHeight;
                     g.FillRectangle(highlight, textX, lineY, Math.Max(1f, width), lineHeight);
-                    g.DrawString(text[start..end], font, selectedText,
+                    g.DrawStringWithoutLegacyStrokeBoost(text[start..end], font, selectedText,
                         new RectangleF(textX, lineY, Math.Max(1f, width), lineHeight), lineFormat);
                 }
                 return;
@@ -3015,11 +3100,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 continue;
             foreach (var span in SelectionVisualSpans(g, box, 0, box.TextRun!.Length))
             {
-                var draw = new RectangleF(
-                    span.X + offsetX + animatedX, span.Y + offsetY,
-                    span.Width, span.Height);
-                if (draw.Width > 0.01f && draw.Height > 0.01f)
-                    g.FillRectangle(brush, draw.X, draw.Y, draw.Width, draw.Height);
+                foreach (var visible in VisibleOverlayRects(
+                             box, span, offsetX + animatedX, offsetY))
+                    g.FillRectangle(brush, visible.X, visible.Y,
+                        visible.Width, visible.Height);
             }
         }
     }
@@ -3072,7 +3156,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             offsetY = frameDest.Y - _selectionFrame.Scroll.Y;
         }
 
-        var selectedSpans = new List<RectangleF>();
+        var selectedSpans = new List<(LayoutBox Box, RectangleF Span)>();
         for (int i = firstIndex; i <= lastIndex; i++)
         {
             var box = ordered[i];
@@ -3114,10 +3198,180 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             if (b < a) (a, b) = (b, a);
             if (b <= a) continue;
             foreach (var span in SelectionVisualSpans(g, box, a, b))
-                selectedSpans.Add(new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height));
+                selectedSpans.Add((box,
+                    new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height)));
         }
-        foreach (var span in selectedSpans)
-            g.FillRectangle(selBrush, span.X + offsetX, span.Y + offsetY, span.Width, span.Height);
+        foreach (var (box, span) in selectedSpans)
+        {
+            foreach (var visible in VisibleOverlayRects(box, span, offsetX, offsetY))
+                g.FillRectangle(selBrush, visible.X, visible.Y,
+                    visible.Width, visible.Height);
+        }
+    }
+
+    private static IReadOnlyList<RectangleF> VisibleOverlayRects(
+        LayoutBox box, RectangleF span, float offsetX, float offsetY,
+        RectangleF? additionalClip = null)
+    {
+        var initial = ClipOverlayRectToAncestors(box, span, offsetX, offsetY);
+        if (additionalClip is { } clip)
+            initial = IntersectRect(initial, clip);
+        if (initial.Width <= 0.01f || initial.Height <= 0.01f)
+            return Array.Empty<RectangleF>();
+
+        var visible = new List<RectangleF> { initial };
+        var pathChild = box;
+        while (pathChild.Parent is { } parent)
+        {
+            var orderedSiblings = parent.Children
+                .Select((sibling, index) => (sibling, index))
+                .OrderBy(item => item.sibling.Element?.Style?.ZIndex ?? 0)
+                .ThenBy(item => item.index)
+                .Select(item => item.sibling)
+                .ToList();
+            int childIndex = orderedSiblings.IndexOf(pathChild);
+            if (childIndex >= 0)
+            {
+                for (int i = childIndex + 1; i < orderedSiblings.Count; i++)
+                {
+                    foreach (var surface in EnumerateSelectionTree(orderedSiblings[i]))
+                    {
+                        if (!HasOpaqueSelectionOccluder(surface))
+                            continue;
+
+                        var cover = ClipOverlayRectToAncestors(
+                            surface, surface.BorderRect, offsetX, offsetY);
+                        if (cover.Width <= 0.01f || cover.Height <= 0.01f)
+                            continue;
+                        visible = visible.SelectMany(rect => SubtractRect(rect, cover))
+                            .ToList();
+                        if (visible.Count == 0)
+                            return Array.Empty<RectangleF>();
+                    }
+                }
+            }
+            pathChild = parent;
+        }
+
+        return visible;
+    }
+
+    private static bool HasOpaqueSelectionOccluder(LayoutBox box)
+    {
+        var element = box.Element;
+        var style = element?.Style;
+        if (element == null || style == null)
+            return false;
+        if (style.BackgroundColor.A == 255)
+            return true;
+        return !string.IsNullOrWhiteSpace(element.GetAttr("bgcolor"));
+    }
+
+    private static IEnumerable<RectangleF> SubtractRect(RectangleF source, RectangleF cover)
+    {
+        var overlap = IntersectRect(source, cover);
+        if (overlap.Width <= 0.01f || overlap.Height <= 0.01f)
+        {
+            yield return source;
+            yield break;
+        }
+
+        if (overlap.Top > source.Top)
+            yield return new RectangleF(source.Left, source.Top,
+                source.Width, overlap.Top - source.Top);
+        if (overlap.Bottom < source.Bottom)
+            yield return new RectangleF(source.Left, overlap.Bottom,
+                source.Width, source.Bottom - overlap.Bottom);
+        if (overlap.Left > source.Left)
+            yield return new RectangleF(source.Left, overlap.Top,
+                overlap.Left - source.Left, overlap.Height);
+        if (overlap.Right < source.Right)
+            yield return new RectangleF(overlap.Right, overlap.Top,
+                source.Right - overlap.Right, overlap.Height);
+    }
+
+    private static RectangleF ClipOverlayRectToAncestors(
+        LayoutBox box, RectangleF rect, float offsetX, float offsetY)
+    {
+        var clippingAncestors = new List<LayoutBox>();
+        for (var current = box; current != null; current = current.Parent)
+        {
+            if (current.Element is not { } element ||
+                !ReferenceEquals(element.LayoutBox, current) ||
+                element.Style is not { } style)
+                continue;
+
+            bool clipsOverflow = style.Overflow != OverflowValue.Visible;
+            bool clipsRect = style.Position != PositionValue.Static && style.Clip.HasValue;
+            if (clipsOverflow || clipsRect)
+                clippingAncestors.Add(current);
+        }
+
+        if (clippingAncestors.Count == 0)
+        {
+            rect.Offset(offsetX, offsetY);
+            return rect;
+        }
+
+        clippingAncestors.Reverse();
+        float outerScrollX = 0f;
+        float outerScrollY = 0f;
+        float totalScrollX = 0f;
+        float totalScrollY = 0f;
+        foreach (var ancestor in clippingAncestors)
+        {
+            if (ancestor.Element?.Style?.Overflow == OverflowValue.Scroll)
+            {
+                totalScrollX += ancestor.ScrollOffsetX;
+                totalScrollY += ancestor.ScrollOffsetY;
+            }
+        }
+
+        rect.Offset(offsetX - totalScrollX, offsetY - totalScrollY);
+        foreach (var ancestor in clippingAncestors)
+        {
+            var style = ancestor.Element!.Style!;
+            if (style.Position != PositionValue.Static && style.Clip is { } clipRect)
+            {
+                var bounds = ancestor.BorderRect;
+                float left = clipRect.Left ?? 0f;
+                float top = clipRect.Top ?? 0f;
+                float right = clipRect.Right ?? bounds.Width;
+                float bottom = clipRect.Bottom ?? bounds.Height;
+                var clip = new RectangleF(
+                    bounds.X + left + offsetX - outerScrollX,
+                    bounds.Y + top + offsetY - outerScrollY,
+                    Math.Max(0f, right - left),
+                    Math.Max(0f, bottom - top));
+                rect = IntersectRect(rect, clip);
+                if (rect.Width <= 0.01f || rect.Height <= 0.01f)
+                    return RectangleF.Empty;
+            }
+
+            if (style.Overflow != OverflowValue.Visible)
+            {
+                var clip = ancestor.PaddingRect;
+                clip.Offset(offsetX - outerScrollX, offsetY - outerScrollY);
+                if (style.Overflow == OverflowValue.Scroll)
+                {
+                    bool hasHorizontalOverflow = ancestor.Descendants()
+                        .Any(child => child.BorderRect.Right > ancestor.PaddingRect.Right + 0.5f);
+                    clip.Width = Math.Max(0f, clip.Width - 14f);
+                    if (hasHorizontalOverflow)
+                        clip.Height = Math.Max(0f, clip.Height - 14f);
+                }
+                rect = IntersectRect(rect, clip);
+                if (rect.Width <= 0.01f || rect.Height <= 0.01f)
+                    return RectangleF.Empty;
+            }
+
+            if (style.Overflow == OverflowValue.Scroll)
+            {
+                outerScrollX += ancestor.ScrollOffsetX;
+                outerScrollY += ancestor.ScrollOffsetY;
+            }
+        }
+        return rect;
     }
 
     private static RectangleF IntersectRect(RectangleF a, RectangleF b)
@@ -3738,7 +3992,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 float x1 = x + MeasureTo(from);
                 float x2 = x + MeasureTo(to);
                 if (x2 <= visibleLeft || x1 >= visibleRight) return;
-                g.DrawString(text.Substring(from, to - from), font, brush,
+                g.DrawStringWithoutLegacyStrokeBoost(text.Substring(from, to - from), font, brush,
                     new RectangleF(x1, face.Y - scrollY,
                         Math.Max(x2 - x1, 1f), face.Height), focusedTextFormat);
             }
@@ -3924,7 +4178,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
                 if (geo.NeedsVerticalScrollbar)
                     PaintTextareaScrollbar(g, new RectangleF(face.X, face.Y, face.Width, face.Height),
-                        geo.Lines.Count, lineHeight, scrollLine);
+                        geo.Lines.Count, lineHeight, scrollLine,
+                        style != null && style.OwnBackground &&
+                        style.BackgroundColor != Color.Transparent
+                            ? backgroundColor
+                            : Color.FromArgb(0xE0, 0xE0, 0xE0));
+                if (geo.NeedsHorizontalScrollbar)
+                    PaintTextareaHorizontalScrollbar(g, face, geo, _fieldScrollX,
+                        style != null && style.OwnBackground &&
+                        style.BackgroundColor != Color.Transparent
+                            ? backgroundColor
+                            : Color.FromArgb(0xE0, 0xE0, 0xE0));
             }
         }
         else
@@ -3977,7 +4241,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     float x1 = textX + MeasureTo(from);
                     float x2 = textX + MeasureTo(to);
                     if (x2 <= visibleLeft || x1 >= visibleRight) return;
-                    g.DrawString(text.Substring(from, to - from), font, brush,
+                    g.DrawStringWithoutLegacyStrokeBoost(text.Substring(from, to - from), font, brush,
                         new RectangleF(x1, face.Y, Math.Max(x2 - x1, 1f), face.Height), format);
                 }
 
@@ -4016,6 +4280,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         float TrackY, float TrackHeight, float ThumbHeight, float Travel,
         float ThumbTop, int MaxScrollLine);
 
+    private readonly record struct TextareaHorizontalScrollbarMetrics(
+        float TrackLeft, float TrackWidth, float ThumbWidth, float Travel,
+        float ThumbLeft, float MaxScroll);
+
     private static bool TryGetTextareaScrollbarMetrics(
         RectangleF face, int lineCount, float lineHeight, int scrollLine,
         out TextareaScrollbarMetrics metrics)
@@ -4043,19 +4311,61 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         return true;
     }
 
+    private static bool TryGetTextareaHorizontalScrollbarMetrics(
+        RectangleF face, TextareaGeometry geo, float scrollX,
+        out TextareaHorizontalScrollbarMetrics metrics)
+    {
+        metrics = default;
+        if (!geo.NeedsHorizontalScrollbar || face.Width < 16f || face.Height < 22f)
+            return false;
+
+        float trackLeft = face.Left + 1f;
+        float trackWidth = Math.Max(1f,
+            face.Width - 2f - (geo.NeedsVerticalScrollbar ? 14f : 0f));
+        float maxScroll = Math.Max(0f, geo.TextWidth - geo.TextViewportWidth);
+        float thumbWidth = Math.Min(Math.Max(2f, trackWidth - 2f),
+            Math.Max(10f, trackWidth * geo.TextViewportWidth /
+                Math.Max(geo.TextViewportWidth, geo.TextWidth)));
+        float travel = Math.Max(0f, trackWidth - 2f - thumbWidth);
+        float thumbLeft = trackLeft + 1f + travel *
+            Math.Clamp(scrollX / Math.Max(1f, maxScroll), 0f, 1f);
+        metrics = new TextareaHorizontalScrollbarMetrics(
+            trackLeft, trackWidth, thumbWidth, travel, thumbLeft, maxScroll);
+        return true;
+    }
+
     private static RectangleF GetTextareaScrollbarRect(RectangleF face) =>
         new(face.Right - 14f, face.Top, 14f, face.Height);
 
+    private static RectangleF GetTextareaHorizontalScrollbarRect(
+        RectangleF face, bool hasVerticalScrollbar) =>
+        new(face.Left, face.Bottom - 14f,
+            Math.Max(0f, face.Width - (hasVerticalScrollbar ? 14f : 0f)), 14f);
+
+    private static void PaintTextareaHorizontalScrollbar(
+        Graphics g, RectangleF face, TextareaGeometry geo, float scrollX,
+        Color trackColor)
+    {
+        if (!TryGetTextareaHorizontalScrollbarMetrics(face, geo, scrollX, out var metrics))
+            return;
+        float top = face.Bottom - 14f + 1f;
+        using var track = new SolidBrush(trackColor);
+        using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
+        g.FillRectangle(track, metrics.TrackLeft, top, metrics.TrackWidth, 13f);
+        g.FillRectangle(thumb, metrics.ThumbLeft, top + 1f,
+            metrics.ThumbWidth, 11f);
+    }
+
     private static void PaintTextareaScrollbar(Graphics g, RectangleF face,
                                                int lineCount, float lineHeight,
-                                               int scrollLine = 0)
+                                               int scrollLine, Color trackColor)
     {
         if (!TryGetTextareaScrollbarMetrics(face, lineCount, lineHeight,
                 scrollLine, out var metrics)) return;
 
         const float barWidth = 14f;
         float trackX = face.Right - barWidth + 1f;
-        using var track = new SolidBrush(Color.FromArgb(0xE0, 0xE0, 0xE0));
+        using var track = new SolidBrush(trackColor);
         using var thumb = new SolidBrush(Color.FromArgb(0x80, 0x80, 0x80));
         g.FillRectangle(track, trackX, metrics.TrackY, barWidth - 1f, metrics.TrackHeight);
         g.FillRectangle(thumb, trackX + 1f, metrics.ThumbTop,
@@ -4099,6 +4409,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         var style = el.Style;
         Color fieldBackground = style != null && style.OwnBackground && style.BackgroundColor != Color.Transparent
             ? style.BackgroundColor : Color.White;
+        Color scrollbarTrack = style != null && style.OwnBackground &&
+            style.BackgroundColor != Color.Transparent
+            ? fieldBackground
+            : Color.FromArgb(0xE0, 0xE0, 0xE0);
         Color fieldForeground = style != null && style.OwnColor ? style.Color : Color.Black;
         using (var background = new SolidBrush(fieldBackground))
             g.FillRectangle(background, face.X + 1 - scrollX, face.Y + 1 - scrollY,
@@ -4137,7 +4451,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (geo.NeedsVerticalScrollbar)
         {
             var screenFace = new RectangleF(face.X - scrollX, face.Y - scrollY, face.Width, face.Height);
-            PaintTextareaScrollbar(g, screenFace, lines.Count, lineHeight, scrollLine);
+            PaintTextareaScrollbar(g, screenFace, lines.Count, lineHeight, scrollLine,
+                scrollbarTrack);
+        }
+        if (geo.NeedsHorizontalScrollbar)
+        {
+            var screenFace = new RectangleF(face.X - scrollX, face.Y - scrollY, face.Width, face.Height);
+            PaintTextareaHorizontalScrollbar(g, screenFace, geo, _fieldScrollX,
+                scrollbarTrack);
         }
 
         using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
@@ -4784,6 +5105,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         float x = clientPoint.X / EffectiveZoom + PaintScrollX;
         float y = clientPoint.Y / EffectiveZoom + PaintScrollY;
 
+        if (_rootBox != null && IsOverflowScrollHoverReady(_rootBox, x, y) &&
+            TryScrollOverflowBox(_rootBox, x, y, delta, horizontal: true))
+        {
+            CloseMenusOnScroll();
+            Invalidate();
+            return true;
+        }
+
         if (TryHitFrame(x, y, out var frameHit) && frameHit.View.ScrollingEnabled)
         {
             var metrics = GetFrameScrollMetrics(frameHit.Box, frameHit.View);
@@ -4881,8 +5210,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // Ordinary wheel scrolling is completely independent of the temporary
         // gesture. In particular, do NOT commit/promote gesture scale here: doing
         // so makes a later toolbar click appear to inherit the gesture zoom.
-        float px = e.X / EffectiveZoom + PaintScrollX;
-        float py = e.Y / EffectiveZoom + PaintScrollY;
+        var pointer = PointToClient(Cursor.Position);
+        float px = pointer.X / EffectiveZoom + PaintScrollX;
+        float py = pointer.Y / EffectiveZoom + PaintScrollY;
         if (TryGetEditableFieldAtPoint(px, py, out var focusedWheelField,
                 out var focusedWheelFieldBox, out var focusedWheelFieldView, out _) &&
             ReferenceEquals(focusedWheelField, _focusedInput) &&
@@ -4922,8 +5252,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             return;
         }
 
-        float x = e.X / EffectiveZoom + PaintScrollX;
-        float y = e.Y / EffectiveZoom + PaintScrollY;
+        float x = px;
+        float y = py;
 
         if (TryGetSelectAtPoint(x, y, out var wheelSelect, out _, out _, out _, out _))
         {
@@ -4939,6 +5269,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 RerenderNow();
                 return;
             }
+        }
+
+        if (_rootBox != null && IsOverflowScrollHoverReady(_rootBox, x, y) &&
+            TryScrollOverflowBox(_rootBox, x, y, e.Delta,
+                (ModifierKeys & Keys.Shift) == Keys.Shift))
+        {
+            CloseMenusOnScroll();
+            Invalidate();
+            return;
         }
 
         if (TryHitFrame(x, y, out var frameHit) && frameHit.View.ScrollingEnabled)
@@ -4983,6 +5322,104 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (Math.Abs(deltaY) < 0.01f) deltaY = Math.Sign(e.Delta) * 2f;
         _scrollOffset.Y = Math.Clamp(_scrollOffset.Y - deltaY, 0f, max);
         Invalidate();
+    }
+
+    private bool TryScrollOverflowBox(
+        LayoutBox root, float x, float y, int wheelDelta, bool horizontal)
+    {
+        foreach (var box in root.Descendants().Reverse())
+        {
+            if (box.Element is not { } element ||
+                element.Style?.Overflow != OverflowValue.Scroll ||
+                !ReferenceEquals(element.LayoutBox, box) ||
+                !box.HitTest(x, y))
+                continue;
+
+            var viewport = box.PaddingRect;
+            float contentRight = box.Descendants()
+                .Select(child => child.BorderRect.Right)
+                .DefaultIfEmpty(viewport.Right)
+                .Max();
+            float contentBottom = box.Descendants()
+                .Select(child => child.BorderRect.Bottom)
+                .DefaultIfEmpty(viewport.Bottom)
+                .Max();
+            bool hasHorizontalOverflow = contentRight > viewport.Right + 0.5f;
+            float viewportWidth = Math.Max(1f, viewport.Width - 14f);
+            float viewportHeight = Math.Max(1f,
+                viewport.Height - (hasHorizontalOverflow ? 14f : 0f));
+            float maxX = Math.Max(0f, contentRight - viewport.Left - viewportWidth);
+            float maxY = Math.Max(0f, contentBottom - viewport.Top - viewportHeight);
+            float amount = wheelDelta / 120f * 40f;
+            if (Math.Abs(amount) < 0.01f)
+                amount = Math.Sign(wheelDelta) * 2f;
+
+            if (horizontal && hasHorizontalOverflow && maxX > 0f)
+            {
+                float next = Math.Clamp(box.ScrollOffsetX - amount, 0f, maxX);
+                if (Math.Abs(next - box.ScrollOffsetX) < 0.01f) continue;
+                box.ScrollOffsetX = next;
+                InvalidateDisplayLists();
+                return true;
+            }
+            if (!horizontal && maxY > 0f)
+            {
+                float next = Math.Clamp(box.ScrollOffsetY - amount, 0f, maxY);
+                if (Math.Abs(next - box.ScrollOffsetY) < 0.01f) continue;
+                box.ScrollOffsetY = next;
+                InvalidateDisplayLists();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private DomElement? FindOverflowScrollElementAtPoint(LayoutBox root, float x, float y)
+    {
+        foreach (var box in root.Descendants().Reverse())
+        {
+            if (box.Element is { } element &&
+                element.Style?.Overflow == OverflowValue.Scroll &&
+                ReferenceEquals(element.LayoutBox, box) &&
+                box.HitTest(x, y))
+                return element;
+        }
+        return null;
+    }
+
+    private void TrackOverflowScrollHover(DomElement? element)
+    {
+        if (ReferenceEquals(element, _hoveredOverflowScrollElement))
+            return;
+
+        _hoveredOverflowScrollElement = element;
+        _overflowScrollHoverStartedAt = element == null ? 0 : Environment.TickCount64;
+    }
+
+    private void UpdateOverflowScrollHover(System.Drawing.Point clientPoint)
+    {
+        if (_rootBox == null)
+        {
+            TrackOverflowScrollHover(null);
+            return;
+        }
+
+        float x = clientPoint.X / EffectiveZoom + PaintScrollX;
+        float y = clientPoint.Y / EffectiveZoom + PaintScrollY;
+        TrackOverflowScrollHover(FindOverflowScrollElementAtPoint(_rootBox, x, y));
+    }
+
+    private bool IsOverflowScrollHoverReady(LayoutBox root, float x, float y)
+    {
+        var hovered = FindOverflowScrollElementAtPoint(root, x, y);
+        if (!ReferenceEquals(hovered, _hoveredOverflowScrollElement))
+        {
+            TrackOverflowScrollHover(hovered);
+            return false;
+        }
+
+        return hovered != null &&
+            Environment.TickCount64 - _overflowScrollHoverStartedAt >= OverflowScrollHoverDelayMs;
     }
 
     protected override void OnResize(EventArgs e)
@@ -5365,6 +5802,25 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             Control: e.Control, Alt: e.Alt, Meta: e.KeyData.HasFlag(Keys.LWin) || e.KeyData.HasFlag(Keys.RWin)));
     }
 
+    private void OnCanvasKeyUp(object? sender, KeyEventArgs e)
+    {
+        var element = _focusedInput;
+        if (element == null) return;
+
+        var js = _focusedInputFrame?.Interpreter ?? _jsInterpreter;
+        if (js == null) return;
+
+        try
+        {
+            js.FireEvent(element, "onkeyup",
+                js.CreateKeyEvent(e.KeyCode.ToString(), (int)e.KeyCode));
+        }
+        catch (Exception ex)
+        {
+            Retro96.DebugLog.WriteException("Textarea/input keyup handler", ex);
+        }
+    }
+
     private void OnCanvasKeyPress(object? sender, KeyPressEventArgs e)
     {
         if (_focusedJavaAppletElement != null && _focusedInput == null && TryGetJavaAppletBox(_focusedJavaAppletElement, out var keyAppletBox))
@@ -5596,6 +6052,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         public required float TextWidth;
         public required float TextViewportWidth;
         public required bool NeedsVerticalScrollbar;
+        public required bool NeedsHorizontalScrollbar;
         public required int VisibleLines;
     }
 
@@ -5616,6 +6073,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             Box = box, Font = font, Text = text, Lines = layout.Lines,
             TextWidth = layout.TextWidth, TextViewportWidth = layout.TextViewportWidth,
             NeedsVerticalScrollbar = layout.NeedsVerticalScrollbar,
+            NeedsHorizontalScrollbar = layout.NeedsHorizontalScrollbar,
             VisibleLines = layout.VisibleLines
         };
     }
@@ -6296,14 +6754,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
         js ??= _jsInterpreter;
         bool alreadyFocused = ReferenceEquals(_focusedInput, el);
+        var focusDoc = frameView?.Document ?? _document;
 
         if (!alreadyFocused)
         {
-            BlurField();
+            var previousFocusDoc = _focusedInputFrame?.Document ?? _document;
+            BlurField(updateCssFocus: !ReferenceEquals(previousFocusDoc, focusDoc));
             _focusedInput = el;
             _focusedInputFrame = frameView;
             _fieldValueAtFocus = GetFieldText(el);
-            var focusDoc = frameView?.Document ?? _document;
             if (focusDoc != null)
                 UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement, focusDoc.ActiveElement, el, relayout: false);
             js?.FireEvent(el, "onfocus");   // FIX: clicking a field never fired onfocus
@@ -6330,7 +6789,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         RequestRerender();
     }
 
-    private void BlurField()
+    private void BlurField(bool updateCssFocus = true)
     {
         var el = _focusedInput;
         if (el == null) return;
@@ -6348,6 +6807,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
         _focusedInput = null;
         _focusedInputFrame = null;
+        if (updateCssFocus)
+        {
+            var focusDoc = ownerFrame?.Document ?? _document;
+            if (focusDoc != null && ReferenceEquals(focusDoc.FocusedElement, el))
+                UpdateCssInteractionState(focusDoc, focusDoc.HoveredElement,
+                    focusDoc.ActiveElement, null);
+        }
         _fieldDragging = false;
         _fieldDragPointerFrame = null;
         _fieldDragAutoScrollTimer.Stop();
@@ -6391,23 +6857,59 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         bool previousHoverStyleMatched = hoveredChanged &&
             doc.HoveredElement != null &&
             StyleResolver.HasMatchingHoverRule(doc);
+        bool previousHoverLayoutAffecting = hoveredChanged &&
+            doc.HoveredElement != null &&
+            StyleResolver.HasLayoutAffectingHoverRule(doc);
         doc.HoveredElement = hovered;
         doc.ActiveElement = active;
         doc.FocusedElement = focused;
         bool currentHoverStyleMatched = hoveredChanged &&
             hovered != null &&
             StyleResolver.HasMatchingHoverRule(doc);
+        bool currentHoverLayoutAffecting = hoveredChanged &&
+            hovered != null &&
+            StyleResolver.HasLayoutAffectingHoverRule(doc);
         bool hoverStyleChanged = previousHoverStyleMatched || currentHoverStyleMatched;
-        relayout &= hoverStyleChanged || activeChanged || focusedChanged;
+        bool hoverLayoutChanged = previousHoverLayoutAffecting || currentHoverLayoutAffecting;
+        relayout &= hoverLayoutChanged || activeChanged || focusedChanged;
 
         // Editable-field focus/hover is painted as a live overlay. Rebuilding
         // the whole document for every mouse move/down/up changes the textarea
         // content-box rounding after the page has been scrolled, so the live
         // text layer can move by a pixel even though the page bitmap did not.
-        // Keep those state transitions paint-only; ordinary links/buttons
-        // still take the full dynamic-CSS relayout path.
+        // Keep paint-only interaction changes out of the full document
+        // reflow path. Hover rules that affect geometry still reflow below.
         if (!relayout)
         {
+            if (hoveredChanged || activeChanged || focusedChanged)
+            {
+                float styleViewportWidth = 800f;
+                if (ReferenceEquals(doc, _document))
+                {
+                    styleViewportWidth = Math.Max(1f,
+                        GetViewportSize().Width / Math.Max(0.25f, EffectiveZoom));
+                }
+                else if (TryFindFrameViewByDocument(doc, out _, out _, out var frameKey) &&
+                         frameKey != null)
+                {
+                    styleViewportWidth = Math.Max(1f, frameKey.Width);
+                }
+
+                try
+                {
+                    // Dynamic interaction states change computed styles, not
+                    // just the legacy BODY ALINK paint color. Re-resolve styles
+                    // without rebuilding layout when the changes only affect
+                    // painting.
+                    StyleResolver.Resolve(doc, styleViewportWidth);
+                }
+                catch (Exception ex)
+                {
+                    Retro96.DebugLog.WriteException("Resolve active CSS styles", ex);
+                    RequestRerender();
+                }
+            }
+
             // Interaction state changes must still rebuild the cached display
             // list when a matching hover style or another visual interaction
             // state actually changes. Ordinary pointer movement over an
@@ -6420,9 +6922,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             return;
         }
 
-        // Dynamic selectors participate in the cascade. Re-resolve and
-        // rebuild this document so :hover/:active/:focus visibly alter
-        // colors, borders and display exactly like normal CSS rules.
+        // Dynamic selectors that change geometry participate in the cascade.
+        // Re-resolve and rebuild this document so hover/active/focus changes
+        // to layout are reflected in the rendered page.
         try
         {
             LayoutBox? frameKey = null;
@@ -6471,7 +6973,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (_openSelectMenu != null && !_openSelectMenu.IsDisposed)
             CloseOpenSelectMenu();
 
-        if (e.Button != MouseButtons.Left || _rootBox == null || _document == null)
+        var currentDocument = _document;
+        if (e.Button != MouseButtons.Left || _rootBox == null || currentDocument == null)
             return;
 
         int scrollPx = e.X;
@@ -6511,6 +7014,56 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             _frameScrollbarMouseDownHandled = true;
             Capture = true;
             return;
+        }
+
+        if (e.Button == MouseButtons.Left &&
+            TryGetTextareaHorizontalScrollbarPoint(x, y, out var horizontalTextarea,
+                out var horizontalScrollbarBox, out var horizontalScrollbarFrame,
+                out float horizontalScrollbarX))
+        {
+            if (!ReferenceEquals(_focusedInput, horizontalTextarea))
+                FocusControl(horizontalTextarea, 0, horizontalScrollbarFrame?.Interpreter,
+                    horizontalScrollbarFrame);
+            var geo = GetTextareaGeometry(horizontalTextarea, horizontalScrollbarBox,
+                horizontalScrollbarFrame);
+            if (geo != null && TryGetTextareaHorizontalScrollbarMetrics(
+                    horizontalScrollbarBox.ContentRect, geo, _fieldScrollX,
+                    out var metrics))
+            {
+                _fieldDragging = false;
+                _fieldDragPointerFrame = null;
+                _fieldDragAutoScrollTimer.Stop();
+                _lastFieldClickElement = null;
+                _lastFieldClickFrame = null;
+                _fieldClickCount = 0;
+
+                if (horizontalScrollbarX < metrics.ThumbLeft ||
+                    horizontalScrollbarX > metrics.ThumbLeft + metrics.ThumbWidth)
+                {
+                    float desiredLeft = Math.Clamp(
+                        horizontalScrollbarX - metrics.ThumbWidth / 2f,
+                        metrics.TrackLeft + 1f,
+                        metrics.TrackLeft + 1f + metrics.Travel);
+                    _fieldScrollX = metrics.Travel <= 0.01f
+                        ? 0f
+                        : (desiredLeft - metrics.TrackLeft - 1f) /
+                            metrics.Travel * metrics.MaxScroll;
+                    _textareaHorizontalScrollbarGrabOffset =
+                        metrics.ThumbWidth / 2f;
+                }
+                else
+                {
+                    _textareaHorizontalScrollbarGrabOffset =
+                        horizontalScrollbarX - metrics.ThumbLeft;
+                }
+
+                PersistFocusedTextareaScrollState();
+                _textareaHorizontalScrollbarDragging = true;
+                _textareaHorizontalScrollbarDragFrame = horizontalScrollbarFrame;
+                Capture = true;
+                Invalidate();
+                return;
+            }
         }
 
         if (e.Button == MouseButtons.Left &&
@@ -6754,8 +7307,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         var linkAnchor = el != null && el.TagName == "a"
             ? el
             : el != null ? FindAncestor(el, "a") : null;
-        bool linkActive = linkAnchor?.HasAttr("href") == true;
-        if (linkActive)
+        if (linkAnchor is { } activeLink && activeLink.HasAttr("href"))
         {
             // A link press ends any focused form-control session first. The
             // focused-field overlay is a live layer; leaving it alive while the
@@ -6764,21 +7316,32 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             if (_focusedInput != null)
                 BlurField();
 
+            var previousFocus = currentDocument.FocusedElement;
             // Keep the layout tree stable during an :active press. Renderer
             // already resolves legacy ALINK from ActiveElement, so this needs
             // no reflow just to turn the link red. More importantly, do not
             // fall through into page-text selection while the link is held.
             // That was the source of the tiny link shift + stray highlights.
             CancelPageTextSelectionForPointerInteraction();
-            _pressedControl = linkAnchor;
+            _pressedControl = activeLink;
             _pressedControlFrame = null;
-            UpdateCssInteractionState(_document, _lastHoveredElement, linkAnchor, _focusedInput,
+            UpdateCssInteractionState(currentDocument, _lastHoveredElement, activeLink, activeLink,
                 relayout: false);
+            if (!ReferenceEquals(previousFocus, activeLink))
+            {
+                if (previousFocus != null)
+                    _jsInterpreter?.FireEvent(previousFocus, "onblur");
+                _jsInterpreter?.FireEvent(activeLink, "onfocus");
+            }
             Capture = true;
             Invalidate();
             return;
         }
-        UpdateCssInteractionState(_document, _lastHoveredElement, el, _focusedInput,
+        var previouslyFocused = currentDocument.FocusedElement;
+        if (previouslyFocused != null &&
+            !ReferenceEquals(previouslyFocused, _focusedInput))
+            _jsInterpreter?.FireEvent(previouslyFocused, "onblur");
+        UpdateCssInteractionState(currentDocument, _lastHoveredElement, el, _focusedInput,
             relayout: false);
 
         // Clicking anywhere other than the focused control itself blurs it.
@@ -6967,14 +7530,49 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             return;
         }
 
+        CursorValue cssCursor = element?.Style?.Cursor ?? CursorValue.Auto;
+        if (cssCursor != CursorValue.Auto)
+        {
+            Cursor = cssCursor switch
+            {
+                CursorValue.Crosshair => Cursors.Cross,
+                CursorValue.Default => Cursors.Default,
+                CursorValue.Pointer => Cursors.Hand,
+                CursorValue.Move => Cursors.SizeAll,
+                CursorValue.EResize or CursorValue.WResize => Cursors.SizeWE,
+                CursorValue.NResize or CursorValue.SResize => Cursors.SizeNS,
+                CursorValue.NeResize or CursorValue.SwResize => Cursors.SizeNESW,
+                CursorValue.NwResize or CursorValue.SeResize => Cursors.SizeNWSE,
+                CursorValue.Text => Cursors.IBeam,
+                CursorValue.Wait => Cursors.WaitCursor,
+                CursorValue.Help => Cursors.Help,
+                _ => Cursors.Default
+            };
+            SetStatus("");
+            return;
+        }
+
         if (hoverAnchor != null && hoverAnchor.HasAttr("href"))
         {
             Cursor = Cursors.Hand;
             try
             {
-                SetStatus(doc.BaseUrl?.Resolve(hoverAnchor.GetAttr("href")!).ToAbsolute() ?? "");
+                var baseUrl = doc.BaseUrl;
+                string href = hoverAnchor.GetAttr("href")!;
+                SetStatus(baseUrl != null && baseUrl.Scheme == "file"
+                    ? FileUrls.Resolve(baseUrl, href)
+                    : baseUrl?.Resolve(href).ToAbsolute() ?? "");
             }
             catch { SetStatus(""); }
+            return;
+        }
+
+        if (element?.TagName == "input" &&
+            element.GetAttrOrDefault("type", "text").Trim()
+                .Equals("image", StringComparison.OrdinalIgnoreCase))
+        {
+            Cursor = Cursors.Hand;
+            SetStatus("");
             return;
         }
 
@@ -6995,6 +7593,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        UpdateOverflowScrollHover(e.Location);
 
         // A pressed link owns the mouse gesture from down to up.  Do not run
         // hover hit-testing or text-selection logic while it is captured: a
@@ -7096,6 +7695,47 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                         return;
                     _selectScrollOffsets[_selectScrollbarDragSelect] = scroll;
                     RerenderNow();
+                }
+            }
+            return;
+        }
+
+        if (_textareaHorizontalScrollbarDragging &&
+            _focusedInput?.TagName == "textarea" && Capture)
+        {
+            var root = _textareaHorizontalScrollbarDragFrame?.RootBox ?? _rootBox;
+            if (root != null)
+            {
+                float px = e.X / EffectiveZoom + PaintScrollX;
+                float py = e.Y / EffectiveZoom + PaintScrollY;
+                float localX = px;
+                if (_textareaHorizontalScrollbarDragFrame != null)
+                {
+                    if (!TryHitFrame(px, py, out var hit) ||
+                        !ReferenceEquals(hit.View, _textareaHorizontalScrollbarDragFrame))
+                        return;
+                    localX = hit.LocalX;
+                }
+
+                var box = FindBoxForElement(root, _focusedInput);
+                if (box != null)
+                {
+                    var geo = GetTextareaGeometry(_focusedInput, box,
+                        _textareaHorizontalScrollbarDragFrame);
+                    if (geo != null && TryGetTextareaHorizontalScrollbarMetrics(
+                            box.ContentRect, geo, _fieldScrollX, out var metrics))
+                    {
+                        float thumbLeft = Math.Clamp(
+                            localX - _textareaHorizontalScrollbarGrabOffset,
+                            metrics.TrackLeft + 1f,
+                            metrics.TrackLeft + 1f + metrics.Travel);
+                        _fieldScrollX = metrics.Travel <= 0.01f
+                            ? 0f
+                            : (thumbLeft - metrics.TrackLeft - 1f) /
+                                metrics.Travel * metrics.MaxScroll;
+                        PersistFocusedTextareaScrollState();
+                        Invalidate();
+                    }
                 }
             }
             return;
@@ -7495,6 +8135,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         {
             _frameScrollbarMouseDownHandled = false;
             Capture = false;
+            return;
+        }
+
+        if (_textareaHorizontalScrollbarDragging)
+        {
+            _textareaHorizontalScrollbarDragging = false;
+            _textareaHorizontalScrollbarDragFrame = null;
+            Capture = false;
+            PersistFocusedTextareaScrollState();
             return;
         }
 
@@ -8279,6 +8928,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     protected override void OnMouseLeave(EventArgs e)
     {
         base.OnMouseLeave(e);
+        TrackOverflowScrollHover(null);
         // FIX: onmouseout never fired when the pointer simply left the
         // canvas, and the I-beam/hand cursor stuck.
         if (!_selecting && !_fieldDragging)
@@ -9382,6 +10032,45 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         return GetTextareaScrollbarRect(face).Contains(localX, localY);
     }
 
+    private bool TryGetTextareaHorizontalScrollbarPoint(
+        float x, float y, out DomElement textarea, out LayoutBox box,
+        out FrameView? frameView, out float localX)
+    {
+        textarea = null!;
+        box = null!;
+        frameView = null;
+        localX = 0f;
+        float localY;
+        if (TryHitFrame(x, y, out var frameHit))
+        {
+            frameView = frameHit.View;
+            localX = frameHit.LocalX;
+            localY = frameHit.LocalY;
+        }
+        else
+        {
+            localX = x;
+            localY = y;
+        }
+        var root = frameView?.RootBox ?? _rootBox;
+        if (root == null) return false;
+        var hitElement = HitTestDeepestBox(root, localX, localY)?.Element;
+        var foundTextarea = hitElement?.TagName == "textarea"
+            ? hitElement : hitElement == null ? null : FindAncestor(hitElement, "textarea");
+        if (foundTextarea == null) return false;
+        var foundBox = FindBoxForElement(root, foundTextarea);
+        if (foundBox == null || !foundBox.BorderRect.Contains(localX, localY))
+            return false;
+        var geo = GetTextareaGeometry(foundTextarea, foundBox, frameView);
+        if (geo == null || !geo.NeedsHorizontalScrollbar ||
+            !GetTextareaHorizontalScrollbarRect(foundBox.ContentRect,
+                geo.NeedsVerticalScrollbar).Contains(localX, localY))
+            return false;
+        textarea = foundTextarea;
+        box = foundBox;
+        return true;
+    }
+
     private static LayoutBox? FindBoxForElement(LayoutBox root, DomElement element) =>
         Engine.Layout.HitTester.BoxForElement(root, element);
 
@@ -10047,6 +10736,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             .Where(o => o.TagName == "option")
             .ToList();
         if (options.Count == 0) return;
+        var rows = Engine.Layout.SelectRowModel.Build(select);
         bool isMultiple = select.HasAttr("multiple");
 
         // The option the control currently shows — the popup must mark it.
@@ -10075,7 +10765,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 BorderStyle = BorderStyle.None,
                 CheckOnClick = true,
                 IntegralHeight = false,
-                HorizontalScrollbar = true,
+                HorizontalScrollbar = false,
                 SelectionMode = SelectionMode.One
             };
             foreach (var opt in options)
@@ -10102,21 +10792,47 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             {
                 BorderStyle = BorderStyle.None,
                 IntegralHeight = false,
-                HorizontalScrollbar = true,
+                HorizontalScrollbar = false,
+                DrawMode = DrawMode.OwnerDrawFixed,
                 SelectionMode = SelectionMode.One
             };
-            foreach (var opt in options)
-                list.Items.Add(GlyphSubstituteOptionLabel(opt));
-            list.SelectedIndex = selectedIndex;
+            foreach (var row in rows)
+                list.Items.Add(GlyphSubstitution.MapGlyphs(row.Label));
+            int selectedRow = rows.FindIndex(row =>
+                ReferenceEquals(row.Option, currentOpt));
+            list.SelectedIndex = Math.Max(0, selectedRow);
+            list.DrawItem += (_, e) =>
+            {
+                if (e.Index < 0 || e.Index >= rows.Count) return;
+                var row = rows[e.Index];
+                e.DrawBackground();
+                float left = e.Bounds.Left + 3f + row.Indent;
+                var drawFont = row.IsGroupHeader
+                    ? new System.Drawing.Font(list.Font, System.Drawing.FontStyle.Bold)
+                    : list.Font;
+                try
+                {
+                    e.Graphics.DrawString((string)list.Items[e.Index]!,
+                        drawFont, System.Drawing.Brushes.Black, left, e.Bounds.Top + 1f);
+                }
+                finally
+                {
+                    if (row.IsGroupHeader) drawFont.Dispose();
+                }
+                e.DrawFocusRectangle();
+            };
             list.MouseClick += (_, e) =>
             {
-                int index = list.IndexFromPoint(e.Location);
-                if (index >= 0) ApplySelectedOption(index);
+                int rowIndex = list.IndexFromPoint(e.Location);
+                if (rowIndex >= 0 && rowIndex < rows.Count &&
+                    rows[rowIndex].Option is { } option)
+                    ApplySelectedOption(options.IndexOf(option));
             };
             list.KeyDown += (_, e) =>
             {
                 if (e.KeyCode != Keys.Enter || list.SelectedIndex < 0) return;
-                ApplySelectedOption(list.SelectedIndex);
+                if (rows[list.SelectedIndex].Option is { } option)
+                    ApplySelectedOption(options.IndexOf(option));
                 e.Handled = true;
             };
             optionList = list;
@@ -10135,7 +10851,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         optionList.Font = Font;
         optionList.IntegralHeight = false;
         int rowHeight = Math.Max(1, optionList.ItemHeight);
-        int visibleRows = Math.Max(1, Math.Min(options.Count,
+        int visibleRows = Math.Max(1, Math.Min(isMultiple ? options.Count : rows.Count,
             (popupMaxHeight - 4) / rowHeight));
         int popupHeight = visibleRows * rowHeight + 4;
         optionList.Size = new System.Drawing.Size(popupWidth, popupHeight);
@@ -10265,7 +10981,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
     private static string GlyphSubstituteOptionLabel(DomElement opt) =>
         Engine.Render.GlyphSubstitution.MapGlyphs(
-            (opt.InnerText ?? "").Trim()) is { Length: > 0 } t ? t : " ";
+            Engine.Layout.SelectRowModel.OptionLabel(opt)) is { Length: > 0 } t ? t : " ";
 
     // ─────────────────────────────────────────────────────────────────────
     // Form control defaults
@@ -10402,7 +11118,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
         if (req.Method == "post")
         {
-            FormSubmitRequested?.Invoke((req.Url, req.QueryString, req.Target, sourceFrame,
+            string body = req.Url.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase)
+                ? req.TextPlainBody ?? req.QueryString
+                : req.QueryString;
+            FormSubmitRequested?.Invoke((req.Url, body, req.Target, sourceFrame,
                 req.MultipartFields, req.MultipartFiles));
         }
         else

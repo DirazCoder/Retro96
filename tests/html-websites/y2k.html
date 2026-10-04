@@ -13,17 +13,28 @@ function y2kReport() {
   var d2001 = new Date(2001, 2, 1);
   lines.push("getYear(2001-03-01)=" + d2001.getYear());
   lines.push("getFullYear(2001-03-01)=" + d2001.getFullYear());
-  // Y2K cookie expiry: set one expiring well past 2000. file: pages carry
-  // no cookie jar (era browsers kept none either) — report skipped there.
+
+  // the Date constructor maps 0-99 to 1900-1999
+  lines.push("new Date(99,0,1).getFullYear()=" + new Date(99, 0, 1).getFullYear());
+
+  // file: pages carry no cookie jar (era browsers kept none either), so the
+  // cookie checks only run over http(s)
   if (location.protocol == "http:" || location.protocol == "https:") {
     document.cookie = "y2k=ok; expires=Fri, 31-Dec-2037 23:59:59 GMT; path=/";
     var hasCookie = (document.cookie.indexOf("y2k=ok") >= 0);
     lines.push("cookie-past-2000=" + (hasCookie ? "stored" : "LOST"));
+
+    // two-digit years follow the RFC 6265 pivot (70-99 = 19xx, 0-69 = 20xx),
+    // so 49 should survive and 99 should be dropped as already expired
+    document.cookie = "y2k49=1; expires=Fri, 01-Jan-49 00:00:00 GMT; path=/";
+    document.cookie = "y2k99=1; expires=Fri, 01-Jan-99 00:00:00 GMT; path=/";
+    var jar = document.cookie;
+    lines.push("cookie-49=" + (jar.indexOf("y2k49=") >= 0 ? "stored" : "LOST"));
+    lines.push("cookie-99=" + (jar.indexOf("y2k99=") >= 0 ? "BAD-stored" : "expired"));
   } else {
     lines.push("cookie-past-2000=skipped-file");
   }
-  // 2-digit expiry years around the pivot.
-  document.cookie = "y2kshort=1; expires=Wed, 01-Jan-25 00:00:00 GMT; path=/";
+
   // Date parse of a full 4-digit year string.
   var parsed = Date.parse("January 1, 2000 00:00:00");
   lines.push("parse(January 1, 2000)=" + (parsed > 946000000000 ? "epoch-ok" : "BAD"));
@@ -39,7 +50,10 @@ This page exercises every date surface that mattered:</p>
   <li><tt>new Date(2000, 0, 1).getYear()</tt> must return <b>100</b>
       (ECMA semantics: year − 1900, JavaScript 1.3 / JScript 5)</li>
   <li><tt>getFullYear()</tt> must return <b>2000</b></li>
+  <li><tt>new Date(99, 0, 1).getFullYear()</tt> must return <b>1999</b></li>
   <li>cookie <tt>expires</tt> dates past 2000 must store and survive</li>
+  <li>two-digit cookie years: <tt>49</tt> must read as 2049 (stored),
+      <tt>99</tt> as 1999 (expired); http(s) only</li>
   <li><tt>Date.parse</tt> of 4-digit-year strings must land in the right epoch</li>
 </ul>
 <p><b>report:</b> <span id="report">(click)</span></p>

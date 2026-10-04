@@ -15,6 +15,7 @@ public record FormSubmitRequest
     public string QueryString { get; init; }
     public string Method { get; init; }
     public string? Target { get; init; }
+    public string? TextPlainBody { get; init; }
     public IReadOnlyList<MultipartField>? MultipartFields { get; init; }
     public IReadOnlyList<MultipartFile>? MultipartFiles { get; init; }
 
@@ -24,12 +25,14 @@ public record FormSubmitRequest
         string method,
         string? target,
         IReadOnlyList<MultipartField>? multipartFields = null,
-        IReadOnlyList<MultipartFile>? multipartFiles = null)
+        IReadOnlyList<MultipartFile>? multipartFiles = null,
+        string? textPlainBody = null)
     {
         Url = url;
         QueryString = queryString;
         Method = method;
         Target = target;
+        TextPlainBody = textPlainBody;
         MultipartFields = multipartFields;
         MultipartFiles = multipartFiles;
     }
@@ -125,6 +128,12 @@ public static class FormSubmitter
 
         string qs = string.Join("&", pairs.Select(p =>
             $"{ParsedUrl.PercentEncode(p.Item1)}={ParsedUrl.PercentEncode(p.Item2)}"));
+        string? textPlainBody = method == "post" &&
+            form.GetAttrOrDefault("enctype", "application/x-www-form-urlencoded")
+                .Equals("text/plain", StringComparison.OrdinalIgnoreCase)
+            ? string.Join("\r\n", pairs.Select(pair => $"{pair.Item1}={pair.Item2}")) +
+              (pairs.Count > 0 ? "\r\n" : "")
+            : null;
 
         string? target = form.GetAttr("target");
         if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(baseTarget))
@@ -164,7 +173,8 @@ public static class FormSubmitter
             }
         }
 
-        return new FormSubmitRequest(resolved, qs, method, target, fields, files);
+        return new FormSubmitRequest(resolved, qs, method, target,
+            fields, files, textPlainBody);
     }
 
     /// <summary>

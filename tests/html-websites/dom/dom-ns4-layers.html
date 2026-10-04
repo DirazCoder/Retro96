@@ -76,8 +76,9 @@ page script probes document.layers, layer geometry (left/top/zIndex),
 visibility (show/hide/inherit), clip rects, bgColor, moveTo/moveBy,
 moveAbove/moveBelow, the capture-events model, Event.* masks and
 window.innerWidth/pageXOffset.</p>
-<p><b>Under the IE5 or union profile this page takes no layer branch at
-all — document.layers is undefined there.</b></p>
+<p><b>Under the IE5 profile this page takes no layer branch because
+document.layers is undefined. The Retro96 union profile exposes document.layers
+alongside document.all and getElementById, so the layer branch runs there.</b></p>
 <p><b id="report3">(running…)</b></p>
 <script language="JavaScript1.3">
 if (document.layers) document.layers["box1"].document.write(

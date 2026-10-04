@@ -19,6 +19,7 @@ public class ComputedStyle
     public FontWeightValue FontWeight { get; set; } = FontWeightValue.Normal;
     public FontStyleValue FontStyle { get; set; } = FontStyleValue.Normal;
     public FontVariantValue FontVariant { get; set; } = FontVariantValue.Normal;
+    public bool OwnFontWeight { get; set; }
     public bool OwnFontSize { get; set; }
 
     // === TEXT ===
@@ -58,9 +59,12 @@ public class ComputedStyle
     /// to decide whether a form control takes CSS1 colours (IE3-era form
     /// styling) or the classic native look: an inherited BODY text=
     /// colour must never turn input text invisible-on-white.</summary>
-    public bool OwnColor, OwnBackground, OwnTextAlign, OwnMarginLeft, OwnPaddingLeft;
+    public bool OwnColor, OwnBackground, OwnTextAlign, OwnMarginLeft;
+    public bool OwnPaddingTop, OwnPaddingRight, OwnPaddingBottom, OwnPaddingLeft;
     public bool OwnListStyleType, OwnListStyleImage;
     public bool OwnBorderTopStyle, OwnBorderRightStyle, OwnBorderBottomStyle, OwnBorderLeftStyle;
+    public bool OwnBorderTopWidth, OwnBorderRightWidth, OwnBorderBottomWidth, OwnBorderLeftWidth;
+    public bool OwnCaptionSide;
 
     // === BOX MODEL (px) ===
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;
@@ -117,6 +121,7 @@ public class ComputedStyle
     public DisplayValue Display { get; set; } = DisplayValue.Inline;
     public VisibilityValue Visibility { get; set; } = VisibilityValue.Visible;
     public OverflowValue Overflow { get; set; } = OverflowValue.Visible;
+    public CssClipRect? Clip { get; set; }
     public ComputedStyle? FirstLineStyle { get; set; }
     public ComputedStyle? FirstLetterStyle { get; set; }
 
@@ -131,6 +136,7 @@ public class ComputedStyle
     public ListStyleType ListStyleType { get; set; } = ListStyleType.Disc;
     public string? ListStyleImage { get; set; }
     public ListStylePosition ListStylePosition { get; set; } = ListStylePosition.Outside;
+    public float MarkerOffset { get; set; }
 
     // === CSS2 CURSOR (inherited; rendering is the shell's job) ===
     public CursorValue Cursor { get; set; } = CursorValue.Auto;
@@ -169,6 +175,7 @@ public class ComputedStyle
     /// "no-open-quote"/"no-close-quote".  Null = none/normal/unset.
     /// Rendering is the integrator's job.</summary>
     public List<ContentToken>? Content { get; set; }
+    public string? ResolvedGeneratedContentText { get; set; }
     /// <summary>quotes: pairs of open/close strings (inherited).
     /// Null = default quotes.</summary>
     public List<QuotePair>? Quotes { get; set; }
@@ -285,10 +292,17 @@ public class ComputedStyle
             // === FONT ===
             case "font-family": FontFamily = ParseFontFamily(value); break;
             case "font-size": FontSize = ParseFontSize(value, parentFontSize); OwnFontSize = true; break;
-            case "font-weight": FontWeight = ParseFontWeight(value, parentFontWeight); break;
+            case "font-weight":
+                FontWeight = ParseFontWeight(value, parentFontWeight);
+                OwnFontWeight = true;
+                break;
             case "font-style": FontStyle = ParseFontStyle(value); break;
             case "font-variant": FontVariant = ParseFontVariant(value); break;
-            case "font": ParseFontShorthand(value, parentFontSize, parentFontWeight); OwnFontSize = true; break;
+            case "font":
+                ParseFontShorthand(value, parentFontSize, parentFontWeight);
+                OwnFontWeight = true;
+                OwnFontSize = true;
+                break;
 
             // === TEXT ===
             case "color": Color = ParseColor(value, Color); OwnColor = true; break;
@@ -327,16 +341,19 @@ public class ComputedStyle
                 break;
             case "margin": ParseMarginShorthand(value, parentFontSize, viewportWidth); OwnMarginLeft = true; break;
 
-            case "padding-top": (PaddingTop, PaddingTopPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
-            case "padding-right": (PaddingRight, PaddingRightPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
-            case "padding-bottom": (PaddingBottom, PaddingBottomPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); break;
+            case "padding-top": (PaddingTop, PaddingTopPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); OwnPaddingTop = true; break;
+            case "padding-right": (PaddingRight, PaddingRightPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); OwnPaddingRight = true; break;
+            case "padding-bottom": (PaddingBottom, PaddingBottomPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); OwnPaddingBottom = true; break;
             case "padding-left": (PaddingLeft, PaddingLeftPercent) = ParseLengthOrPercent(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
-            case "padding": ParsePaddingShorthand(value, parentFontSize, viewportWidth); OwnPaddingLeft = true; break;
+            case "padding":
+                ParsePaddingShorthand(value, parentFontSize, viewportWidth);
+                OwnPaddingTop = OwnPaddingRight = OwnPaddingBottom = OwnPaddingLeft = true;
+                break;
 
-            case "border-top-width": BorderTopWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
-            case "border-right-width": BorderRightWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
-            case "border-bottom-width": BorderBottomWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
-            case "border-left-width": BorderLeftWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); break;
+            case "border-top-width": BorderTopWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); OwnBorderTopWidth = true; break;
+            case "border-right-width": BorderRightWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); OwnBorderRightWidth = true; break;
+            case "border-bottom-width": BorderBottomWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); OwnBorderBottomWidth = true; break;
+            case "border-left-width": BorderLeftWidth = ParseBorderWidth(value, parentFontSize, viewportWidth); OwnBorderLeftWidth = true; break;
             case "border-top-style": BorderTopStyle = ParseBorderStyle(value); OwnBorderTopStyle = true; break;
             case "border-right-style": BorderRightStyle = ParseBorderStyle(value); OwnBorderRightStyle = true; break;
             case "border-bottom-style": BorderBottomStyle = ParseBorderStyle(value); OwnBorderBottomStyle = true; break;
@@ -358,6 +375,7 @@ public class ComputedStyle
             case "display": Display = ParseDisplay(value); break;
             case "visibility": Visibility = ParseVisibility(value); break;
             case "overflow": Overflow = ParseOverflow(value); break;
+            case "clip": Clip = ParseClipRect(value, parentFontSize, viewportWidth); break;
             case "position": Position = ParsePosition(value); break;
             case "top": (Top, TopPercent) = ParseOffset(value, parentFontSize, viewportWidth); break;
             case "right": (Right, RightPercent) = ParseOffset(value, parentFontSize, viewportWidth); break;
@@ -366,6 +384,7 @@ public class ComputedStyle
             case "float": Float = ParseFloat(value); break;
             case "clear": Clear = ParseClear(value); break;
             case "z-index": ZIndex = ParseZIndex(value); break;
+            case "marker-offset": MarkerOffset = ParseLength(value, parentFontSize, viewportWidth); break;
 
             // === LISTS ===
             case "list-style-type": ListStyleType = ParseListStyleType(value); OwnListStyleType = true; break;
@@ -404,7 +423,7 @@ public class ComputedStyle
             case "border-collapse": BorderCollapse = ParseBorderCollapse(value); break;
             case "border-spacing": SetBorderSpacing(value, parentFontSize); break;
             case "table-layout": TableLayout = ParseTableLayout(value); break;
-            case "caption-side": CaptionSide = ParseCaptionSide(value); break;
+            case "caption-side": CaptionSide = ParseCaptionSide(value); OwnCaptionSide = true; break;
             case "empty-cells": EmptyCells = ParseEmptyCells(value); break;
 
             // === CSS2 FONT EXTRAS ===
@@ -660,6 +679,9 @@ public class ComputedStyle
         if (v.Equals("transparent", StringComparison.OrdinalIgnoreCase))
             return Color.Transparent;
 
+        if (TryParseSystemColor(v, out var systemColor))
+            return systemColor;
+
         if (v.StartsWith("#"))
         {
             var hex = v[1..];
@@ -690,6 +712,7 @@ public class ComputedStyle
                         Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255));
                 }
             }
+
             return fallback;
         }
 
@@ -702,6 +725,32 @@ public class ComputedStyle
         {
             return fallback;
         }
+    }
+
+    private static bool TryParseSystemColor(string value, out Color color)
+    {
+        color = value.Trim().ToLowerInvariant() switch
+        {
+            "activeborder" or "inactiveborder" or "buttonface" or "threedface" or
+                "scrollbar" => Color.FromArgb(212, 208, 200),
+            "activecaption" => Color.FromArgb(10, 36, 106),
+            "captiontext" or "highlighttext" or "buttonhighlight" or "threedhighlight" =>
+                Color.White,
+            "appworkspace" or "buttonshadow" or "graytext" or "threedshadow" =>
+                Color.FromArgb(128, 128, 128),
+            "background" => Color.FromArgb(0, 78, 152),
+            "highlight" => Color.FromArgb(49, 106, 197),
+            "inactivecaption" => Color.FromArgb(122, 150, 223),
+            "inactivecaptiontext" => Color.FromArgb(216, 228, 248),
+            "infobackground" => Color.FromArgb(255, 255, 225),
+            "infotext" or "menutext" or "windowtext" => Color.Black,
+            "menu" => Color.FromArgb(240, 240, 240),
+            "threeddarkshadow" or "windowframe" => Color.FromArgb(64, 64, 64),
+            "threedlightshadow" => Color.FromArgb(227, 227, 227),
+            "window" => Color.White,
+            _ => Color.Empty
+        };
+        return color != Color.Empty;
     }
 
     /// <summary>
@@ -1194,6 +1243,7 @@ public class ComputedStyle
         BorderRightWidth = ParseBorderWidth(p[1], fs, vw);
         BorderBottomWidth = ParseBorderWidth(p[2], fs, vw);
         BorderLeftWidth = ParseBorderWidth(p[3], fs, vw);
+        OwnBorderTopWidth = OwnBorderRightWidth = OwnBorderBottomWidth = OwnBorderLeftWidth = true;
     }
 
     private void ParseBorderStyleShorthand(string value)
@@ -1233,6 +1283,7 @@ public class ComputedStyle
             {
                 var w = ParseBorderWidth(part, fs, vw);
                 BorderTopWidth = BorderRightWidth = BorderBottomWidth = BorderLeftWidth = w;
+                OwnBorderTopWidth = OwnBorderRightWidth = OwnBorderBottomWidth = OwnBorderLeftWidth = true;
             }
             else
             {
@@ -1262,22 +1313,22 @@ public class ComputedStyle
         switch (side)
         {
             case "top":
-                if (width.HasValue) BorderTopWidth = width.Value;
+                if (width.HasValue) { BorderTopWidth = width.Value; OwnBorderTopWidth = true; }
                 if (borderStyle.HasValue) { BorderTopStyle = borderStyle.Value; OwnBorderTopStyle = true; }
                 if (borderColor.HasValue) BorderTopColor = borderColor.Value;
                 break;
             case "right":
-                if (width.HasValue) BorderRightWidth = width.Value;
+                if (width.HasValue) { BorderRightWidth = width.Value; OwnBorderRightWidth = true; }
                 if (borderStyle.HasValue) { BorderRightStyle = borderStyle.Value; OwnBorderRightStyle = true; }
                 if (borderColor.HasValue) BorderRightColor = borderColor.Value;
                 break;
             case "bottom":
-                if (width.HasValue) BorderBottomWidth = width.Value;
+                if (width.HasValue) { BorderBottomWidth = width.Value; OwnBorderBottomWidth = true; }
                 if (borderStyle.HasValue) { BorderBottomStyle = borderStyle.Value; OwnBorderBottomStyle = true; }
                 if (borderColor.HasValue) BorderBottomColor = borderColor.Value;
                 break;
             case "left":
-                if (width.HasValue) BorderLeftWidth = width.Value;
+                if (width.HasValue) { BorderLeftWidth = width.Value; OwnBorderLeftWidth = true; }
                 if (borderStyle.HasValue) { BorderLeftStyle = borderStyle.Value; OwnBorderLeftStyle = true; }
                 if (borderColor.HasValue) BorderLeftColor = borderColor.Value;
                 break;
@@ -1301,6 +1352,7 @@ public class ComputedStyle
             "inline-table" => DisplayValue.InlineTable,
             "run-in" => DisplayValue.RunIn,
             "compact" => DisplayValue.Compact,
+            "marker" => DisplayValue.Marker,
             "none" => DisplayValue.None,
             "list-item" => DisplayValue.ListItem,
             "table" => DisplayValue.Table,
@@ -1335,6 +1387,39 @@ public class ComputedStyle
             "auto" => OverflowValue.Auto,
             _ => OverflowValue.Visible
         };
+    }
+
+    private static CssClipRect? ParseClipRect(string value, float fontSize, float viewportWidth)
+    {
+        string v = value.Trim();
+        if (v.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (!v.StartsWith("rect(", StringComparison.OrdinalIgnoreCase) || !v.EndsWith(')'))
+            return null;
+
+        string[] parts = v[5..^1].Replace(',', ' ')
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 4)
+            return null;
+
+        float? ParseSide(string side)
+        {
+            if (side.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                return null;
+            float parsed = ParseLength(side, fontSize, viewportWidth, float.NaN);
+            return float.IsFinite(parsed) ? parsed : null;
+        }
+
+        float? top = ParseSide(parts[0]);
+        float? right = ParseSide(parts[1]);
+        float? bottom = ParseSide(parts[2]);
+        float? left = ParseSide(parts[3]);
+        if ((top == null && !parts[0].Equals("auto", StringComparison.OrdinalIgnoreCase)) ||
+            (right == null && !parts[1].Equals("auto", StringComparison.OrdinalIgnoreCase)) ||
+            (bottom == null && !parts[2].Equals("auto", StringComparison.OrdinalIgnoreCase)) ||
+            (left == null && !parts[3].Equals("auto", StringComparison.OrdinalIgnoreCase)))
+            return null;
+        return new CssClipRect(top, right, bottom, left);
     }
 
     private static PositionValue ParsePosition(string value)
@@ -1382,10 +1467,19 @@ public class ComputedStyle
             "circle" => ListStyleType.Circle,
             "square" => ListStyleType.Square,
             "decimal" => ListStyleType.Decimal,
-            "lower-alpha" or "a" => ListStyleType.LowerAlpha,
-            "upper-alpha" or "A" => ListStyleType.UpperAlpha,
+            "decimal-leading-zero" => ListStyleType.DecimalLeadingZero,
+            "lower-alpha" or "lower-latin" or "a" => ListStyleType.LowerAlpha,
+            "upper-alpha" or "upper-latin" or "A" => ListStyleType.UpperAlpha,
+            "lower-greek" => ListStyleType.LowerGreek,
             "lower-roman" or "i" => ListStyleType.LowerRoman,
             "upper-roman" or "I" => ListStyleType.UpperRoman,
+            "armenian" => ListStyleType.Armenian,
+            "georgian" => ListStyleType.Georgian,
+            "hebrew" => ListStyleType.Hebrew,
+            "hiragana" => ListStyleType.Hiragana,
+            "katakana" => ListStyleType.Katakana,
+            "hiragana-iroha" => ListStyleType.HiraganaIroha,
+            "katakana-iroha" => ListStyleType.KatakanaIroha,
             _ => ListStyleType.Disc
         };
     }
@@ -1721,7 +1815,10 @@ public class ComputedStyle
         {
             var lower = part.ToLowerInvariant();
             if (lower is "disc" or "circle" or "square" or "decimal" or
-                    "lower-alpha" or "upper-alpha" or "lower-roman" or "upper-roman" or "none")
+                    "decimal-leading-zero" or "lower-alpha" or "lower-latin" or
+                    "upper-alpha" or "upper-latin" or "lower-greek" or
+                    "lower-roman" or "upper-roman" or "armenian" or "georgian" or "hebrew" or
+                    "hiragana" or "katakana" or "hiragana-iroha" or "katakana-iroha" or "none")
             {
                 ListStyleType = ParseListStyleType(part);
                 OwnListStyleType = true;
@@ -1757,7 +1854,7 @@ public class ComputedStyle
             // === FONT ===
             case "font-family": FontFamily = new List<string>(parent.FontFamily); break;
             case "font-size": FontSize = parent.FontSize; OwnFontSize = true; break;
-            case "font-weight": FontWeight = parent.FontWeight; break;
+            case "font-weight": FontWeight = parent.FontWeight; OwnFontWeight = true; break;
             case "font-style": FontStyle = parent.FontStyle; break;
             case "font-variant": FontVariant = parent.FontVariant; break;
             case "font-size-adjust": FontSizeAdjust = parent.FontSizeAdjust; break;
@@ -1765,7 +1862,7 @@ public class ComputedStyle
             case "font":
                 FontFamily = new List<string>(parent.FontFamily);
                 FontSize = parent.FontSize; OwnFontSize = true;
-                FontWeight = parent.FontWeight;
+                FontWeight = parent.FontWeight; OwnFontWeight = true;
                 FontStyle = parent.FontStyle;
                 FontVariant = parent.FontVariant;
                 break;
@@ -1843,11 +1940,17 @@ public class ComputedStyle
                 OwnMarginLeft = true;
                 break;
             case "padding-top":
-                PaddingTop = parent.PaddingTop; PaddingTopPercent = parent.PaddingTopPercent; break;
+                PaddingTop = parent.PaddingTop; PaddingTopPercent = parent.PaddingTopPercent;
+                OwnPaddingTop = true;
+                break;
             case "padding-right":
-                PaddingRight = parent.PaddingRight; PaddingRightPercent = parent.PaddingRightPercent; break;
+                PaddingRight = parent.PaddingRight; PaddingRightPercent = parent.PaddingRightPercent;
+                OwnPaddingRight = true;
+                break;
             case "padding-bottom":
-                PaddingBottom = parent.PaddingBottom; PaddingBottomPercent = parent.PaddingBottomPercent; break;
+                PaddingBottom = parent.PaddingBottom; PaddingBottomPercent = parent.PaddingBottomPercent;
+                OwnPaddingBottom = true;
+                break;
             case "padding-left":
                 PaddingLeft = parent.PaddingLeft; PaddingLeftPercent = parent.PaddingLeftPercent;
                 OwnPaddingLeft = true;
@@ -1858,13 +1961,14 @@ public class ComputedStyle
                 PaddingBottom = parent.PaddingBottom; PaddingBottomPercent = parent.PaddingBottomPercent;
                 PaddingLeft = parent.PaddingLeft; PaddingLeftPercent = parent.PaddingLeftPercent;
                 OwnPaddingLeft = true;
+                OwnPaddingTop = OwnPaddingRight = OwnPaddingBottom = true;
                 break;
 
             // === BORDERS ===
-            case "border-top-width": BorderTopWidth = parent.BorderTopWidth; break;
-            case "border-right-width": BorderRightWidth = parent.BorderRightWidth; break;
-            case "border-bottom-width": BorderBottomWidth = parent.BorderBottomWidth; break;
-            case "border-left-width": BorderLeftWidth = parent.BorderLeftWidth; break;
+            case "border-top-width": BorderTopWidth = parent.BorderTopWidth; OwnBorderTopWidth = true; break;
+            case "border-right-width": BorderRightWidth = parent.BorderRightWidth; OwnBorderRightWidth = true; break;
+            case "border-bottom-width": BorderBottomWidth = parent.BorderBottomWidth; OwnBorderBottomWidth = true; break;
+            case "border-left-width": BorderLeftWidth = parent.BorderLeftWidth; OwnBorderLeftWidth = true; break;
             case "border-top-style":
                 BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true; break;
             case "border-right-style":
@@ -1882,6 +1986,7 @@ public class ComputedStyle
                 BorderRightWidth = parent.BorderRightWidth;
                 BorderBottomWidth = parent.BorderBottomWidth;
                 BorderLeftWidth = parent.BorderLeftWidth;
+                OwnBorderTopWidth = OwnBorderRightWidth = OwnBorderBottomWidth = OwnBorderLeftWidth = true;
                 break;
             case "border-style":
                 BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
@@ -1897,21 +2002,25 @@ public class ComputedStyle
                 break;
             case "border-top":
                 BorderTopWidth = parent.BorderTopWidth;
+                OwnBorderTopWidth = true;
                 BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
                 BorderTopColor = parent.BorderTopColor;
                 break;
             case "border-right":
                 BorderRightWidth = parent.BorderRightWidth;
+                OwnBorderRightWidth = true;
                 BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true;
                 BorderRightColor = parent.BorderRightColor;
                 break;
             case "border-bottom":
                 BorderBottomWidth = parent.BorderBottomWidth;
+                OwnBorderBottomWidth = true;
                 BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true;
                 BorderBottomColor = parent.BorderBottomColor;
                 break;
             case "border-left":
                 BorderLeftWidth = parent.BorderLeftWidth;
+                OwnBorderLeftWidth = true;
                 BorderLeftStyle = parent.BorderLeftStyle; OwnBorderLeftStyle = true;
                 BorderLeftColor = parent.BorderLeftColor;
                 break;
@@ -1920,6 +2029,7 @@ public class ComputedStyle
                 BorderRightWidth = parent.BorderRightWidth;
                 BorderBottomWidth = parent.BorderBottomWidth;
                 BorderLeftWidth = parent.BorderLeftWidth;
+                OwnBorderTopWidth = OwnBorderRightWidth = OwnBorderBottomWidth = OwnBorderLeftWidth = true;
                 BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
                 BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true;
                 BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true;
@@ -1933,7 +2043,6 @@ public class ComputedStyle
             // === DISPLAY / POSITIONING ===
             case "display": Display = parent.Display; break;
             case "visibility": Visibility = parent.Visibility; break;
-            case "overflow": Overflow = parent.Overflow; break;
             case "position": Position = parent.Position; break;
             case "top": Top = parent.Top; TopPercent = parent.TopPercent; break;
             case "right": Right = parent.Right; RightPercent = parent.RightPercent; break;
@@ -1981,7 +2090,7 @@ public class ComputedStyle
             case "border-spacing":
                 BorderSpacingX = parent.BorderSpacingX; BorderSpacingY = parent.BorderSpacingY; break;
             case "table-layout": TableLayout = parent.TableLayout; break;
-            case "caption-side": CaptionSide = parent.CaptionSide; break;
+            case "caption-side": CaptionSide = parent.CaptionSide; OwnCaptionSide = true; break;
             case "empty-cells": EmptyCells = parent.EmptyCells; break;
             case "content": Content = parent.Content; break;
             case "quotes":
@@ -2024,6 +2133,8 @@ public class ComputedStyle
     }
 }
 
+public readonly record struct CssClipRect(float? Top, float? Right, float? Bottom, float? Left);
+
 // ── Supporting enums ─────────────────────────────────────────────────────
 
 /// <summary>
@@ -2059,7 +2170,7 @@ public enum DisplayValue
     TableRowGroup, TableColumnGroup, TableColumn,
     TableHeaderGroup, TableFooterGroup,
     // CSS2 additions
-    InlineTable, RunIn, Compact
+    InlineTable, RunIn, Compact, Marker
 }
 
 public enum VisibilityValue { Visible, Hidden, Collapse }
@@ -2076,7 +2187,9 @@ public enum BorderStyleValue
 public enum ListStyleType
 {
     None, Disc, Circle, Square,
-    Decimal, LowerAlpha, UpperAlpha, LowerRoman, UpperRoman
+    Decimal, DecimalLeadingZero, LowerAlpha, UpperAlpha, LowerGreek,
+    LowerRoman, UpperRoman, Armenian, Georgian, Hebrew, Hiragana,
+    Katakana, HiraganaIroha, KatakanaIroha
 }
 
 public enum ListStylePosition { Inside, Outside }

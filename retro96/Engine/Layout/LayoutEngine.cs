@@ -319,6 +319,14 @@ public static class LayoutEngine
                         }
 
                         var boxType = DetermineBoxType(elem, style);
+                        if (elem.TagName == "object" &&
+                            elem.GetAttr("classid")?.StartsWith("clsid:", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            // ActiveX class IDs are unsupported. Treat the object
+                            // as a fallback container so nested object/image content
+                            // participates in layout instead of reserving a plugin box.
+                            boxType = BoxType.InlineBlock;
+                        }
 
                         // ── Flatten inline containers ───────────────────────────
                         // InlineLayout only measures top-level items in the inline
@@ -478,20 +486,24 @@ public static class LayoutEngine
     /// Emits the <c>:before</c>/<c>:after</c> generated-content text as an
     /// inline text-run box.  Only the renderable token types contribute:
     /// "string" tokens emit their literal text and <c>attr(x)</c> emits the
-    /// element's attribute value.  counter()/counters(), the quote keywords
-    /// and url() need counter/quote plumbing the engine does not carry —
-    /// they are skipped (documented simplification).  Empty content emits
-    /// nothing at all.
+    /// element's attribute value. The style resolver provides resolved text
+    /// for counters and quote keywords; marker pseudo-elements are painted
+    /// in the list-marker position rather than inline.
     /// </summary>
     private static void AddGeneratedContent(
         DomElement element, LayoutBox parentBox, List<LayoutBox> result, bool before)
     {
         var pseudo = before ? element.Style?.GeneratedBefore : element.Style?.GeneratedAfter;
-        var tokens = pseudo?.Content;
-        if (tokens == null || tokens.Count == 0)
+        if (pseudo == null)
             return;
 
-        string text = GeneratedContentText(tokens, element);
+        var tokens = pseudo.Content;
+        if (tokens == null || tokens.Count == 0)
+            return;
+        if (pseudo.Display == DisplayValue.Marker)
+            return;
+
+        string text = pseudo.ResolvedGeneratedContentText ?? GeneratedContentText(tokens, element);
         if (text.Length == 0)
             return;
 
@@ -795,13 +807,16 @@ public static class LayoutEngine
         return style.Display switch
         {
             DisplayValue.Table => BoxType.Table,
+            DisplayValue.InlineTable => BoxType.InlineBlock,
             DisplayValue.TableRow => BoxType.TableRow,
-            DisplayValue.TableRowGroup => BoxType.Block,   // container for rows
+            DisplayValue.TableRowGroup or DisplayValue.TableHeaderGroup or
+                DisplayValue.TableFooterGroup => BoxType.Block,
             DisplayValue.TableCell => BoxType.TableCell,
             DisplayValue.TableCaption => BoxType.TableCaption,
             DisplayValue.ListItem => BoxType.ListItem,
             DisplayValue.Block => BoxType.Block,
             DisplayValue.InlineBlock => BoxType.InlineBlock,
+            DisplayValue.Compact => BoxType.Block,
             _ => BoxType.Inline
         };
     }
@@ -887,9 +902,12 @@ public static class LayoutEngine
             box.MarginBottom = Math.Max(box.MarginBottom, vspace);
         }
 
-        // border on <img> and <table> (HTML attribute, not CSS property).
+        // border on images, image inputs, and tables (HTML attribute, not CSS property).
         // <TABLE BORDER> with no value means BORDER=1 (HTML 3.2).
-        if (elem.TagName is "img" or "table")
+        if (elem.TagName is "img" or "table" ||
+            (elem.TagName == "input" &&
+             elem.GetAttrOrDefault("type", "text").Trim()
+                 .Equals("image", StringComparison.OrdinalIgnoreCase)))
         {
             int bw = elem.GetAttrInt("border", -1);
             if (bw < 0 && elem.HasAttr("border") &&
@@ -898,10 +916,11 @@ public static class LayoutEngine
             if (bw >= 0)
             {
                 bw = Math.Min(bw, (int)MaxAttrLength);
-                box.BorderTop = bw;
-                box.BorderRight = bw;
-                box.BorderBottom = bw;
-                box.BorderLeft = bw;
+                var style = elem.Style;
+                if (style?.OwnBorderTopWidth != true) box.BorderTop = bw;
+                if (style?.OwnBorderRightWidth != true) box.BorderRight = bw;
+                if (style?.OwnBorderBottomWidth != true) box.BorderBottom = bw;
+                if (style?.OwnBorderLeftWidth != true) box.BorderLeft = bw;
             }
         }
 
@@ -1384,7 +1403,8 @@ public static class LayoutEngine
         FloatContext? inheritedFloats = null)
     {
         ResolveBoxPercentages(box, containingWidth);
-        if (box.BoxType == BoxType.Table)
+        if (box.BoxType == BoxType.Table ||
+            box.Element?.Style?.Display == DisplayValue.InlineTable)
         {
             ResolvePercentWidth(box, containingWidth);
             // A floated table must inherit the active flow exclusion band, but it
@@ -1409,6 +1429,47 @@ public static class LayoutEngine
         // CSS2 min-height/max-height on the resolved (auto or explicit)
         // height — the width clamp already ran inside ResolveAutoWidth.
         ClampHeightToBounds(box, containingHeight);
+    }
+
+    internal static float LayoutInlineRun(
+        IReadOnlyList<LayoutBox> inlineBoxes, float containerWidth,
+        float contentX, float startY, ComputedStyle containerStyle,
+        FloatContext? floats, float containingHeight)
+    {
+        var inlineBlocks = new List<(LayoutBox Box, float X, float Y)>();
+        foreach (var container in inlineBoxes.Where(child =>
+                     child.BoxType == BoxType.InlineBlock && child.Element != null))
+        {
+            if (container.Element?.Style?.Display == DisplayValue.TableCell &&
+                container.Width <= 0f)
+            {
+                float chrome = container.PaddingLeft + container.PaddingRight
+                    + container.BorderLeft + container.BorderRight;
+                float available = Math.Max(0f,
+                    containerWidth - container.MarginLeft - container.MarginRight);
+                container.Width = Math.Max(0f, Math.Min(available,
+                    TableLayout.MeasureInlineCellPreferredWidth(container)) - chrome);
+            }
+
+            container.X = contentX + container.MarginLeft;
+            container.Y = startY;
+            LayoutBlock(container,
+                container.Width > 0f ? container.Width : containerWidth,
+                containingHeight, floats?.Clone());
+            inlineBlocks.Add((container, container.X, container.Y));
+        }
+
+        float height = InlineLayout.Layout(
+            inlineBoxes, containerWidth, contentX, startY, containerStyle, floats);
+        foreach (var (container, oldX, oldY) in inlineBlocks)
+        {
+            float dx = container.X - oldX;
+            float dy = container.Y - oldY;
+            if (Math.Abs(dx) < 0.01f && Math.Abs(dy) < 0.01f) continue;
+            foreach (var child in container.Children)
+                OffsetBoxTree(child, dx, dy);
+        }
+        return height;
     }
 
     /// <summary>
@@ -1649,9 +1710,9 @@ public static class LayoutEngine
                 LayoutTrace.Log($"FlushInlineRun: box(tag={box.Element?.TagName},anon={box.BoxType == BoxType.Anonymous}) " +
                     $"currentY={currentY:F1} prevMarginBottom={prevMarginBottom:F1} => start={start:F1} " +
                     $"contentX={contentX:F1} box.Width={box.Width:F1}");
-                float inlineHeight = InlineLayout.Layout(
+                float inlineHeight = LayoutInlineRun(
                     pendingInline, box.Width, contentX, start,
-                    containerStyle, floatCtx);
+                    containerStyle, floatCtx, containingHeight);
                 currentY = start + inlineHeight;
                 prevMarginBottom = 0f;   // real inline content breaks collapsing
             }
@@ -1882,7 +1943,9 @@ public static class LayoutEngine
                 st?.Bottom == null && st?.BottomPercent == null)
                 child.Y = currentY + prevMarginBottom;
 
-            var positionedContainingBlock = FindPositionedContainingBlock(box);
+            var positionedContainingBlock = st?.Position == PositionValue.Fixed
+                ? FindViewportContainingBlock(box)
+                : FindPositionedContainingBlock(box);
             LayoutBlock(child, positionedContainingBlock.Width, positionedContainingBlock.Height);
 
             // FIX: the containing block for an absolutely positioned box is its
@@ -1907,7 +1970,9 @@ public static class LayoutEngine
 
         // Relatively positioned children
         foreach (var child in box.Children.Where(c =>
-            c.Element?.Style?.Position == PositionValue.Relative))
+            c.Element is { } element &&
+            element.Style?.Position == PositionValue.Relative &&
+            ReferenceEquals(element.LayoutBox, c)))
             LayoutRelative(child);
     }
 
@@ -2143,6 +2208,14 @@ public static class LayoutEngine
         return root;
     }
 
+    private static LayoutBox FindViewportContainingBlock(LayoutBox from)
+    {
+        var root = from;
+        while (root.Parent != null)
+            root = root.Parent;
+        return root;
+    }
+
     private static void LayoutAbsolute(LayoutBox box, LayoutBox containingBlock)
     {
         var style = box.Element?.Style;
@@ -2152,6 +2225,14 @@ public static class LayoutEngine
                          + containingBlock.BorderLeft + containingBlock.PaddingLeft;
         float cbContentY = containingBlock.Y
                          + containingBlock.BorderTop + containingBlock.PaddingTop;
+        float cbWidth = style.Position == PositionValue.Fixed &&
+            containingBlock.ViewportWidth > 0f
+                ? containingBlock.ViewportWidth
+                : containingBlock.Width;
+        float cbHeight = style.Position == PositionValue.Fixed &&
+            containingBlock.ViewportHeight > 0f
+                ? containingBlock.ViewportHeight
+                : containingBlock.Height;
 
         // FIX: top/left/right/bottom percentages used to be flattened to
         // pixels back in ComputedStyle.Apply, against the page viewport
@@ -2164,10 +2245,10 @@ public static class LayoutEngine
         // to. TopPercent/LeftPercent/etc. carry the raw percentage through
         // instead, resolved here against the real containingBlock now that
         // it's known.
-        float? left = style.Left ?? (style.LeftPercent is { } lp ? lp / 100f * containingBlock.Width : null);
-        float? right = style.Right ?? (style.RightPercent is { } rp ? rp / 100f * containingBlock.Width : null);
-        float? top = style.Top ?? (style.TopPercent is { } tp ? tp / 100f * containingBlock.Height : null);
-        float? bottom = style.Bottom ?? (style.BottomPercent is { } bp ? bp / 100f * containingBlock.Height : null);
+        float? left = style.Left ?? (style.LeftPercent is { } lp ? lp / 100f * cbWidth : null);
+        float? right = style.Right ?? (style.RightPercent is { } rp ? rp / 100f * cbWidth : null);
+        float? top = style.Top ?? (style.TopPercent is { } tp ? tp / 100f * cbHeight : null);
+        float? bottom = style.Bottom ?? (style.BottomPercent is { } bp ? bp / 100f * cbHeight : null);
 
         // Work out the final border-box origin first, then shift the whole
         // subtree exactly once. The box was already laid out provisionally at
@@ -2180,7 +2261,7 @@ public static class LayoutEngine
         if (left.HasValue)
             targetX = cbContentX + left.Value + box.MarginLeft;
         else if (right.HasValue)
-            targetX = cbContentX + containingBlock.Width
+            targetX = cbContentX + cbWidth
                     - right.Value
                     - box.MarginRight - box.BorderLeft - box.BorderRight
                     - box.PaddingLeft - box.PaddingRight - box.Width;
@@ -2188,7 +2269,7 @@ public static class LayoutEngine
         if (top.HasValue)
             targetY = cbContentY + top.Value + box.MarginTop;
         else if (bottom.HasValue)
-            targetY = cbContentY + containingBlock.Height
+            targetY = cbContentY + cbHeight
                     - bottom.Value
                     - box.MarginBottom - box.BorderTop - box.BorderBottom
                     - box.PaddingTop - box.PaddingBottom - box.Height;
@@ -2442,7 +2523,11 @@ public static class LayoutEngine
     }
 
     private static LayoutBox MakeRootBox(DomElement? elem, float w, float h)
-        => new LayoutBox(elem, BoxType.Block) { X = 0, Y = 0, Width = w, Height = h };
+        => new LayoutBox(elem, BoxType.Block)
+        {
+            X = 0, Y = 0, Width = w, Height = h,
+            ViewportWidth = w, ViewportHeight = h
+        };
 
     /// <summary>
     /// Grows the root box to cover the full document extents (any box that

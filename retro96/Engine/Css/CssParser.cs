@@ -495,6 +495,7 @@ public static class CssParser
             var valueSb = new StringBuilder();
             int parenDepth = 0;
             char quote = '\0';
+            bool invalidValue = false;
             while (pos < css.Length)
             {
                 char v = css[pos];
@@ -508,6 +509,8 @@ public static class CssParser
                 }
                 if (v is '\'' or '"') { quote = v; valueSb.Append(v); pos++; continue; }
                 if ((v == ';' || v == '}') && parenDepth == 0) break;
+                if (v == ':' && parenDepth == 0)
+                    invalidValue = true;
                 if (v == '(') parenDepth++;
                 else if (v == ')') parenDepth = Math.Max(0, parenDepth - 1);
                 valueSb.Append(v); pos++;
@@ -515,6 +518,9 @@ public static class CssParser
 
             if (pos < css.Length && css[pos] == ';')
                 pos++;
+
+            if (invalidValue)
+                continue;
 
             string value = valueSb.ToString().Trim();
 
@@ -558,6 +564,15 @@ public static class CssParser
 
         switch (property)
         {
+            case "border-width":
+            case "border-top-width":
+            case "border-right-width":
+            case "border-bottom-width":
+            case "border-left-width":
+                return IsValidBorderWidthList(value)
+                    ? new[] { (property, value) }
+                    : Array.Empty<(string, string)>();
+
             case "margin":
                 return ExpandBox(property, value);
 
@@ -639,7 +654,8 @@ public static class CssParser
                     {
                         var lower = part.ToLowerInvariant();
                         if (lower is "disc" or "circle" or "square" or "decimal" or
-                                "lower-alpha" or "upper-alpha" or "lower-roman" or "upper-roman" or "none")
+                                "lower-alpha" or "upper-alpha" or "lower-greek" or
+                                "lower-roman" or "upper-roman" or "none")
                             result.Add(("list-style-type", part));
                         else if (lower is "inside" or "outside")
                             result.Add(("list-style-position", part));
@@ -654,6 +670,35 @@ public static class CssParser
                 // whole by ComputedStyle.Apply.
                 return new[] { (property, value) };
         }
+    }
+
+    private static bool IsValidBorderWidthList(string value)
+    {
+        var parts = SplitTopLevel(value);
+        if (parts.Count is < 1 or > 4)
+            return false;
+
+        return parts.All(part =>
+        {
+            string token = part.Trim().ToLowerInvariant();
+            if (token is "thin" or "medium" or "thick")
+                return true;
+
+            string number = token;
+            if (token.EndsWith("px") || token.EndsWith("pt") ||
+                token.EndsWith("pc") || token.EndsWith("in") ||
+                token.EndsWith("cm") || token.EndsWith("mm") ||
+                token.EndsWith("em") || token.EndsWith("ex"))
+                number = token[..^2];
+            else if (token != "0")
+                return false;
+
+            return double.TryParse(number,
+                       System.Globalization.NumberStyles.Float,
+                       System.Globalization.CultureInfo.InvariantCulture,
+                       out double parsed) &&
+                   double.IsFinite(parsed) && parsed >= 0;
+        });
     }
 
     private static IEnumerable<(string, string)> ExpandBox(string property, string value)
