@@ -68,6 +68,42 @@ public class CssParserTests
     }
 
     [Fact]
+    public void HoverRelayoutDetectionRequiresAMatchingAuthorRule()
+    {
+        var doc = ParseAndResolve(
+            "<a id='go' href='/x'><span>go</span></a><div id='other'></div>",
+            "#other:hover { display: none; }");
+        var link = doc.AllTags("a")[0];
+        var child = doc.AllTags("span")[0];
+        var other = doc.AllTags("div")[0];
+
+        Check.That(!StyleResolver.HasMatchingHoverRule(doc),
+            "no hover target means no dynamic hover rule applies");
+        doc.HoveredElement = child;
+        Check.That(!StyleResolver.HasMatchingHoverRule(doc),
+            "hovering a normal link without an author hover rule does not require restyling");
+        doc.HoveredElement = other;
+        Check.That(StyleResolver.HasMatchingHoverRule(doc),
+            "a matching element hover rule is detected");
+        doc.HoveredElement = link;
+        Check.That(!StyleResolver.HasMatchingHoverRule(doc),
+            "a selector for a different element does not trigger restyling");
+        doc.HoveredElement = null;
+        Check.That(!StyleResolver.HasMatchingHoverRule(doc),
+            "clearing hover removes the dynamic match");
+        doc.AllTags("style")[0].Children.OfType<DomText>().First().Data =
+            "a:hover { color: red; } #other:hover { color: blue; }";
+        StyleResolver.Resolve(doc, 800);
+        doc.HoveredElement = child;
+        Check.That(StyleResolver.HasMatchingHoverRule(doc),
+            "a matching ancestor hover rule is detected for nested link content");
+        doc.HoveredElement = other;
+        Check.That(StyleResolver.HasMatchingHoverRule(doc),
+            "style recalculation refreshes cached hover selectors");
+        Check.Done();
+    }
+
+    [Fact]
     public void IndexedStyleRulesKeepTypeClassIdAndCombinatorMatches()
     {
         var doc = ParseAndResolve(

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Retro96.Drawing;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Retro96.Engine.Dom;
 
 namespace Retro96.Engine.Css;
@@ -27,6 +28,71 @@ namespace Retro96.Engine.Css;
 /// </summary>
 public static class StyleResolver
 {
+    private sealed record HoverRuleEntry(IReadOnlyList<CssSelector> Selectors);
+
+    private static readonly ConditionalWeakTable<DomDocument, HoverRuleEntry> HoverRuleCache = new();
+    private static readonly object HoverRuleCacheLock = new();
+
+    /// <summary>
+    /// Returns whether the current hovered element or one of its ancestors
+    /// matches an author :hover selector. A hover with no matching rule needs
+    /// cursor/status updates, not a full document reflow.
+    /// </summary>
+    internal static bool HasMatchingHoverRule(DomDocument doc)
+    {
+        ArgumentNullException.ThrowIfNull(doc);
+        if (!HoverRuleCache.TryGetValue(doc, out var entry))
+            entry = CacheHoverRules(doc, ReadAuthorRules(doc));
+        if (doc.HoveredElement == null) return false;
+
+        foreach (var element in HoveredElementAndAncestors(doc.HoveredElement))
+        {
+            foreach (var selector in entry.Selectors)
+                if (selector.Matches(element))
+                    return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<DomElement> HoveredElementAndAncestors(DomElement hovered)
+    {
+        for (DomNode? node = hovered; node is DomElement element; node = element.Parent)
+            yield return element;
+    }
+
+    private static List<CssRule> ReadAuthorRules(DomDocument doc)
+    {
+        var rules = new List<CssRule>();
+        foreach (var element in doc.ElementDescendants())
+        {
+            if (element.TagName != "style") continue;
+            foreach (var text in element.Children.OfType<DomText>())
+                if (!string.IsNullOrEmpty(text.Data))
+                {
+                    var (parsedRules, _) = CssParser.Parse(text.Data);
+                    rules.AddRange(parsedRules);
+                }
+        }
+        return rules;
+    }
+
+    private static HoverRuleEntry CacheHoverRules(DomDocument doc, IEnumerable<CssRule> rules)
+    {
+        var selectors = rules.SelectMany(rule => rule.Selectors)
+            .Where(selector => selector.Parts.Any(part =>
+                part.Kind == PartType.PseudoClass &&
+                part.Value?.Equals("hover", StringComparison.OrdinalIgnoreCase) == true))
+            .ToArray();
+        var entry = new HoverRuleEntry(selectors);
+        lock (HoverRuleCacheLock)
+        {
+            HoverRuleCache.Remove(doc);
+            HoverRuleCache.Add(doc, entry);
+            return entry;
+        }
+    }
+
     // ── Document colour accessors (used by the Renderer) ─────────────────
 
     public static Color GetLinkColor(DomDocument doc) =>
@@ -99,6 +165,7 @@ public static class StyleResolver
             }
         }
 
+        CacheHoverRules(doc, authorRules);
         var ruleIndex = new AuthorRuleIndex(authorRules, doc);
         int activeBaseFontSize = doc.BaseFontSize;
         ResolveNode(doc, null, ruleIndex, doc, viewportWidth, ref activeBaseFontSize);

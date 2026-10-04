@@ -6336,9 +6336,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         bool changed = hoveredChanged || activeChanged || focusedChanged;
         if (!changed) return;
 
+        bool previousHoverStyleMatched = hoveredChanged &&
+            doc.HoveredElement != null &&
+            StyleResolver.HasMatchingHoverRule(doc);
         doc.HoveredElement = hovered;
         doc.ActiveElement = active;
         doc.FocusedElement = focused;
+        bool currentHoverStyleMatched = hoveredChanged &&
+            hovered != null &&
+            StyleResolver.HasMatchingHoverRule(doc);
+        bool hoverStyleChanged = previousHoverStyleMatched || currentHoverStyleMatched;
+        relayout &= hoverStyleChanged || activeChanged || focusedChanged;
 
         // Editable-field focus/hover is painted as a live overlay. Rebuilding
         // the whole document for every mouse move/down/up changes the textarea
@@ -6349,13 +6357,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (!relayout)
         {
             // Interaction state changes must still rebuild the cached display
-            // list so legacy BODY ALINK and :hover/:active colors become visible,
-            // but must never rebuild layout.  The old pressed-link overlay drew a
-            // second copy of the glyphs on top of the normal green link, which
-            // caused the red/green ghost and the tiny text displacement.
-            if (hoveredChanged || activeChanged || focusedChanged)
+            // list when a matching hover style or another visual interaction
+            // state actually changes. Ordinary pointer movement over an
+            // unstyled link must not invalidate and re-record the entire page.
+            if (hoverStyleChanged || activeChanged || focusedChanged)
+            {
                 InvalidateDisplayLists();
-            Invalidate();
+                Invalidate();
+            }
             return;
         }
 
