@@ -15,7 +15,15 @@ namespace Retro96.Engine.Css;
 public record CssSelector(IReadOnlyList<SelectorPart> Parts)
 {
     public string? PseudoElementName =>
-        Parts.FirstOrDefault(p => p.Kind == PartType.PseudoElement)?.Value;
+        GetPseudoElementName();
+
+    private string? GetPseudoElementName()
+    {
+        foreach (var part in Parts)
+            if (part.Kind == PartType.PseudoElement)
+                return part.Value;
+        return null;
+    }
 
     /// <summary>
     /// Specificity (b, c, d): b = IDs, c = classes/attributes/pseudo-classes,
@@ -25,9 +33,19 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
     {
         get
         {
-            int b = Parts.Count(p => p.Kind == PartType.Id);
-            int c = Parts.Count(p => p.Kind is PartType.Class or PartType.PseudoClass or PartType.Attribute);
-            int d = Parts.Count(p => p.Kind is PartType.Type or PartType.PseudoElement);
+            int b = 0, c = 0, d = 0;
+            foreach (var part in Parts)
+            {
+                switch (part.Kind)
+                {
+                    case PartType.Id: b++; break;
+                    case PartType.Class:
+                    case PartType.PseudoClass:
+                    case PartType.Attribute: c++; break;
+                    case PartType.Type:
+                    case PartType.PseudoElement: d++; break;
+                }
+            }
             return (b, c, d);
         }
     }

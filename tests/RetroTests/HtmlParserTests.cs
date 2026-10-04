@@ -80,6 +80,21 @@ public class HtmlParserTests
         Check.Done();
     }
 
+    [Fact]
+    public void EditedTitleElementUpdatesDocumentTitleWithoutChangingBodyText()
+    {
+        var doc = Parse("<html><head><title>Retro67 &amp; Friends</title></head>" +
+                        "<body><h1>Original heading</h1></body></html>");
+
+        Check.That(doc.Title == "Retro67 & Friends",
+            "the first title element supplies the decoded document title", doc.Title);
+        Check.That(doc.FirstTag("title")?.InnerText == "Retro67 & Friends",
+            "the title element retains its edited text");
+        Check.That(doc.FirstTag("h1")?.InnerText == "Original heading",
+            "changing document title does not rewrite visible body content");
+        Check.Done();
+    }
+
     // ── unclosed tag handling ────────────────────────────────────────
 
     [Fact]

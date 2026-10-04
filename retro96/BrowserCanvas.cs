@@ -842,9 +842,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     }
 
     public bool ApplyEditedSource(string markup)
+        => ApplyEditedSource(markup, out _);
+
+    public bool ApplyEditedSource(string markup, out string error)
     {
         if (_document?.BaseUrl == null || _jsInterpreter == null || _fontCache == null || _imageCache == null)
+        {
+            error = "The current page is not ready for source editing.";
             return false;
+        }
 
         try
         {
@@ -853,11 +859,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             Engine.Css.StyleResolver.Resolve(document, viewport.Width);
             var root = LayoutEngineApi.BuildLayoutTree(document, viewport.Width, viewport.Height);
             SetPage(document, root, _jsInterpreter, _fontCache, _imageCache);
-            RequestRerender();
+            ReRenderPage(_fontCache, _imageCache,
+                _resourceLoader ?? throw new InvalidOperationException("Resource loader not configured"));
+            Invalidate();
+            if (IsHandleCreated && !IsDisposed)
+                Update();
+            error = string.Empty;
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            error = ex.Message;
             return false;
         }
     }
@@ -1975,14 +1987,16 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
     }
 
-    private void PaintDynamicEmbeddedContent(SKCanvas canvas, IReadOnlyList<LayoutBox> boxes)
+    private void PaintDynamicEmbeddedContent(
+        SKCanvas canvas, IReadOnlyList<LayoutBox> boxes, RectangleF viewport)
     {
         if (boxes.Count == 0) return;
         // Rendering an embedded element can re-enter layout/cache invalidation
         // and mutate the backing list. Paint the frame's captured set instead.
         foreach (var box in boxes.ToArray())
         {
-            if (box.Element == null || box.Width <= 0f || box.Height <= 0f)
+            if (box.Element == null || box.Width <= 0f || box.Height <= 0f ||
+                !IntersectsViewport(box, viewport))
                 continue;
             try
             {
@@ -2057,11 +2071,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
     private void PaintAnimatedImages(SKCanvas canvas, Renderer renderer,
                                      IEnumerable<LayoutBox> boxes,
-                                     DomDocument document, GRContext? gpuContext)
+                                     DomDocument document, GRContext? gpuContext,
+                                     RectangleF viewport)
     {
         foreach (var box in boxes)
         {
-            if (box.Width <= 0f || box.Height <= 0f) continue;
+            if (box.Width <= 0f || box.Height <= 0f ||
+                !IntersectsViewport(box, viewport))
+                continue;
             try
             {
                 renderer.RenderAnimatedImageToCanvas(canvas, box, document, _imageCache!, gpuContext);
@@ -2072,6 +2089,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             }
         }
     }
+
+    private static bool IntersectsViewport(LayoutBox box, RectangleF viewport) =>
+        box.X < viewport.Right && box.X + box.Width > viewport.Left &&
+        box.Y < viewport.Bottom && box.Y + box.Height > viewport.Top;
 
     protected override void OnPaintSurface(SKPaintGLSurfaceEventArgs e)
     {
@@ -2135,8 +2156,11 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 var picture = GetRootDisplayList(currentGpuContext);
                 if (picture != null)
                     canvas.DrawPicture(picture);
+                var rootContentViewport = new RectangleF(
+                    scrollX, scrollY, logicalVw, logicalVh);
                 if (_rootBox != null)
-                    PaintDynamicEmbeddedContent(canvas, GetRootDynamicEmbeddedContent());
+                    PaintDynamicEmbeddedContent(
+                        canvas, GetRootDynamicEmbeddedContent(), rootContentViewport);
                 if (_rootBox != null && (_rootAnimatedSubtreesCached || _hasMarquee || BrowserRuntime.BlinkEnabled))
                 {
                     var animationRenderer = GetAnimationRenderer();
@@ -2156,7 +2180,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (_rootBox != null && animationRendererForPaint != null && _rootAnimatedImagesCached &&
                     _rootAnimatedImages.Count > 0)
                 {
-                    PaintAnimatedImages(canvas, animationRendererForPaint, _rootAnimatedImages, _document!, currentGpuContext);
+                    PaintAnimatedImages(canvas, animationRendererForPaint, _rootAnimatedImages,
+                        _document!, currentGpuContext, rootContentViewport);
                 }
             }
             finally
@@ -2240,8 +2265,11 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             var picture = GetFrameDisplayList(view, gpuContext);
             if (picture != null)
                 canvas.DrawPicture(picture);
+            var frameContentViewport = new RectangleF(
+                view.Scroll.X, view.Scroll.Y, frameBox.Width, frameBox.Height);
             if (view.RootBox != null)
-                PaintDynamicEmbeddedContent(canvas, GetFrameDynamicEmbeddedContent(view));
+                PaintDynamicEmbeddedContent(
+                    canvas, GetFrameDynamicEmbeddedContent(view), frameContentViewport);
             if (view.RootBox != null && animationRenderer != null)
             {
                 if (!_frameAnimatedSubtrees.TryGetValue(view, out var animatedBoxes))
@@ -2256,7 +2284,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             if (animationRenderer != null && _frameAnimatedImages.TryGetValue(view, out var animatedImages) &&
                 animatedImages.Count > 0)
             {
-                PaintAnimatedImages(canvas, animationRenderer, animatedImages, view.Document, gpuContext);
+                PaintAnimatedImages(canvas, animationRenderer, animatedImages,
+                    view.Document, gpuContext, frameContentViewport);
             }
         }
         finally
@@ -3116,12 +3145,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (segment.SourceElement != null &&
                     IsSearchableControlElement(segment.SourceElement))
                 {
-                    var face = IntersectRect(segment.Box.ContentRect, segment.Box.BorderRect);
+                    var contentRect = segment.Box.ContentRect;
+                    var face = IntersectRect(contentRect, segment.Box.BorderRect);
                     if (face.Width > 0.01f && face.Height > 0.01f)
                     {
                         if (segment.SourceElement.TagName == "textarea")
                         {
-                            PaintTextareaFindHighlight(g, segmentMatch, face,
+                            PaintTextareaFindHighlight(g, segmentMatch, contentRect, face,
                                 segmentOffsetX, offsetY, matchBrush, matchBrush,
                                 matchPen, matchPen, active: false);
                         }
@@ -3478,7 +3508,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     }
 
     private void PaintTextareaFindHighlight(Graphics g, FindMatch match,
-                                               RectangleF face, float offsetX, float offsetY,
+                                               RectangleF contentRect, RectangleF clipFace,
+                                               float offsetX, float offsetY,
                                                Brush matchBrush, Brush activeBrush,
                                                Pen matchPen, Pen activePen, bool active)
     {
@@ -3494,13 +3525,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         bool wrapOff = el.GetAttrOrDefault("wrap", "").Trim()
             .Equals("off", StringComparison.OrdinalIgnoreCase);
         var state = GetTextareaRenderState(el);
-        var geometry = GetTextareaGeometry(el, match.Box, match.Frame);
-        if (geometry == null) return;
-
-        float lineHeight = geometry.Font.GetHeight(g);
-        int maxScrollLine = Math.Max(0, geometry.Lines.Count - geometry.VisibleLines);
+        var layout = TextareaOverlay.CalculateLayout(
+            g.Canvas, text, font, contentRect.Width, contentRect.Height, wrapOff);
+        int maxScrollLine = Math.Max(0, layout.Lines.Count - layout.VisibleLines);
         int scrollLine = Math.Clamp(state.ScrollLine, 0, maxScrollLine);
-        float scrollY = scrollLine * lineHeight;
+        float scrollY = scrollLine * layout.LineHeight;
+        float maxScrollX = Math.Max(0f, layout.TextWidth - layout.TextViewportWidth);
+        float scrollX = wrapOff ? Math.Clamp(state.ScrollX, 0f, maxScrollX) : 0f;
 
         int start = Math.Clamp(match.Start, 0, text.Length);
         int end = Math.Clamp(match.Start + match.Length, start, text.Length);
@@ -3509,13 +3540,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // Use the same line-breaking + prefix-measurement code as the live
         // textarea editor. That makes a find match line up with the actual
         // characters even when the match wraps across visual lines.
-        var rects = Engine.Render.TextareaOverlay.SelectionRects(
-            g, text, font, face, state.ScrollX, scrollY, start, end, wrapOff);
+        var rects = TextareaOverlay.SelectionRects(
+            text, font, contentRect, scrollX, scrollY,
+            start, end, layout);
         if (rects.Count == 0) return;
 
         var clipRect = new RectangleF(
-            face.X + 1f + offsetX, face.Y + 1f + offsetY,
-            Math.Max(1f, face.Width - 2f), Math.Max(1f, face.Height - 2f));
+            clipFace.X + 1f + offsetX, clipFace.Y + 1f + offsetY,
+            Math.Max(1f, clipFace.Width - 2f), Math.Max(1f, clipFace.Height - 2f));
 
         int clipState = g.Save();
         try
@@ -7672,7 +7704,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // select every text run in that wrapper (sometimes effectively the
         // whole page). For <center>, select only the clicked visual line.
         DomElement? scope = null;
-        DomElement? inlineFallback = null;
         for (var node = word.Element; node != null; node = node.Parent as DomElement)
         {
             if (IsTripleClickBlockTag(node.TagName))
@@ -7680,8 +7711,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 scope = node;
                 break;
             }
-            if (inlineFallback == null && IsTripleClickInlineFallbackTag(node.TagName))
-                inlineFallback = node;
         }
 
         List<LayoutBox> textBoxes = new();
@@ -7713,12 +7742,11 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
         else
         {
-            scope ??= inlineFallback;
-            _selectionSemanticScope = scope;
-            _selectionSemanticScopeFrame = _selectionFrame;
-
             if (scope != null)
             {
+                _selectionSemanticScope = scope;
+                _selectionSemanticScopeFrame = _selectionFrame;
+
                 // Never rely on the scope element having a dedicated LayoutBox.
                 // Inline formatting such as <p><font>...</font></p> and table text
                 // can flatten the DOM across anonymous layout wrappers. The DOM
@@ -7728,6 +7756,34 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     .Where(IsSelectionEligibleBox)
                     .Where(b => IsElementWithin(b.Element, scope))
                     .ToList();
+            }
+            else
+            {
+                // Legacy pages often put a sentence, inline link, and images
+                // directly in <body> without a paragraph wrapper. In that case
+                // there is no semantic block to select, so a triple click
+                // selects the rendered line rather than only the clicked word
+                // (or only the inline link).
+                DomElement? lineContainer = null;
+                for (var node = word.Element; node != null; node = node.Parent as DomElement)
+                {
+                    if (node.TagName is "body" or "html")
+                    {
+                        lineContainer = node;
+                        break;
+                    }
+                }
+
+                float lineTolerance = Math.Max(2f, Math.Min(word.ContentRect.Height, 24f) * 0.5f);
+                float lineTop = word.ContentRect.Top;
+                textBoxes = EnumerateSelectionTree(selectionRoot)
+                    .Where(IsSelectionEligibleBox)
+                    .Where(b => lineContainer == null ||
+                        IsElementWithin(b.Element, lineContainer))
+                    .Where(b => Math.Abs(b.ContentRect.Top - lineTop) <= lineTolerance)
+                    .ToList();
+                _selectionSemanticScope = null;
+                _selectionSemanticScopeFrame = null;
             }
         }
 
@@ -7823,13 +7879,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // Inline text is split into LayoutBoxes whose layout parents may be
         // anonymous. Follow the DOM parent chain to find the semantic block;
         // this is what makes triple-click work for <p><font>long text...</font>.
-        DomElement? inlineFallback = null;
+        DomElement? lineFallback = null;
         for (DomNode? node = box?.Element; node is DomElement element; node = element.Parent)
         {
             if (IsTripleClickBlockTag(element.TagName))
                 return element;
-            if (inlineFallback == null && IsTripleClickInlineFallbackTag(element.TagName))
-                inlineFallback = element;
+            if (element.TagName is "body" or "html")
+                lineFallback = element;
         }
 
         for (var current = box?.Parent; current != null; current = current.Parent)
@@ -7837,10 +7893,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             if (current.Element is not DomElement element) continue;
             if (IsTripleClickBlockTag(element.TagName))
                 return element;
-            if (inlineFallback == null && IsTripleClickInlineFallbackTag(element.TagName))
-                inlineFallback = element;
+            if (element.TagName is "body" or "html")
+                lineFallback ??= element;
         }
-        return inlineFallback ?? box?.Element;
+        return lineFallback ?? box?.Element;
     }
 
     private TextSelectionHit? HitTestTextPosition(LayoutBox root, float x, float y)
@@ -9940,53 +9996,94 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             AutoClose = true
         };
         _openSelectMenu = menu;
-        System.Drawing.Font? bold = null;
-        foreach (var opt in options)
+        const int popupWidth = 220;
+        const int popupMaxHeight = 360;
+        int selectedIndex = Math.Max(0, options.IndexOf(currentOpt!));
+        ListBox optionList;
+
+        if (isMultiple)
         {
-            var captured = opt;
-            var item = (ToolStripMenuItem)menu.Items.Add(
-                GlyphSubstituteOptionLabel(opt), null,
-                (s, e) =>
+            var checkedList = new CheckedListBox
+            {
+                BorderStyle = BorderStyle.None,
+                CheckOnClick = true,
+                IntegralHeight = false,
+                HorizontalScrollbar = true,
+                SelectionMode = SelectionMode.One
+            };
+            foreach (var opt in options)
+                checkedList.Items.Add(GlyphSubstituteOptionLabel(opt), opt.HasAttr("selected"));
+            checkedList.SelectedIndex = selectedIndex;
+            checkedList.ItemCheck += (_, e) =>
+            {
+                int index = e.Index;
+                bool selected = e.NewValue == CheckState.Checked;
+                BeginInvoke((Action)(() =>
                 {
-                    if (isMultiple)
-                    {
-                        if (captured.HasAttr("selected"))
-                            captured.SetAttr("selected", null);
-                        else
-                            captured.SetAttr("selected", "");
-                    }
-                    else
-                    {
-                        foreach (var o in options)
-                            o.SetAttr("selected", null);
-                        captured.SetAttr("selected", "");
-                    }
+                    if (index < 0 || index >= options.Count || menu.IsDisposed) return;
+                    options[index].SetAttr("selected", selected ? "" : null);
                     js?.FireEvent(select, "onchange");
                     RequestRerender();
                     menu.Close(ToolStripDropDownCloseReason.ItemClicked);
-                });
-
-            if (isMultiple)
-                item.Checked = opt.HasAttr("selected");
-
-            // Win95 combobox behaviour: the current value carries the
-            // navy highlight bar in the dropped list.
-            if (ReferenceEquals(opt, currentOpt))
+                }));
+            };
+            optionList = checkedList;
+        }
+        else
+        {
+            var list = new ListBox
             {
-                // FIX: a new Font was allocated per menu and never disposed.
-                bold ??= new System.Drawing.Font(item.Font, System.Drawing.FontStyle.Bold);
-                item.BackColor = System.Drawing.SystemColors.Highlight;
-                item.ForeColor = System.Drawing.SystemColors.HighlightText;
-                item.Font = bold;
-            }
+                BorderStyle = BorderStyle.None,
+                IntegralHeight = false,
+                HorizontalScrollbar = true,
+                SelectionMode = SelectionMode.One
+            };
+            foreach (var opt in options)
+                list.Items.Add(GlyphSubstituteOptionLabel(opt));
+            list.SelectedIndex = selectedIndex;
+            list.MouseClick += (_, e) =>
+            {
+                int index = list.IndexFromPoint(e.Location);
+                if (index >= 0) ApplySelectedOption(index);
+            };
+            list.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode != Keys.Enter || list.SelectedIndex < 0) return;
+                ApplySelectedOption(list.SelectedIndex);
+                e.Handled = true;
+            };
+            optionList = list;
         }
 
-        var sharedBold = bold;
+        void ApplySelectedOption(int index)
+        {
+            if (index < 0 || index >= options.Count) return;
+            foreach (var opt in options)
+                opt.SetAttr("selected", ReferenceEquals(opt, options[index]) ? "" : null);
+            js?.FireEvent(select, "onchange");
+            RequestRerender();
+            menu.Close(ToolStripDropDownCloseReason.ItemClicked);
+        }
+
+        optionList.Font = Font;
+        optionList.IntegralHeight = false;
+        int rowHeight = Math.Max(1, optionList.ItemHeight);
+        int visibleRows = Math.Max(1, Math.Min(options.Count,
+            (popupMaxHeight - 4) / rowHeight));
+        int popupHeight = visibleRows * rowHeight + 4;
+        optionList.Size = new System.Drawing.Size(popupWidth, popupHeight);
+        var host = new ToolStripControlHost(optionList)
+        {
+            AutoSize = false,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            Size = optionList.Size
+        };
+        menu.Items.Add(host);
         menu.Disposed += (s, e) =>
         {
             if (ReferenceEquals(_openSelectMenu, menu))
                 _openSelectMenu = null;
-            sharedBold?.Dispose();
         };
 
         // ContextMenuStrip uses PHYSICAL WinForms client coordinates, while
@@ -11290,7 +11387,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (text.Length == 0 || _findText.Length == 0) return;
 
         string query = NormalizeFindQuery(_findText);
-        string normalized = NormalizeFindQuery(text);
+        string normalized = TextareaOverlay.NormalizeFindTextWithSourceMap(
+            text, out var sourceMap);
         if (query.Length == 0 || normalized.Length == 0) return;
 
         int from = 0;
@@ -11299,43 +11397,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             int at = normalized.IndexOf(query, from, comparison);
             if (at < 0) break;
 
-            int originalStart = FindNormalizedOffsetToSource(text, at);
-            int originalEnd = FindNormalizedOffsetToSource(text, at + query.Length);
-            if (originalEnd <= originalStart)
-                originalEnd = Math.Min(text.Length,
-                    originalStart + Math.Max(1, query.Length));
+            int originalStart = sourceMap[at];
+            int originalEnd = sourceMap[at + query.Length - 1] + 1;
 
             output.Add(new FindMatch(frame, box,
                 originalStart, originalEnd - originalStart, sourceElement));
             from = at + Math.Max(1, query.Length);
         }
-    }
-
-    private static int FindNormalizedOffsetToSource(string source, int normalizedOffset)
-    {
-        if (normalizedOffset <= 0) return 0;
-
-        int normalized = 0;
-        bool inWhitespace = false;
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (char.IsWhiteSpace(source[i]))
-            {
-                if (!inWhitespace)
-                {
-                    if (normalized == normalizedOffset) return i;
-                    normalized++;
-                    inWhitespace = true;
-                }
-                continue;
-            }
-
-            inWhitespace = false;
-            if (normalized == normalizedOffset) return i;
-            normalized++;
-        }
-
-        return source.Length;
     }
 
     private void CollectFindMatchesInFrameTree(FrameView frame, List<FindMatch> output,
@@ -11540,7 +11608,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         FindForm()?.BeginInvoke(() =>
         {
             if (FindForm() is Form f)
-                f.Text = $"{title} — Retro96";
+                f.Text = string.IsNullOrWhiteSpace(title) ? "Untitled" : title;
         });
     }
 

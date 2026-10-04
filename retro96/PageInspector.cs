@@ -18,6 +18,36 @@ namespace Retro96;
 public class PageInspector : Form
 {
     private sealed record ConsoleLine(string Level, string Message, DateTime Timestamp);
+
+    private sealed class SourceEditor : TextBox
+    {
+        public event Action? ApplyRequested;
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            if (CanFocus && !Focused) Focus();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (CanFocus && !Focused) Focus();
+            base.OnMouseWheel(e);
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if ((keyData & Keys.KeyCode) == Keys.S &&
+                (keyData & Keys.Control) == Keys.Control)
+            {
+                ApplyRequested?.Invoke();
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+    }
+
     private static readonly List<ConsoleLine> ConsoleLines = new();
     private static readonly object ConsoleLock = new();
     private static event Action? ConsoleUpdated;
@@ -45,10 +75,12 @@ public class PageInspector : Form
     private readonly TextBox _source = new();
     private readonly ListView _console = new();
     private readonly TextBox _consoleFilter = new();
-    private readonly TextBox _sources = new();
+    private readonly SourceEditor _sources = new();
     private readonly ListView _network = new();
     private readonly ToolStripTextBox _search = new();
     private readonly ToolStripLabel _selectionLabel = new();
+    private ToolStripButton? _applySourceButton;
+    private Button? _applySourcePanelButton;
     private readonly Label _summary = new();
     private readonly Label _crumbs = new();
     private readonly CheckBox _showBoxes = new();
@@ -56,7 +88,9 @@ public class PageInspector : Form
     private int _elementCount;
     private bool _sourceDirty;
     private bool _loadingSource;
+    private bool _applyingSource;
     private bool _sourceLoaded;
+    private string _loadedSourceText = "";
     private DomDocument? _sourceDocument;
     private DomDocument? _inspectedDocument;
     private int _activeTab;
@@ -65,6 +99,22 @@ public class PageInspector : Form
     {
         "br", "img", "meta", "link", "input", "hr"
     };
+
+    private static readonly HashSet<string> BlockSourceElements =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "address", "blockquote", "body", "caption", "center", "dd", "dir",
+            "div", "dl", "dt", "fieldset", "form", "frameset", "h1", "h2",
+            "h3", "h4", "h5", "h6", "head", "hr", "html", "li", "menu",
+            "ol", "p", "pre", "table", "tbody", "td", "tfoot", "th", "thead",
+            "tr", "ul"
+        };
+
+    private static readonly HashSet<string> RawTextSourceElements =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "listing", "plaintext", "pre", "script", "style", "textarea", "xmp"
+        };
 
     public static void PublishConsole(string level, string message, DateTime timestamp)
     {
@@ -98,6 +148,9 @@ public class PageInspector : Form
         var clearConsole = new ToolStripButton("Clear console");
         var clearNetwork = new ToolStripButton("Clear network");
         var applySource = new ToolStripButton("Apply source");
+        _applySourceButton = applySource;
+        applySource.Enabled = false;
+        applySource.ToolTipText = "Apply edited source to the current page (Ctrl+S)";
         _showBoxes.Text = "Outline boxes";
         _showBoxes.AutoSize = true;
         _showBoxes.Checked = canvas.ShowBoxOutlines;
@@ -185,8 +238,10 @@ public class PageInspector : Form
         _sources.AcceptsTab = true;
         _sources.TextChanged += (s, e) =>
         {
-            if (!_loadingSource) _sourceDirty = true;
+            if (_loadingSource) return;
+            UpdateSourceDirtyState();
         };
+        _sources.ApplyRequested += ApplySource;
         _sources.MouseDown += (s, e) =>
         {
             if (!_sources.Focused) _sources.Focus();
@@ -337,16 +392,39 @@ public class PageInspector : Form
     private Control BuildSourceView()
     {
         var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0) };
-        var bar = new Panel { Dock = DockStyle.Top, Height = 30, BackColor = Color.FromArgb(238, 241, 245) };
+        var bar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 36,
+            BackColor = Color.FromArgb(238, 241, 245),
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(4, 2, 4, 2)
+        };
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88f));
+        bar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        _applySourcePanelButton = new Button
+        {
+            Dock = DockStyle.Fill,
+            Text = "Apply",
+            Enabled = false,
+            FlatStyle = FlatStyle.System,
+            AutoSize = false,
+            Margin = new Padding(3, 1, 1, 1),
+            UseVisualStyleBackColor = true
+        };
+        _applySourcePanelButton.Click += (s, e) => ApplySource();
         var hint = new Label
         {
             Dock = DockStyle.Fill,
-            Text = "Editable page source",
+            Text = "Editable live page source — Ctrl+S or Apply",
             TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(8, 0, 0, 0),
+            Padding = new Padding(5, 0, 0, 0),
             ForeColor = Color.FromArgb(75, 84, 96)
         };
-        bar.Controls.Add(hint);
+        bar.Controls.Add(hint, 0, 0);
+        bar.Controls.Add(_applySourcePanelButton, 1, 0);
         panel.Controls.Add(_sources);
         panel.Controls.Add(bar);
         return panel;
@@ -372,13 +450,15 @@ public class PageInspector : Form
         _sources.TabStop = true;
         _sources.AcceptsTab = true;
         _sources.ShortcutsEnabled = true;
-        _sources.ScrollBars = ScrollBars.Both;
-        _sources.WordWrap = false;
+        _sources.ScrollBars = ScrollBars.Vertical;
+        _sources.WordWrap = true;
         _sources.HideSelection = false;
         _sources.TabIndex = 0;
         _sources.CausesValidation = false;
         _sources.BorderStyle = BorderStyle.Fixed3D;
         _sources.Font = _monoFont;
+        _sources.BackColor = Color.White;
+        _sources.ForeColor = Color.FromArgb(30, 35, 42);
     }
 
     private void ConfigureConsoleList()
@@ -505,24 +585,8 @@ public class PageInspector : Form
         }
         else if (tabIndex == 2)
         {
-            if (_sources.Focused || _sourceDirty) return;
-
-            var doc = _canvas.PageDocument;
-            // FIX: _sourceDocument used to be written but never READ (dead).
-            // It now drives a reload when the document swapped without a
-            // PageChanged-driven reset — the Sources tab could otherwise
-            // keep showing the previous page's source.
-            if (_sourceLoaded && doc != null && !ReferenceEquals(_sourceDocument, doc))
-                _sourceLoaded = false;
-
-            if (!_sourceLoaded)
-            {
-                _loadingSource = true;
-                try { _sources.Text = BuildPageSource(); }
-                finally { _loadingSource = false; }
-                _sourceLoaded = true;
-                _sourceDocument = doc;
-            }
+            if (!_applyingSource && _sourceDirty) return;
+            LoadPageSource();
         }
         else if (tabIndex == 3)
         {
@@ -551,6 +615,44 @@ public class PageInspector : Form
                 }
             }
             _network.EndUpdate();
+        }
+    }
+
+    private void LoadPageSource()
+    {
+        var document = _canvas.PageDocument;
+        if (_sourceLoaded && ReferenceEquals(_sourceDocument, document)) return;
+
+        _loadingSource = true;
+        try
+        {
+            _sources.Text = BuildPageSource();
+            _sources.SelectionStart = 0;
+            _sources.SelectionLength = 0;
+        }
+        finally
+        {
+            _loadingSource = false;
+        }
+        _sourceDirty = false;
+        _loadedSourceText = _sources.Text;
+        _sourceLoaded = true;
+        _sourceDocument = document;
+        if (_applySourceButton != null) _applySourceButton.Enabled = false;
+        if (_applySourcePanelButton != null) _applySourcePanelButton.Enabled = false;
+    }
+
+    private void UpdateSourceDirtyState()
+    {
+        _sourceDirty = !string.Equals(_sources.Text, _loadedSourceText,
+            StringComparison.Ordinal);
+        if (_applySourceButton != null)
+            _applySourceButton.Enabled = _sourceDirty;
+        if (_applySourcePanelButton != null)
+            _applySourcePanelButton.Enabled = _sourceDirty;
+        if (_sourceDirty)
+        {
+            _summary.Text = "Source has unapplied edits. Press Ctrl+S or Apply source to update the current page.";
         }
     }
 
@@ -584,16 +686,48 @@ public class PageInspector : Form
 
     private void ApplySource()
     {
-        if (_canvas.ApplyEditedSource(_sources.Text))
+        UpdateSourceDirtyState();
+        if (!_sourceDirty)
         {
-            _sourceDirty = false;
-            _sourceLoaded = true;
-            _sourceDocument = _canvas.PageDocument;   // FIX: record the reparsed document
-            _summary.Text = "Source applied. The document was reparsed and relaid out.";
+            _summary.Text = "There are no source edits to apply.";
+            return;
+        }
+
+        _sourceDirty = false;
+        _applyingSource = true;
+        bool applied;
+        string error;
+        try
+        {
+            applied = _canvas.ApplyEditedSource(_sources.Text, out error);
+        }
+        finally
+        {
+            _applyingSource = false;
+        }
+
+        if (applied)
+        {
+            if (_applySourceButton != null) _applySourceButton.Enabled = false;
+            if (_applySourcePanelButton != null) _applySourcePanelButton.Enabled = false;
+            _current = null;
+            _sourceLoaded = false;
+            _sourceDocument = null;
+            _inspectedDocument = null;
+            BuildTree();
+            LoadPageSource();
+            RefreshToolTab(1);
+            RefreshToolTab(3);
+            string title = _canvas.PageDocument?.Title ?? "";
+            _summary.Text = $"Source applied and page repainted — {(title.Length > 0 ? title : "Untitled")}.";
         }
         else
-            MessageBox.Show(this, "The edited source could not be applied to the current document.",
+        {
+            _sourceDirty = true;
+            _summary.Text = "Source could not be applied.";
+            MessageBox.Show(this, $"The edited source could not be applied to the current document.\r\n\r\n{error}",
                 "Source editor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private string BuildPageSource()
@@ -606,63 +740,69 @@ public class PageInspector : Form
     }
 
     /// <summary>
-    /// FIX: iterative (the recursive version overflowed the stack on deeply
-    /// nested tag soup — the same input class the engine's own walkers are
-    /// hardened against), and it now ESCAPES text and attribute content.
-    /// The old serializer wrote raw text/attrs: a page containing
-    /// "a &lt; b", "AT&amp;T" or href="…?x=1&amp;y=2" reparsed into a
-    /// mangled document when Apply source ran.
+    /// Serialize the live DOM with block-level indentation while leaving mixed
+    /// inline and raw-text content untouched.
     /// </summary>
     private static void AppendSource(StringBuilder sb, DomNode root)
     {
-        var stack = new Stack<(DomNode Node, int Depth, bool Closing)>();
-        stack.Push((root, 0, false));
+        var stack = new Stack<(DomNode Node, bool Closing, int Depth, bool LineStart)>();
+        stack.Push((root, false, 0, false));
 
         while (stack.Count > 0)
         {
-            var (node, depth, closing) = stack.Pop();
+            var (node, closing, depth, lineStart) = stack.Pop();
+            if (lineStart)
+                sb.AppendLine().Append(' ', depth * 2);
 
             if (node is DomElement element)
             {
                 if (closing)
                 {
-                    sb.Append(' ', depth * 2).Append("</").Append(element.TagName).AppendLine(">");
+                    sb.Append("</").Append(element.TagName).Append('>');
                     continue;
                 }
 
-                sb.Append(' ', depth * 2).Append('<').Append(element.TagName);
+                sb.Append('<').Append(element.TagName);
                 foreach (var attr in element.Attrs.OrderBy(a => a.Key))
                     sb.Append(' ').Append(attr.Key).Append("=\"").Append(EscapeAttr(attr.Value)).Append('"');
 
-                // FIX: was AppendLine(">\r") — AppendLine already appends
-                // CRLF, so every void element emitted ">\r\r\n" (stray CR,
-                // doubled blank lines in the editor).
-                if (element.Children.Count == 0 && VoidElements.Contains(element.TagName))
+                sb.Append('>');
+                if (VoidElements.Contains(element.TagName))
                 {
-                    sb.AppendLine(">");
                     continue;
                 }
 
-                sb.AppendLine(">");
+                bool formatChildren = !RawTextSourceElements.Contains(element.TagName) &&
+                    element.Children.Any(child => child is DomElement childElement &&
+                        BlockSourceElements.Contains(childElement.TagName)) &&
+                    element.Children.All(child =>
+                        child is DomElement childElement &&
+                            BlockSourceElements.Contains(childElement.TagName) ||
+                        child is DomComment ||
+                        child is DomText textNode && string.IsNullOrWhiteSpace(textNode.Data));
 
-                // LIFO: push the closing tag first, then children reversed,
-                // so children pop in document order and the closer pops last.
-                stack.Push((element, depth, true));
+                stack.Push((element, true, depth, formatChildren));
                 for (int i = element.Children.Count - 1; i >= 0; i--)
-                    stack.Push((element.Children[i], depth + 1, false));
+                {
+                    var child = element.Children[i];
+                    bool childLineStart = formatChildren &&
+                        (child is DomComment || child is DomElement childElement &&
+                            BlockSourceElements.Contains(childElement.TagName));
+                    stack.Push((child, false, depth + 1, childLineStart));
+                }
             }
             else if (node is DomText text)
             {
-                string value = EscapeText((text.Data ?? "").Trim());
-                if (value.Length > 0)
-                    sb.Append(' ', depth * 2).AppendLine(value);
+                string value = text.Data ?? "";
+                var parent = text.Parent as DomElement;
+                sb.Append(parent?.TagName is "script" or "style" ? value : EscapeText(value));
             }
             else if (node is DomComment comment)
             {
                 // "--" is illegal inside an HTML comment — it would truncate
                 // the comment on reparse.
                 string value = (comment.Text ?? "").Replace("--", "- -");
-                sb.Append(' ', depth * 2).Append("<!-- ").Append(value).AppendLine(" -->");
+                sb.Append("<!--").Append(value).Append("-->");
             }
         }
     }
@@ -681,7 +821,7 @@ public class PageInspector : Form
         if (IsDisposed) return;
 
         bool documentChanged = !ReferenceEquals(_inspectedDocument, _canvas.PageDocument);
-        bool editingSource = _sources.Focused || _sourceDirty;
+        bool editingSource = !_applyingSource && _sourceDirty;
         if (documentChanged && !editingSource)
         {
             // FIX: _current pointed at an element of the OLD document —

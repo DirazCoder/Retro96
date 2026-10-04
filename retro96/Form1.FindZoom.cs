@@ -299,6 +299,8 @@ public partial class Form1
     private void OnCanvasPageChanged()
     {
         if (InvokeRequired) { BeginInvokeSafe(() => OnCanvasPageChanged()); return; }
+        if (_canvas.PageDocument is { } document)
+            Text = document.Title.Length > 0 ? document.Title : "Untitled";
         if (_findDialog is not { IsDisposed: false }) return;
         if (string.IsNullOrEmpty(_findDialog.Query)) return;
 

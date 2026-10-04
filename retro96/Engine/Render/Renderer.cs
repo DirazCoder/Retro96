@@ -265,13 +265,28 @@ public class Renderer
         private void DrawSingleLine(string text, Font font, SKPaint paint,
                                     float x, float baseline, SKTextAlign align)
         {
-            if (text.IndexOf(LegacyBulletMarker) >= 0)
-            {
-                DrawTextWithSpecialGlyphs(text, font, paint, x, baseline);
-                return;
-            }
+            // Small monospace glyphs (such as inline <code>) are rasterized
+            // directly by this Skia renderer, bypassing Graphics' legacy text
+            // rendering adjustment. Apply the narrow monospace correction
+            // here without emboldening every regular page-font run.
+            bool previousEmbolden = font.SkFont.Embolden;
+            if (font.LegacyMonospaceStrokeBoost)
+                font.SkFont.Embolden = true;
 
-            Canvas.DrawText(text, x, baseline, align, font.SkFont, paint);
+            try
+            {
+                if (text.IndexOf(LegacyBulletMarker) >= 0)
+                {
+                    DrawTextWithSpecialGlyphs(text, font, paint, x, baseline);
+                    return;
+                }
+
+                Canvas.DrawText(text, x, baseline, align, font.SkFont, paint);
+            }
+            finally
+            {
+                font.SkFont.Embolden = previousEmbolden;
+            }
         }
 
         private void DrawTextWithSpecialGlyphs(string text, Font font, SKPaint paint,

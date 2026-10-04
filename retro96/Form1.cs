@@ -86,6 +86,21 @@ public static class DebugLog
 
 public partial class Form1 : Form
 {
+    private static readonly HashSet<string> SavedHtmlVoidElements =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "area", "base", "basefont", "br", "col", "embed", "frame",
+            "hr", "img", "input", "isindex", "link", "meta", "param",
+            "source", "track", "wbr"
+        };
+    private static readonly HashSet<string> ReservedFileNames =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+            "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
+            "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        };
+
     // Controls
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripDropDownButton _btnFile = new("File");
@@ -131,7 +146,7 @@ public partial class Form1 : Form
     private string? _referrerUrl;          // document.referrer for the next page
 
     // User preferences (search engine etc.); persisted per-user with a portable retro96.ini mirror
-    private readonly UserSettings _settings = UserSettings.Load();
+    private readonly UserSettings _settings;
     // Process DPI awareness is selected by Program before any controls exist,
     // so keep the startup value separate from the editable preference. This
     // prevents changing the checkbox at runtime from making a live monitor
@@ -175,8 +190,7 @@ public partial class Form1 : Form
     internal string? PluginCurrentUrl => _currentPageUrl;
     internal bool PluginDevMode => _settings.PluginDevMode;
 
-    internal string PluginCurrentTitle => Text.EndsWith(" — Retro96", StringComparison.Ordinal)
-        ? Text[..^10] : Text;
+    internal string PluginCurrentTitle => Text;
 
     internal string PluginUserAgent => BrowserRuntime.UserAgent;
 
@@ -304,8 +318,13 @@ public partial class Form1 : Form
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct=default)=>_inner.ReadAsync(buffer,ct);
     }
 
-    public Form1()
+    public Form1() : this(UserSettings.Load())
     {
+    }
+
+    internal Form1(UserSettings settings)
+    {
+        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _highDpiScaleModeActive = _settings.HighDpiScaleMode;
         BrowserRuntime.Apply(_settings);
         InitializeComponent();
@@ -2307,6 +2326,11 @@ public partial class Form1 : Form
             : document.Title;
         foreach (char invalid in Path.GetInvalidFileNameChars())
             suggestedName = suggestedName.Replace(invalid, '_');
+        suggestedName = suggestedName.Trim().TrimEnd('.', ' ');
+        if (suggestedName.Length == 0) suggestedName = "webpage";
+        if (suggestedName.Length > 100) suggestedName = suggestedName[..100];
+        if (ReservedFileNames.Contains(Path.GetFileNameWithoutExtension(suggestedName)))
+            suggestedName = "_" + suggestedName;
 
         using var dialog = new SaveFileDialog
         {
@@ -2323,10 +2347,32 @@ public partial class Form1 : Form
 
         try
         {
-            var html = new StringBuilder();
-            foreach (DomNode child in document.Children)
-                AppendSavedHtml(child, html);
-            File.WriteAllText(dialog.FileName, html.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            string html = SerializePageForSave(document);
+            string destination = Path.GetFullPath(dialog.FileName);
+            string directory = Path.GetDirectoryName(destination)
+                ?? throw new IOException("The selected path has no parent directory.");
+            string temporary = Path.Combine(directory,
+                $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.tmp");
+
+            try
+            {
+                using (var stream = new FileStream(temporary, FileMode.CreateNew,
+                    FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+                {
+                    writer.Write(html);
+                    writer.Flush();
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(temporary, destination, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporary))
+                    File.Delete(temporary);
+            }
+
             _statusLabel.Text = "Page saved";
         }
         catch (Exception ex)
@@ -2370,37 +2416,108 @@ public partial class Form1 : Form
         }
     }
 
-    private static void AppendSavedHtml(DomNode node, StringBuilder html)
+    private static string SerializePageForSave(DomDocument document)
     {
-        switch (node)
+        var html = new StringBuilder();
+        var elements = document.ElementDescendants().ToList();
+        bool hasBaseElement = elements.Any(element =>
+            element.TagName.Equals("base", StringComparison.OrdinalIgnoreCase));
+        bool hasCharsetDeclaration = elements.Any(element =>
+            element.TagName.Equals("meta", StringComparison.OrdinalIgnoreCase) &&
+            (element.HasAttr("charset") ||
+             (element.GetAttrOrDefault("http-equiv", "").Equals(
+                  "content-type", StringComparison.OrdinalIgnoreCase) &&
+              element.GetAttrOrDefault("content", "").Contains(
+                  "charset=", StringComparison.OrdinalIgnoreCase))));
+        var stack = new Stack<(DomNode Node, bool Closing)>();
+        for (int i = document.Children.Count - 1; i >= 0; i--)
+            stack.Push((document.Children[i], false));
+
+        while (stack.Count > 0)
         {
-            case DomDoctype doctype:
+            var (node, closing) = stack.Pop();
+            if (node is DomDoctype doctype)
+            {
                 html.Append('<').Append(doctype.RawText).Append('>');
-                break;
-            case DomComment comment:
-                html.Append("<!--").Append(comment.Text).Append("-->");
-                break;
-            case DomText text:
-                html.Append(EscapeHtmlText(text.Data));
-                break;
-            case DomElement element:
+            }
+            else if (node is DomComment comment)
+            {
+                string value = (comment.Text ?? "").Replace("--", "- -");
+                if (value.EndsWith("-", StringComparison.Ordinal)) value += " ";
+                html.Append("<!--").Append(value).Append("-->");
+            }
+            else if (node is DomText text)
+            {
+                string value = text.Data ?? "";
+                if ((text.Parent as DomElement)?.TagName is "script" or "style")
+                    html.Append(value);
+                else
+                    html.Append(EscapeHtmlText(value));
+            }
+            else if (node is DomElement element)
+            {
+                if (closing)
+                {
+                    html.Append("</").Append(element.TagName).Append('>');
+                    continue;
+                }
+
                 html.Append('<').Append(element.TagName);
                 foreach (var attribute in element.Attrs)
+                {
+                    string value = attribute.Value ?? "";
+                    if (element.TagName.Equals("meta", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (attribute.Key.Equals("charset", StringComparison.OrdinalIgnoreCase))
+                            value = "utf-8";
+                        else if (attribute.Key.Equals("content", StringComparison.OrdinalIgnoreCase) &&
+                                 element.GetAttrOrDefault("http-equiv", "").Equals(
+                                     "content-type", StringComparison.OrdinalIgnoreCase))
+                            value = NormalizeMetaCharset(value);
+                    }
                     html.Append(' ').Append(attribute.Key).Append("=\"")
-                        .Append(EscapeHtmlAttribute(attribute.Value)).Append('"');
+                        .Append(EscapeHtmlAttribute(value)).Append('"');
+                }
                 html.Append('>');
-                if (element.TagName is "area" or "base" or "basefont" or "br" or "col" or "frame"
-                    or "hr" or "img" or "input" or "isindex" or "link" or "meta" or "param")
-                    return;
-                foreach (DomNode child in element.Children)
-                    AppendSavedHtml(child, html);
-                html.Append("</").Append(element.TagName).Append('>');
-                break;
-            default:
-                foreach (DomNode child in node.Children)
-                    AppendSavedHtml(child, html);
-                break;
+
+                if (element.TagName.Equals("head", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!hasCharsetDeclaration)
+                        html.Append("<meta charset=\"utf-8\">");
+                    if (!hasBaseElement && document.BaseUrl is { IsHttp: true } baseUrl)
+                        html.Append("<base href=\"")
+                            .Append(EscapeHtmlAttribute(baseUrl.ToAbsolute()))
+                            .Append("\">");
+                }
+
+                if (SavedHtmlVoidElements.Contains(element.TagName)) continue;
+
+                stack.Push((element, true));
+                for (int i = element.Children.Count - 1; i >= 0; i--)
+                    stack.Push((element.Children[i], false));
+            }
+            else
+            {
+                for (int i = node.Children.Count - 1; i >= 0; i--)
+                    stack.Push((node.Children[i], false));
+            }
         }
+
+        return html.ToString();
+    }
+
+    private static string NormalizeMetaCharset(string content)
+    {
+        var parts = content.Split(';');
+        bool replaced = false;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (!parts[i].TrimStart().StartsWith("charset=", StringComparison.OrdinalIgnoreCase))
+                continue;
+            parts[i] = " charset=utf-8";
+            replaced = true;
+        }
+        return replaced ? string.Join(";", parts) : content;
     }
 
     private static string EscapeHtmlAttribute(string value) =>
@@ -2433,7 +2550,7 @@ public partial class Form1 : Form
         _canvas.SetPage(document, rootBox, _jsInterpreter!, _fontCache, _imageCache);
         _canvas.ReRenderPage(_fontCache, _imageCache, _resourceLoader!);
 
-        Text = (document.Title.Length > 0 ? document.Title : "Untitled") + " — Retro96";
+        Text = document.Title.Length > 0 ? document.Title : "Untitled";
         _pluginManager?.RaiseTitleChanged(url, document.Title);
         _txtUrl.Text = url;
         _statusLabel.Text = "Done";
@@ -2641,6 +2758,12 @@ public partial class Form1 : Form
 
     private void OnCanvasNavigateRequested(string url)
     {
+        if (IsWelcomeUrl(_currentPageUrl) && IsWelcomeRepositoryLink(url))
+        {
+            OpenExternalProtocol(url);
+            return;
+        }
+
         if (_currentPageUrl != null && url.StartsWith('#'))
         {
             string absoluteAnchorUrl = _currentPageUrl + url;
@@ -2660,6 +2783,15 @@ public partial class Form1 : Form
         }
 
         NavigateTo(url);
+    }
+
+    private static bool IsWelcomeRepositoryLink(string value)
+    {
+        return Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+               uri.Scheme is "http" or "https" &&
+               uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) &&
+               uri.AbsolutePath.TrimEnd('/').Equals(
+                   "/DirazCoder/Retro96", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -3334,6 +3466,11 @@ code {
         rendering surface.
     </p>
 
+    <p>
+        This checkout contains about 87,000 lines across tracked text files, including
+        about 78,000 lines in source-code files.
+    </p>
+
     <h2>What it does</h2>
 
     <ul>
@@ -3362,11 +3499,10 @@ code {
     <h2>Status</h2>
 
     <p>
-        The test sources define 261 xUnit cases across the main and focused VBScript suites
-        (229 facts, 9 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract
-        assertions and 54 hand-authored QA HTML files. There is also a layout lab and a
-        Chromium pixel-diff harness. Retro96 loads actual 1996 sites. It's a side project built
-        for fun, and that's what it'll stay.
+        The latest xUnit run passed 236 tests. The live JavaScript page harness contains 29
+        contract checks, and the repository includes 54 hand-authored QA HTML files. There is
+        also a layout lab and a Chromium pixel-diff harness. Retro96 loads actual 1996 sites.
+        It's a side project built for fun, and that's what it'll stay.
     </p>
 
     <h2>Building</h2>

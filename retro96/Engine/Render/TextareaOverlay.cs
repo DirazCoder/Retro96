@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using Retro96.Drawing;
 using SkiaSharp;
 
@@ -16,6 +17,35 @@ public static class TextareaOverlay
         bool NeedsVerticalScrollbar);
 
     private const float ScrollbarGutter = 14f;
+
+    internal static string NormalizeFindTextWithSourceMap(
+        string source, out List<int> sourceMap)
+    {
+        sourceMap = new List<int>(source.Length);
+        var normalized = new StringBuilder(source.Length);
+        int pendingWhitespaceSource = -1;
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (char.IsWhiteSpace(source[i]))
+            {
+                if (normalized.Length > 0 && pendingWhitespaceSource < 0)
+                    pendingWhitespaceSource = i;
+                continue;
+            }
+
+            if (pendingWhitespaceSource >= 0)
+            {
+                normalized.Append(' ');
+                sourceMap.Add(pendingWhitespaceSource);
+                pendingWhitespaceSource = -1;
+            }
+
+            normalized.Append(source[i]);
+            sourceMap.Add(i);
+        }
+
+        return normalized.ToString();
+    }
 
     public static void DrawLines(Graphics g, string text, Font font,
                                  List<(int Start, int End)> lines,
@@ -310,6 +340,38 @@ public static class TextareaOverlay
             rects.Add(new RectangleF(x1, y,
                 Math.Max(1f, x2 - x1), layout.LineHeight));
         }
+        return rects;
+    }
+
+    internal static List<RectangleF> SelectionRects(
+        string text, Font font, RectangleF face,
+        float scrollX, float scrollY, int selStart, int selEnd, Layout layout)
+    {
+        var rects = new List<RectangleF>();
+        text ??= string.Empty;
+        if (selEnd <= selStart) return rects;
+
+        float textX = face.X + 3f - scrollX;
+        float textY = face.Y + 2f - scrollY;
+
+        float Measure(int start, int end) => end <= start
+            ? 0f
+            : font.SkFont.MeasureText(text[start..end]);
+
+        for (int i = 0; i < layout.Lines.Count; i++)
+        {
+            var (lineStart, lineEnd) = layout.Lines[i];
+            int start = Math.Max(selStart, lineStart);
+            int end = Math.Min(selEnd, lineEnd);
+            if (end <= start) continue;
+
+            float x1 = textX + Measure(lineStart, start);
+            float x2 = textX + Measure(lineStart, end);
+            float y = textY + i * layout.LineHeight;
+            rects.Add(new RectangleF(x1, y,
+                Math.Max(1f, x2 - x1), layout.LineHeight));
+        }
+
         return rects;
     }
 

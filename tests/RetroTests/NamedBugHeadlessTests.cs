@@ -21,6 +21,7 @@ using Retro96.Engine.Js;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
 using Retro96.Engine.Render;
+using SkiaSharp;
 using EngineHttpClient = Retro96.Engine.Network.HttpClient;
 
 namespace RetroTests;
@@ -969,6 +970,106 @@ public class NamedBugHeadlessTests
         for (int i = 1; i < rects.Count; i++)
             Check.That(MathF.Abs((rects[i].Y - rects[i - 1].Y) - lineH) < 1.5f,
                 $"band {i} stride == line height (no double-stride skipping)");
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_TextareaFindHighlightIncludesFinalCharacter()
+    {
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Arial", "sans-serif" },
+            16f, false, false);
+        const string text = "The Old";
+        var face = new RectangleF(20f, 30f, 240f, 60f);
+        using var surface = SKSurface.Create(new SKImageInfo(1, 1));
+        var layout = TextareaOverlay.CalculateLayout(
+            surface.Canvas, text, font, face.Width, face.Height, wrapOff: false);
+
+        var rects = TextareaOverlay.SelectionRects(
+            text, font, face, 0f, 0f, 0, text.Length, layout);
+
+        Check.That(rects.Count == 1,
+            "a one-line textarea match produces one highlight band", rects.Count.ToString());
+        float expectedRight = face.X + 3f + font.SkFont.MeasureText(text);
+        Check.That(MathF.Abs(rects[0].Right - expectedRight) < 0.1f,
+            "find highlight reaches the end of the final 'd'",
+            $"right={rects[0].Right:0.###} expected={expectedRight:0.###}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_TextareaFindHighlightUsesFullInteriorMatchRange()
+    {
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Arial", "sans-serif" },
+            16f, false, false);
+        const string prefix = "before ";
+        const string match = "The Old";
+        string text = prefix + match + " after";
+        int start = prefix.Length;
+        int end = start + match.Length;
+        var contentRect = new RectangleF(20f, 30f, 240f, 60f);
+        using var surface = SKSurface.Create(new SKImageInfo(1, 1));
+        var layout = TextareaOverlay.CalculateLayout(
+            surface.Canvas, text, font, contentRect.Width, contentRect.Height,
+            wrapOff: false);
+
+        var rects = TextareaOverlay.SelectionRects(
+            text, font, contentRect, 0f, 0f, start, end, layout);
+
+        float expectedLeft = contentRect.X + 3f +
+            font.SkFont.MeasureText(text[..start]);
+        float expectedRight = contentRect.X + 3f +
+            font.SkFont.MeasureText(text[..end]);
+        Check.That(rects.Count == 1,
+            "the complete interior match occupies one highlight band",
+            rects.Count.ToString());
+        Check.That(MathF.Abs(rects[0].Left - expectedLeft) < 0.1f,
+            "the highlight starts at the first matched glyph",
+            $"left={rects[0].Left:0.###} expected={expectedLeft:0.###}");
+        Check.That(MathF.Abs(rects[0].Right - expectedRight) < 0.1f,
+            "the highlight reaches the final matched glyph",
+            $"right={rects[0].Right:0.###} expected={expectedRight:0.###}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void Bug_TextareaFindMatchMapsPastLeadingIndentation()
+    {
+        const string source = " \tThe   Old should match";
+        const string query = "The Old";
+        string normalized = TextareaOverlay.NormalizeFindTextWithSourceMap(
+            source, out var sourceMap);
+
+        int matchAt = normalized.IndexOf(query, StringComparison.OrdinalIgnoreCase);
+        Check.That(matchAt >= 0, "normalized textarea text contains the query");
+        int start = sourceMap[matchAt];
+        int end = sourceMap[matchAt + query.Length - 1] + 1;
+        Check.That(start == 2,
+            "the range starts after leading indentation",
+            $"start={start}");
+        Check.That(source[start..end] == "The   Old",
+            "the complete match range includes its final character and collapsed spaces",
+            source[start..end]);
+
+        var fonts = new FontCache();
+        var font = fonts.Resolve(new List<string> { "Arial", "sans-serif" },
+            16f, false, false);
+        var face = new RectangleF(20f, 30f, 500f, 60f);
+        using var surface = SKSurface.Create(new SKImageInfo(1, 1));
+        var layout = TextareaOverlay.CalculateLayout(
+            surface.Canvas, source, font, face.Width, face.Height, wrapOff: false);
+        var rects = TextareaOverlay.SelectionRects(
+            source, font, face, 0f, 0f, start, end, layout);
+        float expectedLeft = face.X + 3f + font.SkFont.MeasureText(source[..start]);
+        float expectedRight = face.X + 3f + font.SkFont.MeasureText(source[..end]);
+        Check.That(rects.Count == 1 &&
+                   MathF.Abs(rects[0].Left - expectedLeft) < 0.1f &&
+                   MathF.Abs(rects[0].Right - expectedRight) < 0.1f,
+            "the rendered highlight follows the exact source range",
+            rects.Count == 0
+                ? "no highlight band"
+                : $"left={rects[0].Left:0.###} right={rects[0].Right:0.###}");
         Check.Done();
     }
 

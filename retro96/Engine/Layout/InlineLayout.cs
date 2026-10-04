@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using Retro96.Drawing;
 using System.Linq;
 using Retro96.Engine.Css;
@@ -237,6 +238,32 @@ public static class InlineLayout
 
     private static Render.FontCache? _fontCache;
     private static readonly Graphics _measureG;
+    private const int MaxCachedTextWidths = 32768;
+    private const int TextWidthCacheEvictionBatch = 4096;
+    private static readonly Dictionary<TextWidthKey, float> _textWidthCache =
+        new(new TextWidthKeyComparer());
+    private static readonly Queue<TextWidthKey> _textWidthCacheOrder = new();
+
+    private readonly record struct TextWidthKey(
+        string Text, Font Font, float LetterSpacing, float WordSpacing, FontVariantValue Variant);
+
+    private sealed class TextWidthKeyComparer : IEqualityComparer<TextWidthKey>
+    {
+        public bool Equals(TextWidthKey x, TextWidthKey y) =>
+            ReferenceEquals(x.Font, y.Font) &&
+            x.LetterSpacing.Equals(y.LetterSpacing) &&
+            x.WordSpacing.Equals(y.WordSpacing) &&
+            x.Variant == y.Variant &&
+            string.Equals(x.Text, y.Text, StringComparison.Ordinal);
+
+        public int GetHashCode(TextWidthKey key) =>
+            HashCode.Combine(
+                StringComparer.Ordinal.GetHashCode(key.Text),
+                RuntimeHelpers.GetHashCode(key.Font),
+                key.LetterSpacing,
+                key.WordSpacing,
+                key.Variant);
+    }
 
     static InlineLayout()
     {
@@ -247,7 +274,15 @@ public static class InlineLayout
         _measureG.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
     }
 
-    public static void SetFontCache(Render.FontCache fc) => _fontCache = fc;
+    public static void SetFontCache(Render.FontCache fc)
+    {
+        if (ReferenceEquals(_fontCache, fc))
+            return;
+
+        _fontCache = fc;
+        _textWidthCache.Clear();
+        _textWidthCacheOrder.Clear();
+    }
 
     private static readonly StringFormat _sf = new(StringFormat.GenericTypographic)
     {
@@ -260,25 +295,43 @@ public static class InlineLayout
         if (string.IsNullOrEmpty(text) || _fontCache == null)
             return text is null ? 0f : text.Length * 8f;
 
-        if (style.FontVariant == FontVariantValue.SmallCaps)
-            return MeasureSmallCapsWidth(text, style);
-
         var font = ResolveRunFont(style);
-        if (Math.Abs(style.LetterSpacing) <= 0.001f &&
-            Math.Abs(style.WordSpacing) <= 0.001f)
+        var key = new TextWidthKey(
+            text, font, style.LetterSpacing, style.WordSpacing, style.FontVariant);
+        if (_textWidthCache.TryGetValue(key, out float cachedWidth))
+            return cachedWidth;
+
+        float width;
+        if (style.FontVariant == FontVariantValue.SmallCaps)
+        {
+            width = MeasureSmallCapsWidth(text, style);
+        }
+        else if (Math.Abs(style.LetterSpacing) <= 0.001f &&
+                 Math.Abs(style.WordSpacing) <= 0.001f)
         {
             var measured = _measureG.MeasureString(text, font, int.MaxValue, _sf);
-            return Math.Max(0f, (float)Math.Ceiling(measured.Width));
+            width = Math.Max(0f, (float)Math.Ceiling(measured.Width));
+        }
+        else
+        {
+            width = 0f;
+            for (int i = 0; i < text.Length; i++)
+            {
+                width += _measureG.MeasureString(text[i].ToString(), font, int.MaxValue, _sf).Width;
+                if (i + 1 < text.Length) width += style.LetterSpacing;
+                if (char.IsWhiteSpace(text[i])) width += style.WordSpacing;
+            }
+            width = Math.Max(0f, (float)Math.Ceiling(width));
         }
 
-        float width = 0f;
-        for (int i = 0; i < text.Length; i++)
+        if (_textWidthCache.Count >= MaxCachedTextWidths)
         {
-            width += _measureG.MeasureString(text[i].ToString(), font, int.MaxValue, _sf).Width;
-            if (i + 1 < text.Length) width += style.LetterSpacing;
-            if (char.IsWhiteSpace(text[i])) width += style.WordSpacing;
+            for (int i = 0; i < TextWidthCacheEvictionBatch && _textWidthCacheOrder.Count > 0; i++)
+                _textWidthCache.Remove(_textWidthCacheOrder.Dequeue());
         }
-        return Math.Max(0f, (float)Math.Ceiling(width));
+        _textWidthCache[key] = width;
+        _textWidthCacheOrder.Enqueue(key);
+        return width;
     }
 
     private static float MeasureSmallCapsWidth(string text, ComputedStyle style)

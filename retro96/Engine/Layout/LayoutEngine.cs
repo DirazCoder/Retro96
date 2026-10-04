@@ -100,9 +100,10 @@ public static class LayoutEngine
         var bodyBox = BuildBodyBox(body, rootBox, viewportWidth);
         rootBox.Children.Add(bodyBox);
 
-        Retro96.DebugLog.Write(
-            $"BuildLayoutTree: body DOM children={body.Children.Count} " +
-            $"({string.Join(",", body.Children.Select(n => n is DomElement de ? de.TagName : n is DomText dt ? $"text[{(dt.Data ?? "").Length}]" : n.GetType().Name))})");
+        if (Retro96.DebugLog.Enabled)
+            Retro96.DebugLog.Write(
+                $"BuildLayoutTree: body DOM children={body.Children.Count} " +
+                $"({string.Join(",", body.Children.Select(n => n is DomElement de ? de.TagName : n is DomText dt ? $"text[{(dt.Data ?? "").Length}]" : n.GetType().Name))})");
 
         // ── Generate all descendant boxes ─────────────────────────────────
         var rawChildren = GenerateBoxes(body, bodyBox, bodyBox.Width);
@@ -117,9 +118,10 @@ public static class LayoutEngine
         // does not squeeze the content.)
         ExpandRoot(rootBox, viewportWidth, viewportHeight);
 
-        Retro96.DebugLog.Write(
-            $"BuildLayoutTree: bodyBox children={bodyBox.Children.Count} " +
-            $"bodyBox W={bodyBox.Width} H={bodyBox.Height} X={bodyBox.X} Y={bodyBox.Y}");
+        if (Retro96.DebugLog.Enabled)
+            Retro96.DebugLog.Write(
+                $"BuildLayoutTree: bodyBox children={bodyBox.Children.Count} " +
+                $"bodyBox W={bodyBox.Width} H={bodyBox.Height} X={bodyBox.X} Y={bodyBox.Y}");
 
         return rootBox;
     }

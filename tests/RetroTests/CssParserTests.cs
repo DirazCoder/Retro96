@@ -67,6 +67,29 @@ public class CssParserTests
         Check.Done();
     }
 
+    [Fact]
+    public void IndexedStyleRulesKeepTypeClassIdAndCombinatorMatches()
+    {
+        var doc = ParseAndResolve(
+            "<div class='container'><p id='target' class='shared special'></p><span class='shared'></span></div>",
+            "p { color: red; } .shared { font-weight: bold; } " +
+            ".container > p { font-size: 22px; } #target { color: blue; } " +
+            ".special { background-color: yellow; }");
+        var paragraph = doc.AllTags("p")[0].Style!;
+        var span = doc.AllTags("span")[0].Style!;
+
+        Check.That(paragraph.Color == Color.FromArgb(0, 0, 255),
+            "type and id rule candidates retain the id cascade");
+        Check.That(paragraph.FontWeight >= FontWeightValue.Bold &&
+                   span.FontWeight >= FontWeightValue.Bold,
+            "untyped class rules apply across tag-specific candidate sets");
+        Check.That(paragraph.FontSize == 22f,
+            "child combinator type candidate applies to its subject");
+        Check.That(paragraph.BackgroundColor == Color.FromArgb(255, 255, 0),
+            "class candidate remains available beside type-indexed rules");
+        Check.Done();
+    }
+
     // ── shorthand expansion ──────────────────────────────────────────
 
     [Fact]

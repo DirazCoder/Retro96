@@ -99,8 +99,9 @@ public static class StyleResolver
             }
         }
 
+        var ruleIndex = new AuthorRuleIndex(authorRules, doc);
         int activeBaseFontSize = doc.BaseFontSize;
-        ResolveNode(doc, null, authorRules, doc, viewportWidth, ref activeBaseFontSize);
+        ResolveNode(doc, null, ruleIndex, doc, viewportWidth, ref activeBaseFontSize);
 
         float textSizeScale = float.IsFinite(doc.TextSizeScale)
             ? Math.Clamp(doc.TextSizeScale, 0.5f, 3f)
@@ -113,8 +114,72 @@ public static class StyleResolver
         }
     }
 
+    private sealed class AuthorRuleIndex
+    {
+        private readonly Dictionary<string, CssRule[]> _rulesByTag;
+
+        public AuthorRuleIndex(IReadOnlyList<CssRule> rules, DomDocument document)
+        {
+            var tags = document.ElementDescendants()
+                .Select(element => element.TagName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var candidates = tags.ToDictionary(
+                tag => tag,
+                _ => new List<CssRule>(),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var rule in rules)
+            {
+                var subjectTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool canMatchAnyTag = false;
+
+                foreach (var selector in rule.Selectors)
+                {
+                    bool hasSubjectType = false;
+                    for (int i = selector.Parts.Count - 1; i >= 0; i--)
+                    {
+                        var part = selector.Parts[i];
+                        if (part.Kind is PartType.Descendant or PartType.Child or
+                            PartType.AdjacentSibling or PartType.GeneralSibling)
+                            break;
+
+                        if (part.Kind == PartType.Type && !string.IsNullOrEmpty(part.Value))
+                        {
+                            subjectTags.Add(part.Value);
+                            hasSubjectType = true;
+                        }
+                    }
+
+                    if (!hasSubjectType)
+                        canMatchAnyTag = true;
+                }
+
+                if (canMatchAnyTag)
+                {
+                    foreach (var candidateList in candidates.Values)
+                        candidateList.Add(rule);
+                }
+                else
+                {
+                    foreach (var tag in subjectTags)
+                        if (candidates.TryGetValue(tag, out var candidateList))
+                            candidateList.Add(rule);
+                }
+            }
+
+            _rulesByTag = candidates.ToDictionary(
+                entry => entry.Key,
+                entry => entry.Value.ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+        }
+
+        public IReadOnlyList<CssRule> ForTag(string tag) =>
+            _rulesByTag.TryGetValue(tag, out var rules) ? rules : Array.Empty<CssRule>();
+    }
+
     private static void ResolveNode(DomNode node, ComputedStyle? parentStyle,
-                                    List<CssRule> authorRules, DomDocument doc,
+                                    AuthorRuleIndex authorRules, DomDocument doc,
                                     float viewportWidth, ref int activeBaseFontSize)
     {
         if (node is DomElement elem)
@@ -136,12 +201,12 @@ public static class StyleResolver
             //    apply in a second tier AFTER inline STYLE= — a casual
             //    later rule (or inline style) can never stomp an important
             //    one, which the old apply-in-source-order loop allowed.
-            var importantDecls = new List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>();
-            var normalDecls = new List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>();
-            var pseudoNormalDecls = new Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>(StringComparer.OrdinalIgnoreCase);
-            var pseudoImportantDecls = new Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>(StringComparer.OrdinalIgnoreCase);
+            List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>? importantDecls = null;
+            List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>? normalDecls = null;
+            Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>? pseudoNormalDecls = null;
+            Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>? pseudoImportantDecls = null;
             int order = 0;
-            foreach (var rule in authorRules)
+            foreach (var rule in authorRules.ForTag(elem.TagName))
             {
                 foreach (var selector in rule.Selectors)
                 {
@@ -152,24 +217,27 @@ public static class StyleResolver
                         {
                             if (pseudo != null)
                             {
-                                var target = decl.Important ? pseudoImportantDecls : pseudoNormalDecls;
+                                var target = decl.Important
+                                    ? pseudoImportantDecls ??= new(StringComparer.OrdinalIgnoreCase)
+                                    : pseudoNormalDecls ??= new(StringComparer.OrdinalIgnoreCase);
                                 if (!target.TryGetValue(pseudo, out var list))
                                     target[pseudo] = list = new();
                                 list.Add((decl, selector.Specificity, order));
                             }
                             else if (decl.Important)
-                                importantDecls.Add((decl, selector.Specificity, order));
+                                (importantDecls ??= new()).Add((decl, selector.Specificity, order));
                             else
-                                normalDecls.Add((decl, selector.Specificity, order));
+                                (normalDecls ??= new()).Add((decl, selector.Specificity, order));
                             order++;
                         }
                         break;
                     }
                 }
             }
-            foreach (var (decl, _, _) in
-                     normalDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+            if (normalDecls != null)
+                foreach (var (decl, _, _) in
+                         normalDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
+                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
 
             // 3. Inline STYLE= — outranks non-important author rules.
             var inlineStyle = elem.GetAttr("style");
@@ -178,7 +246,7 @@ public static class StyleResolver
                 foreach (var decl in CssParser.ParseInlineStyle(inlineStyle))
                 {
                     if (decl.Important)
-                        importantDecls.Add((decl, (1_000_000, 0, 0), int.MaxValue));
+                        (importantDecls ??= new()).Add((decl, (1_000_000, 0, 0), int.MaxValue));
                     else
                         style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
                 }
@@ -186,9 +254,10 @@ public static class StyleResolver
 
             // 3b. !important tier — beats every non-important declaration,
             //     inline included.
-            foreach (var (decl, _, _) in
-                     importantDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+            if (importantDecls != null)
+                foreach (var (decl, _, _) in
+                         importantDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
+                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
 
             if (activeBaseFontSize != 3 && !style.OwnFontSize &&
                 elem.TagName is not ("h1" or "h2" or "h3" or "h4" or "h5" or "h6" or
@@ -259,13 +328,15 @@ public static class StyleResolver
 
     private static void ApplyPseudoStyle(
         ComputedStyle baseStyle,
-        Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>> normal,
-        Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>> important,
+        Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>? normal,
+        Dictionary<string, List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>>? important,
         string name, float viewportWidth,
         Action<ComputedStyle> assign)
     {
-        normal.TryGetValue(name, out var normalList);
-        important.TryGetValue(name, out var importantList);
+        List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>? normalList = null;
+        List<(CssDeclaration Decl, (int b, int c, int d) Spec, int Order)>? importantList = null;
+        normal?.TryGetValue(name, out normalList);
+        important?.TryGetValue(name, out importantList);
         if (normalList == null && importantList == null)
             return;
 

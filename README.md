@@ -6,7 +6,7 @@ Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** The entire repo currently contains about 96k lines — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This checkout contains about 87k lines across tracked text files, including about 78k lines in source-code files — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -64,7 +64,7 @@ What a plugin can touch, gated behind explicit manifest permissions: reading and
 
 ### Java applets
 
-Retro96 runs Java applets. It does not have an external JVM. There's no `java.exe` behind the curtain and no JRE to install. `Engine/Java/` is about 7,800 lines of C# that parse `.class` files and execute the bytecode directly, with the `java.*` classes an applet expects written from scratch underneath. Yes, really. I wrote a JVM to make a 1996 scrolling-text banner work
+Retro96 runs Java applets. It does not have an external JVM. There's no `java.exe` behind the curtain and no JRE to install. `Engine/Java/` is 8,919 tracked lines of C# that parse `.class` files and execute the bytecode directly, with the `java.*` classes an applet expects written from scratch underneath. Yes, really. I wrote a JVM to make a 1996 scrolling-text banner work
 
 The bytecode/class-file target is Java 1.0/1.1: the parser accepts class-file version 45.0 through 45.3. Alongside that period-correct core, the built-in runtime deliberately includes selected later library/API conveniences needed by some later retro applets (for example `StringBuilder` and selected later exception types). That compatibility does not mean newer class-file formats are accepted: Java 1.2+ `.class` files are rejected with an explicit unsupported-version error. Compiling an applet for this interpreter? Target Java 1.1 bytecode.
 
@@ -130,11 +130,11 @@ here's what actually happened under the hood:
 
 **layout engine** — the Rust version had one function that did everything. every element, regardless of what it was, got stacked vertically with a hardcoded `current_y += height + 10.0`. that's it. that's the layout engine. ten pixels. between everything. always. framesets returned an empty node. inline layout didn't exist as a concept. Retro96 has `InlineLayout.cs`, `TableLayout.cs`, `LayoutEngine.cs` — actual separate layout passes, actual inline text flow, actual table column width resolution
 
-**CSS parser** — the Rust version's parser handled only a small set of properties. Retro96 currently has a 741-line parser, a 1,170-line computed style system, a 774-line style resolver, and a 364-line selector engine. these are different things that do different things
+**CSS parser** — the Rust version's parser handled only a small set of properties. Retro96 currently has a 741-line parser, a 1,170-line computed style system, an 845-line style resolver, and a 381-line selector engine. these are different things that do different things
 
-**JavaScript engine** — both projects have a hand-written JS engine. the Rust one is a single large file. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, and scope — currently 7,127 lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is currently 1,977 lines on its own
+**JavaScript engine** — both projects have a hand-written JS engine. the Rust engine is centered in a 2,399-line `javascript_engine.rs`. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, and scope — currently 7,160 tracked C# lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is currently 2,005 lines on its own
 
-**testing** — the Rust repo has a `test_js_engine.rs` file with zero `#[test]` functions in it. Retro96 currently has 226 xUnit facts and 6 theory cases in `RetroTests`, plus 23 focused VBScript xUnit tests; the live JS page harness contains 29 contract assertions. There are 54 hand-authored QA HTML files, a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests. the Rust one i tested with hope
+**testing** — the Rust checkout has 144 `#[test]` annotations across 25 tracked Rust files. Its separate 137-line `test_js_engine.rs` is a standalone smoke-test program, not a Rust `#[test]` suite. The latest Retro96 xUnit run passed 236 tests, and the live JS page harness contains 29 contract checks. There are 54 hand-authored QA HTML files, a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests
 
 **real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
 
@@ -158,11 +158,11 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust project was much smaller i think it was about 28.9k total. Retro96 currently has about 96k lines. one of them works
+the Rust checkout has about 29.6k lines across tracked text files (including about 22.9k Rust source lines). Retro96 has about 87k tracked text lines, including about 78k source-code lines. one of them works
 
 ## Status
 
-Side project built for fun, not production software. The test sources currently define 261 xUnit cases across the main and focused VBScript suites (229 facts, 9 theory cases, and 23 VBScript facts), plus 29 live JavaScript page-contract assertions. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for the selected pages in `tests/html-websites/` and `testdata/`.
+Side project built for fun, not production software. The latest xUnit run passed 236 tests, and the live JavaScript page harness contains 29 contract checks. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for selected pages in `tests/html-websites/` and `testdata/`.
 
 ## Rendering stack
 
