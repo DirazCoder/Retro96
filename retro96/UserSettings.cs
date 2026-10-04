@@ -9,7 +9,9 @@ public enum RetroEngineMode
 {
     Retro96,
     Netscape3,
-    InternetExplorer3
+    InternetExplorer3,
+    InternetExplorer5,
+    Netscape47
 }
 
 public enum BackgroundMode
@@ -33,19 +35,28 @@ public enum TrustMode
 public sealed class UserSettings
 {
     public const string DefaultSearchUrl = "https://www.frogfind.com/?q=%s";
-    public const string DefaultRetro96UserAgent = "Mozilla/5.0 (Retro96/1.0; Windows 95; IE3+NN3 compatibility)";
+    public const string DefaultRetro96UserAgent = "Mozilla/5.0 (Retro96/2.0; Windows 98; IE5+NN4.7 compatibility)";
     // Navigator 3 used the Mozilla/3.0 product token with platform and
     // security fields in the parenthesized comment. Keep the default
     // historical rather than carrying the Retro96 product marker.
     public const string DefaultNetscapeUserAgent = "Mozilla/3.0 (Win95; I)";
     public const string DefaultIe3UserAgent = "Mozilla/2.0 (compatible; MSIE 3.02; Windows 95)";
+    // 1999 personas: IE5 shipped March 1999 (MSIE 5.0, Win98 token),
+    // Navigator 4.7 was the August 1999 maintenance release of the
+    // 4.x line. Both use the Mozilla/4 product token.
+    public const string DefaultIe5UserAgent = "Mozilla/4.0 (compatible; MSIE 5.0; Windows 98)";
+    public const string DefaultNetscape47UserAgent = "Mozilla/4.7 [en] (Win98; I)";
     public const string DefaultBackgroundColor = "#C0C0C0";
 
     public string SearchQueryUrl { get; set; } = DefaultSearchUrl;
     public string HomePageUrl { get; set; } = "retro96:home";
     public bool WelcomeDismissed { get; set; }
 
-    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.Retro96;
+    // The 1999 upgrade defaults fresh installs to the IE5 persona
+    // (checklist decision #1: pages sniff document.all first, then
+    // document.layers, then getElementById — a persona exposes exactly
+    // one of the first two). Existing installs keep their saved mode.
+    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.InternetExplorer5;
     public string UserAgentOverride { get; set; } = "";
     public BackgroundMode BackgroundMode { get; set; } = BackgroundMode.PageDefault;
     public string ForcedBackgroundColor { get; set; } = DefaultBackgroundColor;
@@ -76,6 +87,10 @@ public sealed class UserSettings
     public int JavaMaxCallDepth { get; set; } = 400;
     public bool FollowHttpRedirects { get; set; } = true;
     public bool RequestCompressedResponses { get; set; } = true;
+    // HTTP/1.1 validation caching (ETag / If-None-Match / If-Modified-Since,
+    // 304 revalidation). Only responses that actually carry validators or
+    // explicit freshness are ever cached.
+    public bool EnableHttpCache { get; set; } = true;
     public int MaxHttpRedirects { get; set; } = 5;
     public int HttpConnectTimeoutSeconds { get; set; } = 10;
     public int HttpResponseTimeoutSeconds { get; set; } = 30;
@@ -109,7 +124,9 @@ public sealed class UserSettings
             ? EngineMode switch
             {
                 RetroEngineMode.InternetExplorer3 => DefaultIe3UserAgent,
+                RetroEngineMode.InternetExplorer5 => DefaultIe5UserAgent,
                 RetroEngineMode.Netscape3 => DefaultNetscapeUserAgent,
+                RetroEngineMode.Netscape47 => DefaultNetscape47UserAgent,
                 _ => DefaultRetro96UserAgent
             }
             : UserAgentOverride.Trim();
@@ -144,6 +161,7 @@ public sealed class UserSettings
         JavaMaxCallDepth = JavaMaxCallDepth,
         FollowHttpRedirects = FollowHttpRedirects,
         RequestCompressedResponses = RequestCompressedResponses,
+        EnableHttpCache = EnableHttpCache,
         MaxHttpRedirects = MaxHttpRedirects,
         HttpConnectTimeoutSeconds = HttpConnectTimeoutSeconds,
         HttpResponseTimeoutSeconds = HttpResponseTimeoutSeconds,
@@ -298,6 +316,9 @@ public sealed class UserSettings
                     case "network.compressedresponses":
                         s.RequestCompressedResponses = ParseBool(value, s.RequestCompressedResponses);
                         break;
+                    case "network.httpcache":
+                        s.EnableHttpCache = ParseBool(value, s.EnableHttpCache);
+                        break;
                     case "network.maxredirects":
                         if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxRedirects))
                             s.MaxHttpRedirects = maxRedirects;
@@ -404,6 +425,7 @@ public sealed class UserSettings
         sb.AppendLine("Java.MaxCallDepth=" + JavaMaxCallDepth.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Network.Redirects=" + BoolText(FollowHttpRedirects));
         sb.AppendLine("Network.CompressedResponses=" + BoolText(RequestCompressedResponses));
+        sb.AppendLine("Network.HttpCache=" + BoolText(EnableHttpCache));
         sb.AppendLine("Network.MaxRedirects=" + MaxHttpRedirects.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Network.ConnectTimeoutSeconds=" + HttpConnectTimeoutSeconds.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("Network.ResponseTimeoutSeconds=" + HttpResponseTimeoutSeconds.ToString(CultureInfo.InvariantCulture));

@@ -1,0 +1,103 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<title>CSS2 Layout and Box Model Battery (1999)</title>
+<style type="text/css">
+  body { margin: 10px; }
+  .rel { position: relative; left: 30px; top: 10px; background: #EEEEFF; }
+  .abs { position: absolute; top: 10px; right: 10px; width: 120px;
+         background: #FFEEDD; padding: 6px; border: 1px solid #CC6600; }
+  .parent { position: relative; height: 90px;
+            border: 1px dashed #999999; margin-top: 8px; }
+  .z1 { position: absolute; top: 0; left: 0; width: 90px; height: 40px;
+        background: #FF0000; z-index: 1; }
+  .z5 { position: absolute; top: 10px; left: 30px; width: 90px; height: 40px;
+        background: #00AA00; z-index: 5; }
+  .z2 { position: absolute; top: 20px; left: 60px; width: 90px; height: 40px;
+        background: #0000FF; z-index: 2; }
+  .minmax { min-width: 120px; max-width: 260px; background: #EEFFEE;
+            border: 1px solid #008000; padding: 4px; }
+  .minh { max-height: 34px; overflow: hidden; background: #FFEEEE;
+          border: 1px solid #CC0000; }
+  .ov { width: 150px; height: 40px; overflow: scroll; border: 1px inset; }
+  .clip { position: absolute; clip: rect(0px, 60px, 20px, 0px);
+          width: 120px; height: 40px; background: #CC00CC; }
+  .vis { visibility: hidden; background: #FF00FF; }
+  .outline { outline: 2px solid #FF8800; outline-width: 2px;
+             outline-style: solid; outline-color: #FF8800; margin: 6px; }
+  .cursor-hand { cursor: hand; background: #EEEEEE; }
+  .cursor-ptr { cursor: pointer; background: #E0E0E0; }
+  .va-sub { vertical-align: -6px; }
+  .va-super { vertical-align: 8px; }
+  .float-l { float: left; width: 70px; background: #DDDDFF;
+             border: 1px solid #0000AA; margin: 4px; }
+  .clear-b { clear: both; }
+  table.bt { border-collapse: separate; border-spacing: 0; }
+  .tblcell { display: table-cell; border: 1px solid #999999; padding: 4px; }
+  body { margin-left: 10px; margin-right: 10px;
+         margin-top: 15px; margin-bottom: 15px; }
+  #ie5box { width: 200px; padding: 20px; border: 10px solid #000000;
+            background: #FFFFCC; }
+</style>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>CSS2 layout &amp; box model battery</h1>
+
+<h2>position: relative</h2>
+<div class="rel">Relative box shifted (left 30px, top 10px) — flow space preserved.</div>
+
+<h2>position: absolute against nearest positioned ancestor</h2>
+<div class="parent">plain parent content
+  <div class="abs">abs top:10 right:10 (against the dashed parent)</div>
+</div>
+
+<h2>z-index stacking of positioned elements</h2>
+<div class="parent">
+  <div class="z1">z1</div>
+  <div class="z5">z5 (green on top)</div>
+  <div class="z2">z2</div>
+</div>
+
+<h2>min-width / max-width / max-height + overflow</h2>
+<div class="minmax">This box's content is narrow but min-width keeps 120px;
+dragging the window can't exceed 260px max-width.</div>
+<div class="minh">max-height clamps this box and overflow hides the rest of
+this rather long line of text that would otherwise stretch the box height
+well beyond the authored maximum.</div>
+<div class="ov">overflow: scroll — a scrollable box with a long text run
+inside it that will be clipped at the box edges with scrollbars provided
+by the parent document scrolling model of the era.</div>
+
+<h2>clip</h2>
+<div class="parent" style="height:70px">
+  <div class="clip">clip rect(0,60,20,0) — only the top-left patch paints.</div>
+</div>
+
+<h2>visibility: hidden</h2>
+<p>Before hidden <span class="vis">this text is invisible</span> after hidden.</p>
+
+<h2>outline</h2>
+<div class="outline">outlined box (2px orange ring 2px outside the border box)</div>
+
+<h2>cursor: hand (IE) and pointer</h2>
+<p class="cursor-hand">cursor: hand — hover for the pointer.</p>
+<p class="cursor-ptr">cursor: pointer.</p>
+
+<h2>vertical-align lengths</h2>
+<p>baseline <span class="va-sub">sub -6px</span> and
+<span class="va-super">super +8px</span> by length.</p>
+
+<h2>floats and clear</h2>
+<div class="float-l">floated left (70px)</div>
+<p>Text wraps the float on the right; the float's margin keeps a 4px gap.</p>
+<div class="clear-b">cleared box (clear: both) starts below the float.</div>
+
+<h2>display: table-cell (CSS2 values)</h2>
+<div><span class="tblcell">table-cell one</span><span class="tblcell">table-cell two</span></div>
+
+<h2>IE5 box model persona check</h2>
+<div id="ie5box">width:200px padding:20 border:10 —
+in the IE5 persona the border box is 200px total; in the union/W3C persona
+the content box is 200px (total 260px).</div>
+</body>
+</html>

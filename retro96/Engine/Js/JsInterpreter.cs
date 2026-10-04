@@ -93,6 +93,92 @@ public class JsInterpreter
     // source of truth.
     private readonly Dictionary<DomElement, Dictionary<string, JsValue>> _domEventProperties = new();
 
+    // IE5 attachEvent() registry: per element+event, in registration order.
+    // detachEvent removes by function identity. These run AFTER the DOM-0
+    // and inline attribute handlers of the same element (the documented IE
+    // ordering) and participate in the bubble chain.
+    private readonly Dictionary<DomElement, Dictionary<string, List<JsValue>>> _attachEventHandlers = new();
+
+    // Netscape captureEvents() mask (window.captureEvents(Event.CLICK), the
+    // NS4 capture model). Captured event types are dispatched to the
+    // window's own handler (handleEvent / on<event>) before the target.
+    private int _capturedEventMask;
+
+    /// <summary>Normalizes "onclick"/"click" spellings to the on-form.</summary>
+    private static string NormalizeEventKey(string eventName) =>
+        eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
+            ? eventName.ToLowerInvariant()
+            : "on" + eventName.ToLowerInvariant();
+
+    /// <summary>Netscape 4 event-bit masks for captureEvents/releaseEvents.</summary>
+    internal static int EventMaskFor(string normalizedEvent) => normalizedEvent switch
+    {
+        "onmousedown" => 0x00000001,
+        "onmouseup"   => 0x00000002,
+        "onclick"     => 0x00000004,
+        "ondblclick"  => 0x00000008,
+        "onmousemove" => 0x00000010,
+        "onmouseover" => 0x00000020,
+        "onmouseout"  => 0x00000040,
+        "onkeypress"  => 0x00000080,
+        "onkeydown"   => 0x00000100,
+        "onkeyup"     => 0x00000200,
+        "onfocus"     => 0x00000400,
+        "onblur"      => 0x00000800,
+        "onselect"    => 0x00001000,
+        "onchange"    => 0x00002000,
+        "onsubmit"    => 0x00004000,
+        "onreset"     => 0x00008000,
+        "onload"      => 0x00010000,
+        "onunload"    => 0x00020000,
+        _ => 0
+    };
+
+    /// <summary>window.captureEvents(mask) — NS4 event capture.</summary>
+    internal void CaptureEvents(int mask) => _capturedEventMask |= mask;
+
+    /// <summary>window.releaseEvents(mask) — NS4 event capture release.</summary>
+    internal void ReleaseEvents(int mask) => _capturedEventMask &= ~mask;
+
+    /// <summary>IE5 attachEvent(name, fn) — records the handler.</summary>
+    internal void AttachEventHandler(DomElement element, string eventName, JsValue handler)
+    {
+        if (handler.Type != JsType.Function) return;
+        string key = NormalizeEventKey(eventName);
+        if (!_attachEventHandlers.TryGetValue(element, out var byEvent))
+            _attachEventHandlers[element] = byEvent = new(StringComparer.OrdinalIgnoreCase);
+        if (!byEvent.TryGetValue(key, out var list))
+            byEvent[key] = list = new();
+        list.Add(handler);
+    }
+
+    /// <summary>IE5 detachEvent(name, fn) — removes the matching registration.
+    /// Returns true when a registration was removed.</summary>
+    internal bool DetachEventHandler(DomElement element, string eventName, JsValue handler)
+    {
+        string key = NormalizeEventKey(eventName);
+        if (!_attachEventHandlers.TryGetValue(element, out var byEvent) ||
+            !byEvent.TryGetValue(key, out var list))
+            return false;
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (list[i].StrictEquals(handler))
+            {
+                list.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private IReadOnlyList<JsValue> GetAttachedHandlers(DomElement element, string normalizedEvent)
+    {
+        if (_attachEventHandlers.TryGetValue(element, out var byEvent) &&
+            byEvent.TryGetValue(normalizedEvent, out var list))
+            return list;
+        return Array.Empty<JsValue>();
+    }
+
     // Timer registry — ids are handed to script and used by clearTimeout
     private sealed class ScheduledTimer
     {
@@ -222,6 +308,7 @@ public class JsInterpreter
             // to update only the status bar, so an uncaught JS error was
             // invisible in Inspector > Console.
             string message = $"Uncaught {ex.Value.ToJsString()}";
+            if (ReportWindowOnError(message)) return JsValue.Undefined;
             _setStatus($"Script error: {ex.Value.ToJsString()}");
             PublishConsole("error", message);
             return JsValue.Undefined;
@@ -230,6 +317,7 @@ public class JsInterpreter
         {
             Retro96.DebugLog.JsWrite($"SCRIPT_ERROR {ex.GetType().Name}: {ex.Message}");
             string message = $"Uncaught {ex.Message}";
+            if (ReportWindowOnError(message)) return JsValue.Undefined;
             _setStatus($"Script error: {ex.Message}");
             PublishConsole("error", message);
             return JsValue.Undefined;
@@ -255,8 +343,11 @@ public class JsInterpreter
         {
             Retro96.DebugLog.JsWrite($"SCRIPT_PARSE_ERROR line={ex.Line} column={ex.Column}: {ex.Message}");
             string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
-            _setStatus($"Script error: {ex.Message}");
-            PublishConsole("error", message);
+            if (!ReportWindowOnError(message))
+            {
+                _setStatus($"Script error: {ex.Message}");
+                PublishConsole("error", message);
+            }
             return JsValue.Undefined;
         }
     }
@@ -269,8 +360,11 @@ public class JsInterpreter
         catch (JsParserException ex)
         {
             string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
-            _setStatus($"Script error: {ex.Message}");
-            PublishConsole("error", message);
+            if (!ReportWindowOnError(message))
+            {
+                _setStatus($"Script error: {ex.Message}");
+                PublishConsole("error", message);
+            }
             return JsValue.Undefined;
         }
         var old = _currentScope;
@@ -357,21 +451,24 @@ public class JsInterpreter
 
     /// <summary>
     /// Fire an event handler with the element as 'this' and an 'event'
-    /// object in scope.  Handles both forms:
-    ///   • inline attribute source ("onclick" attribute)
+    /// object in scope.  Handles all the 1999 handler sources per element,
+    /// in this order:
     ///   • JS-assigned functions (element.onclick = fn) — the sentinel
-    ///     "__js_handler__" in EventHandlers marks those; the old code
-    ///     PARSED the sentinel as script source, so JS-assigned handlers
-    ///     never ran at all.
-    /// Returns the last value (onMouseOver returns true to keep the
-    /// status-bar text).
+    ///     "__js_handler__" in EventHandlers marks those
+    ///   • inline attribute source ("onclick" attribute)
+    ///   • attachEvent("onclick", fn) registrations, in registration order
+    /// (checklist §11). IE-style bubbling then walks the ancestor chain
+    /// (element → body) unless a handler set event.cancelBubble = true.
+    /// Cancellation: any handler returning false OR setting
+    /// event.returnValue = false makes the dispatch return false so the
+    /// shell cancels the default action (link navigation / submit).
+    /// Returns the last handler's value; boolean true from any handler
+    /// (the onMouseOver "keep status text" idiom) is preserved.
     /// </summary>
     public JsValue FireEvent(DomElement element, string eventName,
                              JsObject? eventObj = null)
     {
-        string normalizedEvent = eventName.StartsWith("on", StringComparison.OrdinalIgnoreCase)
-            ? eventName.ToLowerInvariant()
-            : "on" + eventName.ToLowerInvariant();
+        string normalizedEvent = NormalizeEventKey(eventName);
         string elementId = element.GetAttr("id") ?? "";
         Retro96.DebugLog.JsWrite($"FIRE_EVENT element=<{element.TagName.ToLowerInvariant()}>" +
             (elementId.Length > 0 ? $"#{elementId}" : "") +
@@ -385,44 +482,180 @@ public class JsInterpreter
         if (eventObj == null && IsMouseEventName(normalizedEvent))
             eventObj = CreateMouseEvent(normalizedEvent, 0, 0, 0);
 
-        // DOM-0 property handlers live on the DOM element's scripting state,
-        // not on a transient wrapper. This is the source of truth for
-        // `element.onclick = function () { ... }`.
-        var wrapperForProperty = ElementWrapperHook?.Invoke(element);
-        JsValue propertyHandler;
-        if (TryGetDomEventProperty(element, normalizedEvent, out propertyHandler) &&
+        // Every dispatched event object carries its type ("click",
+        // "keypress", …) — the NS4 which/pageX derivation and era scripts
+        // both read e.type.
+        if (eventObj != null && !eventObj.HasOwn("type"))
+            eventObj.Set("type", JsValue.From(
+                normalizedEvent.StartsWith("on", StringComparison.Ordinal) && normalizedEvent.Length > 2
+                    ? normalizedEvent[2..]
+                    : normalizedEvent));
+
+        // Netscape 4 event shape: target / pageX / pageY / which / modifiers.
+        if (eventObj != null && BrowserRuntime.SupportsNetscapeLegacy)
+            ApplyNetscapeEventFields(eventObj, element);
+
+        // Seed the IE cancel defaults ONCE for the whole dispatch so a
+        // handler-set returnValue=false survives the bubble chain.
+        if (eventObj != null && BrowserRuntime.SupportsInternetExplorerLegacy &&
+            !eventObj.HasOwn("returnValue"))
+            eventObj.Set("returnValue", JsValue.From(true));
+        if (eventObj != null && !eventObj.HasOwn("cancelBubble"))
+            eventObj.Set("cancelBubble", JsValue.From(false));
+
+        // Netscape capture model: events whose mask was captured via
+        // window.captureEvents() go to the window's own handler first.
+        if (eventObj != null && BrowserRuntime.SupportsNetscapeLegacy)
+            RunCapturedWindowHandler(element, normalizedEvent, eventObj);
+
+        bool anyHandled = false, cancel = false, keepTrue = false;
+        JsValue last = JsValue.Undefined;
+
+        // srcElement / target always reference the ORIGINAL dispatch target,
+        // even while handlers run on bubbling ancestors.
+        var originalWrapper = ElementWrapperHook?.Invoke(element);
+        JsValue? srcElementValue = originalWrapper != null
+            ? JsValue.FromObject(originalWrapper)
+            : null;
+
+        foreach (var target in BuildDispatchChain(element, normalizedEvent))
+        {
+            var (result, handled) = DispatchToElement(target, srcElementValue, normalizedEvent, eventObj);
+            if (!handled) continue;
+
+            anyHandled = true;
+            last = result;
+            if (result.Type == JsType.Boolean)
+            {
+                if (result.GetBool()) keepTrue = true;
+                else cancel = true;
+            }
+
+            // event.cancelBubble = true stops the walk to ancestors (IE5).
+            if (eventObj != null && IsCancelBubbleSet(eventObj))
+                break;
+        }
+
+        // event.returnValue = false cancels the default action, exactly like
+        // a literal "return false" (checklist §11 IE5 model).
+        if (eventObj != null)
+        {
+            var rv = eventObj.Get("returnValue");
+            if (rv.Type == JsType.Boolean && !rv.GetBool())
+                cancel = true;
+        }
+
+        if (cancel) return JsValue.From(false);
+        if (keepTrue) return JsValue.From(true);
+        return anyHandled ? last : JsValue.Undefined;
+    }
+
+    /// <summary>IE5 bubbles most interaction events up the ancestor chain;
+    /// load/unload/submit/reset/focus/blur/error stay on their target
+    /// (documented IE behaviour — focus/blur never bubbled before 5.5's
+    /// focusin/focusout).</summary>
+    private static bool IsBubblingEventName(string normalizedEvent) => normalizedEvent is
+        "onclick" or "ondblclick" or "onmousedown" or "onmouseup" or
+        "onmousemove" or "onmouseover" or "onmouseout" or
+        "onkeydown" or "onkeyup" or "onkeypress" or "onchange";
+
+    private static IEnumerable<DomElement> BuildDispatchChain(DomElement element, string normalizedEvent)
+    {
+        yield return element;
+        if (!IsBubblingEventName(normalizedEvent)) yield break;
+        for (var ancestor = element.Parent as DomElement;
+             ancestor != null;
+             ancestor = ancestor.Parent as DomElement)
+            yield return ancestor;
+        // Documented limitation: bubbling covers ELEMENT ancestors only —
+        // document- and window-level handlers are not part of the chain.
+    }
+
+    private static bool IsCancelBubbleSet(JsObject eventObj)
+    {
+        var cb = eventObj.Get("cancelBubble");
+        return cb.Type == JsType.Boolean ? cb.GetBool() : cb.ToBoolean();
+    }
+
+    /// <summary>Dispatches one element's handlers for the event: DOM-0
+    /// property handler → wrapper property handler → inline attribute
+    /// source → attachEvent registrations in order. srcElement always
+    /// reflects the ORIGINAL target, not the bubbling ancestor.</summary>
+    private (JsValue Result, bool Handled) DispatchToElement(
+        DomElement target, JsValue? srcElementValue, string normalizedEvent, JsObject? eventObj)
+    {
+        var wrapperForProperty = ElementWrapperHook?.Invoke(target);
+
+        bool handled = false;
+        JsValue last = JsValue.Undefined;
+
+        // The DOM-0 slot: JS-assigned function (element.onclick = fn),
+        // a wrapper property, or the inline attribute source — first one
+        // present wins; they are alternative representations of the same
+        // on<event> property.
+        if (TryGetDomEventProperty(target, normalizedEvent, out var propertyHandler) &&
             propertyHandler.Type == JsType.Function)
         {
             Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=dom-property event='{normalizedEvent}' handler={DescribeJsValue(propertyHandler)}");
             var thisValue = wrapperForProperty != null
                 ? JsValue.FromObject(wrapperForProperty)
                 : JsValue.Undefined;
-            return CallHandler(propertyHandler, thisValue, eventObj);
+            last = CallHandler(propertyHandler, thisValue, eventObj, srcElementValue);
+            handled = true;
         }
-
-        // Keep compatibility with wrappers created before the per-element
-        // event-property store existed.
-        if (wrapperForProperty != null &&
+        else if (wrapperForProperty != null &&
             wrapperForProperty.Properties.TryGetValue(normalizedEvent, out var wrapperHandler) &&
             wrapperHandler != null &&
             wrapperHandler.Type == JsType.Function)
         {
             Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=wrapper-property event='{normalizedEvent}' handler={DescribeJsValue(wrapperHandler)}");
-            return CallHandler(wrapperHandler, JsValue.FromObject(wrapperForProperty), eventObj);
+            last = CallHandler(wrapperHandler, JsValue.FromObject(wrapperForProperty), eventObj, srcElementValue);
+            handled = true;
+        }
+        else if (target.EventHandlers.TryGetValue(normalizedEvent, out var handlerSource))
+        {
+            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=attribute event='{normalizedEvent}' source='{handlerSource}'");
+            if (handlerSource != "__js_handler__")
+            {
+                last = ExecuteInlineHandler(target, wrapperForProperty, normalizedEvent, eventObj, srcElementValue);
+                handled = true;
+            }
+            else
+            {
+                Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=none event='{normalizedEvent}' sentinel-without-function");
+            }
         }
 
-        if (!element.EventHandlers.TryGetValue(normalizedEvent, out var handlerSource))
+        // attachEvent registrations, in registration order, AFTER the DOM-0
+        // handler (IE5, §11 — "fire the DOM-0 handler, then attached
+        // attachEvent handlers in registration order").
+        var attached = GetAttachedHandlers(target, normalizedEvent);
+        if (attached.Count > 0)
         {
+            foreach (var attachedHandler in attached)
+            {
+                if (attachedHandler.Type != JsType.Function) continue;
+                var thisValue = wrapperForProperty != null
+                    ? JsValue.FromObject(wrapperForProperty)
+                    : JsValue.Undefined;
+                last = CallHandler(attachedHandler, thisValue, eventObj, srcElementValue);
+                handled = true;
+                if (eventObj != null && IsCancelBubbleSet(eventObj)) break;
+            }
+        }
+
+        if (!handled)
             Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=none event='{normalizedEvent}' eventHandlerMap=MISS");
-            return JsValue.Undefined;
-        }
+        return (last, handled);
+    }
 
-        Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=attribute event='{normalizedEvent}' source='{handlerSource}'");
-        if (handlerSource == "__js_handler__")
-        {
-            Retro96.DebugLog.JsWrite($"FIRE_EVENT PATH=none event='{normalizedEvent}' sentinel-without-function");
-            return JsValue.Undefined; // property handler was checked above
-        }
+    /// <summary>Runs the parsed inline attribute handler body in a global-scope
+    /// child with the element wrapper as 'this' and 'event' in scope.</summary>
+    private JsValue ExecuteInlineHandler(DomElement target, JsObject? wrapperForProperty,
+        string normalizedEvent, JsObject? eventObj, JsValue? srcElementValue)
+    {
+        if (!target.EventHandlers.TryGetValue(normalizedEvent, out var handlerSource))
+            return JsValue.Undefined;
 
         try
         {
@@ -435,8 +668,8 @@ public class JsInterpreter
             // document's global script scope rather than a stale transient
             // callback scope.
             var scope = _globalScope.NewChild();
-            var thisValue = ElementWrapperHook != null
-                ? JsValue.FromObject(ElementWrapperHook(element))
+            var thisValue = wrapperForProperty != null
+                ? JsValue.FromObject(wrapperForProperty)
                 : JsValue.Undefined;
             scope.Define("this", thisValue);
 
@@ -451,11 +684,14 @@ public class JsInterpreter
                 if (installedLegacyEvent)
                 {
                     // Legacy IE handlers read the active event from the browser
-                    // global; use this element as srcElement and restore the prior
-                    // event after dispatch so nested handlers cannot clobber it.
-                    eventObj.Set("srcElement", thisValue);
-                    eventObj.Set("returnValue", JsValue.From(true));
-                    eventObj.Set("cancelBubble", JsValue.From(false));
+                    // global; srcElement references the ORIGINAL target and the
+                    // prior event is restored after dispatch so nested handlers
+                    // cannot clobber it.
+                    eventObj.Set("srcElement",
+                        srcElementValue is { Type: JsType.Object } src ? src : thisValue);
+                    // returnValue already seeded for the whole dispatch; do
+                    // NOT reset it here — a bubbling ancestor must still see
+                    // the false an earlier handler wrote.
                     windowObject?.Set("event", JsValue.FromObject(eventObj));
                 }
                 scope.Define("event", JsValue.FromObject(eventObj));
@@ -511,11 +747,74 @@ public class JsInterpreter
         }
         catch (Exception ex)
         {
-            string message = $"Error in {eventName} handler: {ex.Message}";
+            string message = $"Error in {normalizedEvent} handler: {ex.Message}";
+            if (ReportWindowOnError(message)) return JsValue.Undefined;
             _setStatus(message);
             PublishConsole("error", message);
             return JsValue.Undefined;
         }
+    }
+
+    /// <summary>Stamps the Netscape 4 event fields onto the event object:
+    /// target, pageX/pageY (clientX + pageXOffset — scroll offsets are not
+    /// reachable from the bindings, so the offset is 0), which (key events:
+    /// the character code; mouse events: 1-based button), modifiers (0 —
+    /// modifier state is not tracked).</summary>
+    private void ApplyNetscapeEventFields(JsObject eventObj, DomElement target)
+    {
+        if (!eventObj.HasOwn("target") && ElementWrapperHook != null)
+            eventObj.Set("target", JsValue.FromObject(ElementWrapperHook(target)));
+
+        if (!eventObj.HasOwn("pageX"))
+        {
+            double cx = eventObj.Get("clientX") is { Type: JsType.Number } n ? n.GetNumber() : 0;
+            double cy = eventObj.Get("clientY") is { Type: JsType.Number } m ? m.GetNumber() : 0;
+            eventObj.Set("pageX", JsValue.From(cx));
+            eventObj.Set("pageY", JsValue.From(cy));
+        }
+
+        if (!eventObj.HasOwn("which"))
+        {
+            string type = eventObj.Get("type").ToJsString();
+            bool keyEvent = type.StartsWith("key", StringComparison.OrdinalIgnoreCase);
+            if (keyEvent)
+            {
+                double keyCode = eventObj.Get("keyCode") is { Type: JsType.Number } k ? k.GetNumber() : 0;
+                eventObj.Set("which", JsValue.From(keyCode));
+            }
+            else if (eventObj.Get("button") is { Type: JsType.Number } b)
+            {
+                eventObj.Set("which", JsValue.From((int)b.GetNumber() + 1));
+            }
+        }
+
+        if (!eventObj.HasOwn("modifiers"))
+            eventObj.Set("modifiers", JsValue.From(0));
+    }
+
+    /// <summary>NS4 capture model: when window.captureEvents() armed the mask
+    /// for this event type, the window's own handler sees the event before
+    /// the target — a script-assigned window.handleEvent, else the window's
+    /// on&lt;event&gt; property. (The DomBindings handleEvent BUILTIN is not
+    /// a capture handler — redispatching through it would loop.)</summary>
+    private void RunCapturedWindowHandler(DomElement element, string normalizedEvent, JsObject eventObj)
+    {
+        int mask = EventMaskFor(normalizedEvent);
+        if (mask == 0 || (_capturedEventMask & mask) == 0) return;
+        var w = WindowObject;
+        if (w == null) return;
+
+        var wrapper = ElementWrapperHook?.Invoke(element);
+        JsValue? srcValue = wrapper != null ? JsValue.FromObject(wrapper) : null;
+
+        if (w.Get("handleEvent") is { Type: JsType.Function } handleEvent &&
+            !handleEvent.GetFunction().HasOwn("__dom_builtin__"))
+        {
+            CallHandler(handleEvent, JsValue.FromObject(w), eventObj, srcValue);
+            return;
+        }
+        if (w.Get(normalizedEvent) is { Type: JsType.Function } windowHandler)
+            CallHandler(windowHandler, JsValue.FromObject(w), eventObj, srcValue);
     }
 
     private static bool IsMouseEventName(string eventName) => eventName is
@@ -577,8 +876,11 @@ public class JsInterpreter
     /// <summary>
     /// Call a JS-assigned handler (element.onclick = function...) with the
     /// element as 'this'.  Used by the shell when dispatching DOM events.
+    /// <paramref name="srcElementValue"/> overrides the event object's
+    /// srcElement (the original dispatch target while bubbling).
     /// </summary>
-    public JsValue CallHandler(JsValue handler, JsValue thisValue, JsObject? eventObj = null)
+    public JsValue CallHandler(JsValue handler, JsValue thisValue, JsObject? eventObj = null,
+                               JsValue? srcElementValue = null)
     {
         if (handler.Type != JsType.Function)
             return JsValue.Undefined;
@@ -608,9 +910,14 @@ public class JsInterpreter
         {
             if (installedLegacyEvent)
             {
-                eventObj!.Set("srcElement", thisValue);
-                eventObj.Set("returnValue", JsValue.From(true));
-                eventObj.Set("cancelBubble", JsValue.From(false));
+                eventObj!.Set("srcElement",
+                    srcElementValue is { Type: JsType.Object } src ? src : thisValue);
+                // returnValue/cancelBubble persist across the bubble chain —
+                // only seed them when the event object has none yet.
+                if (!eventObj.HasOwn("returnValue"))
+                    eventObj.Set("returnValue", JsValue.From(true));
+                if (!eventObj.HasOwn("cancelBubble"))
+                    eventObj.Set("cancelBubble", JsValue.From(false));
                 windowObject?.Set("event", JsValue.FromObject(eventObj));
             }
             var args = eventObj != null
@@ -621,6 +928,7 @@ public class JsInterpreter
         catch (Exception ex)
         {
             string message = $"Error in event handler: {ex.Message}";
+            if (ReportWindowOnError(message)) return JsValue.Undefined;
             _setStatus(message);
             PublishConsole("error", message);
             return JsValue.Undefined;
@@ -635,6 +943,31 @@ public class JsInterpreter
                     windowObject.Set("event", priorWindowEvent);
             }
             if (isOutermost) _isExecuting = false;
+        }
+    }
+
+    /// <summary>
+    /// window.onerror (checklist §12): invoked from every script error path
+    /// BEFORE the error is surfaced to the status bar / console. Era
+    /// semantics: returning true suppresses the default error reporting.
+    /// Returns true when the error was handled (and thus must be suppressed).
+    /// </summary>
+    private bool ReportWindowOnError(string message)
+    {
+        var w = WindowObject;
+        if (w == null) return false;
+        var handler = w.Get("onerror");
+        if (handler.Type != JsType.Function) return false;
+        try
+        {
+            var result = CallFunction(handler.GetFunction(), JsValue.FromObject(w),
+                new[] { JsValue.From(message), JsValue.From(""), JsValue.From(0) });
+            return result.Type == JsType.Boolean && result.GetBool();
+        }
+        catch
+        {
+            // A handler that itself throws must not loop the error reporter.
+            return false;
         }
     }
 
@@ -1672,6 +2005,12 @@ public class JsInterpreter
                 return target.GetObjectOrFunction().Get(name);
 
             default:
+                // ES3 §8.7.1 / era behaviour: reading a property of null or
+                // undefined is a catchable TypeError ("'x' is null or not
+                // an object", in IE5's words).
+                if (target.Type is JsType.Null or JsType.Undefined)
+                    throw new JsInterpreterException(
+                        $"'{name}' is null or not an object");
                 return JsValue.Undefined;
         }
     }

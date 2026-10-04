@@ -1,0 +1,93 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>Event Models Battery (1999)</title>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>Event models battery</h1>
+
+<h2>IE5 bubbling model: window.event</h2>
+<div id="outer" onclick="window.status='outer:srcElement=' + event.srcElement.id; return true;">
+  <div id="middle" onclick="window.status='middle'; return true;">
+    <div id="inner" style="border:1px solid #000; padding:6px; background:#EEEEFF;">
+      click me — srcElement is always #inner while the event bubbles up
+    </div>
+  </div>
+</div>
+<p>event.keyCode, event.clientX/clientY, event.srcElement available during
+the handler; <tt>event.cancelBubble = true</tt> stops the walk;
+<tt>event.returnValue = false</tt> cancels the default action.</p>
+
+<h2>attachEvent / detachEvent</h2>
+<div id="attach1" style="border:1px solid #080; padding:6px;">
+  click me — handler attached via attachEvent
+</div>
+<script language="JScript">
+var clicks = 0;
+function attachedHandler() {
+  clicks++;
+  window.status = "attachEvent fired " + clicks + " time(s)";
+}
+document.all("attach1").attachEvent("onclick", attachedHandler);
+// detach test:
+// document.all("attach1").detachEvent("onclick", attachedHandler);
+</script>
+
+<h2>return false cancels (onsubmit)</h2>
+<form id="f1" action="/cgi/none" onsubmit="window.status='submit blocked'; return false;">
+  <input type="text" name="t" value="type anything">
+  <input type="submit" value="submit (cancelled)">
+</form>
+
+<h2>event.returnValue = false cancels</h2>
+<form id="f2" action="/cgi/none" onsubmit="event.returnValue = false; window.status='returnValue=false blocked';">
+  <input type="submit" value="submit (cancelled via returnValue)">
+</form>
+
+<h2>HTML 4.01 intrinsic event attributes</h2>
+<p onmouseover="window.status='mouse over paragraph'"
+   onmouseout="window.status=''"
+   onclick="window.status='clicked paragraph'">
+hover and click me — onmouseover/onmouseout/onclick from the 4.01
+intrinsic-events set.
+</p>
+<div ondblclick="window.status='double click'"
+     onmousedown="window.status='mousedown'"
+     onmouseup="window.status='mouseup'"
+     onmousemove="window.status='mousemove'"
+     onkeypress="window.status='keypress'"
+     onkeydown="window.status='keydown'"
+     onkeyup="window.status='keyup'"
+     tabindex="0"
+     style="border:1px dashed #888; padding:8px;">
+  dblclick / mousedown / mouseup / mousemove / keydown / keypress /
+  keyup all fire here (click the box first to give it key focus).
+</div>
+<input type="text" name="focusme" value=""
+  onfocus="window.status='focus'"
+  onblur="window.status='blur'"
+  onselect="window.status='select'"
+  onchange="window.status='change'">
+<textarea rows="2" cols="24" onselect="window.status='textarea select'">select text here</textarea>
+
+<h2>NS4 capture model (Navigator 4.7 profile only)</h2>
+<p>With the NS4.7 persona: <tt>window.captureEvents(Event.MOUSEDOWN)</tt>,
+<tt>routeEvent(e)</tt>, <tt>e.target</tt>, <tt>e.pageX/pageY</tt>,
+<tt>e.which</tt>, <tt>e.modifiers</tt>.</p>
+<script language="JavaScript1.3">
+if (typeof window.captureEvents == "function") {
+  window.captureEvents(Event.MOUSEDOWN | Event.CLICK);
+  window.onmousedown = function (e) {
+    window.status = "NS4 capture: target=" + e.target + " at " +
+                    e.pageX + "," + e.pageY + " which=" + e.which;
+    return true;
+  };
+}
+</script>
+
+<h2>onresize fires (NS4 pages reloaded on resize)</h2>
+<script language="JavaScript1.3">
+window.onresize = function () { window.status = "resized"; };
+</script>
+
+</body>
+</html>

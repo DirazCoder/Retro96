@@ -42,6 +42,27 @@ public sealed class DocumentBindingsState
     public string LastModified = "";
     public string Referrer = "";
 
+    /// <summary>IE5 uniqueID registry — one stable "ms__idN" per element
+    /// (checklist §10), counted per document/page.</summary>
+    public readonly Dictionary<DomElement, string> UniqueIds = new();
+    public int NextUniqueId;
+
+    /// <summary>document.readyState="complete" fires document.onreadystatechange
+    /// exactly once per page, when the post-parse RegisterAll first sees
+    /// ParseComplete == true.</summary>
+    public bool ReadyStateChangeFired;
+
+    /// <summary>NS4 layer-object cache — document.layers["a"] must return the
+    /// SAME layer object on every access.</summary>
+    public readonly Dictionary<DomElement, JsObject> LayerWrappers = new();
+
+    /// <summary>Scripted scroll position surfaced as window.pageXOffset/
+    /// pageYOffset and element.scrollTop/scrollLeft readback. The shell does
+    /// not expose its live scroll offset to the DOM bindings, so scrollTo()
+    /// writes are mirrored here only (documented limitation).</summary>
+    public double PageXOffset;
+    public double PageYOffset;
+
     /// <summary>Element wrapper cache — one JsObject identity per element so
     /// property writes (rollover swaps) survive across script accesses.</summary>
     public readonly Dictionary<DomElement, JsObject> ElementWrappers = new();
@@ -76,8 +97,8 @@ public static class DomBindings
     private static readonly HashSet<string> VoidElements = new(StringComparer.OrdinalIgnoreCase)
     {
         "area", "base", "basefont", "bgsound", "br", "col", "embed",
-        "frame", "hr", "img", "input", "isindex", "link", "meta",
-        "param", "spacer", "wbr"
+        "frame", "hr", "img", "input", "isindex", "keygen", "link", "meta",
+        "param", "server", "spacer", "wbr"
     };
 
     // ─────────────────────────────────────────────────────────────────────
@@ -153,6 +174,29 @@ public static class DomBindings
         // unreachable as a bare identifier: alert("hi") threw
         // "'alert' is not a function" on every page that used one.
         globalScope.GlobalFallback = windowObj;
+
+        // document.readyState transitions to "complete" after the parse;
+        // fire document.onreadystatechange EXACTLY once at that point
+        // (checklist §10 IE5: readyState + onreadystatechange). The
+        // post-parse RegisterAll (the shell runs it before firing
+        // window/body onload) is the transition moment.
+        if (document.ParseComplete && !state.ReadyStateChangeFired)
+        {
+            state.ReadyStateChangeFired = true;
+            if (state.DocumentObject?.Get("onreadystatechange") is { Type: JsType.Function } readyHandler)
+            {
+                try
+                {
+                    state.Interpreter?.CallFunction(readyHandler.GetFunction(),
+                        JsValue.FromObject(state.DocumentObject), Array.Empty<JsValue>());
+                }
+                catch
+                {
+                    // A throwing readystatechange handler must not break
+                    // the rest of the page's bindings.
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -250,11 +294,31 @@ public static class DomBindings
         w.Set("open", Fn(scope, "open", (self, args) =>
         {
             string url = args.Length > 0 ? args[0].ToJsString() : "";
+            string name = args.Length > 1 ? args[1].ToJsString() : "";
             // Feature strings ("width=400,height=300") were cosmetic
-            // differences between shells — accepted and ignored here.
+            // differences between shells — parsed shape is accepted; every
+            // feature beyond opening the window is ignored (documented).
             if (!string.IsNullOrEmpty(url) && BrowserRuntime.ScriptedWindowsAllowed)
                 canvas.OpenNewWindow(url);
-            return JsValue.Undefined;
+
+            // Documented limitation: the opened window is a separate shell
+            // document with its own scripting context — cross-window
+            // scripting is not reachable from these bindings, so window.open
+            // returns a small window-like facade (name/opener/closed/close()
+            // that flips the facade's own closed flag) instead of the real
+            // new window object.
+            var facade = new JsObject { Class = "Window" };
+            facade.Set("name", JsValue.From(name));
+            facade.Set("closed", JsValue.From(false));
+            facade.Set("length", JsValue.From(0));
+            facade.Set("opener", JsValue.FromObject(w));
+            facade.Set("close", Fn(scope, "close", (s2, a2) =>
+            {
+                facade.Set("closed", JsValue.From(true));
+                return JsValue.Undefined;
+            }));
+            facade.Set("focus", Fn(scope, "focus", (s2, a2) => JsValue.Undefined));
+            return JsValue.FromObject(facade);
         }));
 
         w.Set("close", Fn(scope, "close", (self, args) =>
@@ -262,6 +326,130 @@ public static class DomBindings
             canvas.CloseHostWindow();
             return JsValue.Undefined;
         }));
+
+        // window.opener — null unless this window itself was opened by
+        // script (the shell does not wire opener back into the DOM
+        // bindings; documented limitation).
+        if (!w.Has("opener")) w.Set("opener", JsValue.Null);
+
+        // window.frames[] / window.length — the frame/iframe count of THIS
+        // document. Documented limitation: the real per-frame window
+        // objects live in the shell (BrowserCanvas.FrameView / per-frame
+        // interpreters) and are not reachable from the bindings; indexed and
+        // named lookups return the frame ELEMENT wrapper, which at least
+        // exposes src/name etc. to scripts.
+        if (doc != null && state != null)
+        {
+            var frames = new FramesCollectionObject(doc, state, scope);
+            w.Set("frames", JsValue.FromObject(frames));
+            w.Set("length", JsValue.From(frames.FrameCount));
+        }
+        else if (!w.Has("frames"))
+        {
+            w.Set("frames", JsValue.FromObject(NewArray(scope)));
+            if (!w.Has("length")) w.Set("length", JsValue.From(0));
+        }
+
+        // window.showModalDialog (IE5, checklist §10) — era-modal via the
+        // shell's host-modal alert service. The dialog page itself is NOT
+        // fetched (no secondary document plumbing from these bindings —
+        // documented choice) and the return value is undefined (no
+        // returnValue argument passing without a real dialog document).
+        if (BrowserRuntime.SupportsInternetExplorerLegacy)
+        {
+            w.Set("showModalDialog", Fn(scope, "showModalDialog", (self, args) =>
+            {
+                string url = args.Length > 0 ? args[0].ToJsString() : "";
+                if (BrowserRuntime.ScriptedWindowsAllowed && url.Length > 0)
+                    canvas.ShowAlert(url);
+                return JsValue.Undefined;
+            }));
+            w.Set("setActive", Fn(scope, "setActive", (self, args) => JsValue.Undefined));
+        }
+
+        // ── Netscape 4 event capture model (§11) ──
+        if (BrowserRuntime.SupportsNetscapeLegacy && state != null)
+        {
+            var evtConstants = new JsObject { Class = "Event" };
+            evtConstants.Set("MOUSEDOWN", JsValue.From(0x00000001));
+            evtConstants.Set("MOUSEUP", JsValue.From(0x00000002));
+            evtConstants.Set("CLICK", JsValue.From(0x00000004));
+            evtConstants.Set("DBLCLICK", JsValue.From(0x00000008));
+            evtConstants.Set("MOUSEMOVE", JsValue.From(0x00000010));
+            evtConstants.Set("MOUSEOVER", JsValue.From(0x00000020));
+            evtConstants.Set("MOUSEOUT", JsValue.From(0x00000040));
+            evtConstants.Set("KEYPRESS", JsValue.From(0x00000080));
+            evtConstants.Set("KEYDOWN", JsValue.From(0x00000100));
+            evtConstants.Set("KEYUP", JsValue.From(0x00000200));
+            evtConstants.Set("FOCUS", JsValue.From(0x00000400));
+            evtConstants.Set("BLUR", JsValue.From(0x00000800));
+            evtConstants.Set("SELECT", JsValue.From(0x00001000));
+            evtConstants.Set("CHANGE", JsValue.From(0x00002000));
+            evtConstants.Set("SUBMIT", JsValue.From(0x00004000));
+            evtConstants.Set("RESET", JsValue.From(0x00008000));
+            evtConstants.Set("LOAD", JsValue.From(0x00010000));
+            evtConstants.Set("UNLOAD", JsValue.From(0x00020000));
+            // modifier masks — present, all zero at runtime (modifier state
+            // is not tracked; e.modifiers reads 0)
+            evtConstants.Set("ALT_MASK", JsValue.From(0x00000001));
+            evtConstants.Set("CONTROL_MASK", JsValue.From(0x00000002));
+            evtConstants.Set("SHIFT_MASK", JsValue.From(0x00000004));
+            evtConstants.Set("META_MASK", JsValue.From(0x00000008));
+            w.Set("Event", JsValue.FromObject(evtConstants));
+
+            w.Set("captureEvents", Fn(scope, "captureEvents", (self, args) =>
+            {
+                int mask = args.Length > 0 ? (int)args[0].ToNumber() : 0;
+                state.Interpreter?.CaptureEvents(mask);
+                return JsValue.Undefined;
+            }));
+            w.Set("releaseEvents", Fn(scope, "releaseEvents", (self, args) =>
+            {
+                int mask = args.Length > 0 ? (int)args[0].ToNumber() : 0;
+                state.Interpreter?.ReleaseEvents(mask);
+                return JsValue.Undefined;
+            }));
+            w.Set("routeEvent", Fn(scope, "routeEvent", (self, args) =>
+            {
+                // Era-plausible re-dispatch: send the event object back to
+                // its own target's handlers and return the event.
+                if (args.Length > 0 && args[0].Type == JsType.Object)
+                {
+                    var evt = args[0].GetObject();
+                    var target = evt.Get("target");
+                    if (target is { Type: JsType.Object } t &&
+                        t.GetObjectOrFunction() is ElementWrapper wrapper)
+                        state.Interpreter?.FireEvent(wrapper.Element,
+                            evt.Get("type").ToJsString(), evt);
+                }
+                return args.Length > 0 ? args[0] : JsValue.Undefined;
+            }));
+            var handleEventFn = Fn(scope, "handleEvent", (self, args) =>
+            {
+                // window.handleEvent(evt) is accepted and behaves like
+                // routeEvent: re-dispatch to the event's target.
+                if (args.Length > 0 && args[0].Type == JsType.Object)
+                {
+                    var evt = args[0].GetObject();
+                    var target = evt.Get("target");
+                    if (target is { Type: JsType.Object } t &&
+                        t.GetObjectOrFunction() is ElementWrapper wrapper)
+                        state.Interpreter?.FireEvent(wrapper.Element,
+                            evt.Get("type").ToJsString(), evt);
+                }
+                return JsValue.Undefined;
+            });
+            // Marker so the capture model can tell this BUILTIN apart from a
+            // script-assigned window.handleEvent (the capture path calls the
+            // script's own handleEvent; the builtin redispatch would loop).
+            handleEventFn.GetFunction().Set("__dom_builtin__", JsValue.From(true));
+            w.Set("handleEvent", handleEventFn);
+
+            // window.pageXOffset/pageYOffset — read-only 0 (the shell's live
+            // scroll offset is not reachable from the bindings; documented).
+            w.Set("pageXOffset", JsValue.From(0));
+            w.Set("pageYOffset", JsValue.From(0));
+        }
 
         w.Set("scrollTo", Fn(scope, "scrollTo", (self, args) =>
         {
@@ -316,18 +504,22 @@ public static class DomBindings
         w.Set("scriptVersion", JsValue.From(BrowserRuntime.JavaScriptVersion));
 
         // JScript-era global engine probes.  These are deliberately exposed
-        // only through the IE-compatible host personality; Navigator 3 did
-        // not provide the Microsoft ScriptEngine* globals.
+        // only through the IE-compatible host personality; Navigator did not
+        // provide the Microsoft ScriptEngine* globals.  IE3 reports the
+        // JScript 1.0 numbers; the 1999 IE5 persona (and the Retro96 union)
+        // report JScript 5.0 build 6325 (era-plausible for the March 1999
+        // IE5.0 vbscript/jscript binaries).
         if (BrowserRuntime.SupportsInternetExplorerLegacy)
         {
+            bool modern = !BrowserRuntime.IsInternetExplorer3;
             w.Set("ScriptEngine", Fn(scope, "ScriptEngine", (self, args) =>
                 JsValue.From("JScript")));
             w.Set("ScriptEngineMajorVersion", Fn(scope, "ScriptEngineMajorVersion", (self, args) =>
-                JsValue.From(1)));
+                JsValue.From(modern ? 5 : 1)));
             w.Set("ScriptEngineMinorVersion", Fn(scope, "ScriptEngineMinorVersion", (self, args) =>
                 JsValue.From(0)));
             w.Set("ScriptEngineBuildVersion", Fn(scope, "ScriptEngineBuildVersion", (self, args) =>
-                JsValue.From(0)));
+                JsValue.From(modern ? 6325 : 0)));
         }
 
         scope.Define("window", JsValue.FromObject(w));
@@ -346,7 +538,22 @@ public static class DomBindings
         // the exposed DOM. Retro96 is the engine's native compatibility union:
         // it keeps its own identity while exposing both IE- and Navigator-era
         // surfaces instead of pretending to be only one browser.
-        if (prefs.EngineMode == RetroEngineMode.InternetExplorer3)
+        if (prefs.EngineMode == RetroEngineMode.InternetExplorer5)
+        {
+            // IE5, March 1999: JScript 5.0, ES3-era.
+            n.Set("appName", JsValue.From("Microsoft Internet Explorer"));
+            n.Set("appVersion", JsValue.From("5.0 (Windows 98; Win32)"));
+            n.Set("appCodeName", JsValue.From("Mozilla"));
+            n.Set("appMinorVersion", JsValue.From("0"));
+        }
+        else if (prefs.EngineMode == RetroEngineMode.Netscape47)
+        {
+            // Navigator 4.7, August 1999: JavaScript 1.3 (ECMA-262 v1/v2).
+            n.Set("appName", JsValue.From("Netscape"));
+            n.Set("appVersion", JsValue.From("4.7 (Win98; I)"));
+            n.Set("appCodeName", JsValue.From("Mozilla"));
+        }
+        else if (prefs.EngineMode == RetroEngineMode.InternetExplorer3)
         {
             n.Set("appName", JsValue.From("Microsoft Internet Explorer"));
             n.Set("appVersion", JsValue.From("3.02 (Windows 95)"));
@@ -361,7 +568,7 @@ public static class DomBindings
         else
         {
             n.Set("appName", JsValue.From("Retro96"));
-            n.Set("appVersion", JsValue.From("1.0 (Windows 95; IE3+NN3 compatibility)"));
+            n.Set("appVersion", JsValue.From("2.0 (Windows 98; IE5+NN4.7 compatibility)"));
             n.Set("appCodeName", JsValue.From("Mozilla"));
         }
 
@@ -369,12 +576,170 @@ public static class DomBindings
         n.Set("language", JsValue.From("en"));
         n.Set("platform", JsValue.From("Win32"));
         n.Set("cookieEnabled", JsValue.From(BrowserRuntime.CookiesEnabled));
+        // navigator.javaEnabled() — the 1999 host surface (IE5: true with the
+        // MS VM installed; NS4.7: true with the bundled JVM). Always false
+        // when applets are disabled in Preferences or High trust mode.
+        n.Set("javaEnabled", JsValue.FromFunction(new JsFunction(
+            (self, args) => JsValue.From(BrowserRuntime.JavaAppletsEnabled),
+            scope, "javaEnabled")));
 
-        // mimeTypes / plugins — sniffed occasionally; empty arrays
-        n.Set("mimeTypes", JsValue.FromObject(NewArray(scope)));
-        n.Set("plugins", JsValue.FromObject(NewArray(scope)));
+        // navigator.plugins[] / mimeTypes[] — era-flavoured static tables
+        // (checklist §12). The 1996 personas (IE3/NS3) keep the empty lists
+        // their browsers really had; the 1999 personas ship plausible
+        // installs of the year's common plugins. plugins.refresh() is a
+        // no-op (the tables are static by design).
+        var pluginArray = BuildNavigatorPlugins(scope);
+        n.Set("plugins", JsValue.FromObject(pluginArray));
+        n.Set("mimeTypes", JsValue.FromObject(BuildNavigatorMimeTypes(scope, pluginArray)));
 
         scope.Define("navigator", JsValue.FromObject(n));
+    }
+
+    /// <summary>A (name, filename, description, mimeTypes) plugin row.</summary>
+    private sealed record NavigatorPlugin(
+        string Name, string Filename, string Description, string[] MimeTypes);
+
+    /// <summary>
+    /// The 1999 plugin tables per persona. IE5's "plugins" were ActiveX
+    /// controls surfaced through navigator.plugins; NS4.7's list is the
+    /// classic Navigator plugin scan of its plugins directory.
+    /// </summary>
+    private static readonly NavigatorPlugin[] Ie5Plugins =
+    {
+        new("Shockwave Flash", "SWFLASH.OCX",
+            "Macromedia Shockwave Flash 4.0 r10", new[] { "application/x-shockwave-flash" }),
+        new("Acrobat Control for ActiveX", "PDF.PDF.1",
+            "Adobe Acrobat Control for ActiveX 4.05", new[] { "application/pdf" }),
+        new("NetShow Player Control", "NSPLAY.OCX",
+            "Microsoft NetShow Player 3.0", new[] { "video/x-ms-asf" }),
+        new("Windows Media Player Control", "WMP.OCX",
+            "Windows Media Player 6.4", new[] { "video/x-msvideo", "audio/mpeg" }),
+    };
+
+    private static readonly NavigatorPlugin[] Ns47Plugins =
+    {
+        new("Shockwave Flash", "NPSWF32.DLL",
+            "Shockwave Flash 4.0 r10", new[] { "application/x-shockwave-flash", "application/futuresplash" }),
+        new("Netscape Default Plug-in", "NPNUL32.DLL",
+            "Default Plug-in", new[] { "*" }),
+        new("Acrobat Plug-in", "NPPDF32.DLL",
+            "Adobe Acrobat 4.005", new[] { "application/pdf" }),
+        new("LiveAudio", "NPAUDIO.DLL",
+            "LiveAudio; Netscape sound player 3.0", new[] { "audio/basic", "audio/wav", "audio/x-aiff" }),
+        new("QuickTime Plug-in", "NPQTPLUGIN.DLL",
+            "QuickTime 4.1.2 Plug-in", new[] { "video/quicktime", "image/x-quicktime" }),
+        new("RealPlayer\u2122 G2 LiveConnect Plug-In", "NPRLZIP.DLL",
+            "RealPlayer G2 6.0", new[] { "audio/x-pn-realaudio", "audio/x-pn-realaudio-plugin" }),
+    };
+
+    /// <summary>Shared mimeType sample table (the types pages actually probed
+    /// in 1999 sniffers) used for navigator.mimeTypes.</summary>
+    private static readonly (string Type, string Suffixes, string Description, string PluginName)[] EraMimeTypes =
+    {
+        ("application/x-shockwave-flash", "swf", "Shockwave Flash", "Shockwave Flash"),
+        ("application/pdf", "pdf", "Acrobat", "Acrobat Plug-in"),
+        ("audio/x-pn-realaudio", "ra,ram,rm", "RealAudio", "RealPlayer\u2122 G2 LiveConnect Plug-In"),
+        ("video/quicktime", "mov,qt", "QuickTime video", "QuickTime Plug-in"),
+    };
+
+    /// <summary>Builds navigator.plugins with per-plugin mimeType entries
+    /// (each plugin object carries name/filename/description/length plus its
+    /// mimeType rows) and seeds navigator.mimeTypes with the sample table.</summary>
+    private static JsObject BuildNavigatorPlugins(JsScope scope)
+    {
+        var plugins = new JsObject { Class = "PluginArray", Prototype = JsInterpreter.ArrayPrototype };
+
+        NavigatorPlugin[]? table = BrowserRuntime.Settings.EngineMode switch
+        {
+            RetroEngineMode.InternetExplorer5 => Ie5Plugins,
+            RetroEngineMode.Netscape47 => Ns47Plugins,
+            RetroEngineMode.Retro96 => Ns47Plugins, // native union keeps the richer table
+            _ => null
+        };
+
+        if (table == null || table.Length == 0)
+        {
+            plugins.Set("length", JsValue.From(0));
+            plugins.Set("refresh", Fn(scope, "refresh", (self, args) => JsValue.Undefined));
+            return plugins;
+        }
+
+        for (int i = 0; i < table.Length; i++)
+        {
+            var row = table[i];
+            var plugin = new JsObject { Class = "Plugin" };
+            plugin.Set("name", JsValue.From(row.Name));
+            plugin.Set("filename", JsValue.From(row.Filename));
+            plugin.Set("description", JsValue.From(row.Description));
+
+            var mimes = NewArray(scope);
+            int mi = 0;
+            foreach (var type in row.MimeTypes)
+            {
+                var mime = new JsObject { Class = "MimeType" };
+                mime.Set("type", JsValue.From(type));
+                mime.Set("suffixes", JsValue.From(SuffixesFor(type)));
+                mime.Set("description", JsValue.From(row.Description));
+                mime.Set("enabledPlugin", JsValue.FromObject(plugin));
+                mimes.Set(mi.ToString(), JsValue.FromObject(mime));
+                mi++;
+            }
+            mimes.Set("length", JsValue.From(mi));
+            plugin.Set("mimeTypes", JsValue.FromObject(mimes));
+            plugin.Set("length", JsValue.From(mi));
+
+            plugins.Set(i.ToString(), JsValue.FromObject(plugin));
+            if (!plugins.HasOwn(row.Name))
+                plugins.Set(row.Name, JsValue.FromObject(plugin));
+        }
+        plugins.Set("length", JsValue.From(table.Length));
+        plugins.Set("refresh", Fn(scope, "refresh", (self, args) =>
+            JsValue.Undefined));
+
+        return plugins;
+    }
+
+    private static string SuffixesFor(string mime) => mime switch
+    {
+        "application/x-shockwave-flash" => "swf",
+        "application/futuresplash" => "spl",
+        "application/pdf" => "pdf",
+        "audio/basic" => "au,snd",
+        "audio/wav" => "wav",
+        "audio/x-aiff" => "aiff,aifc",
+        "video/quicktime" => "mov,qt",
+        "image/x-quicktime" => "mov,qt",
+        "audio/x-pn-realaudio" => "ra,ram,rm",
+        "audio/x-pn-realaudio-plugin" => "rpm",
+        "video/x-ms-asf" => "asf,asx",
+        "video/x-msvideo" => "avi",
+        "audio/mpeg" => "mp3,mp2",
+        "*" => "*",
+        _ => ""
+    };
+
+    /// <summary>Seeds navigator.mimeTypes with the era sample entries
+    /// (a flat MimeTypeArray whose enabledPlugin back-references the matching
+    /// plugin object, when one exists).</summary>
+    private static JsObject BuildNavigatorMimeTypes(JsScope scope, JsObject plugins)
+    {
+        var mimes = new JsObject { Class = "MimeTypeArray", Prototype = JsInterpreter.ArrayPrototype };
+        int i = 0;
+        foreach (var (type, suffixes, description, pluginName) in EraMimeTypes)
+        {
+            var entry = new JsObject { Class = "MimeType" };
+            entry.Set("type", JsValue.From(type));
+            entry.Set("suffixes", JsValue.From(suffixes));
+            entry.Set("description", JsValue.From(description));
+            var plugin = plugins.Get(pluginName);
+            if (plugin.Type == JsType.Object)
+                entry.Set("enabledPlugin", plugin);
+            mimes.Set(i.ToString(), JsValue.FromObject(entry));
+            mimes.Set(type, JsValue.FromObject(entry));
+            i++;
+        }
+        mimes.Set("length", JsValue.From(i));
+        return mimes;
     }
 
     /// <summary>
@@ -468,9 +833,10 @@ public static class DomBindings
         d.Set("close", Fn(scope, "close", (self, args) => JsValue.Undefined));
         d.Set("clear", Fn(scope, "clear", (self, args) => JsValue.Undefined));
 
-        // getElementById is a later DOM API. IE3 mode deliberately does not
-        // expose it; IE3 pages use document.all / named access instead.
-        if (!BrowserRuntime.IsInternetExplorer3)
+        // getElementById is a DOM Level 1 API (Oct 1998). IE3 mode and the
+        // Navigator 4.x personas deliberately do not expose it — IE3 pages
+        // use document.all, NS4.x pages use document.layers / document.ids.
+        if (BrowserRuntime.SupportsGetElementById)
             d.Set("getElementById", Fn(scope, "getElementById", (self, args) =>
         {
             string id = args.Length > 0 ? args[0].ToJsString().Trim() : "";
@@ -494,8 +860,9 @@ public static class DomBindings
                 : JsValue.FromObject(WrapElement(el, state));
         }));
 
-        // createElement was not part of the IE3 DOM surface.
-        if (!BrowserRuntime.IsInternetExplorer3)
+        // createElement was not part of the IE3 DOM surface, and Navigator 4
+        // exposed no DOM1 factory either.
+        if (BrowserRuntime.SupportsGetElementById)
             d.Set("createElement", Fn(scope, "createElement", (self, args) =>
         {
             string tagName = args.Length > 0 ? args[0].ToJsString() : "";
@@ -505,8 +872,18 @@ public static class DomBindings
             return JsValue.FromObject(WrapElement(element, state));
         }));
 
-        // getElementsByTagName is a later DOM API, so hide it in strict IE3 mode.
-        if (!BrowserRuntime.IsInternetExplorer3)
+        // createTextNode (DOM Level 1, checklist §10). The node is detached
+        // until appendChild/insertBefore graft it; nodeValue stays writable.
+        if (BrowserRuntime.SupportsGetElementById)
+            d.Set("createTextNode", Fn(scope, "createTextNode", (self, args) =>
+        {
+            string data = args.Length > 0 ? args[0].ToJsString() : "";
+            return JsValue.FromObject(new TextNodeObject(new DomText(data), canvas));
+        }));
+
+        // getElementsByTagName is a DOM Level 1 API; hidden in the IE3 and
+        // Navigator 4.x personas.
+        if (BrowserRuntime.SupportsGetElementById)
             d.Set("getElementsByTagName", Fn(scope, "getElementsByTagName", (self, args) =>
         {
             string tagName = args.Length > 0 ? args[0].ToJsString() : "";
@@ -777,6 +1154,17 @@ public static class DomBindings
         return wrapper;
     }
 
+    /// <summary>IE5 uniqueID (§10): a stable "ms__idN" string per element,
+    /// allocated per page from the bindings state.</summary>
+    internal static string GetOrCreateUniqueId(DomElement element, DocumentBindingsState state)
+    {
+        if (state.UniqueIds.TryGetValue(element, out var existing)) return existing;
+        state.NextUniqueId++;
+        var id = $"ms__id{state.NextUniqueId}";
+        state.UniqueIds[element] = id;
+        return id;
+    }
+
     // ═════════════════════════════════════════════════════════════════════
     // Virtual-property objects — JsObject subclasses whose Get/Set touch
     // the live document / shell instead of a plain slot.  (These REPLACE
@@ -876,6 +1264,11 @@ public static class DomBindings
                     if (!BrowserRuntime.CookiesEnabled) return JsValue.From("");
                     try { return JsValue.From(_doc.Cookies.Get(BaseUrlOrBlank)); }
                     catch { return JsValue.From(""); }
+                case "readyState":
+                    // IE5: "loading" while the parser streams, "complete" once
+                    // the parse finished (the post-parse RegisterAll is the
+                    // transition, firing onreadystatechange exactly once).
+                    return JsValue.From(_doc.ParseComplete ? "complete" : "loading");
                 case "all" when BrowserRuntime.SupportsInternetExplorerLegacy:
                     if (_state == null) return JsValue.Undefined;
                     // One stable collection object per document so
@@ -888,11 +1281,17 @@ public static class DomBindings
                         Properties["all"] = cachedAll;
                     }
                     return cachedAll;
-                case "layers" when BrowserRuntime.SupportsNetscapeLegacy:
+                case "layers" when BrowserRuntime.SupportsDocumentLayers:
+                    // NS4 layer collection — LIVE: positioned elements (CSS
+                    // position:absolute/relative via inline or resolved style)
+                    // plus <layer>/<ilayer>, indexable by number AND name
+                    // (id/name attribute). One stable collection object so
+                    // document.layers === document.layers holds.
+                    if (_state == null) return JsValue.Undefined;
                     if (!Properties.TryGetValue("layers", out var layers))
                     {
-                        layers = JsValue.FromObject(
-                            NewArray(_state?.Interpreter?.GlobalScope ?? new JsScope()));
+                        layers = JsValue.FromObject(new LayerCollectionObject(
+                            _doc, _state, _state.Interpreter?.GlobalScope ?? new JsScope()));
                         Properties["layers"] = layers;
                     }
                     return layers;
@@ -1055,15 +1454,70 @@ public static class DomBindings
         }
     }
 
+    /// <summary>
+    /// A DOM text node wrapper (DOM Level 1, §10): nodeType 3, live
+    /// nodeValue/data reads and writes (a write mutates the underlying
+    /// DomText and repaints), nodeNames "#text" / "#comment". Detached nodes
+    /// (document.createTextNode) work the same way until they are grafted
+    /// with appendChild/insertBefore.
+    /// </summary>
     private sealed class TextNodeObject : JsObject
     {
+        private readonly DomText? _node;
+        private readonly BrowserCanvas? _canvas;
+        private readonly string _staticData;
+        private readonly int _nodeType;
+
+        public TextNodeObject(DomText node, BrowserCanvas? canvas)
+        {
+            _node = node;
+            _canvas = canvas;
+            _staticData = node.Data;
+            _nodeType = 3;
+            Class = "Text";
+        }
+
         public TextNodeObject(string data, int nodeType = 3)
         {
-            Set("nodeType", JsValue.From(nodeType));
-            Set("nodeName", JsValue.From(nodeType == 8 ? "#comment" : "#text"));
-            Set("nodeValue", JsValue.From(data));
-            Set("data", JsValue.From(data));
-            Set("length", JsValue.From(data.Length));
+            // Comment / other fallback (old shape): a static text carrier.
+            _node = null;
+            _canvas = null;
+            _staticData = data;
+            _nodeType = nodeType;
+            Class = nodeType == 8 ? "Comment" : "Text";
+        }
+
+        private string Data => _node?.Data ?? _staticData;
+
+        /// <summary>The wrapped DomText (null for the static comment
+        /// fallback) — used by DOM mutation methods to graft created nodes.</summary>
+        internal DomNode? UnderlyingNode => _node;
+
+        public override JsValue Get(string name)
+        {
+            switch (name)
+            {
+                case "nodeType": return JsValue.From(_nodeType);
+                case "nodeName": return JsValue.From(_nodeType == 8 ? "#comment" : "#text");
+                case "nodeValue":
+                case "data": return JsValue.From(Data);
+                case "length": return JsValue.From(Data.Length);
+            }
+            return base.Get(name);
+        }
+
+        public override void Set(string name, JsValue value)
+        {
+            if (name is "nodeValue" or "data")
+            {
+                if (_node != null)
+                {
+                    _node.Data = value.ToJsString();
+                    _canvas?.RequestRerender();
+                }
+                return;   // static/comment fallback nodes are read-only
+            }
+            base.Set(name, value);
         }
     }
 
@@ -1418,8 +1872,8 @@ public static class DomBindings
             opt.GetAttr("value") ?? (opt.InnerText ?? "").Trim();
 
         /// <summary>Wraps a DOM node: elements get the CACHED ElementWrapper
-        /// (stable identity across accesses), text nodes get a minimal
-        /// {nodeType:3, nodeValue/data} object, comments get {nodeType:8}.</summary>
+        /// (stable identity across accesses), text nodes get a live
+        /// TextNodeObject, comments get {nodeType:8}.</summary>
         private JsObject WrapNode(DomNode node)
         {
             if (node is DomElement el)
@@ -1428,8 +1882,21 @@ public static class DomBindings
                 return new ElementWrapper(el, _canvas, _scope);
             }
             if (node is DomText tx)
-                return new TextNodeObject(tx.Data);
+                return new TextNodeObject(tx, _canvas);
             return new TextNodeObject("", nodeType: 8);   // comment / other
+        }
+
+        /// <summary>Unwraps a script node argument: ElementWrapper → its
+        /// DomElement, TextNodeObject → its DomText (or null for the static
+        /// comment fallback). Returns null for anything else.</summary>
+        private static DomNode? UnwrapNodeArg(JsValue value)
+        {
+            if (value.Type != JsType.Object) return null;
+            if (value.GetObject() is ElementWrapper elementWrapper)
+                return elementWrapper.Element;
+            if (value.GetObject() is TextNodeObject textObject)
+                return textObject.UnderlyingNode;
+            return null;
         }
 
         private JsValue WrapSibling(DomElement from, int direction)
@@ -1572,6 +2039,141 @@ public static class DomBindings
                 return JsValue.Undefined;
             }, _scope, "insertAdjacentHTML"));
 
+        /// <summary>insertAdjacentText(position, text) — the IE4/5 text twin
+        /// of insertAdjacentHTML: same four positions, inserts a DomText.</summary>
+        private JsValue MakeInsertAdjacentTextFunction() => JsValue.FromFunction(
+            new JsFunction((self, args) =>
+            {
+                if (args.Length < 2) return JsValue.Undefined;
+
+                string position = args[0].ToJsString().Trim().ToLowerInvariant();
+                var textNode = new DomText { Data = args[1].ToJsString() };
+
+                switch (position)
+                {
+                    case "beforebegin":
+                        _element.Parent?.InsertBefore(textNode, _element);
+                        break;
+                    case "afterbegin":
+                        _element.InsertBefore(textNode, _element.FirstChild);
+                        break;
+                    case "beforeend":
+                        _element.AppendChild(textNode);
+                        break;
+                    case "afterend":
+                        _element.Parent?.InsertBefore(textNode, _element.NextSibling);
+                        break;
+                    default:
+                        return JsValue.Undefined;
+                }
+
+                _canvas?.ReflowDocument();
+                return JsValue.Undefined;
+            }, _scope, "insertAdjacentText"));
+
+        // ── IE5 geometry helpers (offset*/client*) ─────────────────────────
+        //
+        // The layout engine keeps geometry on LayoutBox (element → box via
+        // LayoutBox.Element, or a future DomElement.Box); the resolved
+        // ComputedStyle carries authored lengths. offset*/client* read the
+        // box when one exists and fall back to the authored style — a page
+        // that never laid out still reports its inline widths.
+
+        private DomElement? OffsetParent()
+        {
+            for (var ancestor = _element.Parent as DomElement;
+                 ancestor != null;
+                 ancestor = ancestor.Parent as DomElement)
+            {
+                if (IsPositionedElement(ancestor) || ancestor.TagName == "body")
+                    return ancestor;
+            }
+            // IE5 contract: an attached element's offsetParent is the BODY
+            // when no positioned ancestor exists — null only for detached
+            // or display:none elements.
+            return _element.OwnerDocument()?.ElementDescendants().FirstOrDefault(e => e.TagName == "body");
+        }
+
+        private static bool IsPositionedElement(DomElement element)
+        {
+            if (element.TagName is "layer" or "ilayer") return true;
+            var position = element.Style?.Position;
+            if (position is Css.PositionValue.Relative or Css.PositionValue.Absolute
+                or Css.PositionValue.Fixed)
+                return true;
+            // Inline STYLE= position (style resolution may not have run yet).
+            var inlinePosition = element.GetAttr("style");
+            if (inlinePosition != null)
+            {
+                foreach (var decl in Css.CssParser.ParseInlineStyle(inlinePosition))
+                    if (string.Equals(decl.Property, "position", StringComparison.OrdinalIgnoreCase) &&
+                        (decl.Value ?? "").Trim() is "absolute" or "relative" or "fixed")
+                        return true;
+            }
+            return false;
+        }
+
+        private (double Left, double Top, double Width, double Height) OffsetMetrics()
+        {
+            var box = _element.Box;
+            var parentBox = OffsetParent()?.Box;
+            if (box != null)
+            {
+                double left = parentBox != null ? box.X - parentBox.X : box.X;
+                double top = parentBox != null ? box.Y - parentBox.Y : box.Y;
+                double width = box.Width + box.PaddingLeft + box.PaddingRight +
+                               box.BorderLeft + box.BorderRight;
+                double height = box.Height + box.PaddingTop + box.PaddingBottom +
+                                box.BorderTop + box.BorderBottom;
+                return (left, top, width, height);
+            }
+
+            var style = _element.Style;
+            if (style == null) return (0, 0, 0, 0);
+            double w = (style.Width ?? 0) + style.PaddingLeft + style.PaddingRight +
+                       style.BorderLeftWidth + style.BorderRightWidth;
+            double h = (style.Height ?? 0) + style.PaddingTop + style.PaddingBottom +
+                       style.BorderTopWidth + style.BorderBottomWidth;
+            return (style.Left ?? 0, style.Top ?? 0, w, h);
+        }
+
+        private (double Width, double Height) ClientMetrics()
+        {
+            var box = _element.Box;
+            if (box != null)
+                return (box.Width + box.PaddingLeft + box.PaddingRight,
+                        box.Height + box.PaddingTop + box.PaddingBottom);
+            var style = _element.Style;
+            if (style == null) return (0, 0);
+            double width = (style.Width ?? 0) + style.PaddingLeft + style.PaddingRight;
+            double height = (style.Height ?? 0) + style.PaddingTop + style.PaddingBottom;
+            return (width, height);
+        }
+
+        /// <summary>Deep/shallow DOM clone (DOM1 cloneNode): attributes and
+        /// inline event handler sources are copied (IE cloned them); deep
+        /// clones copy the whole child subtree.</summary>
+        private static DomElement CloneElement(DomElement source, bool deep)
+        {
+            var clone = new DomElement(source.TagName);
+            foreach (var (attrName, attrValue) in source.Attrs)
+                clone.SetAttr(attrName, attrValue);
+            foreach (var (eventName, handlerSource) in source.EventHandlers)
+                clone.EventHandlers[eventName] = handlerSource;
+            if (deep)
+                foreach (var child in source.Children)
+                    clone.AppendChild(CloneNodeDeep(child));
+            return clone;
+        }
+
+        private static DomNode CloneNodeDeep(DomNode node) => node switch
+        {
+            DomElement element => CloneElement(element, deep: true),
+            DomText text => new DomText { Data = text.Data },
+            DomComment comment => new DomComment(comment.Text),
+            _ => node
+        };
+
         /// <summary>Wraps a child element for a mutation-method return value,
         /// tolerating a null state instead of crashing.</summary>
         private JsValue WrapChildValue(DomElement child) =>
@@ -1617,6 +2219,120 @@ public static class DomBindings
                     _scope, "createTextRange"));
             }
 
+            // ── DOM Level 1 Core (checklist §10) ─────────────────────────
+            if (name == "hasChildNodes")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.From(_element.Children.Count > 0), _scope, "hasChildNodes"));
+            if (name == "hasAttributes")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                    JsValue.From(_element.Attrs.Count > 0), _scope, "hasAttributes"));
+            if (name == "ownerDocument")
+                return _state?.DocumentObject != null
+                    ? JsValue.FromObject(_state.DocumentObject)
+                    : JsValue.Null;
+            if (name == "removeAttribute")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    string attrName = args.Length > 0 ? args[0].ToJsString() : "";
+                    if (attrName.Length == 0) return JsValue.Undefined;
+                    _element.SetAttr(attrName, null);
+                    if (attrName.StartsWith("on", StringComparison.OrdinalIgnoreCase) &&
+                        attrName.Length > 2)
+                    {
+                        string eventName = attrName.ToLowerInvariant();
+                        _state?.Interpreter?.ClearDomEventProperty(_element, eventName);
+                        _element.EventHandlers.Remove(eventName);
+                    }
+                    _canvas?.RequestRerender();
+                    return JsValue.Undefined;
+                }, _scope, "removeAttribute"));
+            if (name == "replaceChild")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length < 2) return JsValue.Null;
+                    var newNode = UnwrapNodeArg(args[0]);
+                    var oldNode = UnwrapNodeArg(args[1]);
+                    if (newNode == null || oldNode == null || !ReferenceEquals(oldNode.Parent, _element))
+                        return JsValue.Null;
+                    _element.InsertBefore(newNode, oldNode);
+                    _element.RemoveChild(oldNode);
+                    _canvas?.ReflowDocument();
+                    return JsValue.FromObject(WrapNode(oldNode));   // DOM1: returns the replaced node
+                }, _scope, "replaceChild"));
+            if (name == "cloneNode")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    bool deep = args.Length > 0 && args[0].ToBoolean();
+                    var clone = CloneElement(_element, deep);
+                    return _state != null
+                        ? JsValue.FromObject(WrapElement(clone, _state))
+                        : JsValue.FromObject(new ElementWrapper(clone, _canvas, _scope));
+                }, _scope, "cloneNode"));
+            if (name == "attributes")
+                return JsValue.FromObject(new AttributesObject(_element, _canvas, _scope, _state));
+
+            // ── IE5 DHTML object model (checklist §10) ───────────────────
+            if (BrowserRuntime.SupportsInternetExplorerLegacy)
+            {
+                if (string.Equals(name, "attachEvent", StringComparison.OrdinalIgnoreCase))
+                    return JsValue.FromFunction(new JsFunction((self, args) =>
+                    {
+                        string evt = args.Length > 0 ? args[0].ToJsString() : "";
+                        if (args.Length > 1 && args[1].Type == JsType.Function && evt.Length > 0)
+                            _state?.Interpreter?.AttachEventHandler(_element, evt, args[1]);
+                        return JsValue.From(args.Length > 1 && args[1].Type == JsType.Function);
+                    }, _scope, "attachEvent"));
+                if (string.Equals(name, "detachEvent", StringComparison.OrdinalIgnoreCase))
+                    return JsValue.FromFunction(new JsFunction((self, args) =>
+                    {
+                        string evt = args.Length > 0 ? args[0].ToJsString() : "";
+                        bool removed = args.Length > 1 && evt.Length > 0 &&
+                            _state?.Interpreter?.DetachEventHandler(_element, evt, args[1]) == true;
+                        return JsValue.From(removed);
+                    }, _scope, "detachEvent"));
+                if (string.Equals(name, "insertAdjacentText", StringComparison.OrdinalIgnoreCase))
+                    return MakeInsertAdjacentTextFunction();
+                if (name == "currentStyle" && !Properties.ContainsKey("currentStyle"))
+                    Properties["currentStyle"] = JsValue.FromObject(new CurrentStyleObject(_element));
+                if (name == "uniqueID" && _state != null)
+                    return JsValue.From(DomBindings.GetOrCreateUniqueId(_element, _state));
+                if (name == "setActive")
+                    return JsValue.FromFunction(new JsFunction((self, args) =>
+                    {
+                        // setActive() is focus-without-scroll; the engine's
+                        // focus state is the document's FocusedElement slot.
+                        var owner = _element.OwnerDocument();
+                        if (owner != null) owner.FocusedElement = _element;
+                        _canvas?.RequestRerender();
+                        return JsValue.Undefined;
+                    }, _scope, "setActive"));
+
+                // IE5 geometry (§10): offset*/client*/scroll*. LayoutBox when
+                // a layout ran (box carries document-space border-box origin
+                // + content size); the resolved ComputedStyle otherwise.
+                switch (name)
+                {
+                    case "offsetParent":
+                        return OffsetParent() is { } op && _state != null
+                            ? JsValue.FromObject(WrapElement(op, _state))
+                            : JsValue.Null;
+                    case "offsetLeft": return JsValue.From(OffsetMetrics().Left);
+                    case "offsetTop": return JsValue.From(OffsetMetrics().Top);
+                    case "offsetWidth": return JsValue.From(OffsetMetrics().Width);
+                    case "offsetHeight": return JsValue.From(OffsetMetrics().Height);
+                    case "clientWidth": return JsValue.From(ClientMetrics().Width);
+                    case "clientHeight": return JsValue.From(ClientMetrics().Height);
+                    case "scrollTop":
+                    case "scrollLeft":
+                        // Readback of scripted writes (the engine has no
+                        // per-element content scrolling — documented
+                        // limitation); default 0, matching an unscrolled box.
+                        if (Properties.TryGetValue(name, out var stored) && stored.Type == JsType.Number)
+                            return stored;
+                        return JsValue.From(0);
+                }
+            }
+
             // IE's legacy `element.all` is a callable sub-collection of every
             // descendant element. Keep it live so scripts see DOM changes made
             // after the wrapper was first obtained.
@@ -1660,7 +2376,10 @@ public static class DomBindings
             {
                 case "tagName":
                 case "nodeName":
-                    return JsValue.From(_element.TagName);
+                    // DOM Level 1 HTML: element names report in the
+                    // uppercase HTML canonical form ("BODY"), exactly like
+                    // IE5 and NS4.7 did.
+                    return JsValue.From(_element.TagName.ToUpperInvariant());
                 case "nodeType":
                     return JsValue.From(1);
                 case "innerHTML":
@@ -1888,56 +2607,55 @@ public static class DomBindings
                     return JsValue.Undefined;
                 }, _scope, "submit"));
 
-            // appendChild / insertBefore / removeChild — enough of the old DOM
-            // mutation surface for pages that build small bits of UI at runtime.
+            // appendChild / insertBefore / removeChild / replaceChild — the
+            // old DOM mutation surface for pages that build small bits of UI
+            // at runtime. Elements AND text nodes (document.createTextNode)
+            // are accepted as children.
             if (name == "appendChild")
                 return JsValue.FromFunction(new JsFunction((self, args) =>
                 {
-                    if (args.Length == 0 || args[0].Type != JsType.Object)
-                        return JsValue.Null;
+                    if (args.Length == 0) return JsValue.Null;
+                    var child = UnwrapNodeArg(args[0]);
+                    if (child == null) return JsValue.Null;
 
-                    if (args[0].GetObject() is not ElementWrapper childWrapper)
-                        return JsValue.Null;
-
-                    var child = childWrapper.Element;
                     _element.AppendChild(child);
                     _canvas?.ReflowDocument();
-                    return WrapChildValue(child);
+                    return child is DomElement childElement
+                        ? WrapChildValue(childElement)
+                        : JsValue.FromObject(WrapNode(child));
                 }, _scope, "appendChild"));
 
             if (name == "insertBefore")
                 return JsValue.FromFunction(new JsFunction((self, args) =>
                 {
-                    if (args.Length == 0 || args[0].Type != JsType.Object)
-                        return JsValue.Null;
+                    if (args.Length == 0) return JsValue.Null;
+                    var child = UnwrapNodeArg(args[0]);
+                    if (child == null) return JsValue.Null;
 
-                    if (args[0].GetObject() is not ElementWrapper childWrapper)
-                        return JsValue.Null;
-
-                    var child = childWrapper.Element;
-                    DomElement? reference = null;
-                    if (args.Length > 1 && args[1].Type == JsType.Object &&
-                        args[1].GetObject() is ElementWrapper referenceWrapper)
-                        reference = referenceWrapper.Element;
+                    DomNode? reference = null;
+                    if (args.Length > 1)
+                        reference = UnwrapNodeArg(args[1]);
 
                     _element.InsertBefore(child, reference);
                     _canvas?.ReflowDocument();
-                    return WrapChildValue(child);
+                    return child is DomElement childElement
+                        ? WrapChildValue(childElement)
+                        : JsValue.FromObject(WrapNode(child));
                 }, _scope, "insertBefore"));
 
             if (name == "removeChild")
                 return JsValue.FromFunction(new JsFunction((self, args) =>
                 {
-                    if (args.Length == 0 || args[0].Type != JsType.Object)
+                    if (args.Length == 0) return JsValue.Null;
+                    var child = UnwrapNodeArg(args[0]);
+                    if (child == null || !ReferenceEquals(child.Parent, _element))
                         return JsValue.Null;
 
-                    if (args[0].GetObject() is not ElementWrapper childWrapper)
-                        return JsValue.Null;
-
-                    var child = childWrapper.Element;
                     _element.RemoveChild(child);
                     _canvas?.ReflowDocument();
-                    return WrapChildValue(child);
+                    return child is DomElement childElement
+                        ? WrapChildValue(childElement)
+                        : JsValue.FromObject(WrapNode(child));
                 }, _scope, "removeChild"));
 
             // DOM-0 NAMED CONTROL ACCESS — form.digits (the era's field
@@ -1975,19 +2693,20 @@ public static class DomBindings
                 foreach (var oldChild in _element.Children.ToList())
                     _element.RemoveChild(oldChild);
                 var doc = _element.OwnerDocument();
-                if (doc != null)
-                {
-                    var fragment = HtmlParser.Parse(value.ToJsString(),
-                        doc.BaseUrl ?? ParsedUrl.Parse("about:blank"), doc.Cookies);
-                    var body = fragment.ElementDescendants()
-                        .FirstOrDefault(e => e.TagName.Equals("body", StringComparison.OrdinalIgnoreCase));
-                    // Fall back to the fragment's own children when the parser
-                    // did not synthesise a <body> — the old code appended
-                    // NOTHING in that case, silently discarding the markup.
-                    var source = body != null ? body.Children : fragment.Children;
-                    foreach (var child in source.ToList())
-                        _element.AppendChild(child);
-                }
+                // Detached elements (document.createElement + innerHTML, the
+                // era's UI-building idiom) have no owner document yet — parse
+                // the fragment against a blank base so the children still land.
+                var baseUrl = doc?.BaseUrl ?? ParsedUrl.Parse("about:blank");
+                var fragment = HtmlParser.Parse(value.ToJsString(), baseUrl,
+                    doc?.Cookies ?? new CookieStore());
+                var body = fragment.ElementDescendants()
+                    .FirstOrDefault(e => e.TagName.Equals("body", StringComparison.OrdinalIgnoreCase));
+                // Fall back to the fragment's own children when the parser
+                // did not synthesise a <body> — the old code appended
+                // NOTHING in that case, silently discarding the markup.
+                var source = body != null ? body.Children : fragment.Children;
+                foreach (var child in source.ToList())
+                    _element.AppendChild(child);
                 _canvas?.ReflowDocument();
                 return;
             }
@@ -2110,6 +2829,18 @@ public static class DomBindings
                 }
             }
 
+            // IE5 element.scrollTop/scrollLeft writes — the engine has no
+            // per-element content scrolling; the value is stored for
+            // readback and a repaint is requested (documented limitation:
+            // setting scrollTop does not actually scroll clipped content).
+            if ((name == "scrollTop" || name == "scrollLeft") &&
+                BrowserRuntime.SupportsInternetExplorerLegacy)
+            {
+                base.Set(name, value);
+                _canvas?.RequestRerender();
+                return;
+            }
+
             if (RoutedAttrs.Contains(name))
             {
                 if (name == "checked")
@@ -2218,12 +2949,48 @@ public static class DomBindings
             if (name == "cssText")
                 return JsValue.From(_element.GetAttr("style") ?? "");
 
+            // IE5 style.pixel*/pos* (§10): numeric pixel reads of the inline
+            // left/top/width/height declarations. posLeft/posTop are the
+            // same numbers (IE stored the unitful authored value; scripts
+            // used the pair interchangeably for positioned DHTML).
+            switch (name)
+            {
+                case "pixelLeft":
+                case "posLeft":
+                    return JsValue.From(InlinePixels("left"));
+                case "pixelTop":
+                case "posTop":
+                    return JsValue.From(InlinePixels("top"));
+                case "pixelWidth":
+                    return JsValue.From(InlinePixels("width"));
+                case "pixelHeight":
+                    return JsValue.From(InlinePixels("height"));
+                case "pixelRight":
+                    return JsValue.From(InlinePixels("right"));
+                case "pixelBottom":
+                    return JsValue.From(InlinePixels("bottom"));
+            }
+
             var decls = ParseCurrent();
             if (decls.TryGetValue(name.ToLowerInvariant(), out string? v))
                 return JsValue.From(v);
             if (decls.TryGetValue(NormalizeStyleKey(name), out v))
                 return JsValue.From(v);
             return JsValue.From("");
+        }
+
+        /// <summary>The numeric px value of an inline declaration (unitless
+        /// numbers count as px, the era default), 0 when absent.</summary>
+        private double InlinePixels(string property)
+        {
+            var decls = ParseCurrent();
+            if (!decls.TryGetValue(property, out string? raw) || raw == null)
+                return 0;
+            string t = raw.Trim();
+            if (t.EndsWith("px", StringComparison.OrdinalIgnoreCase))
+                t = t[..^2].Trim();
+            return double.TryParse(t, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double n) ? n : 0;
         }
 
         public override void Set(string name, JsValue value)
@@ -2233,6 +3000,26 @@ public static class DomBindings
                 _element.SetAttr("style", value.ToJsString());
                 Reflow();
                 return;
+            }
+
+            // IE5 style.pixel*/pos* writes (§10): numeric writes land as px
+            // declarations, so layer-style DHTML animation scripts work.
+            switch (name)
+            {
+                case "pixelLeft":
+                case "posLeft":
+                    SetInlinePx("left", value); return;
+                case "pixelTop":
+                case "posTop":
+                    SetInlinePx("top", value); return;
+                case "pixelWidth":
+                    SetInlinePx("width", value); return;
+                case "pixelHeight":
+                    SetInlinePx("height", value); return;
+                case "pixelRight":
+                    SetInlinePx("right", value); return;
+                case "pixelBottom":
+                    SetInlinePx("bottom", value); return;
             }
 
             string v = value.ToJsString().Trim();
@@ -2249,11 +3036,670 @@ public static class DomBindings
             Reflow();
         }
 
+        /// <summary>Writes an inline declaration as "<paramref name="property"/>: Npx"
+        /// (replacing any existing declaration) and reflows.</summary>
+        private void SetInlinePx(string property, JsValue value)
+        {
+            double n = value.ToNumber();
+            var decls = ParseCurrent();
+            decls[property] = double.IsNaN(n) ? "0px" :
+                $"{n.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}px";
+            _element.SetAttr("style",
+                string.Join("; ", decls.Select(kv => $"{kv.Key}: {kv.Value}")));
+            Reflow();
+        }
+
         private void Reflow()
         {
             if (_canvas == null) return;
             try { _canvas.ReflowDocument(); }
             catch { /* best-effort reflow */ }
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // 1999 DOM additions: attributes map, currentStyle, frames, NS4 layers
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// element.attributes — a NamedNodeMap-ish live view (DOM Level 1, §10):
+    /// attributes[i].name/.value, attributes.length, attributes[name],
+    /// attributes.getNamedItem(name). Attribute nodes are {nodeType: 2} with
+    /// a writable .value (a write hits the live element and repaints).
+    /// </summary>
+    private sealed class AttributesObject : JsObject
+    {
+        private readonly DomElement _element;
+        private readonly BrowserCanvas? _canvas;
+        private readonly JsScope _scope;
+        private readonly DocumentBindingsState? _state;
+
+        public AttributesObject(DomElement element, BrowserCanvas? canvas,
+                                JsScope scope, DocumentBindingsState? state)
+        {
+            _element = element;
+            _canvas = canvas;
+            _scope = scope;
+            _state = state;
+            Class = "NamedNodeMap";
+        }
+
+        private List<KeyValuePair<string, string>> Snapshot() =>
+            _element.Attrs.ToList();
+
+        private JsValue WrapAttr(KeyValuePair<string, string> attr) =>
+            JsValue.FromObject(new AttributeNodeObject(_element, attr.Key, _canvas));
+
+        public override JsValue Get(string name)
+        {
+            if (name == "length")
+                return JsValue.From(_element.Attrs.Count);
+
+            if (name == "getNamedItem")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    string key = args.Length > 0 ? args[0].ToJsString() : "";
+                    return _element.HasAttr(key)
+                        ? WrapAttr(new KeyValuePair<string, string>(key, _element.GetAttr(key)!))
+                        : JsValue.Null;
+                }, _scope, "getNamedItem"));
+
+            if (name == "setNamedItem")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    if (args.Length > 0 && args[0].GetObject() is AttributeNodeObject node)
+                    {
+                        node.Commit(_element);
+                        _canvas?.RequestRerender();
+                    }
+                    return JsValue.Undefined;
+                }, _scope, "setNamedItem"));
+
+            if (name == "removeNamedItem")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    string key = args.Length > 0 ? args[0].ToJsString() : "";
+                    if (!_element.HasAttr(key)) return JsValue.Null;
+                    var removed = WrapAttr(new KeyValuePair<string, string>(key, _element.GetAttr(key)!));
+                    _element.SetAttr(key, null);
+                    _canvas?.RequestRerender();
+                    return removed;
+                }, _scope, "removeNamedItem"));
+
+            // Index or attribute-name access
+            if (int.TryParse(name, out int index))
+            {
+                var snapshot = Snapshot();
+                return index >= 0 && index < snapshot.Count
+                    ? WrapAttr(snapshot[index])
+                    : JsValue.Undefined;
+            }
+            if (_element.HasAttr(name))
+                return WrapAttr(new KeyValuePair<string, string>(name, _element.GetAttr(name)!));
+            return base.Get(name);
+        }
+    }
+
+    /// <summary>One attribute node: nodeType 2, name, live value
+    /// (write → SetAttr + repaint), specified, nodeName/nodeValue.</summary>
+    private sealed class AttributeNodeObject : JsObject
+    {
+        private readonly DomElement _element;
+        private readonly BrowserCanvas? _canvas;
+        private readonly string _name;
+
+        public AttributeNodeObject(DomElement element, string name, BrowserCanvas? canvas)
+        {
+            _element = element;
+            _name = name;
+            _canvas = canvas;
+            Class = "Attr";
+        }
+
+        internal void Commit(DomElement element) =>
+            element.SetAttr(_name, element.GetAttr(_name) ?? "");
+
+        public override JsValue Get(string name)
+        {
+            switch (name)
+            {
+                case "nodeType": return JsValue.From(2);
+                case "nodeName":
+                case "name": return JsValue.From(_name);
+                case "nodeValue":
+                case "value": return JsValue.From(_element.GetAttr(_name) ?? "");
+                case "specified": return JsValue.From(_element.HasAttr(_name));
+            }
+            return base.Get(name);
+        }
+
+        public override void Set(string name, JsValue value)
+        {
+            if (name is "nodeValue" or "value")
+            {
+                _element.SetAttr(_name, value.ToJsString());
+                _canvas?.RequestRerender();
+                return;
+            }
+            base.Set(name, value);
+        }
+    }
+
+    /// <summary>
+    /// element.currentStyle — IE5's READ-ONLY computed style object (§10).
+    /// Reads the resolved ComputedStyle the style resolver installed on the
+    /// element, exposing the same camelCase property surface as
+    /// element.style; writes are silently ignored (read-only contract).
+    /// Before the first style resolve the reads return "".
+    /// </summary>
+    private sealed class CurrentStyleObject : JsObject
+    {
+        private readonly DomElement _element;
+
+        public CurrentStyleObject(DomElement element)
+        {
+            _element = element;
+            Class = "CSSCurrentStyle";
+        }
+
+        private static string NormalizeKey(string name)
+        {
+            if (name.IndexOf('-') >= 0) return name.ToLowerInvariant();
+            var sb = new System.Text.StringBuilder(name.Length + 4);
+            foreach (char c in name)
+            {
+                if (char.IsUpper(c) && sb.Length > 0) sb.Append('-');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            return sb.ToString();
+        }
+
+        private static string Px(float v) =>
+            ((int)Math.Round(v)).ToString(System.Globalization.CultureInfo.InvariantCulture) + "px";
+
+        private static string Hex(Retro96.Drawing.Color c) =>
+            $"#{c.R:x2}{c.G:x2}{c.B:x2}";
+
+        public override JsValue Get(string name)
+        {
+            if (name == "length" || name == "cssText") return base.Get(name);
+            var style = _element.Style;
+            if (style == null) return JsValue.From("");
+
+            switch (NormalizeKey(name))
+            {
+                case "color": return JsValue.From(Hex(style.Color));
+                case "background-color":
+                    return JsValue.From(style.BackgroundColor == Retro96.Drawing.Color.Transparent
+                        ? "transparent" : Hex(style.BackgroundColor));
+                case "background-image":
+                    return JsValue.From(style.BackgroundImage ?? "none");
+                case "background-repeat":
+                    return JsValue.From(style.BackgroundRepeat.ToString().ToLowerInvariant());
+                case "display": return JsValue.From(style.Display.ToString().ToLowerInvariant());
+                case "visibility": return JsValue.From(style.Visibility.ToString().ToLowerInvariant());
+                case "overflow": return JsValue.From(style.Overflow.ToString().ToLowerInvariant());
+                case "position": return JsValue.From(style.Position.ToString().ToLowerInvariant());
+                case "float": return JsValue.From(style.Float.ToString().ToLowerInvariant());
+                case "clear": return JsValue.From(style.Clear.ToString().ToLowerInvariant());
+                case "z-index": return JsValue.From(style.ZIndex.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture));
+                case "font-family": return JsValue.From(string.Join(", ", style.FontFamily));
+                case "font-size": return JsValue.From(Px(style.FontSize));
+                case "font-weight": return JsValue.From(style.FontWeight switch
+                {
+                    Css.FontWeightValue.Bold => "bold",
+                    Css.FontWeightValue.Bolder => "bolder",
+                    Css.FontWeightValue.Lighter => "lighter",
+                    _ => "normal"
+                });
+                case "font-style": return JsValue.From(style.FontStyle == Css.FontStyleValue.Italic
+                    ? "italic" : "normal");
+                case "font-variant": return JsValue.From(style.FontVariant == Css.FontVariantValue.SmallCaps
+                    ? "small-caps" : "normal");
+                case "text-align": return JsValue.From(style.TextAlign.ToString().ToLowerInvariant());
+                case "text-decoration":
+                {
+                    var d = style.TextDecoration;
+                    if (d == Css.TextDecoration.None) return JsValue.From("none");
+                    var parts = new List<string>();
+                    if ((d & Css.TextDecoration.Underline) != 0) parts.Add("underline");
+                    if ((d & Css.TextDecoration.Overline) != 0) parts.Add("overline");
+                    if ((d & Css.TextDecoration.LineThrough) != 0) parts.Add("line-through");
+                    if ((d & Css.TextDecoration.Blink) != 0) parts.Add("blink");
+                    return JsValue.From(string.Join(" ", parts));
+                }
+                case "text-transform": return JsValue.From(style.TextTransform.ToString().ToLowerInvariant());
+                case "white-space": return JsValue.From(style.WhiteSpace.ToString().ToLowerInvariant());
+                case "line-height":
+                    return JsValue.From(style.LineHeightMode == Css.LineHeightMode.Normal
+                        ? "normal" : Px(style.LineHeightPixels));
+                case "width": return JsValue.From(style.Width is { } w ? Px(w) : "auto");
+                case "height": return JsValue.From(style.Height is { } h ? Px(h) : "auto");
+                case "top": return JsValue.From(style.Top is { } t ? Px(t) : "auto");
+                case "left": return JsValue.From(style.Left is { } l ? Px(l) : "auto");
+                case "right": return JsValue.From(style.Right is { } r ? Px(r) : "auto");
+                case "bottom": return JsValue.From(style.Bottom is { } b ? Px(b) : "auto");
+                case "margin-top": return JsValue.From(Px(style.MarginTop));
+                case "margin-right": return JsValue.From(Px(style.MarginRight));
+                case "margin-bottom": return JsValue.From(Px(style.MarginBottom));
+                case "margin-left": return JsValue.From(Px(style.MarginLeft));
+                case "padding-top": return JsValue.From(Px(style.PaddingTop));
+                case "padding-right": return JsValue.From(Px(style.PaddingRight));
+                case "padding-bottom": return JsValue.From(Px(style.PaddingBottom));
+                case "padding-left": return JsValue.From(Px(style.PaddingLeft));
+                case "border-top-width": return JsValue.From(Px(style.BorderTopWidth));
+                case "border-right-width": return JsValue.From(Px(style.BorderRightWidth));
+                case "border-bottom-width": return JsValue.From(Px(style.BorderBottomWidth));
+                case "border-left-width": return JsValue.From(Px(style.BorderLeftWidth));
+                case "border-top-color": return JsValue.From(Hex(style.BorderTopColor));
+                case "border-left-color": return JsValue.From(Hex(style.BorderLeftColor));
+                case "list-style-type": return JsValue.From(style.ListStyleType.ToString().ToLowerInvariant());
+            }
+            return JsValue.From("");
+        }
+
+        /// <summary>currentStyle is read-only — writes are ignored (IE5
+        /// threw only in the DOM1 spec; scripts probed with typeof).</summary>
+        public override void Set(string name, JsValue value)
+        {
+            // deliberately ignored
+        }
+    }
+
+    /// <summary>
+    /// window.frames[] + window.length — the frame/iframe elements of THIS
+    /// document in tree order, indexable by number and by name (documented
+    /// limitation: entries are the frame ELEMENT wrappers, not the real
+    /// cross-frame window objects, which the shell owns).
+    /// </summary>
+    private sealed class FramesCollectionObject : JsObject
+    {
+        private readonly DomDocument _doc;
+        private readonly DocumentBindingsState _state;
+        private readonly JsScope _scope;
+
+        public FramesCollectionObject(DomDocument doc, DocumentBindingsState state, JsScope scope)
+        {
+            _doc = doc;
+            _state = state;
+            _scope = scope;
+            Class = "FramesArray";
+        }
+
+        internal int FrameCount => Frames().Count;
+
+        private List<DomElement> Frames() =>
+            _doc.ElementDescendants()
+                .Where(e => e.TagName is "frame" or "iframe")
+                .ToList();
+
+        public override JsValue Get(string name)
+        {
+            if (name == "length")
+                return JsValue.From(FrameCount);
+
+            var frames = Frames();
+            if (int.TryParse(name, out int index))
+                return index >= 0 && index < frames.Count
+                    ? JsValue.FromObject(WrapElement(frames[index], _state))
+                    : JsValue.Undefined;
+
+            foreach (var frame in frames)
+            {
+                var frameName = frame.GetAttr("name") ?? frame.GetAttr("id");
+                if (frameName == name)
+                    return JsValue.FromObject(WrapElement(frame, _state));
+            }
+            return base.Get(name);
+        }
+    }
+
+    /// <summary>
+    /// document.layers — the NS4 layer collection (checklist §10): every
+    /// element declared positioned (CSS position:absolute/relative via
+    /// inline OR resolved style) plus &lt;layer&gt;/&lt;ilayer&gt; elements,
+    /// in document order, indexable by number AND by name (id/name attr).
+    /// </summary>
+    private sealed class LayerCollectionObject : JsObject
+    {
+        private readonly DomDocument _doc;
+        private readonly DocumentBindingsState _state;
+        private readonly JsScope _scope;
+
+        public LayerCollectionObject(DomDocument doc, DocumentBindingsState state, JsScope scope)
+        {
+            _doc = doc;
+            _state = state;
+            _scope = scope;
+            Class = "LayerArray";
+        }
+
+        internal static bool IsLayerElement(DomElement element)
+        {
+            if (element.TagName is "layer" or "ilayer") return true;
+
+            // Resolved style (a StyleResolver pass ran)
+            if (element.Style?.Position is Css.PositionValue.Absolute
+                or Css.PositionValue.Relative or Css.PositionValue.Fixed)
+                return true;
+
+            // Inline STYLE= position (may predate style resolution)
+            var inline = element.GetAttr("style");
+            if (inline != null)
+            {
+                foreach (var decl in Css.CssParser.ParseInlineStyle(inline))
+                    if (string.Equals(decl.Property, "position", StringComparison.OrdinalIgnoreCase) &&
+                        (decl.Value ?? "").Trim() is "absolute" or "relative" or "fixed")
+                        return true;
+            }
+            return false;
+        }
+
+        private List<DomElement> Layers() =>
+            _doc.ElementDescendants().Where(IsLayerElement).ToList();
+
+        public override JsValue Get(string name)
+        {
+            if (name == "length")
+                return JsValue.From(Layers().Count);
+
+            var layers = Layers();
+            if (int.TryParse(name, out int index))
+                return index >= 0 && index < layers.Count
+                    ? JsValue.FromObject(GetOrWrapLayer(layers[index]))
+                    : JsValue.Undefined;
+
+            foreach (var layer in layers)
+            {
+                var layerName = layer.GetAttr("name") ?? layer.GetAttr("id");
+                if (layerName == name)
+                    return JsValue.FromObject(GetOrWrapLayer(layer));
+            }
+            return base.Get(name);
+        }
+
+        /// <summary>One stable layer object per element
+        /// (document.layers["a"] === document.layers["a"]).</summary>
+        private JsObject GetOrWrapLayer(DomElement element)
+        {
+            if (_state.LayerWrappers.TryGetValue(element, out var existing))
+                return existing;
+            var layer = new NetscapeLayerObject(element, _state, _scope);
+            _state.LayerWrappers[element] = layer;
+            return layer;
+        }
+    }
+
+    /// <summary>
+    /// A Netscape 4 layer object (checklist §10): left/top/zIndex/visibility
+    /// ("show"/"hide"/"inherit"), clip.{left,top,right,bottom}, bgColor,
+    /// background, src, document, and the moveTo/moveBy/resizeTo/moveAbove/
+    /// moveBelow/load methods. Writing left/top REALLY moves the element —
+    /// the write lands in the inline style (forcing position:absolute when
+    /// missing) and triggers the same reflow the innerHTML writer uses.
+    /// </summary>
+    private sealed class NetscapeLayerObject : JsObject
+    {
+        private readonly DomElement _element;
+        private readonly DocumentBindingsState _state;
+        private readonly JsScope _scope;
+
+        public NetscapeLayerObject(DomElement element, DocumentBindingsState state, JsScope scope)
+        {
+            _element = element;
+            _state = state;
+            _scope = scope;
+            Class = "Layer";
+        }
+
+        private JsValue Fn(string name, Func<JsValue, JsValue[], JsValue> impl) =>
+            JsValue.FromFunction(new JsFunction(impl, _scope, name));
+
+        private Dictionary<string, string> StyleDecls()
+        {
+            var decls = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var attr = _element.GetAttr("style");
+            if (attr == null) return decls;
+            foreach (var decl in Css.CssParser.ParseInlineStyle(attr))
+            {
+                string key = (decl.Property ?? "").Trim().ToLowerInvariant();
+                if (key.Length > 0) decls[key] = decl.Value ?? "";
+            }
+            return decls;
+        }
+
+        private void WriteStyle(Action<Dictionary<string, string>> mutate)
+        {
+            var decls = StyleDecls();
+            // Layer-style writes imply positioned elements (NS4 layers were
+            // always positioned boxes).
+            decls.TryAdd("position", "absolute");
+            mutate(decls);
+            _element.SetAttr("style",
+                string.Join("; ", decls.Select(kv => $"{kv.Key}: {kv.Value}")));
+            try { _state.Canvas?.ReflowDocument(); }
+            catch { /* best-effort reflow */ }
+        }
+
+        private static double PxOf(string? raw)
+        {
+            if (raw == null) return 0;
+            string t = raw.Trim();
+            if (t.EndsWith("px", StringComparison.OrdinalIgnoreCase)) t = t[..^2].Trim();
+            return double.TryParse(t, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double n) ? n : 0;
+        }
+
+        private double ReadPx(string property) => PxOf(StyleDecls().TryGetValue(property, out var raw) ? raw : null);
+
+        public override JsValue Get(string name)
+        {
+            switch (name)
+            {
+                case "left": return JsValue.From(ReadPx("left"));
+                case "top": return JsValue.From(ReadPx("top"));
+                case "zIndex":
+                    return JsValue.From(PxOf(StyleDecls().TryGetValue("z-index", out var z) ? z : "0"));
+                case "visibility":
+                {
+                    // NS4 vocabulary: show/hide/inherit (checklist §10)
+                    var resolved = _element.Style?.Visibility;
+                    if (StyleDecls().TryGetValue("visibility", out var vis))
+                        return JsValue.From(vis.Trim() switch
+                        {
+                            "show" or "visible" => "show",
+                            "hide" or "hidden" => "hide",
+                            _ => "inherit"
+                        });
+                    return JsValue.From(resolved == Css.VisibilityValue.Hidden ? "hide" : "inherit");
+                }
+                case "bgColor":
+                {
+                    if (StyleDecls().TryGetValue("background-color", out var bg)) return JsValue.From(bg);
+                    var attr = _element.GetAttr("bgcolor");
+                    return JsValue.From(attr ?? "null");
+                }
+                case "background":
+                {
+                    if (StyleDecls().TryGetValue("background-image", out var img)) return JsValue.From(img);
+                    return JsValue.From("null");
+                }
+                case "src":
+                    return JsValue.From(_element.GetAttr("src") ?? "null");
+                case "document":
+                    // NS4 layers were separate documents; the engine keeps one
+                    // DOM, so the layer's "document" view IS the parent
+                    // document (documented choice: nested layer lookups via
+                    // layer.document.layers work against the same collection).
+                    return _state.DocumentObject != null
+                        ? JsValue.FromObject(_state.DocumentObject)
+                        : JsValue.Null;
+                case "name":
+                    return JsValue.From(_element.GetAttr("name") ?? _element.GetAttr("id") ?? "");
+                case "id":
+                    return JsValue.From(_element.GetAttr("id") ?? "");
+                case "clip":
+                {
+                    // ONE clip object per layer wrapper — NS4 pages write
+                    // layer.clip.right = 100 and expect the value to stick
+                    // (a fresh object per read threw the write away).
+                    if (Properties.TryGetValue("clip", out var cachedClip) &&
+                        cachedClip.Type == JsType.Object)
+                        return cachedClip;
+                    var clip = new JsObject { Class = "LayerClip" };
+                    double width = _element.Box?.BorderRect.Width ?? _element.Style?.Width ?? 0;
+                    double height = _element.Box?.BorderRect.Height ?? _element.Style?.Height ?? 0;
+                    string? raw = StyleDecls().TryGetValue("clip", out var c) ? c : null;
+                    clip.Set("left", JsValue.From(0));
+                    clip.Set("top", JsValue.From(0));
+                    clip.Set("right", JsValue.From(width));
+                    clip.Set("bottom", JsValue.From(height));
+                    if (raw != null)
+                    {
+                        // rect(10 20 30 5) / rect(10,20,30,5)
+                        var digits = raw.Replace("rect(", "").Replace(")", "")
+                            .Split(new[] { ' ', ',', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (digits.Length == 4)
+                        {
+                            clip.Set("left", JsValue.From(PxOf(digits[3])));
+                            clip.Set("top", JsValue.From(PxOf(digits[0])));
+                            clip.Set("right", JsValue.From(PxOf(digits[1])));
+                            clip.Set("bottom", JsValue.From(PxOf(digits[2])));
+                        }
+                    }
+                    var clipValue = JsValue.FromObject(clip);
+                    Properties["clip"] = clipValue;
+                    return clipValue;
+                }
+                case "moveTo":
+                    return Fn("moveTo", (self, args) =>
+                    {
+                        double x = args.Length > 0 ? args[0].ToNumber() : 0;
+                        double y = args.Length > 1 ? args[1].ToNumber() : 0;
+                        WriteStyle(d =>
+                        {
+                            d["left"] = x.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                            d["top"] = y.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                        });
+                        return JsValue.Undefined;
+                    });
+                case "moveBy":
+                    return Fn("moveBy", (self, args) =>
+                    {
+                        double dx = args.Length > 0 ? args[0].ToNumber() : 0;
+                        double dy = args.Length > 1 ? args[1].ToNumber() : 0;
+                        WriteStyle(d =>
+                        {
+                            double x = PxOf(d.TryGetValue("left", out var l) ? l : null) + dx;
+                            double y = PxOf(d.TryGetValue("top", out var t) ? t : null) + dy;
+                            d["left"] = x.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                            d["top"] = y.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                        });
+                        return JsValue.Undefined;
+                    });
+                case "resizeTo":
+                    return Fn("resizeTo", (self, args) =>
+                    {
+                        double w = args.Length > 0 ? args[0].ToNumber() : 0;
+                        double h = args.Length > 1 ? args[1].ToNumber() : 0;
+                        WriteStyle(d =>
+                        {
+                            d["width"] = w.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                            d["height"] = h.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                        });
+                        return JsValue.Undefined;
+                    });
+                case "resizeBy":
+                    return Fn("resizeBy", (self, args) =>
+                    {
+                        double dw = args.Length > 0 ? args[0].ToNumber() : 0;
+                        double dh = args.Length > 1 ? args[1].ToNumber() : 0;
+                        WriteStyle(d =>
+                        {
+                            double w = PxOf(d.TryGetValue("width", out var wv) ? wv : null) + dw;
+                            double h = PxOf(d.TryGetValue("height", out var hv) ? hv : null) + dh;
+                            d["width"] = w.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                            d["height"] = h.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                        });
+                        return JsValue.Undefined;
+                    });
+                case "moveAbove":
+                case "moveBelow":
+                    return Fn(name, (self, args) =>
+                    {
+                        if (args.Length == 0 || args[0].GetObject() is not NetscapeLayerObject other)
+                            return JsValue.Undefined;
+                        int ownZ = (int)ReadPx("z-index");
+                        int otherZ = (int)other.ReadPx("z-index");
+                        int target = name == "moveAbove" ? otherZ + 1 : otherZ - 1;
+                        if (ownZ == target) target += name == "moveAbove" ? 1 : -1;
+                        WriteStyle(d => d["z-index"] = target.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture));
+                        return JsValue.Undefined;
+                    });
+                case "load":
+                    return Fn("load", (self, args) =>
+                    {
+                        // layer.load(url, width): re-fetch the layer's source.
+                        // Documented limitation: the DOM bindings cannot drive
+                        // the shell's resource fetcher — the URL is recorded
+                        // as the layer's src attribute (and width as the
+                        // inline width) and the page reflows.
+                        string url = args.Length > 0 ? args[0].ToJsString() : "";
+                        double width = args.Length > 1 ? args[1].ToNumber() : 0;
+                        _element.SetAttr("src", url);
+                        WriteStyle(d =>
+                        {
+                            if (args.Length > 1)
+                                d["width"] = width.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px";
+                        });
+                        return JsValue.Undefined;
+                    });
+            }
+            return base.Get(name);
+        }
+
+        public override void Set(string name, JsValue value)
+        {
+            switch (name)
+            {
+                case "left":
+                case "top":
+                    WriteStyle(d => d[name] =
+                        value.ToNumber().ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "px");
+                    return;
+                case "zIndex":
+                    WriteStyle(d => d["z-index"] =
+                        ((int)value.ToNumber()).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    return;
+                case "visibility":
+                {
+                    string v = value.ToJsString().Trim().ToLowerInvariant();
+                    // NS4 show/hide/inherit map to CSS visible/hidden/inherit
+                    string css = v switch
+                    {
+                        "show" => "visible",
+                        "hide" => "hidden",
+                        _ => "inherit"
+                    };
+                    WriteStyle(d => d["visibility"] = css);
+                    return;
+                }
+                case "bgColor":
+                    WriteStyle(d => d["background-color"] = value.ToJsString());
+                    _state.Canvas?.RequestRerender();
+                    return;
+                case "background":
+                    WriteStyle(d => d["background-image"] = value.ToJsString());
+                    return;
+                case "src":
+                    // Writing src would reload the layer; without shell fetch
+                    // reachability the attribute is recorded (documented).
+                    _element.SetAttr("src", value.ToJsString());
+                    return;
+            }
+            base.Set(name, value);
         }
     }
 }

@@ -29,12 +29,12 @@ public static class VbsKeywords
 {
     public static readonly HashSet<string> All = new(System.StringComparer.Ordinal)
     {
-        "AND", "BYVAL", "BYREF", "CALL", "CASE", "CONST", "DIM", "DO", "EACH",
-        "ELSE", "ELSEIF", "END", "EQV", "ERASE", "ERROR", "EXIT", "EXPLICIT",
+        "AND", "BYVAL", "BYREF", "CALL", "CASE", "CLASS", "CONST", "DIM", "DO",
+        "EACH", "ELSE", "ELSEIF", "END", "EQV", "ERASE", "ERROR", "EXIT", "EXPLICIT",
         "FALSE", "FOR", "FUNCTION", "GOTO", "IF", "IMP", "IN", "IS", "LET",
-        "LOOP", "MOD", "NEXT", "NOT", "NOTHING", "NULL", "ON", "OPTION", "OR",
-        "PRESERVE", "PUBLIC", "PRIVATE", "REDIM", "REM", "RESUME", "SELECT",
-        "SET", "STEP", "STOP", "SUB", "THEN", "TO", "TRUE", "UNTIL", "WEND",
-        "WHILE", "XOR", "EMPTY"
+        "LOOP", "ME", "MOD", "NEW", "NEXT", "NOT", "NOTHING", "NULL", "ON", "OPTION",
+        "OR", "PRESERVE", "PROPERTY", "PUBLIC", "PRIVATE", "REDIM", "REM", "RESUME",
+        "SELECT", "SET", "STEP", "STOP", "SUB", "THEN", "TO", "TRUE", "UNTIL",
+        "WEND", "WHILE", "WITH", "XOR", "EMPTY"
     };
 }

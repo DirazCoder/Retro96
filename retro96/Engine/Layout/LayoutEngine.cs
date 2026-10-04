@@ -83,6 +83,18 @@ public static class LayoutEngine
         if (document == null)
             return MakeRootBox(null, viewportWidth, viewportHeight);
 
+        // ── DomElement ↔ LayoutBox wiring (Task 9) ────────────────────────
+        // Layout trees are rebuilt from scratch on every pass, so every
+        // element reference is invalidated up front and re-published below
+        // (GenerateBoxes / BuildBodyBox / spacer / frameset construction).
+        // Elements that stop generating a box therefore never keep a stale
+        // geometry reference for JS offset* reads.
+        foreach (var e in document.ElementDescendants())
+        {
+            e.Box = null;
+            e.LayoutBox = null;
+        }
+
         // ── Frameset document? ────────────────────────────────────────────
         var frameset = FindTopLevelFrameset(document);
         if (frameset != null)
@@ -195,7 +207,7 @@ public static class LayoutEngine
         float contentW = Math.Max(0f,
             viewportWidth - marginL - marginR - borL - borR - padL - padR);
 
-        return new LayoutBox(body, BoxType.Block)
+        var bodyBox = new LayoutBox(body, BoxType.Block)
         {
             X = marginL,           // border-box origin X (margins external)
             Y = marginT,           // border-box origin Y
@@ -215,6 +227,22 @@ public static class LayoutEngine
             BorderLeft = borL,
             Parent = rootBox
         };
+
+        // Body's principal box publication (see the wiring note in
+        // BuildLayoutTree) — the body box is built here, not in GenerateBoxes.
+        body.LayoutBox = bodyBox;
+        body.Box = bodyBox;
+
+        return bodyBox;
+    }
+
+    /// <summary>Publishes an element's principal box on both the canonical
+    /// LayoutBox property and the legacy Box slot (DomElement ↔ LayoutBox
+    /// wiring, Task 9).</summary>
+    private static void PublishBox(DomElement element, LayoutBox box)
+    {
+        element.LayoutBox = box;
+        element.Box = box;
     }
 
     private static float ResolveStyleLength(float? absolute, float? percent, float fallback,
@@ -251,6 +279,14 @@ public static class LayoutEngine
         bool parentIsPre = inheritedPre
             || element.Style?.WhiteSpace == WhiteSpaceValue.Pre
             || element.TagName is "pre" or "listing" or "xmp" or "plaintext";
+
+        // CSS2 generated content (Task 9): the :before pseudo-element's
+        // content flows as a synthetic text run at the very start of the
+        // element's inline content.  The run keeps the element as its
+        // Element (so ancestry/hit-testing see it as element content) and
+        // carries the pseudo-element's computed style as a StyleOverride,
+        // exactly like the first-letter fragments do.
+        AddGeneratedContent(element, parentBox, result, before: true);
 
         foreach (var node in element.Children)
         {
@@ -309,6 +345,15 @@ public static class LayoutEngine
 
                         var box = new LayoutBox(elem, boxType) { Parent = parentBox };
 
+                        // DomElement ↔ LayoutBox wiring: publish the element's
+                        // PRINCIPAL box (the canonical LayoutBox property and
+                        // the legacy Box slot DomBindings reads).  Text-run
+                        // fragments created later keep the element as their
+                        // Element but never overwrite this reference — the
+                        // assignment happens only here, at construction.
+                        elem.LayoutBox = box;
+                        elem.Box = box;
+
                         ApplyStylesToBox(box, style);
                         ApplyHtmlPresentationalAttrs(box, elem, containingWidth);
 
@@ -324,8 +369,32 @@ public static class LayoutEngine
                         // CSS1 cascade puts presentational attributes below author
                         // styles, exactly like NN4).  Percentage widths wait for
                         // layout (StyleWidthPercent); pixel sizes apply now.
-                        if (style.Width is > 0f) box.Width = style.Width.Value;
-                        if (style.Height is > 0f) box.Height = style.Height.Value;
+                        //
+                        // IE5 quirks box model (checklist §9, the layout idiom
+                        // 1999 pages were built around): an authored CSS pixel
+                        // width/height is the BORDER box — content = authored −
+                        // padding − border.  Percentage widths and HTML width
+                        // ATTRIBUTES stay on their existing border-box-ish
+                        // resolution paths and are never re-subtracted here.
+                        // IMG quirk: an img lays out as margin+border+width+
+                        // border+margin — padding never participates at all,
+                        // so it is dropped from the box itself.
+                        if (BrowserRuntime.UsesIe5BoxModel && elem.TagName == "img" &&
+                            (style.Width is > 0f || style.Height is > 0f))
+                        {
+                            box.PaddingLeft = 0f;
+                            box.PaddingRight = 0f;
+                            box.PaddingTop = 0f;
+                            box.PaddingBottom = 0f;
+                        }
+                        if (style.Width is > 0f)
+                            box.Width = AuthoredContentExtent(elem, style.Width.Value,
+                                box.PaddingLeft + box.PaddingRight,
+                                box.BorderLeft + box.BorderRight);
+                        if (style.Height is > 0f)
+                            box.Height = AuthoredContentExtent(elem, style.Height.Value,
+                                box.PaddingTop + box.PaddingBottom,
+                                box.BorderTop + box.BorderBottom);
 
                         // FIX: natural-size / aspect derivation moved AFTER the
                         // CSS override (used to run inside the attribute pass, so
@@ -334,6 +403,17 @@ public static class LayoutEngine
                         // width participated in nothing).
                         if (boxType == BoxType.Replaced && elem.TagName == "img")
                             ResolveImageNaturalSize(box, elem);
+
+                        // CSS2 min/max clamping — applied to whatever extent the
+                        // box now carries (authored CSS, HTML attribute or the
+                        // natural image size).  AUTO-width blocks skip it here:
+                        // their clamp runs inside ResolveAutoWidth AFTER the
+                        // container stretch, and auto heights clamp in LayoutBlock
+                        // after the content is laid out (a generation-time raise
+                        // would be mistaken for an explicit height).  Block
+                        // layout re-clamps authored extents — idempotent.
+                        if (box.Width > 0f) ClampWidthToBounds(box, containingWidth);
+                        if (box.Height > 0f) ClampHeightToBounds(box, 0f);
 
                         // Replaced elements / frames do not generate child boxes
                         // here (their visuals are painted from the element itself).
@@ -387,7 +467,63 @@ public static class LayoutEngine
             }
         }
 
+        // CSS2 generated content — the :after pseudo-element's content run
+        // closes the element's inline content.
+        AddGeneratedContent(element, parentBox, result, before: false);
+
         return result;
+    }
+
+    /// <summary>
+    /// Emits the <c>:before</c>/<c>:after</c> generated-content text as an
+    /// inline text-run box.  Only the renderable token types contribute:
+    /// "string" tokens emit their literal text and <c>attr(x)</c> emits the
+    /// element's attribute value.  counter()/counters(), the quote keywords
+    /// and url() need counter/quote plumbing the engine does not carry —
+    /// they are skipped (documented simplification).  Empty content emits
+    /// nothing at all.
+    /// </summary>
+    private static void AddGeneratedContent(
+        DomElement element, LayoutBox parentBox, List<LayoutBox> result, bool before)
+    {
+        var pseudo = before ? element.Style?.GeneratedBefore : element.Style?.GeneratedAfter;
+        var tokens = pseudo?.Content;
+        if (tokens == null || tokens.Count == 0)
+            return;
+
+        string text = GeneratedContentText(tokens, element);
+        if (text.Length == 0)
+            return;
+
+        result.Add(new LayoutBox(element, BoxType.Inline)
+        {
+            TextRun = Render.GlyphSubstitution.MapGlyphs(text),
+            Parent = parentBox,
+            StyleOverride = pseudo
+        });
+    }
+
+    /// <summary>Flattens generated-content tokens to their text value.</summary>
+    internal static string GeneratedContentText(List<ContentToken> tokens, DomElement element)
+    {
+        var sb = new StringBuilder();
+        foreach (var token in tokens)
+        {
+            switch (token.Type)
+            {
+                case "string":
+                    sb.Append(token.Text);
+                    break;
+                case "attr":
+                    sb.Append(element.GetAttr(token.Text) ?? string.Empty);
+                    break;
+                // "counter"/"counters" — no counter registry exists yet;
+                // "open-quote"/"close-quote"/"no-open-quote"/"no-close-quote"
+                // — no quote nesting depth is tracked;
+                // "uri" — generated images unsupported (era-simple).
+            }
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -613,7 +749,7 @@ public static class LayoutEngine
         int width = Math.Max(0, elem.GetAttrInt("width", size));
         int height = Math.Max(0, elem.GetAttrInt("height", size));
 
-        return type switch
+        LayoutBox? box = type switch
         {
             "horizontal" => new LayoutBox(elem, BoxType.Inline)
             { Width = Math.Max(1, width), Height = 1, Parent = parentBox },
@@ -623,6 +759,8 @@ public static class LayoutEngine
             { Width = Math.Max(1, width), Height = Math.Max(1, height), Parent = parentBox },
             _ => null
         };
+        if (box != null) PublishBox(elem, box);
+        return box;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1267,6 +1405,10 @@ public static class LayoutEngine
         ResolveAutoWidth(box, containingWidth);
 
         LayoutBlockChildren(box, containingWidth, containingHeight, inheritedFloats);
+
+        // CSS2 min-height/max-height on the resolved (auto or explicit)
+        // height — the width clamp already ran inside ResolveAutoWidth.
+        ClampHeightToBounds(box, containingHeight);
     }
 
     /// <summary>
@@ -1347,6 +1489,106 @@ public static class LayoutEngine
                 - box.MarginLeft - box.MarginRight
                 - box.BorderLeft - box.BorderRight
                 - box.PaddingLeft - box.PaddingRight);
+        }
+
+        // CSS2 min/max-width applies to whatever width was resolved above
+        // (authored, percentage or auto-stretched).  Percentage bounds
+        // resolve against the containing block exactly like width %.
+        // NOTE: the anonymous-block width computed in LayoutBlockChildren
+        // needs no IE5 variant — anonymous boxes never carry padding or
+        // border, so border-box and content-box coincide for them.
+        ClampWidthToBounds(box, containingWidth);
+    }
+
+    /// <summary>
+    /// IE5 quirks-mode interpretation of an authored CSS width/height
+    /// (checklist §9): the authored extent is the BORDER box, so the content
+    /// extent is authored minus the padding and border chrome.  IMG elements
+    /// ignore padding entirely (margin+border+width+border+margin, the
+    /// classic IE image rule).  In the W3C model the authored value already
+    /// IS the content extent and passes through unchanged.
+    /// </summary>
+    private static float AuthoredContentExtent(DomElement elem, float authored,
+        float paddingExtent, float borderExtent)
+    {
+        if (!BrowserRuntime.UsesIe5BoxModel)
+            return authored;
+        float pad = elem.TagName == "img" ? 0f : paddingExtent;
+        return Math.Max(0f, authored - pad - borderExtent);
+    }
+
+    /// <summary>
+    /// CSS2 min-width/max-width clamp.  In the W3C model the constraint
+    /// applies to the CONTENT width; under the IE5 quirks box model the
+    /// authored width semantics are border-box, so the clamp is applied to
+    /// the border-box extent and converted back.  Idempotent (safe to run
+    /// in both the generation pass and block layout).
+    /// </summary>
+    private static void ClampWidthToBounds(LayoutBox box, float containingWidth)
+    {
+        var style = box.Element?.Style;
+        if (style == null) return;
+        if (!style.MinWidth.HasValue && !style.MaxWidth.HasValue &&
+            !style.MinWidthPercent.HasValue && !style.MaxWidthPercent.HasValue)
+            return;
+
+        float basis = Math.Max(0f, containingWidth);
+        float min = style.MinWidth ??
+            (style.MinWidthPercent is { } mp ? basis * mp / 100f : 0f);
+        float max = style.MaxWidth ??
+            (style.MaxWidthPercent is { } xp ? basis * xp / 100f : float.MaxValue);
+        if (max < min) max = min;
+
+        if (BrowserRuntime.UsesIe5BoxModel)
+        {
+            float chrome = box.BorderLeft + box.BorderRight
+                         + box.PaddingLeft + box.PaddingRight;
+            float outer = box.Width + chrome;
+            if (outer < min) outer = min;
+            if (outer > max) outer = max;
+            box.Width = Math.Max(0f, outer - chrome);
+        }
+        else
+        {
+            if (box.Width < min) box.Width = min;
+            if (box.Width > max) box.Width = max;
+        }
+    }
+
+    /// <summary>
+    /// CSS2 min-height/max-height clamp, mirroring <see cref="ClampWidthToBounds"/>.
+    /// <paramref name="containingHeight"/> of 0 leaves percentage bounds
+    /// unresolved-at-zero (a containing height that is not yet known — the
+    /// pixel bounds still apply).
+    /// </summary>
+    private static void ClampHeightToBounds(LayoutBox box, float containingHeight)
+    {
+        var style = box.Element?.Style;
+        if (style == null) return;
+        if (!style.MinHeight.HasValue && !style.MaxHeight.HasValue &&
+            !style.MinHeightPercent.HasValue && !style.MaxHeightPercent.HasValue)
+            return;
+
+        float basis = Math.Max(0f, containingHeight);
+        float min = style.MinHeight ??
+            (style.MinHeightPercent is { } mp ? basis * mp / 100f : 0f);
+        float max = style.MaxHeight ??
+            (style.MaxHeightPercent is { } xp ? basis * xp / 100f : float.MaxValue);
+        if (max < min) max = min;
+
+        if (BrowserRuntime.UsesIe5BoxModel)
+        {
+            float chrome = box.BorderTop + box.BorderBottom
+                         + box.PaddingTop + box.PaddingBottom;
+            float outer = box.Height + chrome;
+            if (outer < min) outer = min;
+            if (outer > max) outer = max;
+            box.Height = Math.Max(0f, outer - chrome);
+        }
+        else
+        {
+            if (box.Height < min) box.Height = min;
+            if (box.Height > max) box.Height = max;
         }
     }
 
@@ -1996,6 +2238,7 @@ public static class LayoutEngine
             Width = width,
             Height = height
         };
+        PublishBox(frameset, box);
 
         var rows = ParseFramesetSizes(frameset.GetAttrOrDefault("rows", ""), height);
         var cols = ParseFramesetSizes(frameset.GetAttrOrDefault("cols", ""), width);
@@ -2049,6 +2292,7 @@ public static class LayoutEngine
                             Height = rows[r],
                             Parent = box
                         };
+                        PublishBox(frameElem, frameBox);
                         box.Children.Add(frameBox);
                     }
                 }

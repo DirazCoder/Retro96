@@ -1331,6 +1331,17 @@ public partial class Form1 : Form
             }
         });
 
+        // The HTTP "Refresh:" response header (Netscape/IE extension, later
+        // standardized as RFC 7231's Refresh) behaves exactly like
+        // <meta http-equiv=refresh>: "5; url=next.html". The meta tag wins
+        // when both are present.
+        if (string.IsNullOrEmpty(document.MetaRefresh) &&
+            success.Headers.TryGetValue("refresh", out var httpRefresh) &&
+            !string.IsNullOrWhiteSpace(httpRefresh))
+        {
+            document.MetaRefresh = httpRefresh;
+        }
+
         if (BrowserRuntime.MetaRefreshEnabled && !string.IsNullOrEmpty(document.MetaRefresh))
         {
             var (delay, refreshUrl) = ParseMetaRefresh(document.MetaRefresh, url);
@@ -1573,6 +1584,19 @@ public partial class Form1 : Form
 
         foreach (var link in links)
         {
+            // CSS2 media-scoped stylesheets: skip print/aural-only links
+            // (a blank media or "screen"/"all" applies). Same rule the
+            // @import expansion applies.
+            string? linkMedia = link.GetAttr("media");
+            if (!string.IsNullOrWhiteSpace(linkMedia))
+            {
+                bool applies = linkMedia.Split(',')
+                    .Any(m => { string t = m.Trim(); return t.Length == 0 ||
+                        t.Equals("screen", StringComparison.OrdinalIgnoreCase) ||
+                        t.Equals("all", StringComparison.OrdinalIgnoreCase); });
+                if (!applies) continue;
+            }
+
             string href = link.GetAttr("href")!;
             try
             {
@@ -1620,6 +1644,12 @@ public partial class Form1 : Form
         {
             try
             {
+                // CSS2 §7.2.2: a media-scoped @import only pulls the sheet
+                // in for the media types it declares. Print/aural-only
+                // imports are skipped for screen rendering.
+                if (!import.AppliesTo("screen"))
+                    continue;
+
                 string abs = baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
                     ? FileUrls.Resolve(baseUrl, import.Url)
                     : baseUrl.Resolve(import.Url).ToAbsolute();

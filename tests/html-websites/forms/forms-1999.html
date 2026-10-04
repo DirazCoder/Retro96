@@ -1,0 +1,91 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>HTML 4.01 Forms Battery (1999)</title></head>
+<body bgcolor="#FFFFFF" text="#000000">
+<h1>Forms 4.01 battery</h1>
+
+<h2>label for= and wrapped labels</h2>
+<form name="labels" action="/cgi/echo" method="post">
+  <label for="email">E-mail (click-to-focus):</label>
+  <input type="text" id="email" name="email" size="30" tabindex="1"><br>
+  <label><input type="radio" name="acct" value="p" checked> Personal account</label>
+  <label><input type="radio" name="acct" value="b"> Business account</label><br>
+  tabindex order: 1, 2 (checkbox), 3 (select), 4 (file), 5 (image), 6 (submit)
+</form>
+
+<h2>fieldset with legend (border drawn around the group)</h2>
+<form name="groups" action="/cgi/echo" method="post">
+  <fieldset>
+    <legend>Contact</legend>
+    Full name: <input type="text" name="who" tabindex="2"><br>
+    <input type="checkbox" name="mail" value="yes" tabindex="3"> Send me mail
+  </fieldset>
+  <fieldset>
+    <legend disabled>Disabled group (fieldset)</legend>
+    <input type="text" name="locked" value="disabled field" disabled><br>
+    <input type="text" name="ro" value="readonly field" readonly>
+  </fieldset>
+</form>
+
+<h2>button with rich content</h2>
+<form name="btns" action="/cgi/echo" method="get">
+  <button type="submit" name="go" value="v1"><b>Submit</b> <font color="#008000">button</font></button>
+  <button type="reset">Reset <tt>type=reset</tt></button>
+  <button type="button" onclick="window.status='pushed'"><u>Plain</u> button</button>
+</form>
+
+<h2>optgroup and option label</h2>
+<form name="sel">
+  <select name="zone" size="1">
+    <option value="">-- choose --</option>
+    <optgroup label="America">
+      <option value="ny">New York</option>
+      <option value="sf" selected>San Francisco</option>
+    </optgroup>
+    <optgroup label="Europe">
+      <option value="uk">London</option>
+      <option label="Paris (label attr)" value="fr">Paris</option>
+    </optgroup>
+  </select>
+  <select name="list" size="5" multiple>
+    <optgroup label="A">
+      <option selected>alpha</option>
+      <option>beta</option>
+    </optgroup>
+    <option>gamma (loose, after group)</option>
+  </select>
+</form>
+
+<h2>file upload (multipart) and image submit (click coords)</h2>
+<form name="up" action="/cgi/upload" method="post"
+      enctype="multipart/form-data">
+  <input type="file" name="attachment" size="24" tabindex="4"><br>
+  <input type="image" src="../images/pixel-dot.gif" alt="Go"
+         name="imggo" width="40" height="20" border="1" tabindex="5">
+</form>
+
+<h2>textarea wrap modes</h2>
+<form name="wraps">
+  <textarea name="off" rows="2" cols="30" wrap="off">wrap=off — no soft wrapping, horizontal scrollbar.</textarea>
+  <textarea name="soft" rows="2" cols="30" wrap="soft">wrap=soft — wraps for display, submits one line.</textarea>
+  <textarea name="hard" rows="2" cols="30" wrap="hard">wrap=hard — wraps and submits with newlines.</textarea>
+</form>
+
+<h2>DOM contracts</h2>
+<form name="domf" onsubmit="return false">
+  <input type="text" name="field1" value="initial">
+  <input type="hidden" name="h" value="x">
+  <input type="submit" value="submit me (onsubmit returns false — stays)">
+</form>
+<script language="JavaScript">
+  // form.elements, form.submit(), form.reset(), onsubmit cancel
+  function showElements() {
+    var names = "";
+    for (var i = 0; i < document.domf.elements.length; i++)
+      names += document.domf.elements[i].name + ";";
+    return names;
+  }
+</script>
+
+</body>
+</html>

@@ -241,6 +241,12 @@ public static class FileUrls
             return "file://" + EscapeFilePath(unc, encodeColon: true);
         }
 
+        // POSIX-mapped drive path ("/C:/web/..." from LocalPathFromFileUrl
+        // on a non-Windows host) canonicalises back to the drive URL form
+        // instead of percent-escaping the drive colon.
+        if (path.Length >= 3 && path[0] == '/' && char.IsLetter(path[1]) && path[2] == ':')
+            path = path[1..];
+
         if (IsDrivePath(path))
             return "file:///" + EscapeFilePath(path, encodeColon: false);
 
@@ -269,29 +275,33 @@ public static class FileUrls
             return unc.Replace('/', '\\');
         }
 
-        // Canonical file:///C:/... arrives as ///C:/... from the opaque parser.
-        if (p.StartsWith("///", StringComparison.Ordinal))
-            p = p[2..];
+        // Normalise the leading-slash soup before deciding what the path
+        // means. Period pages (and hand-built test pages) produce
+        // file:/x, file:///x and file:////x alike; every one of those
+        // carries an EMPTY authority, so only the segment content decides
+        // whether this is a drive path, a UNC path or a POSIX path.
+        // Mapping //tmp/x or ////tmp/x to a bogus \\tmp\... UNC path on
+        // POSIX broke every relative link on a locally-opened page.
+        int leading = 0;
+        while (leading < p.Length && p[leading] == '/') leading++;
+        string body = p[leading..].Replace('\\', '/');
 
-        if (p.Length >= 4 && p[0] == '/' && char.IsLetter(p[1]) && p[2] == ':')
-            return p[1..].Replace('/', '\\');
-
-        if (p.StartsWith("//", StringComparison.Ordinal))
+        // Drive path: file:///C:/web/index.html (any slash count).
+        if (body.Length >= 2 && char.IsLetter(body[0]) && body[1] == ':')
         {
-            string candidate = p[2..];
-            if (IsDrivePath(candidate))
-                return candidate.Replace('/', '\\');
-            if (candidate.Contains('/'))
-                return "\\\\" + candidate.Replace('/', '\\');
+            return OperatingSystem.IsWindows()
+                ? body.Replace('/', '\\')
+                : "/" + body;   // rooted POSIX form; File APIs report not-found
         }
 
-        if (IsDrivePath(p))
-            return p.Replace('/', '\\');
+        // Host-less authority form: //server/share/... is UNC on Windows.
+        if (leading == 2 && body.Contains('/') && OperatingSystem.IsWindows())
+            return "\\\\" + body.Replace('/', '\\');
 
-        if (p.StartsWith('/'))
-            return p.Replace('/', Path.DirectorySeparatorChar);
-
-        return null;
+        // POSIX (or unknown) → single-root path on any OS.
+        if (body.Length == 0)
+            return OperatingSystem.IsWindows() ? "\\" : "/";
+        return (OperatingSystem.IsWindows() ? "\\" : "/") + body;
     }
 
     /// <summary>
@@ -418,6 +428,15 @@ public static class FileUrls
         }
 
         if (IsDrivePath(t) || IsUncPath(t))
+        {
+            SplitPathSuffix(t, out string path, out string query, out string fragment);
+            canonicalUrl = AppendUrlSuffix(CanonicalFileUrl(path), query, fragment);
+            return true;
+        }
+
+        // POSIX absolute paths are first-class address-bar targets on
+        // non-Windows hosts, exactly like C:\ paths are on Windows.
+        if (!OperatingSystem.IsWindows() && t.StartsWith('/'))
         {
             SplitPathSuffix(t, out string path, out string query, out string fragment);
             canonicalUrl = AppendUrlSuffix(CanonicalFileUrl(path), query, fragment);

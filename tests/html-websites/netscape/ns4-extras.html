@@ -1,0 +1,81 @@
+<!DOCTYPE HTML PUBLIC "-//Netscape//DTD HTML 4.0//EN">
+<html>
+<head><title>Netscape Navigator 4.7 Extras Battery (1999)</title>
+<style type="text/javascript">
+// JavaScript Style Sheets (JSSS) — Netscape 4.x only.
+// A 1999 browser with NS4 profile reads this; everyone else ignores it.
+tags.H3.color = "blue";
+tags.P.marginLeft = "10px";
+classes.highlight.all.color = "green";
+ids.jsssProbe.color = "purple";
+</style>
+<style type="text/css">
+  #jsssProbe { color: purple; }   /* CSS twin for non-NS engines */
+</style>
+</head>
+<body bgcolor="#FFFFFF" text="#000000">
+<h1>Netscape 4.7 extras battery</h1>
+
+<h2>layer / ilayer with the full attribute set</h2>
+<layer name="lay1" left="20" top="30" width="180" bgcolor="#DDEEFF"
+       above="lay2" visibility="show"
+       clip="0,0,180,40">
+  LAYER lay1: absolutely positioned, bgcolor, clip rect.
+</layer>
+<layer name="lay2" left="60" top="60" width="180" height="30"
+       bgcolor="#FFEECC" visibility="inherit">
+  LAYER lay2 (lay1 stays above).
+</layer>
+<ilayer name="ilay" left="12" top="0">
+  ILAYER: inline layer, offsets content from its natural position.
+</ilayer>
+<nolayer>
+  NOLAYER fallback — renders only in browsers WITHOUT layer support,
+  so it stays hidden here.
+</nolayer>
+
+<h2>multicol</h2>
+<multicol cols="2" gutter="12" width="80%">
+  Multi-column flow: the era's newspaper columns. Netscape 4.x lays this
+  text out in two balanced columns with a 12px gutter. The text flows
+  down the first column, then the second, exactly like a magazine.
+</multicol>
+
+<h2>spacer</h2>
+<p>horizontal: word<spacer type="horizontal" size="24">another word<br>
+vertical: <spacer type="vertical" size="14">line below<br>
+block: <spacer type="block" width="80" height="20"
+  align="left">text flows around a block spacer like a float.</p>
+
+<h2>dynamic fonts (point-size/weight on font)</h2>
+<font face="Courier New" point-size="14" weight="bold">point-size 14
+bold (Netscape dynamic-font attrs render as a normal font here).</font>
+
+<h2>parse-and-ignore tags</h2>
+<keygen name="spki" challenge="abc"> keygen (client cert generation
+request — parsed, ignored server-side).
+<server>server-side JavaScript block — parsed and ignored.</server>
+
+<h2>navigator.plugins surface</h2>
+<script language="JavaScript1.3">
+function pluginReport() {
+  var out = [];
+  out.push("plugins=" + navigator.plugins.length);
+  out.push("mimeTypes=" + navigator.mimeTypes.length);
+  out.push("refresh=" + (typeof navigator.plugins.refresh));
+  return out.join(" | ");
+}
+</script>
+<p><b id="nsr">(running…)</b></p>
+<script language="JavaScript1.3">
+document.getElementById("nsr").innerText = pluginReport();
+</script>
+
+<h2>JSSS probe (style type="text/javascript")</h2>
+<h3>This heading is blue via JSSS tags.H3.color (NS profile) or the CSS
+twin (union profile).</h3>
+<p class="highlight">highlight class via JSSS (green in NS profile).</p>
+<p id="jsssProbe">id selector via JSSS (purple).</p>
+
+</body>
+</html>

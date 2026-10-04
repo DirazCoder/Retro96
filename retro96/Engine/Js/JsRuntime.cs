@@ -703,6 +703,98 @@ public static class JsRuntime
 
         numProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => self));
 
+        // ── ES3 / JScript 5.0 number formatting (checklist §12) ──
+        // toFixed — fixed-point with era round-half-away-from-zero on the
+        // double's true binary value (so 1.005.toFixed(2) === "1.00", the
+        // classic binary-representation behaviour both JScript 5 and
+        // ECMAScript implementations exhibit).
+        numProto.Set("toFixed", Fn(scope, "toFixed", (self, args) =>
+        {
+            double num = self.ToNumber();
+            if (double.IsNaN(num)) return JsValue.From("NaN");
+            if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
+            if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
+
+            int digits = 0;
+            if (args.Length > 0)
+            {
+                double d = args[0].ToNumber();
+                if (double.IsNaN(d)) return JsValue.From("NaN");
+                if (d < 0 || d > 100)
+                    throw new JsInterpreterException("toFixed() digits argument must be between 0 and 100");
+                digits = (int)d;
+            }
+            // ES3: |x| ≥ 10^21 returns the plain (exponential) ToString form.
+            if (Math.Abs(num) >= 1e21)
+                return JsValue.From(JsValue.NumberToString(num));
+            return JsValue.From(FixedString(num, digits));
+        }));
+
+        numProto.Set("toExponential", Fn(scope, "toExponential", (self, args) =>
+        {
+            double num = self.ToNumber();
+            if (double.IsNaN(num)) return JsValue.From("NaN");
+            if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
+            if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
+
+            bool noArgument = args.Length == 0 || args[0].Type == JsType.Undefined;
+            int digits;
+            if (!noArgument)
+            {
+                double d = args[0].ToNumber();
+                if (double.IsNaN(d)) return JsValue.From("NaN");
+                if (d < 0 || d > 100)
+                    throw new JsInterpreterException("toExponential() fraction digits argument must be between 0 and 100");
+                digits = (int)d;
+            }
+            else
+            {
+                // No argument: as many fraction digits as the shortest
+                // round-trip representation needs (ES3).
+                digits = ShortestSignificantDigits(num);
+                if (num != 0.0) digits = Math.Max(0, digits - 1);
+            }
+            string s = ExponentialString(num, digits);
+            if (noArgument)
+            {
+                // ES3 no-argument form trims insignificant trailing zeros.
+                int eIdx = s.IndexOf('e');
+                if (eIdx > 0)
+                {
+                    string mantissa = s[..eIdx].TrimEnd('0').TrimEnd('.');
+                    s = mantissa + s[eIdx..];
+                }
+            }
+            return JsValue.From(s);
+        }));
+
+        numProto.Set("toPrecision", Fn(scope, "toPrecision", (self, args) =>
+        {
+            double num = self.ToNumber();
+            if (double.IsNaN(num)) return JsValue.From("NaN");
+            if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
+            if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
+
+            if (args.Length == 0 || args[0].Type == JsType.Undefined)
+                return JsValue.From(JsValue.NumberToString(num));
+
+            double pd = args[0].ToNumber();
+            if (double.IsNaN(pd)) return JsValue.From("NaN");
+            if (pd < 1 || pd > 100)
+                throw new JsInterpreterException("toPrecision() argument must be between 1 and 100");
+            int precision = (int)pd;
+
+            if (num == 0.0)
+                return JsValue.From(FixedString(num, precision - 1));
+
+            int exponent = (int)Math.Floor(Math.Log10(Math.Abs(num)));
+            // Round first — 99.5 to 2 significant digits bumps the exponent.
+            double rounded = RoundSignificant(num, precision, exponent, out int roundedExponent);
+            if (roundedExponent < -6 || roundedExponent >= precision)
+                return JsValue.From(ExponentialString(rounded, precision - 1));
+            return JsValue.From(FixedString(rounded, precision - 1 - roundedExponent));
+        }));
+
         var numberCtor = new JsFunction((self, args) =>
         {
             double value = args.Length > 0 ? args[0].ToNumber() : 0;
@@ -773,6 +865,84 @@ public static class JsRuntime
         }
 
         return sb.ToString();
+    }
+
+    // ── ES3 number-formatting helpers (toFixed/toExponential/toPrecision) ──
+
+    /// <summary>Fixed-point decimal string with <paramref name="digits"/>
+    /// fraction digits, era round-half-away-from-zero applied to the double's
+    /// true binary value.</summary>
+    private static string FixedString(double num, int digits)
+    {
+        double rounded = Math.Round(num, Math.Max(0, digits), MidpointRounding.AwayFromZero);
+        return rounded.ToString("F" + Math.Max(0, digits), CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Exponential string "d.ddde+dd": fraction digits given, JS-style
+    /// exponent (sign always, no zero padding).</summary>
+    private static string ExponentialString(double num, int digits)
+    {
+        if (num == 0.0)
+        {
+            // (0).toExponential(2) → "0.00e+0"
+            string zeroMantissa = "0";
+            if (digits > 0) zeroMantissa += "." + new string('0', digits);
+            return zeroMantissa + "e+0";
+        }
+
+        int exponent = (int)Math.Floor(Math.Log10(Math.Abs(num)));
+        double mantissa = Math.Round(num / Math.Pow(10, exponent), digits, MidpointRounding.AwayFromZero);
+        // Rounding the mantissa may bump it to 10 (e.g. 9.99 → 1 digit → 10.0)
+        if (Math.Abs(mantissa) >= 10.0)
+        {
+            exponent++;
+            mantissa = Math.Round(num / Math.Pow(10, exponent), digits, MidpointRounding.AwayFromZero);
+        }
+        string m = mantissa.ToString("F" + Math.Max(0, digits), CultureInfo.InvariantCulture);
+        string e = exponent < 0 ? "-" : "+";
+        int absExp = Math.Abs(exponent);
+        string expDigits = absExp == 0 ? "0" : absExp.ToString(CultureInfo.InvariantCulture);
+        return m + "e" + e + expDigits;
+    }
+
+    /// <summary>Number of significant decimal digits in the shortest
+    /// round-trip representation of <paramref name="num"/>.</summary>
+    private static int ShortestSignificantDigits(double num)
+    {
+        if (num == 0.0 || double.IsNaN(num) || double.IsInfinity(num)) return 1;
+        string s = Math.Abs(num).ToString("R", CultureInfo.InvariantCulture);
+        int significant = 0;
+        bool seenNonZero = false;
+        foreach (char c in s)
+        {
+            if (c == '-' || c == '.') continue;
+            if (!char.IsDigit(c)) break;   // 'E' — mantissa digits counted so far
+            if (c != '0') seenNonZero = true;
+            if (seenNonZero) significant++;
+        }
+        return Math.Max(1, significant);
+    }
+
+    /// <summary>Rounds to <paramref name="precision"/> significant digits;
+    /// reports the exponent of the ROUNDED value (rounding 99.5 to 2 digits
+    /// yields 100, exponent 2).</summary>
+    private static double RoundSignificant(double num, int precision, int exponent, out int roundedExponent)
+    {
+        int decimals = precision - 1 - exponent;
+        double rounded = decimals >= 0
+            ? Math.Round(num, decimals, MidpointRounding.AwayFromZero)
+            : Math.Round(num / Math.Pow(10, -decimals), 0, MidpointRounding.AwayFromZero) * Math.Pow(10, -decimals);
+        roundedExponent = rounded == 0.0 ? exponent : (int)Math.Floor(Math.Log10(Math.Abs(rounded)));
+        if (rounded != 0.0 && roundedExponent != exponent)
+        {
+            // Exponent bumped by rounding (99.5 → 100): re-round at the new
+            // magnitude so the output carries exactly `precision` digits.
+            decimals = precision - 1 - roundedExponent;
+            rounded = decimals >= 0
+                ? Math.Round(num, decimals, MidpointRounding.AwayFromZero)
+                : rounded;
+        }
+        return rounded;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -881,6 +1051,59 @@ public static class JsRuntime
     private static DateTime LocalOf(JsValue self)
         => Epoch.AddMilliseconds(MsOf(self)).ToLocalTime();
 
+    private static DateTime UtcOf(JsValue self)
+        => Epoch.AddMilliseconds(MsOf(self));
+
+    /// <summary>
+    /// Shared implementation of the ES3 Date setters: reads the current local
+    /// time, replaces the components whose argument index was supplied (the
+    /// others keep their current values), writes the new epoch-ms back onto
+    /// the Date object and returns the new time value. ECMAScript's
+    /// month/day/hour overflow is preserved by building from DateTime(1,1)
+    /// and adding the raw component deltas.
+    /// </summary>
+    private static double SetDateParts(JsValue self, JsValue[] args,
+        int year = -1, int month = -1, int day = -1,
+        int hour = -1, int minute = -1, int second = -1, int milli = -1)
+    {
+        double ms = MsOf(self);
+        if (double.IsNaN(ms)) return double.NaN;
+
+        var current = Epoch.AddMilliseconds(ms).ToLocalTime();
+
+        int ArgAt(int index) =>
+            index >= 0 && index < args.Length ? (int)args[index].ToNumber() : int.MinValue;
+
+        int yv = ArgAt(year);
+        int y = yv != int.MinValue ? yv : current.Year;
+        if (yv != int.MinValue && y >= 0 && y <= 99) y += 1900;   // era two-digit rule
+        int mo = ArgAt(month); if (mo == int.MinValue) mo = current.Month - 1;
+        int d  = ArgAt(day);   if (d  == int.MinValue) d  = current.Day;
+        int h  = ArgAt(hour);  if (h  == int.MinValue) h  = current.Hour;
+        int mi = ArgAt(minute); if (mi == int.MinValue) mi = current.Minute;
+        int se = ArgAt(second); if (se == int.MinValue) se = current.Second;
+        int ml = ArgAt(milli); if (ml == int.MinValue) ml = current.Millisecond;
+
+        double newMs;
+        try
+        {
+            var rebuilt = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Local)
+                .AddYears(y - 1)
+                .AddMonths(mo)
+                .AddDays(d - 1)
+                .AddHours(h)
+                .AddMinutes(mi)
+                .AddSeconds(se)
+                .AddMilliseconds(ml);
+            newMs = (rebuilt.ToUniversalTime() - Epoch).TotalMilliseconds;
+        }
+        catch { return double.NaN; }
+
+        if (self.Type is (JsType.Object or JsType.Function))
+            self.GetObjectOrFunction().Set("value", JsValue.From(newMs));
+        return newMs;
+    }
+
     private static void RegisterDate(JsScope scope, JsObject objectProto)
     {
         var dateProto = new JsObject { Class = "Date", Prototype = objectProto };
@@ -900,6 +1123,56 @@ public static class JsRuntime
         // getYear — the era's method: year minus 1900
         dateProto.Set("getYear", Fn(scope, "getYear", (s, a) =>
             JsValue.From(LocalOf(s).Year - 1900)));
+
+        // ── UTC getters (JScript 5 / JavaScript 1.3, ES3) ──
+        dateProto.Set("getUTCFullYear",   Fn(scope, "getUTCFullYear",   (s, a) => JsValue.From(UtcOf(s).Year)));
+        dateProto.Set("getUTCMonth",      Fn(scope, "getUTCMonth",      (s, a) => JsValue.From(UtcOf(s).Month - 1)));
+        dateProto.Set("getUTCDate",       Fn(scope, "getUTCDate",       (s, a) => JsValue.From(UtcOf(s).Day)));
+        dateProto.Set("getUTCDay",        Fn(scope, "getUTCDay",        (s, a) => JsValue.From((int)UtcOf(s).DayOfWeek)));
+        dateProto.Set("getUTCHours",      Fn(scope, "getUTCHours",      (s, a) => JsValue.From(UtcOf(s).Hour)));
+        dateProto.Set("getUTCMinutes",    Fn(scope, "getUTCMinutes",    (s, a) => JsValue.From(UtcOf(s).Minute)));
+        dateProto.Set("getUTCSeconds",    Fn(scope, "getUTCSeconds",    (s, a) => JsValue.From(UtcOf(s).Second)));
+        dateProto.Set("getUTCMilliseconds", Fn(scope, "getUTCMilliseconds", (s, a) => JsValue.From(UtcOf(s).Millisecond)));
+
+        // ── Local setters (ES3 / JScript 5 — Y2K remediation surface) ──
+        dateProto.Set("setFullYear", Fn(scope, "setFullYear", (self, args) =>
+            JsValue.From(SetDateParts(self, args,
+                year: 0, month: 1, day: 2))));
+        dateProto.Set("setMonth", Fn(scope, "setMonth", (self, args) =>
+            JsValue.From(SetDateParts(self, args, month: 0, day: 1))));
+        dateProto.Set("setDate", Fn(scope, "setDate", (self, args) =>
+            JsValue.From(SetDateParts(self, args, day: 0))));
+        dateProto.Set("setHours", Fn(scope, "setHours", (self, args) =>
+            JsValue.From(SetDateParts(self, args, hour: 0, minute: 1, second: 2, milli: 3))));
+        dateProto.Set("setMinutes", Fn(scope, "setMinutes", (self, args) =>
+            JsValue.From(SetDateParts(self, args, minute: 0, second: 1, milli: 2))));
+        dateProto.Set("setSeconds", Fn(scope, "setSeconds", (self, args) =>
+            JsValue.From(SetDateParts(self, args, second: 0, milli: 1))));
+        dateProto.Set("setMilliseconds", Fn(scope, "setMilliseconds", (self, args) =>
+            JsValue.From(SetDateParts(self, args, milli: 0))));
+
+        dateProto.Set("toDateString", Fn(scope, "toDateString", (s, a) =>
+        {
+            double ms = MsOf(s);
+            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
+            // ECMAScript-ish "Fri Mar 05 1999"
+            return JsValue.From(LocalOf(s).ToString(
+                "ddd MMM dd yyyy", CultureInfo.InvariantCulture));
+        }));
+
+        dateProto.Set("toTimeString", Fn(scope, "toTimeString", (s, a) =>
+        {
+            double ms = MsOf(s);
+            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
+            var local = LocalOf(s);
+            var offset = TimeZoneInfo.Local.GetUtcOffset(local);
+            string sign = offset < TimeSpan.Zero ? "-" : "+";
+            var abs = offset < TimeSpan.Zero ? -offset : offset;
+            string off = $"{sign}{abs.Hours:00}{abs.Minutes:00}";
+            return JsValue.From(local.ToString(
+                "HH:mm:ss", CultureInfo.InvariantCulture) + " GMT" + off);
+        }));
+
 
         dateProto.Set("setTime", Fn(scope, "setTime", (self, args) =>
         {
@@ -1083,6 +1356,49 @@ public static class JsRuntime
         {
             var o = self.GetObjectOrFunction();
             return JsValue.From($"/{o.Get("source").ToJsString()}/{o.Get("flags").ToJsString()}");
+        }));
+
+        // compile(pattern, flags) — the JScript-era recompile-in-place API.
+        // JScript 5 returns the recompiled RegExp object itself.
+        regexProto.Set("compile", Fn(scope, "compile", (self, args) =>
+        {
+            if (self.Type is not (JsType.Object or JsType.Function))
+                return JsValue.Undefined;
+            var o = self.GetObjectOrFunction();
+
+            string pattern;
+            string flags = "";
+            if (args.Length > 0 && args[0].Type is (JsType.Object or JsType.Function) &&
+                args[0].GetObjectOrFunction().Class == "RegExp")
+            {
+                var src = args[0].GetObjectOrFunction();
+                pattern = src.Get("source").ToJsString();
+                flags = src.Get("flags").ToJsString();
+            }
+            else
+            {
+                pattern = args.Length > 0 ? args[0].ToJsString() : "";
+            }
+            if (args.Length > 1 && args[1].Type != JsType.Undefined)
+                flags = args[1].ToJsString();
+
+            var valid = new StringBuilder();
+            foreach (char c in flags)
+            {
+                if (c is not ('g' or 'i' or 'm') || valid.ToString().Contains(c))
+                    throw new JsInterpreterException("Invalid or duplicate RegExp flag");
+                valid.Append(c);
+            }
+
+            o.Class = "RegExp";
+            o.Set("source", JsValue.From(pattern));
+            o.Set("flags", JsValue.From(valid.ToString()));
+            o.Set("global", JsValue.From(valid.ToString().Contains('g')));
+            o.Set("ignoreCase", JsValue.From(valid.ToString().Contains('i')));
+            o.Set("multiline", JsValue.From(valid.ToString().Contains('m')));
+            o.Set("lastIndex", JsValue.From(0));
+            o.Prototype = regexProto;
+            return self;
         }));
 
         var regexpCtor = new JsFunction((self, args) =>

@@ -17,12 +17,14 @@ public sealed record VbsErrorInfo(int Number, string Description, string Source,
 }
 
 /// <summary>
-/// Facade over the VBScript 1.0 engine: compile, run, and error mapping.
+/// Facade over the VBScript 5.0 engine: compile, run, and error mapping.
 /// Typical browser wiring:
 ///   1. `IVbsScriptHost` implemented by the shell (MsgBox → canvas dialog,
 ///      WriteLine → document.write / console, CreateObject → denied).
 ///   2. Reuse one `VbsSession` per document and call `Run(source)` for each
-///      &lt;script language="VBScript"&gt; block; globals and procedures are shared.
+///      &lt;script language="VBScript"&gt; block; globals, procedures, classes and
+///      instances are shared. Dispose/Terminate at document teardown runs
+///      Class_Terminate for every live instance.
 /// </summary>
 public static class VbsEngine
 {
@@ -179,5 +181,21 @@ public sealed class VbsSession
     {
         bool ok = TryRun(out error, out _);
         return ok && error == null;
+    }
+
+    /// <summary>
+    /// Deterministic class teardown: runs Class_Terminate for every instance
+    /// created by this session, newest first (errors inside destructors are
+    /// swallowed). Real VBScript uses COM refcounting; this engine documents
+    /// session-end teardown as its lifetime model — call this when the
+    /// document goes away.
+    /// </summary>
+    public void Terminate() => _interpreter.TerminateClasses();
+
+    /// <summary>Terminates class instances (see Terminate).</summary>
+    public void Dispose()
+    {
+        Terminate();
+        GC.SuppressFinalize(this);
     }
 }

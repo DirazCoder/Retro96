@@ -1,0 +1,41 @@
+<html>
+<head><title>Main frame</title></head>
+<body bgcolor="#FFFFFF" text="#000000">
+<h2 id="one">Main frame target (id=one)</h2>
+
+<h3>iframe with the full 1999 attribute set</h3>
+<iframe src="frame-child99.html" name="iframe99" width="260" height="90"
+        frameborder="1" scrolling="no" marginwidth="6" marginheight="6"
+        hspace="8" vspace="8" align="left">
+  iframe fallback text (hidden — engine supports iframes)
+</iframe>
+<p>Text wraps around the floated iframe (hspace/vspace margins).<br>
+<br clear="all">
+IE extras on the iframe: <tt>allowtransparency</tt> and
+<tt>contentWindow</tt> are script surfaces.
+
+<h3>object nesting and fallback</h3>
+<object classid="clsid:333C7BC4-460F-11D0-BC04-0080C7055A83"
+        width="200" height="40" type="application/x-unknown">
+  <param name="DataURL" value="data.csv">
+  <object data="../images/dot16.png" type="image/png" width="64" height="48">
+    <embed src="../images/pixel-dot.gif" width="16" height="16">
+    <noembed>NOEMBED fallback: never renders while embed is supported</noembed>
+    final fallback text (shows only when nothing above resolves)
+  </object>
+</object>
+<p>The ActiveX-style classid fails gracefully into the nested PNG object;
+unknown plugin types fall through to fallback content.</p>
+
+<h3>script frame access</h3>
+<script language="JavaScript1.3">
+  function pokeFrame() {
+    var f = window.frames;
+    var n = (f && f.length) ? f.length : 0;
+    window.status = "frames.length=" + n;
+    return true;
+  }
+</script>
+<a href="#" onclick="return pokeFrame()">probe frames[]</a>
+</body>
+</html>

@@ -20,14 +20,18 @@ public record CommentToken(string Text) : HtmlToken;
 public record DoctypeToken(string RawText) : HtmlToken;
 
 /// <summary>
-/// HTML tokenizer for the 1996 compatibility target.
+/// HTML tokenizer for the 1996/1999 compatibility targets.
 ///
-/// Recovers from everything a real 1996 page throws at it:
+/// Recovers from everything a real 1996/1999 page throws at it:
 ///   - tag/attribute names in any case
-///   - unquoted / missing-value attributes
+///   - unquoted / missing-value attributes (minimized boolean attributes
+///     expand to name="name", per the HTML 4.01 SGML declaration)
 ///   - comments spanning lines and containing '&gt;'
 ///   - stray '&lt;' that starts no tag
-///   - raw-text elements (SCRIPT, STYLE, LISTING, XMP, PLAINTEXT)
+///   - raw-text elements (SCRIPT, STYLE, LISTING, XMP, PLAINTEXT, plus the
+///     IE5/NS4-era COMMENT / NOEMBED / NOLAYER / XML data-island tags)
+///   - NOSCRIPT: raw text ONLY while scripting is enabled (fallback
+///     content parses as ordinary markup when scripting is off)
 ///   - RCDATA elements (TEXTAREA, TITLE)
 ///   - unterminated everything at EOF — including a synthetic end tag for
 ///     an unterminated raw-text element, so a truncated page's last
@@ -35,7 +39,15 @@ public record DoctypeToken(string RawText) : HtmlToken;
 /// </summary>
 public static class HtmlTokenizer
 {
-    public static IEnumerable<HtmlToken> Tokenize(string html)
+    public static IEnumerable<HtmlToken> Tokenize(string html) =>
+        Tokenize(html, scriptingEnabled: false);
+
+    /// <param name="scriptingEnabled">True while the host executes page
+    /// scripts — switches &lt;noscript&gt; into raw-text mode (the era
+    /// behaviour: with scripting on, the fallback content is never parsed
+    /// as markup; with scripting off it renders like any other element).
+    /// </param>
+    public static IEnumerable<HtmlToken> Tokenize(string html, bool scriptingEnabled)
     {
         if (string.IsNullOrEmpty(html))
             yield break;
@@ -153,7 +165,7 @@ public static class HtmlTokenizer
                         // never enters raw text mode.
                         if (!startTag.SelfClosing && tagName != null)
                         {
-                            if (IsRawTextElement(tagName))
+                            if (IsRawTextElement(tagName, scriptingEnabled))
                             {
                                 rawTextTag = tagName;
                                 isRcdata = false;
@@ -265,8 +277,23 @@ public static class HtmlTokenizer
         return sb.Length > 0 ? sb.ToString() : null;
     }
 
-    private static bool IsRawTextElement(string name) =>
-        name is "script" or "style" or "listing" or "xmp" or "plaintext";
+    private static bool IsRawTextElement(string name, bool scriptingEnabled) =>
+        name is "script" or "style" or "listing" or "xmp" or "plaintext"
+            // IE5 <comment> element: its content is annotation text that
+            // must never reach the renderer (or the DOM as markup).
+            or "comment"
+            // NOEMBED is the fallback for browsers WITHOUT <embed> — this
+            // engine HAS embed, so the fallback is concealed (raw text).
+            or "noembed"
+            // NOLAYER is the fallback for browsers WITHOUT layer support —
+            // this engine HAS layers, so the fallback is concealed (raw text).
+            or "nolayer"
+            // IE5 XML data islands (<xml id=...>...</xml>): the payload is
+            // XML source kept as a raw text child for scripts
+            // (document.all(id).innerHTML), never parsed as HTML markup.
+            or "xml"
+            // <noscript> content is markup ONLY for non-scripting browsers.
+            || (scriptingEnabled && name == "noscript");
 
     private static bool IsRcdataElement(string name) =>
         name is "textarea" or "title";
@@ -464,11 +491,18 @@ public static class HtmlTokenizer
             }
             else
             {
-                // No '=' — boolean attribute.  Restore position only when we
-                // actually advanced past whitespace without finding '='.
+                // No '=' — boolean/minimized attribute.  Per the HTML 4.01
+                // SGML declaration the minimized form expands to the
+                // attribute NAME as its value: <option selected> ≡
+                // selected="selected".  (The 3.2-era parser stored "";
+                // every engine consumer tests presence via HasAttr, so the
+                // richer value is a pure correctness win — and matches what
+                // IE5/NS4.7 handed to getAttribute.)
+                // Restore position only when we actually advanced past
+                // whitespace without finding '='.
                 if (pos != savePos && pos >= html.Length)
                     pos = savePos;
-                attrs.TryAdd(attrName, "");
+                attrs.TryAdd(attrName, attrName);
             }
         }
 

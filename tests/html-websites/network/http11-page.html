@@ -1,0 +1,48 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>HTTP/1.1 Page (served by the VisualDiff loopback server)</title>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>HTTP/1.1 contract page</h1>
+<p>This page is meant to be SERVED over HTTP (the loopback server in
+tests/VisualDiff serves the whole html-websites tree). The 1999 engine
+profiles speak HTTP/1.1 on the wire:</p>
+<ul>
+  <li>Request line <tt>GET /… HTTP/1.1</tt> (1996 profiles keep HTTP/1.0)</li>
+  <li>Mandatory <tt>Host:</tt> header — always present</li>
+  <li><tt>Connection: keep-alive</tt> with per-origin socket pooling</li>
+  <li>Chunked transfer responses decode transparently</li>
+  <li>ETag / If-None-Match / If-Modified-Since revalidation with 304
+      served from cache</li>
+  <li><tt>image/png</tt> advertised in Accept (the 1999 personas)</li>
+  <li>Charset: HTTP <tt>Content-Type</tt> charset beats the
+      <tt>&lt;meta&gt;</tt> tag</li>
+  <li>Refresh header (this page carries <tt>Refresh: 30</tt> when served
+      with the test header injection)</li>
+</ul>
+
+<h2>Validation-cache probe</h2>
+<p>The image below is fetched twice on load: the first request warms the
+validation cache (the test server sends an ETag); the second must be
+answered by a conditional request and a 304.</p>
+<p><img id="cacheprobe" src="../images/dot16.png" width="32" height="32"
+  border="1" alt="cache probe"></p>
+<script language="JavaScript1.3">
+var p1 = new Image(); p1.src = "../images/pixel-dot.gif";
+var p2 = new Image(); p2.src = "../images/pixel-dot.gif";
+</script>
+
+<h2>Redirect chain</h2>
+<p>Link targets on the loopback server exercise 301/302/303/307:
+<a href="/redirect-301">301</a> <a href="/redirect-302">302</a>
+<a href="/redirect-307">307</a> — the client converts 301/302/303 to GET,
+keeps the method for 307, and caps the chain at 5.</p>
+
+<h2>about: / mailto: / javascript: URLs</h2>
+<p><a href="about:blank">about:blank</a> |
+<a href="mailto:webmaster@example.com">mailto:</a> |
+<a href="javascript:window.status='javascript URL ran'">javascript:</a></p>
+</body>
+</html>

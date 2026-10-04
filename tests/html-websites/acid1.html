@@ -1,0 +1,91 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>Acid1: CSS1 box-model smoke test (1998)</title>
+<style type="text/css">
+  /* The Acid1 contract: every image below must butt EXACTLY against its
+     neighbours — no gaps, no overlap. That only happens when padding,
+     border, margin, line-height and vertical-align all measure correctly.
+     One wrong box metric anywhere tears a seam into the mosaic. */
+  body { background: #FFFFFF; margin: 8px; font-family: "Times New Roman", serif; }
+  table.a { border-collapse: collapse; border-spacing: 0; }
+  table.a td { padding: 0; border: 0; margin: 0; line-height: 0; }
+  td.solid { width: 32px; height: 32px; background: #000000; }
+  td.thin  { width: 8px;  height: 8px;  background: #FF0000; }
+  td.pad   { padding: 4px; background: #FFFFFF; }
+  td.pad img { display: block; }
+  .marq { margin: 0 auto; width: 400px; }
+  .stack { border: 4px solid #000000; padding: 8px; background: #CCCCFF; }
+  .flo { float: left; margin: 0 8px 8px 0; }
+  .bg  { background-image: url(../images/pixel-dot.gif); }
+  .indent { text-indent: 32px; line-height: 18px; }
+  .inset { margin-left: 40px; margin-right: 40px;
+           border-left: 2px solid #008000; padding-left: 10px; }
+</style>
+</head>
+<body>
+
+<h2>Mosaic table (the box-metric contract)</h2>
+<table class="a" cellspacing="0" cellpadding="0">
+  <tr>
+    <td class="solid" colspan="4" rowspan="4"></td>
+    <td class="thin"></td>
+    <td class="thin"></td>
+    <td class="thin"></td>
+    <td class="thin"></td>
+    <td class="solid" colspan="4" rowspan="4"></td>
+  </tr>
+  <tr><td class="thin" colspan="4" rowspan="2"></td></tr>
+  <tr></tr>
+  <tr>
+    <td class="thin"></td><td class="thin"></td>
+    <td class="thin"></td><td class="thin"></td>
+  </tr>
+  <tr>
+    <td class="thin" rowspan="4"></td>
+    <td class="pad"><img src="../images/dot16.png" width="16" height="16"
+      alt="16" border="0"></td>
+    <td class="pad"><img src="../images/dot16.png" width="16" height="16"
+      alt="16" border="0"></td>
+    <td class="thin" rowspan="4"></td>
+  </tr>
+  <tr>
+    <td class="pad"><img src="../images/dot16.png" width="16" height="16"
+      alt="16" border="0"></td>
+    <td class="pad"><img src="../images/dot16.png" width="16" height="16"
+      alt="16" border="0"></td>
+  </tr>
+  <tr><td class="thin" colspan="2"></td><td class="thin" colspan="2"></td></tr>
+  <tr><td class="thin"></td><td class="thin"></td><td class="thin"></td></tr>
+</table>
+
+<h2>Nested boxes: margins collapse, borders stack</h2>
+<div class="marq">
+  <div class="stack">
+    <div class="stack" style="border-width:2px">
+      <div class="stack" style="border-width:1px padding:2px">
+        Three nested boxes: 4px + 8px + 2px + 10px + 1px + 4px + 2px of
+        border+padding accumulate to a perfectly deterministic width.
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>Float + text indent</h2>
+<p><img class="flo" src="../images/dot16.png" width="32" height="32"
+  alt="float" border="1">The floated image keeps an 8px right/bottom
+margin; this paragraph wraps around it without touching the border.</p>
+<p class="indent">First line indented 32px via text-indent; the second
+line returns flush left — a CSS1 metric that only works when the
+inline layout measures the first line's leading correctly.</p>
+
+<p class="inset">Margined, bordered, padded block: 40px side margins,
+2px green left border, 10px left padding. If any one of those metrics
+is off by even a pixel, the border will not align with the text edge.</p>
+
+<p class="bg">A tiled background image behind text exercises
+background-position anchoring with the box's padding box.</p>
+
+</body>
+</html>

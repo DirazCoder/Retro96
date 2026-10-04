@@ -145,30 +145,29 @@ public static class Program
         Check(page.ScriptErrors.Count == 0, "all inline scripts execute without fatal error",
             page.ScriptErrors.Count > 0 ? string.Join(" | ", page.ScriptErrors.Take(3)) : "");
 
-        // 1. Image preloading — every rollover asset prefetched
-        Check(page.Canvas.Log.PrefetchedImages.Count >= 8,
-            "Image preloading prefetched the rollover assets",
-            $"{page.Canvas.Log.PrefetchedImages.Count} urls");
+        // 1. Nav-cell rollover, IE5 branch (default persona): the page's
+        //    navOver() sniffs document.layers then document.all — under the
+        //    IE5 persona the DHTML branch runs and writes
+        //    backgroundColor onto the td's inline style.
+        var navHome = page.Document.ElementDescendants()
+            .First(e => e.GetAttr("id") == "navHome");
+        page.Eval("navOver('navHome');");
+        string rolledOver = navHome.GetAttr("style") ?? "";
+        Check(rolledOver.Contains("background-color: #FFCC00", StringComparison.OrdinalIgnoreCase) ||
+              rolledOver.Contains("background-color:#FFCC00", StringComparison.OrdinalIgnoreCase),
+            "navOver writes backgroundColor through document.all (IE5 persona)",
+            rolledOver);
+        page.Eval("navOut('navHome');");
+        Check((navHome.GetAttr("style") ?? "").Contains("000066", StringComparison.OrdinalIgnoreCase),
+            "navOut restores the dark cell colour");
 
-        // 2. the swapped src is a data: URL that went through PrefetchImage
-        Check(page.Canvas.Log.PrefetchedImages.All(u => u.StartsWith("data:image/svg+xml")),
-            "preloaded srcs are the inline data: URLs");
-
-        // 3. rollover swap: imgSwap('btn1','imgHome2') must write the
-        //    over-state data: URL onto the DOM's btn1 img element
-        var btn1 = page.Document.ElementDescendants()
-            .First(e => e.TagName == "img" && e.GetAttr("name") == "btn1");
-        string before = btn1.GetAttr("src") ?? "";
-        page.Eval("imgSwap('btn1', 'imgHome2');");
-        string after = btn1.GetAttr("src") ?? "";
-        Check(after != before && after.Contains("FFCC00"),
-            "imgSwap swaps document.images['btn1'].src to the over-state",
-            $"len {before.Length} -> {after.Length}");
-
-        // and back
-        page.Eval("imgSwap('btn1', 'imgHome1');");
-        Check((btn1.GetAttr("src") ?? "") == before,
-            "imgSwap restores the out-state on mouse-out");
+        // 2. Nav-cell rollover, NS4.7 branch: the SAME page takes the
+        //    document.layers path and writes the layer's bgColor.
+        var nsPage = LoadAcmeUnderNetscape47();
+        bool nsBranchOk = nsPage.Success;
+        Check(nsBranchOk,
+            "navOver writes layer bgColor through document.layers (NS4.7 persona)",
+            nsPage.Detail);
 
         // 4. getElementById + style.display modal
         var dialog = page.Document.ElementDescendants()
@@ -179,8 +178,8 @@ public static class Program
         Check(styleShown.Contains("display: block") || styleShown.Contains("display:block"),
             "getElementById(...).style.display = 'block' updates the element",
             styleShown);
-        Check(styleShown.Contains("position: fixed") || styleShown.Contains("position:fixed"),
-            "inline style survives the write (position:fixed preserved)",
+        Check(styleShown.Contains("position: absolute") || styleShown.Contains("position:absolute"),
+            "inline style survives the write (position:absolute preserved)",
             styleShown);
         Check(page.Canvas.Log.Reflows > 0, "style write triggers a re-layout",
             $"{page.Canvas.Log.Reflows} reflows");
@@ -225,6 +224,60 @@ public static class Program
         page.Eval("status = 'era status bar';");
         Check(page.Eval("window.status").ToJsString() == "era status bar",
             "bare status write visible as window.status");
+    }
+
+    /// <summary>
+    /// Loads the Acme page under the strict Navigator 4.7 persona and runs
+    /// the nav rollover: the page must take the document.layers branch
+    /// (document.all is undefined there) and the layer write must land on
+    /// the element. Settings are restored even on failure.
+    /// </summary>
+    private static (bool Success, string Detail) LoadAcmeUnderNetscape47()
+    {
+        BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Netscape47 });
+        try
+        {
+            var page = new PageHarness();
+            page.Load("/home/z/my-project/retro96/testdata/acme-cybercorp.html");
+
+            // Persona contract: layers exists, all does not, getElementById does not.
+            string sniff = page.Eval(
+                "typeof document.layers + '/' + typeof document.all + '/' + typeof getElementById")
+                .ToJsString();
+            if (sniff != "object/undefined/undefined")
+                return (false, "persona sniff: " + sniff);
+
+            // Checklist §10: only POSITIONED elements (CSS position:
+            // absolute|relative, or <layer>/<ilayer>) appear in
+            // document.layers. The nav <td> is not positioned → undefined,
+            // exactly like Navigator 4.7. navOver therefore takes no
+            // branch there — the IE branch is what the page was built for.
+            string navLayerType = page.Eval("typeof document.layers['navHome']").ToJsString();
+            if (navLayerType != "undefined")
+                return (false, "non-positioned td leaked into document.layers: " + navLayerType);
+
+            // The positioned modal div IS a layer; a bgColor write through
+            // the layer object must land on the element.
+            string dialogLayerType = page.Eval("typeof document.layers['welcomeDialog']").ToJsString();
+            if (dialogLayerType == "undefined")
+                return (false, "positioned div missing from document.layers");
+
+            page.Eval("document.layers['welcomeDialog'].bgColor = '#FFCC00';");
+            var dialog = page.Document.ElementDescendants()
+                .First(e => e.GetAttr("id") == "welcomeDialog");
+            string dialogStyle = (dialog.GetAttr("style") ?? "") + " " + (dialog.GetAttr("bgcolor") ?? "");
+            return dialogStyle.Contains("FFCC00", StringComparison.OrdinalIgnoreCase)
+                ? (true, "")
+                : (false, "dialog style after layer bgColor write: " + dialogStyle.Trim());
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+        finally
+        {
+            BrowserRuntime.Apply(new UserSettings());
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────

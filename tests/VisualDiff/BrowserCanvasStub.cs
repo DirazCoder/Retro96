@@ -34,8 +34,17 @@ public class BrowserCanvas
     public void OpenNewWindow(string url) { Log.Navigations.Add("[window] " + url); NewWindowRequested?.Invoke(url); }
     public void ScrollTo(int x, int y) { }
     public void ScrollBy(int dx, int dy) { }
+    public void ClearPageSelection() { }
+    public string? GetDomSelectionText() => null;
+    public bool IsHandleCreated { get; } = true;
+    public bool IsDisposed { get; private set; }
+    public void Dispose() => IsDisposed = true;
+    public bool InvokeRequired { get; } = false;
+    public IAsyncResult BeginInvoke(Delegate method) { method.DynamicInvoke(); return null!; }
+    public IAsyncResult BeginInvoke(Action method) { method(); return null!; }
+    public object EndInvoke(IAsyncResult result) => null!;
     public Size GetViewportSize() => new(800, 600);
-    public void SubmitForm(DomElement? form, object? clickCoords) { }
+    public void SubmitForm(DomElement? form, object? clickCoords, bool dispatchSubmitEvent = true) { }
     public void UpdateDocumentTitle(string title) { }
     public void RequestRerender() { Log.Rerenders++; }
     public void ReflowDocument() { Log.Reflows++; }

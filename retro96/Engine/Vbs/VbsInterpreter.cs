@@ -17,6 +17,11 @@ internal sealed class VbsFrame
     public bool IsGlobal;
     public bool ErrorResumeNext;
     public VbsCell? ReturnCell;
+    /// <summary>Current class instance while executing class code (Me).</summary>
+    public VbsClassInstance? Me;
+    /// <summary>Objects of enclosing With blocks, outermost first. Unqualified
+    /// `.Member` resolves against this stack, innermost first.</summary>
+    public List<VbsVariant>? WithStack;
 }
 
 internal sealed class VbsExitProcedureException : Exception { }
@@ -45,10 +50,14 @@ public sealed class VbsProcedure
 }
 
 /// <summary>
-/// Tree-walking VBScript 1.0 runtime. Exactly two scopes (script-global and
-/// procedure-local), procedures hoisted regardless of definition order,
-/// ByRef via cell aliasing, On Error Resume Next scoped per procedure,
-/// recursion capped (error 28).
+/// Tree-walking VBScript 5.0 runtime. Two scopes (script-global and
+/// procedure-local) plus per-instance class fields visible to class code;
+/// procedures and classes hoisted regardless of definition order, ByRef via
+/// cell aliasing, On Error Resume Next scoped per procedure, recursion
+/// capped (error 28). Adds With blocks (frame-local stack), classes with
+/// Public/Private members, Property Get/Let/Set, Me, New, GetRef and the
+/// Eval/Execute/ExecuteGlobal builtins (which call back into this object
+/// through VbsRuntimeContext).
 /// </summary>
 public sealed class VbsInterpreter
 {
@@ -57,6 +66,8 @@ public sealed class VbsInterpreter
     private readonly VbsScript _script;
     private readonly Dictionary<string, VbsCell> _globals = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, VbsProcedure> _procedures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, VbsClass> _classes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<VbsClassInstance> _liveInstances = new();
     private readonly IVbsScriptHost _host;
     private readonly VbsErrObject _err = new();
     private readonly Random _random = new();
@@ -72,7 +83,7 @@ public sealed class VbsInterpreter
     {
         _script = script ?? throw new ArgumentNullException(nameof(script));
         _host = host ?? throw new ArgumentNullException(nameof(host));
-        _ctx = new VbsRuntimeContext(_host, _random, _err);
+        _ctx = new VbsRuntimeContext(_host, _random, _err) { Interpreter = this };
 
         RegisterProcedures(_script);
 
@@ -83,6 +94,20 @@ public sealed class VbsInterpreter
     }
 
     public bool HasProcedure(string name) => _procedures.ContainsKey(name);
+
+    /// <summary>Class names defined in this interpreter (incl. later blocks).</summary>
+    public IReadOnlyCollection<string> ClassNames => _classes.Keys;
+
+    /// <summary>Deterministic teardown: runs Class_Terminate for every live
+    /// instance, newest first. Called by VbsSession.Terminate/Dispose — real
+    /// VBScript uses COM refcounting; this engine documents session-end
+    /// teardown as its lifetime model.</summary>
+    public void TerminateClasses()
+    {
+        for (int i = _liveInstances.Count - 1; i >= 0; i--)
+            _liveInstances[i].Terminate();
+        _liveInstances.Clear();
+    }
 
     // ── Entry points ───────────────────────────────────────────────────────
 
@@ -111,6 +136,13 @@ public sealed class VbsInterpreter
                 throw new VbsRuntimeException(VbsErrorNumbers.NameRedefined,
                     $"Name redefined: '{stmt.Name}'", stmt.Line);
         }
+        foreach (var stmt in script.Body.OfType<VbsClassStatement>())
+        {
+            if (_procedures.ContainsKey(stmt.Name) || _classes.ContainsKey(stmt.Name))
+                throw new VbsRuntimeException(VbsErrorNumbers.NameRedefined,
+                    $"Name redefined: '{stmt.Name}'", stmt.Line);
+            _classes[stmt.Name] = VbsClass.Build(stmt);
+        }
     }
 
     /// <summary>Host-call a procedure by name with by-value arguments.</summary>
@@ -137,7 +169,7 @@ public sealed class VbsInterpreter
     {
         foreach (var stmt in list)
         {
-            if (stmt is VbsSubStatement) continue;      // hoisted at construction
+            if (stmt is VbsSubStatement or VbsClassStatement) continue;   // hoisted at construction
             if (frame.ErrorResumeNext)
             {
                 try { ExecuteStatement(stmt, frame); }
@@ -178,7 +210,29 @@ public sealed class VbsInterpreter
             case VbsExitStatement exit: ExecExit(exit); break;
             case VbsOnErrorStatement onError: f.ErrorResumeNext = onError.ResumeNext; break;
             case VbsOptionExplicitStatement: _optionExplicit = true; break;
-            case VbsNopStatement: break;
+            case VbsWithStatement with: ExecWith(with, f); break;
+            case VbsClassStatement: break;   // hoisted at construction
+            case VbsNopStatement: break;   // Stop — no debugger halt
+        }
+    }
+
+    private void ExecWith(VbsWithStatement stmt, VbsFrame f)
+    {
+        var objVal = EvalExpr(stmt.Object, f);
+        if (objVal.Type != VbVarType.Object)
+            throw new VbsRuntimeException(VbsErrorNumbers.ObjectRequired,
+                "Object required", stmt.Line);
+        var obj = objVal.AsObject() ??
+            throw new VbsRuntimeException(VbsErrorNumbers.ObjectVariableNotSet,
+                "Object variable not set", stmt.Line);
+        (f.WithStack ??= new List<VbsVariant>()).Add(objVal);
+        try
+        {
+            ExecuteStatementList(stmt.Body, f);
+        }
+        finally
+        {
+            f.WithStack.RemoveAt(f.WithStack.Count - 1);
         }
     }
 
@@ -265,6 +319,18 @@ public sealed class VbsInterpreter
         return lengths;
     }
 
+    /// <summary>Class field array bounds (`Public A(10)`), evaluated with a
+    /// Me-bound construction frame.</summary>
+    internal int[] EvaluateArrayLengths(IReadOnlyList<VbsExpr> bounds, VbsFrame f, string fieldName)
+    {
+        try { return EvaluateArrayLengths(bounds, f, 0); }
+        catch (VbsRuntimeException ex)
+        {
+            throw new VbsRuntimeException(ex.Number, ex.Description, 0,
+                $"Microsoft VBScript runtime error: class field '{fieldName}'");
+        }
+    }
+
     private void ExecErase(VbsEraseStatement stmt, VbsFrame f)
     {
         foreach (string name in stmt.Names)
@@ -335,6 +401,42 @@ public sealed class VbsInterpreter
                     throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
                         $"Object doesn't support this property or method: '{m.Member}'");
                 return;
+            }
+
+            case VbsWithMemberExpr wm:
+            {
+                foreach (var o in WithObjects(f))
+                    if (o.TrySetMember(wm.Member, value))
+                        return;
+                throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
+                    $"Object doesn't support this property or method: '{wm.Member}'");
+            }
+
+            // obj.Prop(i, …) = v / Set obj.Prop(i, …) = o → indexed Property
+            // Let/Set (class instances; other objects fall through to 438).
+            case VbsInvokeExpr inv when inv.Target is VbsMemberExpr m2:
+            {
+                var objVal = EvalExpr(m2.Object, f);
+                if (objVal.Type == VbVarType.Object &&
+                    objVal.AsObject() is IVbsIndexedPropertyAssign indexed)
+                {
+                    var indices = EvalArgs(inv.Args, f);
+                    if (indexed.TryAssignIndexed(m2.Member, indices, value, isSet))
+                        return;
+                }
+                throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
+                    $"Object doesn't support this property or method: '{m2.Member}'");
+            }
+
+            case VbsInvokeExpr inv when inv.Target is VbsWithMemberExpr wm2:
+            {
+                var indices = EvalArgs(inv.Args, f);
+                foreach (var o in WithObjects(f))
+                    if (o is IVbsIndexedPropertyAssign indexed &&
+                        indexed.TryAssignIndexed(wm2.Member, indices, value, isSet))
+                        return;
+                throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
+                    $"Object doesn't support this property or method: '{wm2.Member}'");
             }
 
             case VbsInvokeExpr inv when !isSet && inv.Target is VbsNameExpr n2:
@@ -529,6 +631,7 @@ public sealed class VbsInterpreter
         {
             case VbsExitKind.Sub:
             case VbsExitKind.Function:
+            case VbsExitKind.Property:
                 throw new VbsExitProcedureException();
             case VbsExitKind.Do:
                 throw new VbsExitLoopException(VbsExitKind.Do);
@@ -556,6 +659,13 @@ public sealed class VbsInterpreter
             case VbsNameExpr n: return EvalName(n, f);
             case VbsMemberExpr m: return EvalMemberGet(m, f);
             case VbsInvokeExpr inv: return EvalInvoke(inv, f, byrefAllowed: true);
+            case VbsMeExpr:
+                if (f.Me == null)
+                    throw new VbsRuntimeException(VbsErrorNumbers.ObjectRequired,
+                        "Object required");
+                return VbsVariant.Of(f.Me);
+            case VbsNewExpr ne: return EvalNew(ne);
+            case VbsWithMemberExpr wm: return EvalWithMemberGet(wm, f);
             case VbsUnaryExpr u:
             {
                 var v = EvalExpr(u.Operand, f);
@@ -601,7 +711,10 @@ public sealed class VbsInterpreter
             return cell.Value;
 
         if (VbsBuiltins.Table.TryGetValue(e.Name, out var builtin))
+        {
+            _ctx.CallerFrame = f;   // Eval/Execute/GetRef need the caller scope
             return builtin(_ctx, Array.Empty<VbsVariant>());   // Now, Date, Rnd, Err, …
+        }
 
         if (VbsBuiltins.Constants.TryGetValue(e.Name, out var constant))
             return constant;
@@ -629,6 +742,49 @@ public sealed class VbsInterpreter
             $"Object doesn't support this property or method: '{m.Member}'");
     }
 
+    // ── New / With ────────────────────────────────────────────────────────────
+
+    private VbsVariant EvalNew(VbsNewExpr ne)
+    {
+        if (_classes.TryGetValue(ne.ClassName, out var cls))
+        {
+            var instance = new VbsClassInstance(cls, this);
+            instance.Construct(new VbsFrame { Me = instance });
+            _liveInstances.Add(instance);
+            return VbsVariant.Of(instance);
+        }
+        // Intrinsic construction: the sandboxed browser host denies
+        // CreateObject("VBScript.RegExp"), so RegExp is exposed through New.
+        if (ne.ClassName.Equals("RegExp", StringComparison.OrdinalIgnoreCase))
+            return VbsVariant.Of(new VbsRegExpObject());
+        throw new VbsRuntimeException(VbsErrorNumbers.ObjectRequired,
+            $"Class is not defined: '{ne.ClassName}'", ne.Line);
+    }
+
+    /// <summary>With objects of the frame, innermost first.</summary>
+    private IEnumerable<IVbsDispatchObject> WithObjects(VbsFrame f)
+    {
+        if (f.WithStack != null)
+            for (int i = f.WithStack.Count - 1; i >= 0; i--)
+            {
+                var v = f.WithStack[i];
+                if (v.Type == VbVarType.Object && v.AsObject() is { } o)
+                    yield return o;
+            }
+    }
+
+    /// <summary>Unqualified `.Member` read: innermost With object first; the
+    /// outer blocks are consulted only when the inner object lacks the member
+    /// (documented resolution choice).</summary>
+    private VbsVariant EvalWithMemberGet(VbsWithMemberExpr e, VbsFrame f)
+    {
+        foreach (var o in WithObjects(f))
+            if (o.TryGetMember(e.Member, out var value))
+                return value;
+        throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
+            $"Object doesn't support this property or method: '{e.Member}'");
+    }
+
     /// <summary>
     /// Runtime resolution of name(args): user procedure → builtin → array
     /// index → object default-property invoke. byrefAllowed is false only for
@@ -644,7 +800,11 @@ public sealed class VbsInterpreter
                 return InvokeProcedure(proc, e.Args, f, byrefAllowed);
 
             if (VbsBuiltins.Table.TryGetValue(n, out var builtin))
-                return builtin(_ctx, EvalArgs(e.Args, f));
+            {
+                var vals = EvalArgs(e.Args, f);
+                _ctx.CallerFrame = f;   // Eval/Execute/GetRef need the caller scope
+                return builtin(_ctx, vals);
+            }
 
             if (TryFindCell(n, f, out var cell))
             {
@@ -685,6 +845,19 @@ public sealed class VbsInterpreter
             if (argVals.Length == 0 && obj.TryGetMember(mem.Member, out result)) return result;
             throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
                 $"Object doesn't support this property or method: '{mem.Member}'");
+        }
+
+        // `.Member(args)` inside a With block.
+        if (e.Target is VbsWithMemberExpr wm)
+        {
+            var argVals = EvalArgs(e.Args, f);
+            foreach (var o in WithObjects(f))
+                if (o.TryInvoke(wm.Member, argVals, out var result)) return result;
+            if (argVals.Length == 0)
+                foreach (var o in WithObjects(f))
+                    if (o.TryGetMember(wm.Member, out var result)) return result;
+            throw new VbsRuntimeException(VbsErrorNumbers.ObjectDoesntSupport,
+                $"Object doesn't support this property or method: '{wm.Member}'");
         }
 
         throw new VbsRuntimeException(VbsErrorNumbers.TypeMismatch, "Type mismatch");
@@ -761,6 +934,102 @@ public sealed class VbsInterpreter
         }
     }
 
+    // ── Class methods / Eval / Execute / GetRef ──────────────────────────────
+
+    /// <summary>
+    /// Invokes a class method or property accessor with `me` bound and
+    /// private access enabled. Arguments are values (ByVal only) — the
+    /// IVbsDispatchObject interface cannot carry cells for ByRef writeback.
+    /// </summary>
+    internal VbsVariant InvokeMethod(VbsProcedure proc, VbsVariant[] args, VbsClassInstance me)
+    {
+        if (args.Length != proc.Params.Count)
+            throw new VbsRuntimeException(VbsErrorNumbers.WrongNumberOfArguments,
+                $"Wrong number of arguments: '{proc.Name}'");
+
+        if (++_callDepth > MaxCallDepth)
+        {
+            _callDepth--;
+            throw new VbsRuntimeException(VbsErrorNumbers.OutOfStackSpace,
+                "Out of stack space");
+        }
+        try
+        {
+            var frame = new VbsFrame { Me = me };
+            for (int i = 0; i < proc.Params.Count; i++)
+                frame.Locals[proc.Params[i].Name] = new VbsCell(args[i]);
+
+            VbsCell? ret = null;
+            if (proc.IsFunction)   // Function or Property Get: name = return var
+            {
+                ret = new VbsCell();
+                frame.Locals[proc.Name] = ret;
+                frame.ReturnCell = ret;
+            }
+
+            me.MethodDepth++;
+            try { ExecuteStatementList(proc.Body, frame); }
+            catch (VbsExitProcedureException) { }
+            finally { me.MethodDepth--; }
+
+            return proc.IsFunction ? ret!.Value : VbsVariant.Empty;
+        }
+        finally
+        {
+            _callDepth--;
+        }
+    }
+
+    /// <summary>GetRef(name) → callable reference to a script procedure.</summary>
+    internal IVbsDispatchObject CreateGetRef(string procName)
+    {
+        if (!_procedures.TryGetValue(procName, out var proc))
+            throw new VbsRuntimeException(VbsErrorNumbers.InvalidProcedureCall,
+                $"Invalid procedure call or argument: GetRef('{procName}')");
+        return new VbsGetRefObject(this, proc);
+    }
+
+    /// <summary>Eval(code): compiles an expression and evaluates it in the
+    /// CALLER's scope. `=` is comparison here — assignments never happen
+    /// through Eval.</summary>
+    internal VbsVariant EvalText(string code, VbsFrame? callerFrame)
+    {
+        VbsExpr expr;
+        try { expr = VbsParser.ParseExpressionText(code); }
+        catch (VbsSyntaxException ex)
+        { throw new VbsRuntimeException(ex.Number, ex.Message); }
+        var frame = callerFrame ?? new VbsFrame { Locals = _globals, IsGlobal = true };
+        return EvalExpr(expr, frame);
+    }
+
+    /// <summary>Execute(code): compiles statements and runs them in the
+    /// CALLER's scope (procedure locals are visible and mutable). Procedures
+    /// and classes declared inside become global.</summary>
+    internal void ExecuteText(string code, VbsFrame? callerFrame)
+    {
+        VbsScript script = ParseRuntimeCode(code);
+        RegisterProcedures(script);   // procs/classes declared inside become global
+        var frame = callerFrame ?? new VbsFrame { Locals = _globals, IsGlobal = true };
+        ExecuteStatementList(script.Body, frame);
+    }
+
+    /// <summary>ExecuteGlobal(code): compiles statements and runs them in the
+    /// GLOBAL scope — procedure locals of the caller are NOT visible.</summary>
+    internal void ExecuteGlobalText(string code)
+    {
+        VbsScript script = ParseRuntimeCode(code);
+        RegisterProcedures(script);
+        var frame = new VbsFrame { Locals = _globals, IsGlobal = true };
+        ExecuteStatementList(script.Body, frame);
+    }
+
+    private static VbsScript ParseRuntimeCode(string code)
+    {
+        try { return VbsParser.Parse(code); }
+        catch (VbsSyntaxException ex)
+        { throw new VbsRuntimeException(ex.Number, ex.Message); }
+    }
+
     // ── Scope helpers ───────────────────────────────────────────────────────
 
     private bool TryFindCell(string name, VbsFrame f, out VbsCell cell)
@@ -768,6 +1037,12 @@ public sealed class VbsInterpreter
         if (f.Locals.TryGetValue(name, out var localCell))
         {
             cell = localCell;
+            return true;
+        }
+        // Class code sees its instance's fields unqualified (Me.X optional).
+        if (f.Me != null && f.Me.Fields.TryGetValue(name, out var meCell))
+        {
+            cell = meCell;
             return true;
         }
         if (_globals.TryGetValue(name, out var globalCell))
@@ -781,12 +1056,13 @@ public sealed class VbsInterpreter
 
     /// <summary>
     /// Cell for an assignment: existing declaration first (procedure-local,
-    /// then global). Undeclared: Option Explicit → 500; otherwise implicit —
-    /// local when inside a procedure, global at script level.
+    /// class field, then global). Undeclared: Option Explicit → 500; otherwise
+    /// implicit — local when inside a procedure, global at script level.
     /// </summary>
     private VbsCell ResolveCellForWrite(string name, VbsFrame f)
     {
         if (f.Locals.TryGetValue(name, out var cell)) return cell;
+        if (f.Me != null && f.Me.Fields.TryGetValue(name, out var meCell)) return meCell;
         if (f.IsGlobal)
         {
             cell = new VbsCell();

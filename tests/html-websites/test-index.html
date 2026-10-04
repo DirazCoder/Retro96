@@ -1,26 +1,58 @@
-<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
-<HTML>
-<HEAD><TITLE>Retro96 HTML Website Test Index</TITLE></HEAD>
-<BODY BGCOLOR="#FFFFCC" TEXT="#000000" LINK="#0000EE" VLINK="#551A8B" ALINK="#FF0000">
-<H1><FONT COLOR="#800000">Retro96 HTML Website Test Suite</FONT></H1>
-<P>The fixtures are organised by feature. The <B>FULL</B> pages are the broad integration batteries; the other pages are intentionally focused regressions used to isolate specific bugs.</P>
-<HR>
-<TABLE BORDER="1" CELLPADDING="4" CELLSPACING="0" WIDTH="100%">
-<TR BGCOLOR="#E0E0E0"><TH>Area</TH><TH>Full battery</TH><TH>Focused fixtures</TH></TR>
-<TR><TD>HTML / parser</TD><TD><A HREF="html/html-full-fixed.html">html-full-fixed.html</A><BR><A HREF="html/broken-html-full.html">broken-html-full.html</A></TD><TD>basic-text, broken-html, encoding-entities, legacy-html-96, links, lists, whitespace-inline</TD></TR>
-<TR><TD>CSS</TD><TD><A HREF="css/css-full-fixed.html">css-full-fixed.html</A></TD><TD>css-basic, css-box-model, css-selectors, css-layout-edge, floats</TD></TR>
-<TR><TD>Forms</TD><TD><A HREF="forms/forms-full-fixed.html">forms-full-fixed.html</A></TD><TD>forms-controls-extended, forms-checked-regression, password-selection, selection-mouse</TD></TR>
-<TR><TD>Images</TD><TD><A HREF="images/images-full-fixed.html">images-full-fixed.html</A></TD><TD>images-alt, images-in-tables</TD></TR>
-<TR><TD>JavaScript / DOM</TD><TD><A HREF="javascript/javascript-full-fixed.html">javascript-full-fixed.html</A></TD><TD>javascript-nasty, javascript-timers, dom-properties-events, navigation-history-query</TD></TR>
-<TR><TD>Tables</TD><TD><A HREF="tables/tables-full-fixed.html">tables-full-fixed.html</A></TD><TD>table-edge-cases, table-links, table-nasty</TD></TR>
-<TR><TD>Frames</TD><TD><A HREF="frames/frames-full-fixed.html">frames-full-fixed.html</A></TD><TD>frames-main, frames-nav, frames-banner, frame-child, frames-interaction</TD></TR>
-<TR><TD>Java</TD><TD><A HREF="java/java-full-fixed.html">java-full-fixed.html</A></TD><TD>test.html + class fixtures</TD></TR>
-<TR><TD>Server</TD><TD><A HREF="server/server-full-fixed.html">server-full-fixed.html</A></TD><TD>register.cgi, register.py, sizes.cgi, sizes.py</TD></TR>
-<TR><TD>1996-style sites</TD><TD><A HREF="sites/sites-full-fixed.html">sites-full-fixed.html</A></TD><TD>1996-corporate, corp-top, corp-nav, corp-main</TD></TR>
-</TABLE>
-<HR>
-<P><FONT SIZE="2">Server helpers are under <A HREF="server/cgi-bin/register.py">server/cgi-bin/</A>. CSS companion assets remain beside the CSS full battery.</FONT></P>
-<P><FONT SIZE="2">Do not edit the malformed full fixture to make it valid: <A HREF="html/broken-html-full.html">broken-html-full.html</A> is deliberately tag soup.</FONT></P>
-</BODY>
-</HTML>
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>Retro96 → 1999 QA Suite Index</title></head>
+<body bgcolor="#FFFFFF" text="#000000" link="#0000FF" vlink="#800080">
+<h1>Retro96 → 1999 QA Suite</h1>
+<p>One page per checklist section of the 1996→1999 upgrade, plus the
+error-recovery, Acid1 and Y2K pages the test plan calls for. Load each
+page in the browser and read the in-page report lines; the xUnit suite
+(tests/RetroTests/Retro99SuiteTests.cs) asserts the same contracts
+headlessly.</p>
 
+<h2>Core batteries</h2>
+<ul>
+<li><a href="html/html401-full.html">HTML 4.01 element battery</a> — §4: the full 4.0/4.01 set, deprecated-but-rendered, entities, concealment, ruby</li>
+<li><a href="html/broken-html-1999.html">Deliberately broken HTML</a> — §4/§17 error recovery torture page</li>
+<li><a href="forms/forms-1999.html">Forms 4.01</a> — §5: label, fieldset/legend, button, optgroup, disabled/readonly, file, image, wrap</li>
+<li><a href="tables/tables-1999.html">Tables</a> — §6: row groups, frame/rules, bordercolor family, collapse/fixed CSS2 tables</li>
+<li><a href="frames/frames-1999.html">Frames, iframe, object</a> — §7: frameset battery (nav/banner/main children)</li>
+<li><a href="css/css2-selectors.html">CSS2 selectors</a> — §8: child/adjacent/attribute/:first-child/:lang/:before/:after/inherit/@media</li>
+<li><a href="css/css2-boxmodel.html">CSS2 layout &amp; box model</a> — §9: positioning, z-index, min/max, overflow/clip, outline, IE5 box-model persona</li>
+</ul>
+
+<h2>DOM and scripting</h2>
+<ul>
+<li><a href="dom/dom-level1.html">DOM Level 1</a> — §10: tree surgery, createTextNode, attributes</li>
+<li><a href="dom/dom-ie5-dhtml.html">IE5 DHTML object model</a> — §10: document.all, innerHTML family, offsets, currentStyle, pixelLeft</li>
+<li><a href="dom/dom-ns4-layers.html">NS4.7 layer DOM</a> — §10: document.layers battery (use the Navigator 4.7 profile)</li>
+<li><a href="events/events-1999.html">Event models</a> — §11: IE bubbling/window.event/attachEvent + NS4 capture model + 4.01 intrinsics</li>
+<li><a href="javascript/es3-1999.html">JavaScript/JScript</a> — §12: ES3 + JS1.3 + JScript 5, version gating, host objects</li>
+<li><a href="vbscript/vbscript5.html">VBScript 5.0</a> — §13: Class/With/Eval/Execute/RegExp/GetRef</li>
+</ul>
+
+<h2>Compatibility extras</h2>
+<ul>
+<li><a href="ie/ie5-extras.html">IE5 extras</a> — §14a: marquee, bgsound, comment, ruby, body margins, filters, xml islands</li>
+<li><a href="netscape/ns4-extras.html">NS4.7 extras</a> — §14b: layer/ilayer/nolayer, multicol, spacer, JSSS, keygen</li>
+</ul>
+
+<h2>Images, media, network</h2>
+<ul>
+<li><a href="images/images-media.html">Images &amp; media</a> — §15: PNG alpha, GIF89a, JPEG, lowsrc, maps, audio</li>
+<li><a href="network/http11-page.html">HTTP/1.1</a> — §16: served by the loopback server; keep-alive, chunked, cache validation</li>
+</ul>
+
+<h2>Classic reference tests</h2>
+<ul>
+<li><a href="acid1.html">Acid1</a> — 1998 CSS1 box-model smoke test</li>
+<li><a href="y2k.html">Y2K</a> — Date.getYear/getFullYear, cookie expiry past 2000</li>
+</ul>
+
+<h2>Regression</h2>
+<ul>
+<li><a href="javascript/javascript-basic.html">javascript-basic.html</a> — the 1996-era script-contract page kept for xUnit dependencies</li>
+<li>Real-world 1996/1999 pages live in <tt>../../testdata/</tt> (the-old-net style sites)</li>
+<li>Java applet fixtures live in <tt>java/</tt> (Java is parked at 1996 compatibility on purpose)</li>
+</ul>
+</body>
+</html>

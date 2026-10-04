@@ -1,0 +1,59 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>Images and Media Battery (1999)</title>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>Images &amp; media battery</h1>
+
+<h2>PNG (native in both big browsers since autumn 1997)</h2>
+<p><img src="../images/dot16.png" width="64" height="64" border="0"
+  alt="16x16 PNG scaled 64x64"></p>
+<p>Full alpha is the engine default; the period-correct toggle turns it
+into binary transparency (NS 4.04-4.51 had none, IE4 on Windows converted
+alpha to binary transparency).</p>
+
+<h2>GIF89a: animation, transparency, interlace</h2>
+<p><img src="../css/bullet.gif" width="12" height="12" alt="bullet">
+plain GIF bullet.
+<img src="../../testdata/anistarbkgd.gif" width="80" height="24" alt="animated">
+animated GIF from the regression corpus.</p>
+
+<h2>JPEG</h2>
+<p><img src="../../testdata/logo.jpg" width="120" alt="JPEG photo">
+progressive + baseline JPEG both decode.</p>
+
+<h2>lowsrc: the low-resolution image shows first</h2>
+<p><img src="../../testdata/one.jpg" lowsrc="../images/pixel-dot.gif"
+  width="100" alt="lowsrc pair">lowsrc first, then the real image.</p>
+
+<h2>Image maps: client-side map + server-side ismap</h2>
+<p><img src="../images/dot16.png" width="120" height="40" border="1"
+  usemap="#navmap" alt="client-side map">
+<map name="navmap">
+  <area shape="rect" coords="0,0,40,40" href="#png" alt="left">
+  <area shape="rect" coords="40,0,80,40" href="#gif" alt="middle">
+  <area shape="rect" coords="80,0,120,40" href="#jpeg" alt="right">
+</map></p>
+<p><a href="/cgi/ismap"><img src="../images/pixel-dot.gif" ismap
+  width="40" height="16" border="0" alt="server-side ismap"></a>
+server-side image map (click coordinates appended to the URL).</p>
+
+<h2>Preloading with the Image() constructor</h2>
+<script language="JavaScript1.3">
+var pre1 = new Image();
+pre1.onload = function () { window.status = "preloaded ok"; };
+pre1.src = "../images/pixel-dot.gif";
+</script>
+
+<h2>bgsound and embed audio</h2>
+<bgsound src="../images/tada.wav" loop="infinite">
+<embed src="../images/theme.mid" width="140" height="28"
+  autostart="false" loop="true">
+<noembed>audio embed not supported</noembed>
+
+<h2>dynsrc AVI</h2>
+<p><img dynsrc="../images/clip.avi" src="../images/pixel-dot.gif"
+  start="mouseover" loop="infinite" width="32" height="32" alt="avi"></p>
+
+</body>
+</html>

@@ -7,8 +7,11 @@ namespace Retro96.Engine.Vbs;
 
 /// <summary>
 /// Shared runtime state handed to every builtin: the host (output, dialogs,
-/// object creation), the RNG (Rnd/Randomize), the Err object, and the last
-/// Rnd value (Rnd(0) repeats it).
+/// object creation), the RNG (Rnd/Randomize), the Err object, the last Rnd
+/// value (Rnd(0) repeats it), and — for the VBScript 5.0 builtins that call
+/// back into the runtime — the owning interpreter and the frame active at
+/// the call site (Eval/Execute run in the caller's scope; GetRef needs the
+/// procedure table).
 /// </summary>
 public sealed class VbsRuntimeContext
 {
@@ -16,6 +19,17 @@ public sealed class VbsRuntimeContext
     public Random Random { get; set; }
     public VbsErrObject Err { get; }
     internal double LastRnd;
+
+    /// <summary>The interpreter invoking the builtin (set by the interpreter;
+    /// builtins are never called without one).</summary>
+    internal VbsInterpreter? Interpreter { get; set; }
+
+    /// <summary>The frame active at the builtin call site — the caller scope
+    /// of Eval/Execute. Maintained by the interpreter.</summary>
+    internal VbsFrame? CallerFrame { get; set; }
+
+    /// <summary>Cached Debug object (Write buffering is per-session).</summary>
+    internal VbsDebugObject? Debug { get; set; }
 
     public VbsRuntimeContext(IVbsScriptHost host, Random random, VbsErrObject err)
     {
@@ -28,9 +42,11 @@ public sealed class VbsRuntimeContext
 public delegate VbsVariant VbsBuiltinFunction(VbsRuntimeContext ctx, VbsVariant[] args);
 
 /// <summary>
-/// The VBScript 1.0 intrinsic library: conversions, string functions, math,
-/// dates, type information, and the host-routed MsgBox/InputBox/
-/// CreateObject/GetObject — plus the vb* named constants.
+/// The VBScript 5.0 intrinsic library: conversions, string functions, math,
+/// dates, type information, the host-routed MsgBox/InputBox/CreateObject/
+/// GetObject — plus the 5.0 additions (Array, Filter, RGB, Eval, Execute,
+/// ExecuteGlobal, GetRef, Escape/Unescape, ScriptEngine*, Debug) and the
+/// vb* named constants.
 ///
 /// The tables are case-insensitive (VBScript identifiers are), and the
 /// interpreter checks procedure locals/globals BEFORE the builtin table for
@@ -38,10 +54,12 @@ public delegate VbsVariant VbsBuiltinFunction(VbsRuntimeContext ctx, VbsVariant[
 /// </summary>
 public static class VbsBuiltins
 {
-    // Engine version reported by the WSH-style host probes.
-    public const int EngineMajor = 1;
+    // Engine version reported by ScriptEngine*/WScript probes.
+    // Build 6325: a plausible IE5.0-era VBScript 5.0 build number (IE5.0 in
+    // 1999 shipped v5.0; Windows 2000's later 5.1 reported build 5010).
+    public const int EngineMajor = 5;
     public const int EngineMinor = 0;
-    public const int EngineBuild = 0;
+    public const int EngineBuild = 6325;
 
     public static readonly Dictionary<string, VbsVariant> Constants =
         new(StringComparer.OrdinalIgnoreCase);
@@ -58,6 +76,7 @@ public static class VbsBuiltins
         RegisterDates();
         RegisterTypeInformation();
         RegisterHostFunctions();
+        RegisterVbs50Functions();
     }
 
     // ── Argument helpers ───────────────────────────────────────────────────
@@ -137,7 +156,8 @@ public static class VbsBuiltins
         C("vbEmpty", 0); C("vbNull", 1); C("vbInteger", 2); C("vbLong", 3);
         C("vbSingle", 4); C("vbDouble", 5); C("vbCurrency", 6); C("vbDate", 7);
         C("vbString", 8); C("vbObject", 9); C("vbError", 10); C("vbBoolean", 11);
-        C("vbVariant", 12); C("vbArray", 8192); C("vbByte", 17);
+        C("vbVariant", 12); C("vbDataObject", 13); C("vbDecimal", 14);
+        C("vbArray", 8192); C("vbByte", 17);
 
         // FormatDateTime named formats
         C("vbGeneralDate", 0); C("vbLongDate", 1); C("vbShortDate", 2);
@@ -994,6 +1014,171 @@ public static class VbsBuiltins
                     "ActiveX component can't create object");
             return VbsVariant.Of(obj);
         };
+    }
+
+    // ── VBScript 5.0 additions ──────────────────────────────────────────────
+
+    private static VbsInterpreter Runtime(VbsRuntimeContext ctx) =>
+        ctx.Interpreter ??
+        throw new VbsRuntimeException(VbsErrorNumbers.InvalidProcedureCall,
+            "Invalid procedure call or argument");
+
+    private static void RegisterVbs50Functions()
+    {
+        // Array(arglist) — zero-based fixed Variant array.
+        Table["Array"] = (ctx, a) =>
+        {
+            var arr = VbsArray.Allocate(false, a.Length);
+            for (int i = 0; i < a.Length; i++)
+                arr.Set(new[] { i }, a[i]);
+            return VbsVariant.Of(arr);
+        };
+
+        // Filter(InputStrings, Value[, Include[, Compare]])
+        Table["Filter"] = (ctx, a) =>
+        {
+            if (a.Length < 2) throw Err5();
+            var input = a[0];
+            if (input.Type != VbVarType.Array) throw Err13();
+            var arr = input.AsArray();
+            string value = a[1].Type == VbVarType.Null ? "" : S(a[1]);
+            bool include = Tri(a, 2, true);
+            StringComparison cmp = Cmp(a, 3);
+            var kept = new List<VbsVariant>();
+            foreach (var el in arr.Elements())
+            {
+                string s = el.Type == VbVarType.Null ? "" : S(el);
+                bool contains = s.IndexOf(value, cmp) >= 0;
+                if (contains == include)
+                    kept.Add(VbsVariant.Of(s));
+            }
+            var result = VbsArray.Allocate(false, kept.Count);
+            for (int i = 0; i < kept.Count; i++)
+                result.Set(new[] { i }, kept[i]);
+            return VbsVariant.Of(result);
+        };
+
+        // RGB(red, green, blue) — the classic BGR-packed color value.
+        Table["RGB"] = (ctx, a) =>
+        {
+            if (a.Length < 3) throw Err5();
+            long r = a[0].ToLongMath(), g = a[1].ToLongMath(), b = a[2].ToLongMath();
+            if (r is < 0 or > 255 || g is < 0 or > 255 || b is < 0 or > 255) throw Err5();
+            return VbsVariant.FromLong(r + g * 256 + b * 65536);
+        };
+
+        // Eval(exprString) — expression evaluation in the CALLER's scope;
+        // `=` inside is comparison, never assignment.
+        Table["Eval"] = (ctx, a) =>
+        {
+            var v = Need1(a);
+            return Runtime(ctx).EvalText(S(v), ctx.CallerFrame);
+        };
+
+        // Execute(statements) — runs in the CALLER's scope, returns nothing.
+        Table["Execute"] = (ctx, a) =>
+        {
+            var v = Need1(a);
+            Runtime(ctx).ExecuteText(S(v), ctx.CallerFrame);
+            return VbsVariant.Empty;
+        };
+
+        // ExecuteGlobal(statements) — runs in the GLOBAL scope.
+        Table["ExecuteGlobal"] = (ctx, a) =>
+        {
+            var v = Need1(a);
+            Runtime(ctx).ExecuteGlobalText(S(v));
+            return VbsVariant.Empty;
+        };
+
+        // GetRef(procname) → callable reference.
+        Table["GetRef"] = (ctx, a) =>
+            VbsVariant.Of(Runtime(ctx).CreateGetRef(S(Need1(a))));
+
+        // The Debug object (Write buffers, WriteLine flushes through the host).
+        Table["Debug"] = (ctx, a) =>
+            VbsVariant.Of(ctx.Debug ??= new VbsDebugObject(ctx.Host));
+
+        // ScriptEngine* version surface.
+        Table["ScriptEngine"] = (ctx, a) => VbsVariant.Of("VBScript");
+        Table["ScriptEngineMajorVersion"] = (ctx, a) => VbsVariant.Of((short)EngineMajor);
+        Table["ScriptEngineMinorVersion"] = (ctx, a) => VbsVariant.Of((short)EngineMinor);
+        Table["ScriptEngineBuildVersion"] = (ctx, a) => VbsVariant.FromLong(EngineBuild);
+
+        Table["Escape"] = (ctx, a) =>
+        {
+            var v = Need1(a);
+            if (v.Type == VbVarType.Null) return VbsVariant.Null;
+            return VbsVariant.Of(EscapeString(S(v)));
+        };
+
+        Table["Unescape"] = (ctx, a) =>
+        {
+            var v = Need1(a);
+            if (v.Type == VbVarType.Null) return VbsVariant.Null;
+            return VbsVariant.Of(UnescapeString(S(v)));
+        };
+    }
+
+    /// <summary>JScript-compatible escape: [A-Za-z0-9*@_+-.] pass through,
+    /// chars ≤ 0xFF become %XX, above become %uXXXX (uppercase hex).</summary>
+    private static string EscapeString(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (char c in s)
+        {
+            if (c is (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9')
+                or '@' or '*' or '_' or '+' or '-' or '.')
+            {
+                sb.Append(c);
+            }
+            else if (c <= 0xFF)
+            {
+                sb.Append('%').Append(((int)c).ToString("X2"));
+            }
+            else
+            {
+                sb.Append("%u").Append(((int)c).ToString("X4"));
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>JScript-compatible unescape: %uXXXX and %XX decode; malformed
+    /// escapes are passed through literally.</summary>
+    private static string UnescapeString(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '%')
+            {
+                if (i + 5 < s.Length && (s[i + 1] is 'u' or 'U') && IsHex(s, i + 2, 4))
+                {
+                    sb.Append((char)Convert.ToInt32(s.Substring(i + 2, 4), 16));
+                    i += 5;
+                    continue;
+                }
+                if (i + 2 < s.Length && IsHex(s, i + 1, 2))
+                {
+                    sb.Append((char)Convert.ToInt32(s.Substring(i + 1, 2), 16));
+                    i += 2;
+                    continue;
+                }
+            }
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsHex(string s, int start, int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            if (!Uri.IsHexDigit(s[start + i])) return false;
+        }
+        return true;
     }
 }
 

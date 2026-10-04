@@ -1,0 +1,89 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>IE5 Extras Battery (1999)</title>
+<style type="text/css">
+  .hand { cursor: hand; }
+  .gray { filter: gray; }
+  .flip { filter: flipv; }
+  .alpha { filter: alpha(opacity=50); }
+</style>
+</head>
+<body bgcolor="#FFFFFF" leftmargin="10" topmargin="15" rightmargin="10"
+      bottommargin="15" bgproperties="fixed" scroll="yes">
+<h1>IE5 extras battery</h1>
+
+<h2>marquee: the full attribute set</h2>
+<marquee behavior="scroll" direction="left" scrollamount="6"
+         scrolldelay="85" width="70%" height="24" bgcolor="#FFFFCC"
+         hspace="8" vspace="8"
+         onstart="window.status='marquee started'"
+         onbounce="window.status='marquee bounced'"
+         onfinish="window.status='marquee finished'">
+  scrolling marquee (behavior=scroll, default loop)
+</marquee>
+<marquee behavior="alternate" direction="right" scrollamount="3"
+         trueSpeed scrolldelay="20" loop="2" height="24">
+  alternating marquee (bounce events fire)
+</marquee>
+<marquee behavior="slide" scrollamount="8" loop="1">
+  slide marquee (onfinish after one pass)
+</marquee>
+<p>defaults: scrollamount 6, scrolldelay 85ms, loop infinite; delays under
+60ms round up unless <tt>trueSpeed</tt>.</p>
+
+<h2>bgsound (audio: WAV/MIDI)</h2>
+<bgsound src="../images/tada.wav" loop="1">
+<p>bgsound src + loop (audio device permitting).</p>
+
+<h2>comment / nobr / ruby</h2>
+<comment>IE COMMENT content never renders — check view-source only</comment>
+<nobr>this line will not wrap no matter how narrow the window gets
+<wbr>except at this explicit word-break opportunity</nobr>
+<p><ruby>HTML<rt>HyperText Markup Language</rt></ruby> — ruby annotation.</p>
+
+<h2>body IE extras</h2>
+<p>leftmargin=10 topmargin=15 rightmargin=10 bottommargin=15,
+bgproperties=fixed, scroll=yes — all set on this page's body.</p>
+<table border="1"><tr><td nowrap>dd nowrap (IE)</td>
+<td nowrap><div nowrap>div nowrap (IE)</div></td></tr></table>
+
+<h2>IE table/frameset extras</h2>
+<table border="2" bordercolor="#0000FF" bordercolorlight="#CCCCFF"
+       bordercolordark="#000080" cellpadding="3">
+  <caption valign="bottom">caption valign=bottom</caption>
+  <tr><td>border color family above</td></tr>
+</table>
+
+<h2>dynsrc / lowsrc (AVI + low-res image)</h2>
+<p><img src="../images/pixel-dot.gif" lowsrc="../images/pixel-dot.gif"
+  dynsrc="../images/clip.avi" loop="1" start="fileopen" width="16"
+  height="16" alt="dynsrc"> lowsrc first, then dynsrc video.</p>
+
+<h2>CSS: cursor hand + static filters (alpha/gray/flip)</h2>
+<p class="hand" style="border:1px solid #888; padding:6px;">
+cursor: hand — the IE alias</p>
+<p class="gray" style="border:1px solid #888; padding:6px;">
+filter: gray (desaturated text block)</p>
+<p class="flip" style="border:1px solid #888; padding:6px;">
+filter: flipv (vertically flipped)</p>
+<p class="alpha" style="border:1px solid #888; padding:6px; background:#CCFFCC;">
+filter: alpha(opacity=50)</p>
+
+<h2>xml data island + ActiveX fallback</h2>
+<xml id="island">
+  <courses>
+    <course id="1" title="DHTML for pros"/>
+    <course id="2" title="IE5 in 21 days"/>
+  </courses>
+</xml>
+<script language="JScript">
+function readIsland() {
+  var xml = document.all("island");
+  window.status = "island=" + (xml ? "present" : "NULL");
+  return true;
+}
+</script>
+<p><a href="#" onclick="return readIsland()">probe the XML data island</a></p>
+
+</body>
+</html>

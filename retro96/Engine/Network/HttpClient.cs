@@ -35,10 +35,12 @@ public record TooManyRedirects() : HttpResult;
 internal sealed record PluginNetworkRuleDecision(bool Blocked, string? RedirectUrl, IReadOnlySet<string> StripHeaders);
 
 /// <summary>
-/// Minimal HTTP/1.0 client over raw sockets — one connection per request,
-/// "Connection: close", no keep-alive, exactly like the era.  Supports
-/// GET/POST, redirects with a cap, cookies, Basic authentication, gzip
-/// (defensive — the request never asks for it), and never lets a bad
+/// HTTP client over raw sockets.  The 1999 personas speak HTTP/1.1
+/// (RFC 2616): keep-alive connection pooling, chunked responses, mandatory
+/// Host header, and ETag / If-None-Match / If-Modified-Since validation
+/// caching.  The 1996 historical personas keep the original one-shot
+/// HTTP/1.0 + "Connection: close" behaviour.  Supports GET/POST, redirects
+/// with a cap, cookies, Basic authentication, gzip, and never lets a bad
 /// Content-Length — or a gzip bomb — allocate unbounded memory.
 /// </summary>
 public class HttpClient
@@ -50,11 +52,23 @@ public class HttpClient
         _allowInvalidCertificates = allowInvalidCertificates;
     }
 
+    /// <summary>True when the process-wide HTTP cache should be consulted
+    /// for plain GETs (no cookies, no auth).  Tests can force it off.</summary>
+    public static bool CacheEnabled => BrowserRuntime.HttpCacheEnabled;
+
     /// <summary>When set by a broker session, this replaces BrowserRuntime.UserAgent for wire headers.</summary>
     public string? UserAgentOverride { get; set; }
 
     /// <summary>Current page URL used as the Referer header when enabled.</summary>
     public string? ReferrerOverride { get; set; }
+
+    /// <summary>Exposes the shared validation cache so shells/tests can clear it.</summary>
+    public static void ClearCache() => _sharedCache.Clear();
+
+    // Process-wide: the era's browser kept ONE connection cache and ONE
+    // document cache for the whole session, and so do we.
+    private static readonly HttpValidationCache _sharedCache = new();
+    private static readonly ConnectionPool _sharedPool = new();
 
     internal Func<string, IReadOnlyDictionary<string, string>, PluginNetworkRuleDecision>? PluginRuleEvaluator { get; set; }
 
@@ -163,9 +177,33 @@ public class HttpClient
             ? url.Path
             : url.Path + "?" + url.Query;
 
+        // ── HTTP/1.1 validation caching (GET only, never for cookie/auth
+        // personalized requests). A fresh entry short-circuits the wire;
+        // a stale one attaches If-None-Match / If-Modified-Since so a 304
+        // can be answered from cache.
+        string cacheKey = url.ToAbsolute();
+        HttpValidationCache.CachedResponse? cached = null;
+        string? ifNoneMatch = null, ifModifiedSince = null;
+        if (CacheEnabled && method == "GET" && body == null &&
+            string.IsNullOrEmpty(cookieValues) && BasicAuthHeader == null)
+        {
+            cached = _sharedCache.Lookup(cacheKey);
+            if (cached is { IsFresh: true })
+            {
+                Retro96.DebugLog.Write($"[HTTP] cache HIT (fresh) {cacheKey}");
+                return cached.Success;
+            }
+            if (cached != null)
+            {
+                ifNoneMatch = cached.ETag;
+                ifModifiedSince = cached.LastModified;
+            }
+        }
+
         var requestHeaders = extraHeaders == null ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) : new Dictionary<string, string>(extraHeaders, StringComparer.OrdinalIgnoreCase);
         var (headerBlock, headerBytes) = BuildRequestHeaders(
-            method, url, requestPath, cookieValues, body, contentType, requestHeaders, ruleDecision?.StripHeaders);
+            method, url, requestPath, cookieValues, body, contentType, requestHeaders, ruleDecision?.StripHeaders,
+            ifNoneMatch, ifModifiedSince);
 
         HttpResult result;
         if (SandboxContext.BrokerAllNetwork ||
@@ -188,11 +226,26 @@ public class HttpClient
         }
         else
         {
-            result = await SendOverSocketAsync(url, headerBytes, ct);
+            result = await SendOverSocketAsync(url, headerBytes, ct).ConfigureAwait(false);
         }
 
         if (result is not HttpSuccess success)
             return result;
+
+        // 304 Not Modified → serve the stored representation.
+        if (success.StatusCode == 304 && cached != null)
+        {
+            Retro96.DebugLog.Write($"[HTTP] cache REVALIDATED (304) {cacheKey}");
+            _sharedCache.Touch(cacheKey);
+            return cached.Success;
+        }
+
+        // Store cacheable 200 GETs for later revalidation.
+        if (CacheEnabled && method == "GET" && success.StatusCode == 200 &&
+            string.IsNullOrEmpty(cookieValues) && BasicAuthHeader == null)
+        {
+            _sharedCache.Store(cacheKey, success);
+        }
 
         // Set-Cookie on ANY response (including redirects). Keep each field
         // separate because Expires=... contains commas and HTTP does not
@@ -285,12 +338,16 @@ public class HttpClient
     private (string Text, byte[] Wire) BuildRequestHeaders(
         string method, ParsedUrl url, string path,
         string cookieValues, byte[]? body, string? contentType,
-        IReadOnlyDictionary<string, string>? extraHeaders = null, IReadOnlySet<string>? stripHeaders = null)
+        IReadOnlyDictionary<string, string>? extraHeaders = null, IReadOnlySet<string>? stripHeaders = null,
+        string? ifNoneMatch = null, string? ifModifiedSince = null)
     {
         var sb = new StringBuilder(256);
 
+        // 1999 personas speak HTTP/1.1 (RFC 2616, June 1999); the 1996
+        // historical personas keep the HTTP/1.0 request line.
+        bool http11 = BrowserRuntime.Http11Enabled;
         sb.Append(method.ToUpperInvariant()).Append(' ')
-          .Append(path).Append(" HTTP/1.0\r\n");
+          .Append(path).Append(http11 ? " HTTP/1.1\r\n" : " HTTP/1.0\r\n");
 
         // Only the scheme's DEFAULT port is omitted — the old scheme-blind
         // check dropped ":80" from "https://host:80" too.
@@ -302,8 +359,19 @@ public class HttpClient
 
         // Match navigator.userAgent so sniffing scripts agree with the wire
         sb.Append("User-Agent: ").Append(UserAgentOverride ?? BrowserRuntime.UserAgent).Append("\r\n");
-        sb.Append("Accept: text/html, image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, */*\r\n");
+        // The era's Accept line. IE3/NS3 never advertised image/png —
+        // servers doing content negotiation keyed on that (checklist §16);
+        // the 1999 personas do advertise it.
+        sb.Append("Accept: text/html, image/gif, image/x-xbitmap, image/jpeg, image/pjpeg")
+          .Append(BrowserRuntime.AdvertisesPngImages ? ", image/png" : "")
+          .Append(", */*\r\n");
         sb.Append("Accept-Charset: iso-8859-1,*,utf-8\r\n");
+
+        // HTTP/1.1 cache validators (revalidation requests only).
+        if (!string.IsNullOrEmpty(ifNoneMatch))
+            sb.Append("If-None-Match: ").Append(ifNoneMatch).Append("\r\n");
+        if (!string.IsNullOrEmpty(ifModifiedSince))
+            sb.Append("If-Modified-Since: ").Append(ifModifiedSince).Append("\r\n");
         if (BrowserRuntime.RequestCompressedResponses)
             sb.Append("Accept-Encoding: gzip\r\n");
 
@@ -344,7 +412,9 @@ public class HttpClient
             }
         }
 
-        sb.Append("Connection: close\r\n");
+        // HTTP/1.1 defaults to persistent connections; the client keeps a
+        // pooled socket per origin. HTTP/1.0 keeps the era's close semantics.
+        sb.Append(http11 ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
         sb.Append("\r\n");
 
         string headerText = sb.ToString();
@@ -385,78 +455,121 @@ public class HttpClient
         ParsedUrl url, byte[] wire, CancellationToken ct,
         System.Net.IPAddress? connectAddress = null, int maxResponseBytes = MaxBodySize)
     {
-        TcpClient? tcpClient = null;
-        try
+        // HTTP/1.1 keep-alive: the first attempt reuses a pooled persistent
+        // connection when one exists; a stale pooled socket fails fast and
+        // the request is retried exactly once on a fresh connection (the
+        // classic browser behaviour — a dead keep-alive never surfaces as
+        // a page error). HTTP/1.0 modes never pool.
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            tcpClient = new TcpClient();
+            TcpClient? pooledClient = null;
+            Stream? pooledStream = null;
+            bool fromPool = attempt == 0 && BrowserRuntime.Http11Enabled &&
+                            _sharedPool.TryTake(url, out pooledClient, out pooledStream);
 
-            var connectTask = connectAddress == null
-                ? tcpClient.ConnectAsync(url.Host, url.Port, ct).AsTask()
-                : tcpClient.ConnectAsync(connectAddress, url.Port, ct).AsTask();
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(BrowserRuntime.HttpConnectTimeoutSeconds), ct);
-            var completed = await Task.WhenAny(connectTask, timeoutTask);
-
-            if (completed != connectTask)
+            TcpClient? tcpClient = pooledClient;
+            Stream? stream = pooledStream;
+            bool keepAliveCapable = false;
+            try
             {
-                // Observe the abandoned connect so a late failure doesn't
-                // surface as an unobserved-task exception.
-                _ = connectTask.ContinueWith(
-                    t => _ = t.Exception,
-                    TaskContinuationOptions.OnlyOnFaulted |
-                    TaskContinuationOptions.ExecuteSynchronously);
-                return new HttpError("Connection timed out");
+                if (tcpClient == null || stream == null)
+                {
+                    tcpClient = new TcpClient();
+
+                    var connectTask = connectAddress == null
+                        ? tcpClient.ConnectAsync(url.Host, url.Port, ct).AsTask()
+                        : tcpClient.ConnectAsync(connectAddress, url.Port, ct).AsTask();
+                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(BrowserRuntime.HttpConnectTimeoutSeconds), ct);
+                    var completed = await Task.WhenAny(connectTask, timeoutTask);
+
+                    if (completed != connectTask)
+                    {
+                        // Observe the abandoned connect so a late failure doesn't
+                        // surface as an unobserved-task exception.
+                        _ = connectTask.ContinueWith(
+                            t => _ = t.Exception,
+                            TaskContinuationOptions.OnlyOnFaulted |
+                            TaskContinuationOptions.ExecuteSynchronously);
+                        return new HttpError("Connection timed out");
+                    }
+
+                    stream = tcpClient.GetStream();
+
+                    if (url.Scheme == "https")
+                    {
+                        try
+                        {
+                            var sslStream = new SslStream(stream, false,
+                                (sender, cert, chain, errors) => _allowInvalidCertificates || errors == SslPolicyErrors.None);
+                            await sslStream.AuthenticateAsClientAsync(url.Host);
+                            stream = sslStream;
+                        }
+                        catch (AuthenticationException ex)
+                        {
+                            return new CertError($"Certificate error: {ex.Message}");
+                        }
+                    }
+                }
+
+                int responseTimeoutMs = checked(BrowserRuntime.HttpResponseTimeoutSeconds * 1000);
+                stream.ReadTimeout = responseTimeoutMs;
+                stream.WriteTimeout = responseTimeoutMs;
+
+                    await stream.WriteAsync(wire, ct);
+                await stream.FlushAsync(ct);
+
+                // Overall read deadline — a server that never closes the
+                // connection must not hang the browser
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(responseTimeoutMs);
+
+                var (result, connectionReusable) = await ReadResponseAsync(
+                    stream, url, readCts.Token, maxResponseBytes);
+
+                // Return a deterministic-framed, server-acknowledged
+                // keep-alive connection to the pool instead of closing it.
+                if (connectionReusable && result is HttpSuccess && BrowserRuntime.Http11Enabled)
+                {
+                    _sharedPool.Return(url, tcpClient, stream);
+                    keepAliveCapable = true;   // ownership transferred — don't close below
+                }
+
+                // A failure on a REUSED connection means the pooled socket
+                // went stale — retry once on a fresh connection before
+                // surfacing an error to the page.
+                if (fromPool && result is not HttpSuccess)
+                    continue;
+
+                return result;
             }
-
-            Stream stream = tcpClient.GetStream();
-            int responseTimeoutMs = checked(BrowserRuntime.HttpResponseTimeoutSeconds * 1000);
-            stream.ReadTimeout = responseTimeoutMs;
-            stream.WriteTimeout = responseTimeoutMs;
-
-            if (url.Scheme == "https")
+            catch (OperationCanceledException)
             {
-                try
+                return new HttpError("Request cancelled or timed out");
+            }
+            catch (SocketException ex)
+            {
+                if (fromPool) continue;    // stale pooled socket
+                return new HttpError($"Connection failed: {ex.SocketErrorCode} ({ex.Message})", ex);
+            }
+            catch (IOException ex)
+            {
+                if (fromPool) continue;    // stale pooled socket
+                return new HttpError($"Network I/O error: {ex.Message}", ex);
+            }
+            catch (Exception ex)
+            {
+                return new HttpError($"Network error: {ex.Message}", ex);
+            }
+            finally
+            {
+                if (!keepAliveCapable)
                 {
-                    var sslStream = new SslStream(stream, false,
-                        (sender, cert, chain, errors) => _allowInvalidCertificates || errors == SslPolicyErrors.None);
-                    await sslStream.AuthenticateAsClientAsync(url.Host);
-                    stream = sslStream;
-                }
-                catch (AuthenticationException ex)
-                {
-                    return new CertError($"Certificate error: {ex.Message}");
+                    try { tcpClient?.Close(); } catch { }
                 }
             }
+        }
 
-            await stream.WriteAsync(wire, ct);
-            await stream.FlushAsync(ct);
-
-            // Overall read deadline — a server that never closes the
-            // connection must not hang the browser
-            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            readCts.CancelAfter(responseTimeoutMs);
-
-            return await ReadResponseAsync(stream, url, readCts.Token, maxResponseBytes);
-        }
-        catch (OperationCanceledException)
-        {
-            return new HttpError("Request cancelled or timed out");
-        }
-        catch (SocketException ex)
-        {
-            return new HttpError($"Connection failed: {ex.SocketErrorCode} ({ex.Message})", ex);
-        }
-        catch (IOException ex)
-        {
-            return new HttpError($"Network I/O error: {ex.Message}", ex);
-        }
-        catch (Exception ex)
-        {
-            return new HttpError($"Network error: {ex.Message}", ex);
-        }
-        finally
-        {
-            tcpClient?.Close();
-        }
+        return new HttpError("Connection failed after retry");
     }
 
     /// <summary>
@@ -485,12 +598,21 @@ public class HttpClient
         }
     }
 
-    private async Task<HttpResult> ReadResponseAsync(Stream stream, ParsedUrl url,
-                                                     CancellationToken ct, int maxBodySize)
+    /// <summary>
+    /// Reads and decodes one HTTP response.  Returns the result plus
+    /// whether the connection can safely serve another request afterwards
+    /// (HTTP/1.1 + deterministic framing + no "Connection: close").
+    /// </summary>
+    private async Task<(HttpResult Result, bool ConnectionReusable)> ReadResponseAsync(
+        Stream stream, ParsedUrl url, CancellationToken ct, int maxBodySize)
     {
         string? statusLine = await ReadRawLineAsync(stream, ct);
         if (string.IsNullOrEmpty(statusLine))
-            return new HttpError("Empty response from server");
+            return (new HttpError("Empty response from server"), false);
+
+        // "HTTP/1.1 200 OK" — the response protocol version decides
+        // whether persistent connections are on the table.
+        bool responseIsHttp11 = statusLine.StartsWith("HTTP/1.1", StringComparison.OrdinalIgnoreCase);
 
         // "HTTP/1.0 200 OK"
         int statusCode = 0;
@@ -502,7 +624,7 @@ public class HttpClient
             if (statusParts.Length == 3) reason = statusParts[2];
         }
         if (statusCode <= 0)
-            return new HttpError($"Malformed status line: {statusLine}");
+            return (new HttpError($"Malformed status line: {statusLine}"), false);
 
         // Headers
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -526,6 +648,14 @@ public class HttpClient
             }
         }
 
+        // "Connection: close" (or an HTTP/1.0 response without an explicit
+        // keep-alive) ends the connection after this response.
+        bool serverCloses = headers.TryGetValue("connection", out var connectionValue) &&
+                            connectionValue.Contains("close", StringComparison.OrdinalIgnoreCase);
+        bool explicitKeepAlive = headers.TryGetValue("connection", out var kaValue) &&
+                                 kaValue.Contains("keep-alive", StringComparison.OrdinalIgnoreCase);
+        bool connectionReusable = !serverCloses && (responseIsHttp11 || explicitKeepAlive);
+
         string contentType = "text/html";
         string charset = "iso-8859-1";
         if (headers.TryGetValue("content-type", out var ctHeader))
@@ -540,15 +670,19 @@ public class HttpClient
             }
         }
 
-        // Body
+        // Body — the framing style decides whether the connection can
+        // serve another request afterwards: Content-Length and chunked
+        // leave the stream exactly at the next response; read-to-close
+        // does not.
         byte[] body;
+        bool framingDeterministic;
         if (headers.TryGetValue("content-length", out var contentLengthStr) &&
             int.TryParse(contentLengthStr.Trim(), out int contentLength))
         {
             if (contentLength < 0)
-                return new HttpError("Invalid Content-Length");
+                return (new HttpError("Invalid Content-Length"), false);
             if (contentLength > maxBodySize)
-                return new HttpError($"Response body too large: {contentLength} bytes");
+                return (new HttpError($"Response body too large: {contentLength} bytes"), false);
 
             try
             {
@@ -556,17 +690,20 @@ public class HttpClient
             }
             catch (EndOfStreamException)
             {
-                return new HttpError("Truncated HTTP response body");
+                return (new HttpError("Truncated HTTP response body"), false);
             }
+            framingDeterministic = true;
         }
         else if (headers.TryGetValue("transfer-encoding", out var transferEncoding) &&
                  transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
         {
             body = await ReadChunkedAsync(stream, ct, maxBodySize);
+            framingDeterministic = true;
         }
         else
         {
             body = await ReadUntilCloseAsync(stream, ct, maxBodySize);
+            framingDeterministic = false;
         }
 
         // Content-Encoding: gzip (defensive — the request never asks)
@@ -590,19 +727,19 @@ public class HttpClient
                     int n = await gzip.ReadAsync(buf, ct);
                     if (n <= 0) break;
                     if (output.Length + n > maxBodySize)
-                        return new HttpError("Decompressed response body too large");
+                        return (new HttpError("Decompressed response body too large"), false);
                     await output.WriteAsync(buf.AsMemory(0, n), ct);
                 }
                 body = output.ToArray();
             }
             catch
             {
-                return new HttpError("Failed to decompress gzip response body");
+                return (new HttpError("Failed to decompress gzip response body"), false);
             }
         }
 
-        return new HttpSuccess(statusCode, headers, contentType, charset, body,
-            url.ToAbsolute(), setCookies);
+        return (new HttpSuccess(statusCode, headers, contentType, charset, body,
+            url.ToAbsolute(), setCookies), connectionReusable && framingDeterministic);
     }
 
     private static async Task<byte[]> ReadExactAsync(Stream stream, int length, CancellationToken ct)
@@ -689,5 +826,296 @@ internal static class StreamByteExtensions
         byte[] one = new byte[1];
         int n = await stream.ReadAsync(one.AsMemory(0, 1), ct);
         return n == 0 ? -1 : one[0];
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP/1.1 keep-alive connection pool (RFC 2616 §8.1) — one origin-keyed
+// cache of persistent sockets for the whole process, exactly like the era's
+// browsers. Idle connections expire; a dead pooled socket is detected by
+// the request retry in SendOverSocketAsync and never surfaces to the page.
+// ─────────────────────────────────────────────────────────────────────────────
+internal sealed class ConnectionPool
+{
+    private sealed class Entry
+    {
+        public required TcpClient Client { get; init; }
+        public required Stream Stream { get; init; }
+        public DateTime ReturnedUtc { get; init; }
+    }
+
+    private readonly object _gate = new();
+    private readonly Dictionary<string, Queue<Entry>> _byOrigin =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxIdleSeconds = 30;
+    private const int MaxPerOrigin = 4;
+    private const int MaxTotal = 16;
+
+    private static string OriginKey(ParsedUrl url) =>
+        $"{url.Scheme.ToLowerInvariant()}://{url.Host.ToLowerInvariant()}:{url.Port}";
+
+    public bool TryTake(ParsedUrl url, out TcpClient? client, out Stream? stream)
+    {
+        client = null;
+        stream = null;
+        lock (_gate)
+        {
+            if (!_byOrigin.TryGetValue(OriginKey(url), out var queue) || queue.Count == 0)
+                return false;
+            while (queue.Count > 0)
+            {
+                var entry = queue.Dequeue();
+                if ((DateTime.UtcNow - entry.ReturnedUtc).TotalSeconds > MaxIdleSeconds)
+                {
+                    try { entry.Client.Close(); } catch { }
+                    continue;
+                }
+                client = entry.Client;
+                stream = entry.Stream;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public void Return(ParsedUrl url, TcpClient client, Stream stream)
+    {
+        lock (_gate)
+        {
+            SweepExpiredNoLock();
+            string key = OriginKey(url);
+            if (!_byOrigin.TryGetValue(key, out var queue))
+            {
+                queue = new Queue<Entry>();
+                _byOrigin[key] = queue;
+            }
+            if (queue.Count >= MaxPerOrigin || TotalNoLock() >= MaxTotal)
+            {
+                try { client.Close(); } catch { }
+                return;
+            }
+            queue.Enqueue(new Entry
+            {
+                Client = client,
+                Stream = stream,
+                ReturnedUtc = DateTime.UtcNow
+            });
+        }
+    }
+
+    private int TotalNoLock()
+    {
+        int total = 0;
+        foreach (var queue in _byOrigin.Values) total += queue.Count;
+        return total;
+    }
+
+    private void SweepExpiredNoLock()
+    {
+        foreach (var key in _byOrigin.Keys.ToList())
+        {
+            var queue = _byOrigin[key];
+            var keep = new Queue<Entry>();
+            while (queue.Count > 0)
+            {
+                var entry = queue.Dequeue();
+                if ((DateTime.UtcNow - entry.ReturnedUtc).TotalSeconds > MaxIdleSeconds)
+                {
+                    try { entry.Client.Close(); } catch { }
+                    continue;
+                }
+                keep.Enqueue(entry);
+            }
+            if (keep.Count == 0) _byOrigin.Remove(key);
+            else _byOrigin[key] = keep;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP/1.1 validation cache (RFC 2616 §13): ETag / Last-Modified validators
+// with If-None-Match / If-Modified-Since revalidation and 304 handling.
+// Conservative by design:
+//   • only GET 200 responses are cached
+//   • only responses that carry a validator (ETag / Last-Modified) or an
+//     explicit freshness lifetime (Cache-Control: max-age / Expires) are
+//     stored — a response with neither is never cached
+//   • cookie- or auth-personalized requests bypass the cache entirely
+//   • Cache-Control: no-store evicts; no-cache forces revalidation
+// ─────────────────────────────────────────────────────────────────────────────
+internal sealed class HttpValidationCache
+{
+    public sealed class CachedResponse
+    {
+        public required HttpSuccess Success { get; init; }
+        public string? ETag { get; init; }
+        public string? LastModified { get; init; }
+        public DateTime StoredUtc { get; internal set; }
+        public double FreshnessSeconds { get; init; }
+
+        /// <summary>True while the freshness lifetime (max-age/Expires) has not elapsed.</summary>
+        public bool IsFresh =>
+            FreshnessSeconds > 0 &&
+            (DateTime.UtcNow - StoredUtc).TotalSeconds < FreshnessSeconds;
+    }
+
+    private readonly object _gate = new();
+    private readonly Dictionary<string, CachedResponse> _entries =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<string> _lru = new();
+    private readonly Dictionary<string, LinkedListNode<string>> _lruIndex =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxEntries = 128;
+    private const long MaxTotalBytes = 16L * 1024 * 1024;
+
+    public CachedResponse? Lookup(string url)
+    {
+        lock (_gate)
+        {
+            if (_entries.TryGetValue(url, out var entry))
+            {
+                TouchLru(url);
+                return entry;
+            }
+            return null;
+        }
+    }
+
+    /// <summary>A 304 revalidation restarts the freshness lifetime.</summary>
+    public void Touch(string url)
+    {
+        lock (_gate)
+        {
+            if (_entries.TryGetValue(url, out var entry))
+            {
+                entry.StoredUtc = DateTime.UtcNow;
+                TouchLru(url);
+            }
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            _entries.Clear();
+            _lru.Clear();
+            _lruIndex.Clear();
+        }
+    }
+
+    public void Store(string url, HttpSuccess success)
+    {
+        if (success.StatusCode != 200)
+            return;
+
+        string? etag = Header(success, "etag");
+        string? lastModified = Header(success, "last-modified");
+        string? cacheControl = Header(success, "cache-control");
+        string? expires = Header(success, "expires");
+
+        bool noStore = HasDirective(cacheControl, "no-store");
+        if (noStore)
+        {
+            lock (_gate) { _entries.Remove(url); }
+            return;
+        }
+
+        bool noCache = HasDirective(cacheControl, "no-cache");
+        double maxAge = ParseMaxAge(cacheControl);
+        double freshness = noCache ? 0 : maxAge;
+        if (freshness <= 0 && !noCache && !string.IsNullOrEmpty(expires) &&
+            DateTimeOffset.TryParse(expires, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal, out var expiresDate))
+        {
+            freshness = Math.Max(0, (expiresDate - DateTimeOffset.UtcNow).TotalSeconds);
+        }
+
+        // No validator and no freshness information → never cache.
+        bool hasValidator = !string.IsNullOrEmpty(etag) || !string.IsNullOrEmpty(lastModified);
+        if (!hasValidator && freshness <= 0)
+            return;
+
+        lock (_gate)
+        {
+            EvictFor(success.Body.Length, url);
+            var entry = new CachedResponse
+            {
+                Success = success,
+                ETag = etag,
+                LastModified = lastModified,
+                StoredUtc = DateTime.UtcNow,
+                FreshnessSeconds = freshness
+            };
+            _entries[url] = entry;
+            TouchLru(url);
+        }
+    }
+
+    private void EvictFor(long incomingBytes, string protectedUrl)
+    {
+        long total = 0;
+        foreach (var e in _entries.Values) total += e.Success.Body.Length;
+
+        while ((_entries.Count >= MaxEntries || total + incomingBytes > MaxTotalBytes) &&
+               _lru.Count > 0)
+        {
+            string oldest = _lru.First!.Value;
+            if (oldest == protectedUrl && _lru.Count == 1) break;
+            _lru.RemoveFirst();
+            _lruIndex.Remove(oldest);
+            if (_entries.Remove(oldest, out var evicted))
+                total -= evicted.Success.Body.Length;
+        }
+    }
+
+    private void TouchLru(string url)
+    {
+        if (_lruIndex.TryGetValue(url, out var node))
+        {
+            _lru.Remove(node);
+            _lru.AddLast(node);
+        }
+        else
+        {
+            node = _lru.AddLast(url);
+            _lruIndex[url] = node;
+        }
+    }
+
+    private static string? Header(HttpSuccess success, string name) =>
+        success.Headers.TryGetValue(name, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : null;
+
+    private static bool HasDirective(string? cacheControl, string directive)
+    {
+        if (string.IsNullOrEmpty(cacheControl)) return false;
+        foreach (var part in cacheControl.Split(','))
+        {
+            string token = part.Trim();
+            int eq = token.IndexOf('=');
+            if (eq >= 0) token = token[..eq];
+            if (token.Trim().Equals(directive, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static double ParseMaxAge(string? cacheControl)
+    {
+        if (string.IsNullOrEmpty(cacheControl)) return -1;
+        foreach (var part in cacheControl.Split(','))
+        {
+            string token = part.Trim();
+            if (token.StartsWith("max-age", StringComparison.OrdinalIgnoreCase) &&
+                token.Length > 7 && token[7] == '=')
+            {
+                if (int.TryParse(token[8..].Trim('"'), out int seconds))
+                    return seconds;
+            }
+        }
+        return -1;
     }
 }

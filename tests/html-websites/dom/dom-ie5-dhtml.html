@@ -1,0 +1,80 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>IE5 DHTML Object Model Battery (1999)</title>
+<style type="text/css">
+  #pixelbox { background-color: #CCCCFF; border: 2px outset; width: 100px; }
+</style>
+<script language="JScript">
+function ie5Report() {
+  var out = [];
+
+  // document.all collection: index, name, item(), tags()
+  out.push("all-count=" + (document.all.length > 5));
+  var byName = document.all("ie5probe");
+  out.push("all(name)=" + (byName ? byName.id : "NULL"));
+  out.push("all.item=" + (document.all.item("ie5probe") ? "ok" : "NULL"));
+  out.push("all.tags(H2)=" + (document.all.tags("H2").length >= 3));
+
+  // innerHTML / outerHTML / innerText / outerText / insertAdjacentHTML/Text
+  var t = document.all("ie5probe");
+  t.innerHTML = "<b>replaced</b> <i>innerHTML</i>";
+  out.push("innerHTML=" + t.innerHTML);
+  t.insertAdjacentHTML("BeforeEnd", " +tail");
+  t.insertAdjacentText("AfterBegin", "head+ ");
+  out.push("innerText=" + t.innerText);
+  out.push("outerHTML-has-tag=" + (t.outerHTML.indexOf("<DIV") >= 0 ||
+                                    t.outerHTML.indexOf("<div") >= 0));
+
+  // style pixel/pos properties
+  var s = t.style;
+  s.pixelLeft = 40;
+  out.push("pixelLeft=" + s.pixelLeft);
+  out.push("posLeft=" + s.posLeft);
+
+  // offset geometry family
+  out.push("offsetWidth>0=" + (t.offsetWidth > 0));
+  out.push("offsetHeight>0=" + (t.offsetHeight > 0));
+  out.push("offsetParent=" + (t.offsetParent != null ? "ok" : "NULL"));
+  out.push("clientWidth=" + t.clientWidth);
+  out.push("scrollTop=" + t.scrollTop);
+
+  // currentStyle
+  out.push("currentStyle=" + (t.currentStyle ? "ok" : "NULL"));
+  if (t.currentStyle)
+    out.push("currentStyle.width=" + t.currentStyle.width);
+
+  // document colour family
+  out.push("bgColor=" + document.bgColor);
+  out.push("linkColor=" + document.linkColor);
+
+  // readyState + uniqueID
+  out.push("readyState=" + document.readyState);
+  out.push("uniqueID=" + (t.uniqueID && t.uniqueID.length > 0 ? "ok" : "NULL"));
+
+  // parentElement / children / contains
+  out.push("parentElement=" + t.parentElement.tagName);
+  out.push("children=" + (t.children.length >= 0 ? "ok" : "NULL"));
+
+  return out.join(" | ");
+}
+</script>
+</head>
+<body bgcolor="#FFFFFF" text="#000000" link="#0000FF" vlink="#800080" alink="#FF0000">
+<h1>IE5 DHTML object model battery</h1>
+<h2>The all collection</h2>
+<p>document.all with index, name lookup, item(), namedItem(), tags();
+element.all; the classic sniffing contract: <tt>if (document.all)</tt>
+takes the IE branch.</p>
+<h2>Content mutation</h2>
+<div id="ie5probe" class="block">initial probe content</div>
+<h2>Geometry</h2>
+<p>offsetLeft/Top/Width/Height/Parent, clientWidth/Height,
+scrollTop/Left, style.pixelLeft/pixelWidth/posLeft, currentStyle —
+the pre-getComputedStyle reading surface every 1999 DHTML menu used.</p>
+<h2>Report</h2>
+<p><b id="report2">(running…)</b></p>
+<script language="JScript">
+document.all("report2").innerText = ie5Report();
+</script>
+</body>
+</html>

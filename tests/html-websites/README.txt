@@ -1,43 +1,57 @@
-Retro96 HTML Website QA Suite
-==============================
+Retro96 → 1999 QA Suite
+=======================
 
-The fixtures are organised by feature rather than one flat directory.
-The small pages stay focused and are kept as separate regression cases.
-The FULL pages are the broad integration batteries, modelled on the existing
-css/css-full-fixed.html approach rather than appending a generic table to every
-individual page.
+The 1996-era hand-authored QA pages were rewritten as the 1999 upgrade
+battery: one page per section of the upgrade checklist (HTML 4.01,
+CSS2, DOM Level 1, IE5 + NS4.7 personas, ES3, VBScript 5.0, HTTP/1.1),
+plus the checklist §17 test-plan specials: a deliberately broken HTML
+recovery page, the Acid1 CSS1 box-model smoke test, a Y2K date/cookie
+battery, and the frames/media pages the plan calls for.
 
-Folders
--------
-html/       HTML 3.2 document structure, text, links, lists, entities, legacy markup
-css/        CSS1 property/selectors/layout battery + companion assets
-forms/      form controls, state and interaction
-images/     image loading, alt/fallback, sizing and tables
-javascript/ ES3-era JavaScript / DOM-0 / timers / navigation / mouse
-frames/     framesets and frame-document interaction
-java/       JDK 1.0/1.1 applet pages and .class fixtures
-tables/     table layout, links, malformed and edge-case tables
-sites/      realistic 1996-style multi-page/frame sites
-server/     CGI/Python helper fixtures
+Pages
+-----
+html/html401-full.html        HTML 4.01 element battery (new elements, deprecated set, entities, concealment, ruby)
+html/broken-html-1999.html    deliberately malformed tag-soup recovery page
+forms/forms-1999.html         label/fieldset/legend/button/optgroup, disabled/readonly, file+image, textarea wrap
+tables/tables-1999.html       row groups, frame/rules, IE border colors, CSS2 collapse/fixed/spacing tables
+frames/frames-1999.html       frameset battery (+ frames-nav99/banner99/main99/frame-child99 children)
+css/css2-selectors.html       child/adjacent/attribute selectors, :first-child, :lang, :before/:after, inherit, @media
+css/css2-boxmodel.html        positioning, z-index, min/max, overflow/clip, outline, IE5 box-model persona check
+dom/dom-level1.html           DOM Level 1 tree surgery + attributes map
+dom/dom-ie5-dhtml.html        document.all, innerHTML family, offset geometry, currentStyle, pixelLeft
+dom/dom-ns4-layers.html       Navigator 4.7 layer DOM (load with the NS4.7 profile)
+events/events-1999.html       IE5 bubbling + attachEvent, NS4 capture model, 4.01 intrinsic events
+javascript/es3-1999.html      ES3/JS1.3/JScript5 language battery + version gating + host objects
+vbscript/vbscript5.html       VBScript 5.0: Class/With/Eval/Execute/RegExp/GetRef
+ie/ie5-extras.html            marquee, bgsound, comment, ruby, body extras, static filters, xml islands
+netscape/ns4-extras.html      layer/ilayer/nolayer, multicol, spacer, JSSS, keygen
+images/images-media.html      PNG/GIF/JPEG, lowsrc, image maps, audio embeds
+network/http11-page.html      served by the loopback server: keep-alive, chunked, 304 validation
+acid1.html                    Acid1 CSS1 box-model smoke test (1998)
+y2k.html                      Y2K: getYear/getFullYear, cookie expiry past 2000
+test-index.html               index linking every page
 
-Full integration fixtures
---------------------------
-- html/html-full-fixed.html     broad valid HTML 3.2 + legacy element battery
-- html/html-full-fixed.html     broad valid HTML 3.2 + legacy element battery
-- html/broken-html-full.html    dedicated malformed/tag-soup recovery battery
-- css/css-full-fixed.html       broad CSS1 battery
-- forms/forms-full-fixed.html   broad form-control/state/interaction battery
-- images/images-full-fixed.html broad image loading/fallback/sizing/alignment battery
-- javascript/javascript-full-fixed.html broad JavaScript/DOM/event/timer/navigation battery
-- tables/tables-full-fixed.html broad table layout/spans/nesting/recovery battery
-- frames/frames-full-fixed.html broad frameset/named-frame/no-frames battery
-- java/java-full-fixed.html     broad classic APPLET/PARAM/class-fixture battery
-- server/server-full-fixed.html broad local CGI/request/error battery
-- sites/sites-full-fixed.html   broad 1996-style site/layout/form/link battery
+Assets
+------
+images/pixel-dot.gif          1x1 transparent GIF
+images/dot16.png              16x16 PNG (alpha-capable)
+images/tada.wav               generated 0.3s chord (bgsound fixture)
+images/theme.mid              generated 3-note MIDI (embed audio fixture)
+css/bullet.gif, css/bg-tile.gif, css/import-test.css  kept from the 1996 suite (referenced by CSS pages)
 
-Focused fixtures are intentionally not padded with repeated "coverage matrix"
-content. They remain useful for bisecting a single regression.
+Kept from the 1996 suite
+------------------------
+javascript/javascript-basic.html   required by tests/RetroTests/JsEngineTests.cs
+java/                              applet .class fixtures required by JavaEngineTests.cs
+                                    (Java is parked at 1996 compatibility per the checklist)
 
-The VisualDiff harness scans html-websites recursively and preserves the
-relative URL path of each page when serving it, so links between organised
-folders continue to behave like real browser URLs.
+Where the assertions live
+-------------------------
+tests/RetroTests/Retro99SuiteTests.cs runs the same pages headlessly:
+parse → style → layout for every page, script contracts for the script
+pages, persona switches (IE5 default / NS4.7 / union) where relevant.
+The VisualDiff harness still scans this folder recursively and preserves
+relative URL paths when serving.
+
+The 1996 regression corpus (the-old-net style real pages) stays in
+testdata/ untouched.

@@ -53,6 +53,7 @@ public static class TableLayout
         var floats = inheritedFloats?.Clone() ?? new FloatContext();
 
         var tableElem = tableBox.Element;
+        var tableStyle = tableElem.Style;
 
         // The table's own margins come out of the available width —
         // previously a <table align=left hspace=…> could overflow its band.
@@ -60,11 +61,47 @@ public static class TableLayout
 
         // ── Table-level attributes ────────────────────────────────────────────
         float? tableWidthAttr = ResolveWidth(tableElem, "width", avail);
-        // FIX: clamped ≥ 0 — a negative CELLSPACING/CELLPADDING attribute
-        // used to flow straight into every cell's geometry.
-        float cellSpacing = Math.Max(0f, GetPx(tableElem, "cellspacing", 2f));   // NN default 2
+        // Authored CSS width on the table (Task 9): honoured as the
+        // border-box target in the FIXED algorithm (see below); the AUTO
+        // algorithm keeps its attribute/shrink-to-fit behaviour — a CSS
+        // pixel width on an auto table is a documented gap.
+        float? cssWidthPx = tableStyle?.Width is > 0f ? tableStyle.Width : null;
+        float? cssWidthPercent = tableStyle?.WidthPercent;
+
+        // ── CSS2 border-collapse / border-spacing (Task 9) ─────────
+        // Collapse: the shared-edge model — no spacing at all, and cell
+        // borders merge at shared edges (see the cell border pass below).
+        // Separate: CSS border-spacing when authored (a stored 0 is
+        // indistinguishable from "not authored", so an authored
+        // border-spacing: 0 alone falls back to the attribute default —
+        // documented limitation), else the NN CELLSPACING attribute.
+        bool collapsed = tableStyle?.BorderCollapse == BorderCollapseValue.Collapse;
+        float attrSpacing = Math.Max(0f, GetPx(tableElem, "cellspacing", 2f));   // NN default 2
+        float cellSpacingX, cellSpacingY;
+        if (collapsed)
+        {
+            cellSpacingX = 0f;
+            cellSpacingY = 0f;
+        }
+        else if ((tableStyle?.BorderSpacingX ?? 0f) > 0f ||
+                 (tableStyle?.BorderSpacingY ?? 0f) > 0f)
+        {
+            cellSpacingX = Math.Max(0f, tableStyle!.BorderSpacingX);
+            cellSpacingY = Math.Max(0f, tableStyle.BorderSpacingY);
+        }
+        else
+        {
+            cellSpacingX = cellSpacingY = attrSpacing;
+        }
         float cellPadding = Math.Max(0f, GetPx(tableElem, "cellpadding", 1f));   // NN default 1
         float borderWidth = ResolveBorderWidth(tableElem);
+
+        // table-layout: fixed — column widths come from <col>/<colgroup> and
+        // first-row cell widths ONLY; content never influences the columns
+        // and the remaining space splits equally.  Requires an authored
+        // table width (CSS or attribute) to distribute.
+        bool fixedLayout = tableStyle?.TableLayout == TableLayoutValue.Fixed &&
+                           (tableWidthAttr.HasValue || cssWidthPx.HasValue || cssWidthPercent.HasValue);
 
         // ── Build the logical cell grid ───────────────────────────────────────
         var rows = BuildRowList(tableBox);
@@ -112,7 +149,7 @@ public static class TableLayout
         // width=760), 25% + 75% cells must sum to exactly that table,
         // not to table + padding.  Resolve against the spec'd inner
         // width when there is one, else against the available width.
-        float spacing0 = cellSpacing * (colCount + 1);
+        float spacing0 = cellSpacingX * (colCount + 1);
         float chrome0 = 2f * borderWidth;
         float percentBase = tableWidthAttr.HasValue
             ? Math.Max(0f, tableWidthAttr.Value - spacing0 - chrome0)
@@ -185,7 +222,7 @@ public static class TableLayout
 
                 // colW includes the cell's own horizontal chrome, while the
                 // table grid adds cellspacing only *between* spanned columns.
-                float interColumnSpacing = cellSpacing * (eff - 1);
+                float interColumnSpacing = cellSpacingX * (eff - 1);
 
                 float minSum = 0f;
                 float prefSum = 0f;
@@ -229,14 +266,18 @@ public static class TableLayout
         for (int c = 0; c < colCount; c++)
             prefW[c] = Math.Max(prefW[c], minW[c]);
 
-        // ── Table width (border-box target) ──────────────────────────────────
-        float spacing = cellSpacing * (colCount + 1);
+        // ── Table width (border-box target) ──────────────────────────
+        float spacing = cellSpacingX * (colCount + 1);
         float chromeW = 2f * borderWidth;
         float totalMin = minW.Sum() + spacing + chromeW;
         float totalPref = prefW.Sum() + spacing + chromeW;
 
         float tableW;
-        if (tableWidthAttr.HasValue)
+        if (fixedLayout && tableWidthAttr == null && cssWidthPercent is { } cssPct)
+            tableW = Math.Max(1f, avail * cssPct / 100f);   // CSS % width = border box
+        else if (fixedLayout && tableWidthAttr == null && cssWidthPx is { } cssPx)
+            tableW = Math.Max(1f, cssPx);                   // CSS px width = border box
+        else if (tableWidthAttr.HasValue)
             tableW = Math.Max(1f, tableWidthAttr.Value);
         else
         {
@@ -261,7 +302,15 @@ public static class TableLayout
         float innerW = tableW - spacing - chromeW;
 
         float[] colW;
-        if (tableW <= totalMin + 0.5f)
+        if (fixedLayout)
+        {
+            // table-layout: fixed — explicit col/colgroup widths plus
+            // first-row cell widths ONLY; the remaining space splits
+            // equally.  Content-based auto sizing (minW/prefW measured
+            // above) is deliberately ignored.
+            colW = BuildFixedColumns(tableElem, rows, colCount, innerW);
+        }
+        else if (tableW <= totalMin + 0.5f)
         {
             colW = (float[])minW.Clone();
             float availableColumns = Math.Max(0f, innerW);
@@ -324,11 +373,11 @@ public static class TableLayout
         // Column X offsets (relative to the table's border-box origin)
         var colX = new float[colCount];
         {
-            float x = borderWidth + cellSpacing;
+            float x = borderWidth + cellSpacingX;
             for (int c = 0; c < colCount; c++)
             {
                 colX[c] = x;
-                x += colW[c] + cellSpacing;
+                x += colW[c] + cellSpacingX;
             }
         }
 
@@ -358,7 +407,7 @@ public static class TableLayout
             else topCaptionH = capOuterH;
         }
 
-        float gridTop = tableBox.Y + topCaptionH + borderWidth + cellSpacing;
+        float gridTop = tableBox.Y + topCaptionH + borderWidth + cellSpacingY;
         float provisionalY = gridTop;
 
         for (int r = 0; r < nRows; r++)
@@ -374,7 +423,7 @@ public static class TableLayout
                 float cellW = 0f;
                 for (int c = cell.Col; c < end; c++)
                     cellW += colW[c];
-                cellW += cellSpacing * (end - cell.Col - 1);
+                cellW += cellSpacingX * (end - cell.Col - 1);
 
                 // Keep CSS borders declared on the cell. The table border is
                 // only the fallback for cells without their own CSS border.
@@ -391,6 +440,22 @@ public static class TableLayout
                 float cellBorderBottom = cellStyle?.OwnBorderBottomStyle == true &&
                                          cellStyle.BorderBottomStyle == BorderStyleValue.None
                     ? 0f : (box.BorderBottom > 0f ? box.BorderBottom : borderWidth);
+
+                if (collapsed)
+                {
+                    // border-collapse: collapse (Task 9) — the era
+                    // approximation: each shared edge is drawn ONCE, by the
+                    // cell on its LEADING side.  Left/top borders always
+                    // paint; right/bottom borders only survive on the grid
+                    // boundary (last column / last spanned row).  No border
+                    // width comparison/conflict resolution (the leading
+                    // cell's border wins — documented simplification).
+                    int endRow = Math.Min(cell.RowIndex + cell.RowSpan, nRows) - 1;
+                    bool atRightGridEdge = cell.ColEnd >= colCount;
+                    bool atBottomGridEdge = endRow >= nRows - 1;
+                    if (!atRightGridEdge) cellBorderRight = 0f;
+                    if (!atBottomGridEdge) cellBorderBottom = 0f;
+                }
 
                 box.X = tableBox.X + colX[cell.Col];
                 box.Y = provisionalY;
@@ -431,7 +496,7 @@ public static class TableLayout
             float trH = GetPx(row.RowBox?.Element, "height", 0f);
             if (trH > 0f) rowH[r] = Math.Max(rowH[r], trH);
 
-            provisionalY += rowH[r] + cellSpacing;
+            provisionalY += rowH[r] + cellSpacingY;
         }
 
         // Distribute rowspan cell heights across their spanned rows so each
@@ -441,7 +506,7 @@ public static class TableLayout
             int end = Math.Min(startRow + rowSpan, nRows) - 1;
             if (end < startRow) continue;
 
-            float spanned = cellSpacing * (end - startRow);
+            float spanned = cellSpacingY * (end - startRow);
             for (int k = startRow; k <= end; k++)
                 spanned += rowH[k];
 
@@ -455,12 +520,12 @@ public static class TableLayout
 
         // ── Table HEIGHT attribute — distribute surplus evenly over rows ────
         float naturalGrid = nRows > 0
-            ? rowH.Sum() + cellSpacing * (nRows - 1)
+            ? rowH.Sum() + cellSpacingY * (nRows - 1)
             : 0f;
         float tableHAttr = GetPx(tableElem, "height", 0f);
-        if (tableHAttr > naturalGrid + 2f * borderWidth + 2f * cellSpacing && nRows > 0)
+        if (tableHAttr > naturalGrid + 2f * borderWidth + 2f * cellSpacingY && nRows > 0)
         {
-            float extra = (tableHAttr - naturalGrid - 2f * borderWidth - 2f * cellSpacing) / nRows;
+            float extra = (tableHAttr - naturalGrid - 2f * borderWidth - 2f * cellSpacingY) / nRows;
             for (int r = 0; r < nRows; r++)
                 rowH[r] += extra;
         }
@@ -496,7 +561,7 @@ public static class TableLayout
                 float spanH = 0f;
                 for (int k = cell.RowIndex; k <= endRow; k++)
                     spanH += rowH[k];
-                spanH += cellSpacing * (endRow - cell.RowIndex);
+                spanH += cellSpacingY * (endRow - cell.RowIndex);
                 float outerH = Math.Max(rowH[r], spanH);
 
                 float contentH = Math.Max(0f, outerH - 2f * cellPadding - 2f * borderWidth);
@@ -525,16 +590,16 @@ public static class TableLayout
                 }
             }
 
-            y += rowH[r] + cellSpacing;
+            y += rowH[r] + cellSpacingY;
         }
 
         // Bottom caption sits under the grid
         if (captionBox != null && bottomCaptionH > 0f)
         {
-            float dy = (y + cellSpacing) - captionBox.Y;
+            float dy = (y + cellSpacingY) - captionBox.Y;
             if (Math.Abs(dy) > 0.5f)
                 OffsetChildren(captionBox, 0f, dy);
-            captionBox.Y = y + cellSpacing;
+            captionBox.Y = y + cellSpacingY;
         }
         if (captionBox != null)
         {
@@ -555,8 +620,91 @@ public static class TableLayout
 
         // Total height: caption(s) + grid + trailing spacing + bottom border,
         // minus the borders — Height is the CONTENT height per the box model.
-        float borderBoxH = (y + cellSpacing + bottomCaptionH) - tableBox.Y + borderWidth;
+        float borderBoxH = (y + cellSpacingY + bottomCaptionH) - tableBox.Y + borderWidth;
         tableBox.Height = Math.Max(0f, borderBoxH - 2f * borderWidth);
+    }
+
+    /// <summary>
+    /// table-layout: fixed column distribution (Task 9).  Column widths come
+    /// from (in order of precedence) <c>&lt;col width&gt;</c> (span-aware,
+    /// incl. colgroup wrappers) and first-row cell widths (HTML attribute or
+    /// authored CSS pixel width; a colspan cell divides its width evenly
+    /// across the spanned columns).  Columns with no specification split the
+    /// remaining inner width EQUALLY — content never influences the columns.
+    /// </summary>
+    private static float[] BuildFixedColumns(DomElement tableElem, List<RowEntry> rows,
+        int colCount, float innerWidth)
+    {
+        var colW = new float[colCount];
+        var specified = new bool[colCount];
+
+        void ApplyColWidth(DomElement col)
+        {
+            int span = Math.Clamp(col.GetAttrInt("span", 1), 1, Math.Max(1, colCount));
+            float? w = ResolveWidth(col, "width", innerWidth);
+            if (!w.HasValue) return;
+            float per = Math.Max(0f, w.Value / span);
+            for (int c = 0; c < Math.Min(span, colCount); c++)
+            {
+                colW[c] = Math.Max(colW[c], per);
+                specified[c] = true;
+            }
+        }
+
+        foreach (var node in tableElem.Children)
+        {
+            if (node is not DomElement e) continue;
+            if (e.TagName == "colgroup")
+            {
+                foreach (var sub in e.Children)
+                    if (sub is DomElement col && col.TagName == "col")
+                        ApplyColWidth(col);
+            }
+            else if (e.TagName == "col")
+            {
+                ApplyColWidth(e);
+            }
+        }
+
+        // First-row cell widths pin their column(s).
+        if (rows.Count > 0)
+        {
+            foreach (var cell in rows[0].Cells)
+            {
+                if (cell.Col >= colCount) continue;
+                int end = Math.Min(cell.ColEnd, colCount);
+                if (end <= cell.Col) continue;
+
+                float? w = ResolveWidth(cell.Box.Element, "width", innerWidth)
+                           ?? cell.Box.Element?.Style?.Width;
+                if (w.HasValue)
+                {
+                    float per = Math.Max(0f, w.Value / (end - cell.Col));
+                    for (int c = cell.Col; c < end; c++)
+                    {
+                        colW[c] = Math.Max(colW[c], per);
+                        specified[c] = true;
+                    }
+                }
+            }
+        }
+
+        // Remaining space splits equally among the unspecified columns.
+        float used = 0f;
+        int free = 0;
+        for (int c = 0; c < colCount; c++)
+        {
+            if (specified[c]) used += colW[c];
+            else free++;
+        }
+        if (free > 0)
+        {
+            float share = Math.Max(0f, (innerWidth - used) / free);
+            for (int c = 0; c < colCount; c++)
+                if (!specified[c]) colW[c] = share;
+        }
+
+        return colW;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1042,6 +1190,16 @@ public static class TableLayout
 
     private static bool IsCaptionAtBottom(LayoutBox captionBox)
     {
+        // CSS2 caption-side (Task 9) wins over the legacy ALIGN attribute.
+        // left/right fall back to TOP — side captions are not a thing this
+        // engine lays out (documented).
+        var style = captionBox.Element?.Style;
+        if (style?.CaptionSide is CaptionSideValue.Bottom) return true;
+        if (style?.CaptionSide is CaptionSideValue.Top
+                              or CaptionSideValue.Left
+                              or CaptionSideValue.Right)
+            return false;
+
         string align = captionBox.Element?.GetAttrOrDefault("align", "").Trim().ToLowerInvariant() ?? "";
         return align is "bottom";
     }

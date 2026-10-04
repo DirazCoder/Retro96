@@ -29,6 +29,9 @@ public static class VbsErrorNumbers
     public const int ObjectDoesntSupport = 438;
     public const int WrongNumberOfArguments = 450;
     public const int VariableNotDefined = 500;
+    /// <summary>VBScript.RegExp pattern errors occupy 5017–5021 in the real
+    /// engine; 5017 is the generic "syntax error in regular expression".</summary>
+    public const int RegExpSyntax = 5017;
 
     // Compile (syntax) errors
     public const int SyntaxError = 1002;
@@ -58,6 +61,7 @@ public static class VbsErrorNumbers
         [438] = "Object doesn't support this property or method",
         [450] = "Wrong number of arguments",
         [500] = "Variable is not defined",
+        [5017] = "Syntax error in regular expression",
     };
 
     public static string Describe(int number) =>

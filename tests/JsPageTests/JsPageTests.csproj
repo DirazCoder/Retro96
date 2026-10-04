@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -10,14 +10,47 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="SkiaSharp" Version="3.116.1" />
-    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.116.1" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="4.153.1" />
   </ItemGroup>
   <ItemGroup>
+    <!-- headless stubs (same approach as RetroTests) -->
     <Compile Include="Program.cs" />
     <Compile Include="DebugLogStub.cs" />
-    <Compile Include="../../retro96/Engine/Drawing/*.cs" />
     <Compile Include="BrowserCanvasStub.cs" />
+    <!-- engine sources (mirrors the RetroTests compile set) -->
+    <Compile Include="../../retro96/Engine/Drawing/*.cs" />
+    <Compile Include="../../retro96/Engine/Html/HtmlTokenizer.cs" />
+    <Compile Include="../../retro96/Engine/Html/HtmlParser.cs" />
+    <Compile Include="../../retro96/Engine/Html/HtmlEntities.cs" />
+    <Compile Include="../../retro96/LegacyMidi.cs" />
+    <Compile Include="../../retro96/Engine/Dom/DomNode.cs" />
+    <Compile Include="../../retro96/Engine/Css/ComputedStyle.cs" />
+    <Compile Include="../../retro96/Engine/Css/CssParser.cs" />
+    <Compile Include="../../retro96/Engine/Css/CssSelector.cs" />
+    <Compile Include="../../retro96/Engine/Css/StyleResolver.cs" />
+    <Compile Include="../../retro96/Engine/Layout/LayoutBox.cs" />
+    <Compile Include="../../retro96/Engine/Layout/InlineLayout.cs" />
+    <Compile Include="../../retro96/Engine/Layout/LayoutEngine.cs" />
+    <Compile Include="../../retro96/Engine/Layout/TableLayout.cs" />
+    <Compile Include="../../retro96/Engine/Layout/TextMeasurer.cs" />
+    <Compile Include="../../retro96/Engine/Layout/LayoutDebug.cs" />
+    <Compile Include="../../retro96/Engine/Render/FontCache.cs" />
+    <Compile Include="../../retro96/Engine/Render/ImageCache.cs" />
+    <Compile Include="../../retro96/Engine/Render/ImageDecoder.cs" />
+    <Compile Include="../../retro96/Engine/Render/DataUriDecoder.cs" />
+    <Compile Include="../../retro96/Engine/Render/Renderer.cs" />
+    <Compile Include="../../retro96/Engine/Render/GlyphSubstitution.cs" />
+    <Compile Include="../../retro96/Engine/Render/TextareaOverlay.cs" />
+    <Compile Include="../../retro96/Engine/Render/SelectionOverlay.cs" />
+    <Compile Include="../../retro96/Engine/Render/PasswordMaskLayout.cs" />
+    <Compile Include="../../retro96/Engine/Network/ParsedUrl.cs" />
+    <Compile Include="../../retro96/Engine/Network/CookieStore.cs" />
+    <Compile Include="../../retro96/Engine/Network/ResourceLoader.cs" />
+    <Compile Include="../../retro96/Engine/Network/HttpClient.cs" />
+    <Compile Include="../../retro96/Engine/Network/ResourceKind.cs" />
+    <Compile Include="../../retro96/Engine/Network/FrameLoader.cs" />
+    <Compile Include="../../retro96/Engine/ErrorPage.cs" />
     <Compile Include="../../retro96/Engine/Js/JsLexer.cs" />
     <Compile Include="../../retro96/Engine/Js/JsParser.cs" />
     <Compile Include="../../retro96/Engine/Js/JsAst.cs" />
@@ -26,18 +59,24 @@
     <Compile Include="../../retro96/Engine/Js/JsInterpreter.cs" />
     <Compile Include="../../retro96/Engine/Js/JsRuntime.cs" />
     <Compile Include="../../retro96/Engine/Js/DomBindings.cs" />
-    <Compile Include="../../retro96/Engine/Html/HtmlTokenizer.cs" />
-    <Compile Include="../../retro96/Engine/Html/HtmlParser.cs" />
-    <Compile Include="../../retro96/Engine/Html/HtmlEntities.cs" />
-    <Compile Include="../../retro96/Engine/Dom/DomNode.cs" />
-    <Compile Include="../../retro96/Engine/Css/ComputedStyle.cs" />
-    <Compile Include="../../retro96/Engine/Css/CssParser.cs" />
-    <Compile Include="../../retro96/Engine/Css/CssSelector.cs" />
-    <Compile Include="../../retro96/Engine/Css/StyleResolver.cs" />
-    <Compile Include="../../retro96/Engine/Network/ParsedUrl.cs" />
-    <Compile Include="../../retro96/Engine/Network/CookieStore.cs" />
-    <Compile Include="../../retro96/Engine/Layout/LayoutBox.cs" />
+    <Compile Include="../../retro96/Engine/Js/JsDialogGeometry.cs" />
     <Compile Include="../../retro96/Engine/NavigationHistory.cs" />
-    <Compile Include="../../retro96/Engine/Render/GlyphSubstitution.cs" />
+    <Compile Include="../../retro96/Engine/Forms/FormSubmitter.cs" />
+    <Compile Include="../../retro96/Engine/Forms/HitTester.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginApi.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginPermissionCatalog.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginPermissionSecurity.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginContentTransformPolicy.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginJsValueCodec.cs" />
+    <Compile Include="../../retro96/Engine/Plugins/PluginSandboxProtocol.cs" />
+    <Compile Include="../../retro96/Engine/Java/*.cs" />
+    <!-- shell policy surface referenced by the engine sources -->
+    <Compile Include="../../retro96/BrowserRuntime.cs" />
+    <Compile Include="../../retro96/UserSettings.cs" />
+    <Compile Include="../../retro96/WindowsSecurity.cs" />
+    <Compile Include="../../retro96/SandboxProtocol.cs" />
+    <Compile Include="../../retro96/SandboxContext.cs" />
+    <Compile Include="../../retro96/SandboxBrokerClient.cs" />
+    <Compile Include="../../retro96/StartupDiagnostics.cs" />
   </ItemGroup>
 </Project>

@@ -64,6 +64,33 @@ public class Renderer
     // the marquee is first painted, makes one traversal, then stays parked.
     private readonly Dictionary<DomElement, long> _marqueeStartTicks = new();
 
+    // ── Marquee script-event bridge (Task 9, checklist §11) ───────────
+    // The render layer cannot call the script interpreter directly (the
+    // interpreter lives with the shell), so the shell installs this hook to
+    // route marquee events into JsInterpreter.FireEvent.  Invoked with
+    // (element, eventName) using the DOM-0 handler spellings:
+    // "onstart" (scroll begins, once per marquee epoch), "onbounce"
+    // (alternate mode, each direction reversal), "onfinish" (slide mode,
+    // the single traversal reaching the resting edge).
+    internal static Action<DomElement, string>? MarqueeEventHook = null;
+
+    // Alternate-mode bounce counters (each span-length of travel is one
+    // turnaround) and the slide-mode completion flags, per marquee element.
+    private readonly Dictionary<DomElement, long> _marqueeBounces = new();
+    private readonly HashSet<DomElement> _marqueeFinished = new();
+
+    private static void RaiseMarqueeEvent(DomElement elem, string eventName)
+    {
+        var hook = MarqueeEventHook;
+        if (hook == null) return;
+        try { hook(elem, eventName); }
+        catch (Exception ex)
+        {
+            // A faulty shell hook must never break painting.
+            Retro96.DebugLog.WriteException("Renderer.MarqueeEventHook", ex);
+        }
+    }
+
     private static SKPaint CreateFillPaint(Color c, bool antialias = true) => new()
     {
         Color = c.ToSkColor(),
@@ -721,10 +748,13 @@ public class Renderer
         bool isDecorationFragment = box.BoxType == BoxType.Inline &&
             box.Element?.Style?.Display is not null &&
             box.Element.Style.Display != DisplayValue.Inline;
-        if (!isDecorationFragment)
+        if (!isDecorationFragment && !ShouldConcealEmptyCell(box))
         {
             PaintBackground(g, box, images);
             PaintBorder(g, box);
+            // CSS2 outline (Task 9) — drawn after the border, out of flow
+            // (never affects layout).
+            PaintOutline(g, box);
         }
         PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
 
@@ -782,6 +812,9 @@ public class Renderer
         {
             start = now;
             _marqueeStartTicks[elem] = start;
+            // The first animation query IS the start of the scroll — the
+            // natural single point to fire onstart (every behavior).
+            RaiseMarqueeEvent(elem, "onstart");
             return 0L;
         }
 
@@ -819,6 +852,18 @@ public class Renderer
                         (long)Math.Ceiling((2f * span) / Math.Max(0.0001f, pxPerMs)));
                     float pos = (elapsedMs % cycleMs) * pxPerMs;
                     if (pos > span) pos = 2f * span - pos;
+
+                    // BEHAVIOR=alternate — each span-length of travel is a
+                    // direction reversal (a bounce).  Fire onbounce once per
+                    // new turnaround without spamming every paint frame.
+                    long travelSteps = (long)Math.Floor(
+                        (elapsedMs % cycleMs) * pxPerMs / span);
+                    if (travelSteps > _marqueeBounces.GetValueOrDefault(elem))
+                    {
+                        _marqueeBounces[elem] = travelSteps;
+                        RaiseMarqueeEvent(elem, "onbounce");
+                    }
+
                     return rightward ? pos : (rect.Width - contentW) - pos;
                 }
 
@@ -828,6 +873,15 @@ public class Renderer
                     // edge, travel across the marquee viewport, then stop at the
                     // resting edge. Never modulo the elapsed time.
                     float done = Math.Clamp(elapsedMs * pxPerMs, 0f, rect.Width);
+
+                    // The single traversal reaching the resting edge is the
+                    // slide "loop completion" — fire onfinish exactly once.
+                    if (done >= rect.Width && !_marqueeFinished.Contains(elem))
+                    {
+                        _marqueeFinished.Add(elem);
+                        RaiseMarqueeEvent(elem, "onfinish");
+                    }
+
                     return rightward ? -contentW + done : rect.Width - done;
                 }
 
@@ -1218,6 +1272,68 @@ public class Renderer
 
     /// <summary>An unset border colour paints black (an Empty colour makes an invisible pen).</summary>
     private static Color BorderColorOrBlack(Color c) => c == Color.Empty ? Color.Black : c;
+
+    // ── CSS2 outline (Task 9) ────────────────────────────────────────────
+
+    /// <summary>
+    /// Paints the CSS2 outline: a ring around the border box, offset 2px
+    /// from the border edge (outline-offset itself is CSS2.1 — the period
+    /// engines used a fixed 2px gap).  The stroke sits OUTSIDE the offset
+    /// gap.  <c>outline-color: invert</c> (the CSS2 initial) paints black —
+    /// true pixel inversion is out of scope (documented).  Dotted/dashed
+    /// outlines fall back to solid (documented simplification — the era
+    /// raster approximation).
+    /// </summary>
+    private static void PaintOutline(SkiaRenderContext g, LayoutBox box)
+    {
+        var style = box.Element?.Style;
+        if (style == null) return;
+        if (style.OutlineStyle == BorderStyleValue.None || style.OutlineWidth <= 0f)
+            return;
+
+        var rect = box.BorderRect;
+        if (rect.Width <= 0 || rect.Height <= 0) return;
+
+        const float OutlineOffset = 2f;
+        float w = Math.Max(1f, style.OutlineWidth);
+        float x = rect.X - OutlineOffset - w / 2f;
+        float y = rect.Y - OutlineOffset - w / 2f;
+        float width = rect.Width + 2f * (OutlineOffset + w / 2f);
+        float height = rect.Height + 2f * (OutlineOffset + w / 2f);
+
+        Color color = style.OutlineColorInvert
+            ? Color.Black                       // 'invert' → black (documented)
+            : BorderColorOrBlack(style.OutlineColor);
+
+        using var pen = CreateStrokePaint(color, w);
+        g.DrawRectangle(pen, x, y, width, height);
+    }
+
+    /// <summary>
+    /// CSS2 empty-cells:hide — a fully empty cell paints neither background
+    /// nor border.  The property is read from the cell itself OR the owning
+    /// TABLE (the common authoring position — empty-cells is not wired into
+    /// ComputedStyle.Inherit, so a table-level declaration never reaches the
+    /// cells' computed styles).  Only applies in the separated-borders model;
+    /// a collapsed table keeps its shared grid lines.
+    /// </summary>
+    private static bool ShouldConcealEmptyCell(LayoutBox box)
+    {
+        if (box.BoxType != BoxType.TableCell || box.Element == null)
+            return false;
+
+        bool hide = box.Element.Style?.EmptyCells == EmptyCellsValue.Hide;
+        bool collapsedTable = false;
+        for (var p = box.Parent; p != null; p = p.Parent)
+        {
+            if (p.BoxType != BoxType.Table) continue;
+            hide |= p.Element?.Style?.EmptyCells == EmptyCellsValue.Hide;
+            collapsedTable = p.Element?.Style?.BorderCollapse == BorderCollapseValue.Collapse;
+            break;
+        }
+
+        return hide && !collapsedTable && box.Children.Count == 0;
+    }
 
     private static void PaintTableOuterBorder(SkiaRenderContext g, LayoutBox box)
     {
@@ -2568,10 +2684,12 @@ public class Renderer
         int sizeAttr = Math.Max(1, elem.GetAttrInt("size", 1));
         bool isListbox = sizeAttr > 1 || elem.HasAttr("multiple");   // MULTIPLE → listbox, era rule
         int visibleRows = elem.HasAttr("multiple") && sizeAttr == 1 ? 4 : sizeAttr;
-        var options = elem.Descendants()
-            .OfType<DomElement>()
-            .Where(o => o.TagName == "option")
-            .ToList();
+
+        // OPTGROUP-aware row model (Task 9): header rows are non-selectable,
+        // options inside a group are indented.  The flat options list is
+        // derived back out of it for the closed-dropdown face below.
+        var rows = SelectRowModel.Build(elem);
+        var options = rows.Where(r => r.Option != null).Select(r => r.Option!).ToList();
 
         Color selectFaceColor = disabled
             ? Color.FromArgb(0xE0, 0xE0, 0xE0) : Color.White;
@@ -2579,37 +2697,55 @@ public class Renderer
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
         PaintSunkenRect(g, rect, 2, selectFaceColor);
 
-        if (isListbox && options.Count > 0)
+        if (isListbox && rows.Count > 0)
         {
             float rowH = font.GetHeight() + 2;
             visibleRows = Math.Max(1, visibleRows);
-            int maxScroll = Math.Max(0, options.Count - visibleRows);
+            int maxScroll = Math.Max(0, rows.Count - visibleRows);
             int scrollOffset = Math.Clamp(SelectScrollResolver?.Invoke(elem) ?? 0, 0, maxScroll);
-            bool needsScrollbar = options.Count > visibleRows && face.Width >= 16;
+            bool needsScrollbar = rows.Count > visibleRows && face.Width >= 16;
             const float scrollbarWidth = 14f;
             float optionWidth = Math.Max(1f, face.Width - (needsScrollbar ? scrollbarWidth : 0f));
             var optionFace = new RectangleF(face.X, face.Y, optionWidth, face.Height);
 
-            int rows = Math.Min(visibleRows, options.Count - scrollOffset);
+            // Group headers render bold-ish (a heavier weight of the control
+            // font), like the era dropdowns.
+            var headerFamily = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
+            var headerFont = fonts.Resolve(headerFamily,
+                Math.Max(1f, style.FontSize), 700, false, false);
+
+            int displayRows = Math.Min(visibleRows, rows.Count - scrollOffset);
             var state = g.Save();
             try
             {
                 g.SetClip(optionFace, SKClipOperation.Intersect);
-                for (int row = 0; row < rows; row++)
+                for (int row = 0; row < displayRows; row++)
                 {
-                    var opt = options[scrollOffset + row];
+                    var r = rows[scrollOffset + row];
                     float rowY = face.Y + row * rowH;
                     if (rowY + rowH > face.Bottom) break;
 
+                    if (r.IsGroupHeader)
+                    {
+                        // Non-selectable group header — plain face, no
+                        // selection band, label from LABEL/direct text.
+                        using var headerBrush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+                        g.DrawString(GlyphSubstitution.MapGlyphs(r.Label), headerFont, headerBrush,
+                            optionFace.X + 3 + r.Indent, rowY + 1);
+                        continue;
+                    }
+
+                    var opt = r.Option!;
                     bool selected = opt.HasAttr("selected");
                     if (selected)
                         g.FillRectangle(FillPaintFor(Color.Navy),
-                            optionFace.X + 1, rowY, Math.Max(1f, optionFace.Width - 2), rowH);
+                            optionFace.X + 1 + r.Indent, rowY,
+                            Math.Max(1f, optionFace.Width - 2 - r.Indent), rowH);
 
                     using var brush = CreateFillPaint(disabled
                         ? Color.Gray : selected ? Color.White : Color.Black);
                     g.DrawString(GlyphSubstitution.MapGlyphs((opt.InnerText ?? "").Trim()), font, brush,
-                        optionFace.X + 3, rowY + 1);
+                        optionFace.X + 3 + r.Indent, rowY + 1);
                 }
             }
             finally
@@ -2618,7 +2754,7 @@ public class Renderer
             }
 
             if (needsScrollbar)
-                PaintSelectScrollbar(g, face, options.Count, visibleRows, scrollOffset);
+                PaintSelectScrollbar(g, face, rows.Count, visibleRows, scrollOffset);
             return;
         }
 

@@ -6,7 +6,8 @@ using System.Text;
 namespace Retro96.Engine.Html;
 
 /// <summary>
-/// HTML 2.0 / 3.2 named character entities plus the full Latin-1 set, and
+/// HTML 2.0 / 3.2 / 4.01 named character entities (core markup, the full
+/// Latin-1 set, the complete HTML 4.01 symbols/Greek/special appendix) and
 /// numeric references (decimal and hex).  Handles the unterminated-entity
 /// typo case (`&amp` with no semicolon) the way period browsers did: decode
 /// the longest known entity name at the position.
@@ -86,7 +87,53 @@ public static class HtmlEntities
         { "sdot", "\u22C5" }, { "lceil", "\u2308" }, { "rceil", "\u2309" },
         { "lfloor", "\u230A" }, { "rfloor", "\u230B" }, { "lang", "\u2329" },
         { "rang", "\u232A" }, { "loz", "\u25CA" }, { "spades", "\u2660" },
-        { "clubs", "\u2663" }, { "hearts", "\u2665" }, { "diams", "\u2666" }
+        { "clubs", "\u2663" }, { "hearts", "\u2665" }, { "diams", "\u2666" },
+
+        // ── HTML 4.01 named entities (W3C, Dec 1999, appendix
+        //    http://www.w3.org/TR/html4/sgml/entities.html) that the 3.2
+        //    table above lacked.  Greek block, general punctuation, the
+        //    letterlike symbols, double arrows and the remaining math —
+        //    everything the 1999 pages (and the spec's own examples) use.
+
+        // Latin extended / letterlike
+        { "fnof", "\u0192" }, { "weierp", "\u2118" }, { "alefsym", "\u2135" },
+
+        // Greek capitals (U+0391..U+03A9; U+03A2 is unassigned in Unicode,
+        // exactly as in SGML — no "Sigma"-variant entity exists for it)
+        { "Alpha", "\u0391" }, { "Beta", "\u0392" }, { "Gamma", "\u0393" },
+        { "Delta", "\u0394" }, { "Epsilon", "\u0395" }, { "Zeta", "\u0396" },
+        { "Eta", "\u0397" }, { "Theta", "\u0398" }, { "Iota", "\u0399" },
+        { "Kappa", "\u039A" }, { "Lambda", "\u039B" }, { "Mu", "\u039C" },
+        { "Nu", "\u039D" }, { "Xi", "\u039E" }, { "Omicron", "\u039F" },
+        { "Pi", "\u03A0" }, { "Rho", "\u03A1" }, { "Sigma", "\u03A3" },
+        { "Tau", "\u03A4" }, { "Upsilon", "\u03A5" }, { "Phi", "\u03A6" },
+        { "Chi", "\u03A7" }, { "Psi", "\u03A8" }, { "Omega", "\u03A9" },
+
+        // Greek small letters + final sigma + symbol variants
+        { "alpha", "\u03B1" }, { "beta", "\u03B2" }, { "gamma", "\u03B3" },
+        { "delta", "\u03B4" }, { "epsilon", "\u03B5" }, { "zeta", "\u03B6" },
+        { "eta", "\u03B7" }, { "theta", "\u03B8" }, { "iota", "\u03B9" },
+        { "kappa", "\u03BA" }, { "lambda", "\u03BB" }, { "mu", "\u03BC" },
+        { "nu", "\u03BD" }, { "xi", "\u03BE" }, { "omicron", "\u03BF" },
+        { "pi", "\u03C0" }, { "rho", "\u03C1" }, { "sigmaf", "\u03C2" },
+        { "sigma", "\u03C3" }, { "tau", "\u03C4" }, { "upsilon", "\u03C5" },
+        { "phi", "\u03C6" }, { "chi", "\u03C7" }, { "psi", "\u03C8" },
+        { "omega", "\u03C9" }, { "thetasym", "\u03D1" }, { "upsih", "\u03D2" },
+        { "piv", "\u03D6" },
+
+        // General punctuation: spaces, joiners, marks, low quotes,
+        // single/g double angle quotes
+        { "ensp", "\u2002" }, { "emsp", "\u2003" }, { "thinsp", "\u2009" },
+        { "zwnj", "\u200C" }, { "zwj", "\u200D" }, { "lrm", "\u200E" },
+        { "rlm", "\u200F" }, { "sbquo", "\u201A" }, { "bdquo", "\u201E" },
+        { "lsaquo", "\u2039" }, { "rsaquo", "\u203A" },
+
+        // Double-headed arrows
+        { "lArr", "\u21D0" }, { "uArr", "\u21D1" }, { "rArr", "\u21D2" },
+        { "dArr", "\u21D3" }, { "hArr", "\u21D4" },
+
+        // Remaining math
+        { "nsub", "\u2284" }
     };
 
     private static readonly int _longestEntityName;

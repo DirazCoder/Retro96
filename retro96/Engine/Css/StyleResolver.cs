@@ -67,6 +67,7 @@ public static class StyleResolver
         foreach (var element in doc.ElementDescendants())
         {
             if (element.TagName != "style") continue;
+            if (!MediaAppliesToScreen(element.GetAttr("media"))) continue;
             foreach (var text in element.Children.OfType<DomText>())
                 if (!string.IsNullOrEmpty(text.Data))
                 {
@@ -75,6 +76,27 @@ public static class StyleResolver
                 }
         }
         return rules;
+    }
+
+    /// <summary>
+    /// CSS2 media matching for &lt;style media=…&gt; attributes: applies when
+    /// the list is absent/empty or contains "screen"/"all" (comma lists
+    /// count, print-only sheets do not).  Mirrors the CssParser @media
+    /// behaviour.
+    /// </summary>
+    internal static bool MediaAppliesToScreen(string? media)
+    {
+        if (string.IsNullOrWhiteSpace(media))
+            return true;
+        foreach (var part in media.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string token = part.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault() ?? "";
+            if (token.Equals("screen", StringComparison.OrdinalIgnoreCase) ||
+                token.Equals("all", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private static HoverRuleEntry CacheHoverRules(DomDocument doc, IEnumerable<CssRule> rules)
@@ -150,10 +172,16 @@ public static class StyleResolver
 
         // Author rules from every <style> element (including <link
         // rel=stylesheet> sheets that the loader injected as <style> nodes).
+        // CSS2: a <style media=…> attribute limits the sheet to the listed
+        // media types — non-screen sheets are skipped (the attribute was
+        // previously ignored entirely, so print-only <style> blocks
+        // applied on screen).
         var authorRules = new List<CssRule>();
         foreach (var styleElem in doc.ElementDescendants())
         {
             if (styleElem.TagName != "style")
+                continue;
+            if (!MediaAppliesToScreen(styleElem.GetAttr("media")))
                 continue;
             foreach (var child in styleElem.Children)
             {
@@ -304,7 +332,8 @@ public static class StyleResolver
             if (normalDecls != null)
                 foreach (var (decl, _, _) in
                          normalDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+                    style.Apply(decl, parentFs, viewportWidth,
+                        parentStyle?.FontWeight ?? FontWeightValue.Normal, parentStyle);
 
             // 3. Inline STYLE= — outranks non-important author rules.
             var inlineStyle = elem.GetAttr("style");
@@ -315,7 +344,8 @@ public static class StyleResolver
                     if (decl.Important)
                         (importantDecls ??= new()).Add((decl, (1_000_000, 0, 0), int.MaxValue));
                     else
-                        style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+                        style.Apply(decl, parentFs, viewportWidth,
+                            parentStyle?.FontWeight ?? FontWeightValue.Normal, parentStyle);
                 }
             }
 
@@ -324,7 +354,8 @@ public static class StyleResolver
             if (importantDecls != null)
                 foreach (var (decl, _, _) in
                          importantDecls.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                    style.Apply(decl, parentFs, viewportWidth, parentStyle?.FontWeight ?? FontWeightValue.Normal);
+                    style.Apply(decl, parentFs, viewportWidth,
+                        parentStyle?.FontWeight ?? FontWeightValue.Normal, parentStyle);
 
             if (activeBaseFontSize != 3 && !style.OwnFontSize &&
                 elem.TagName is not ("h1" or "h2" or "h3" or "h4" or "h5" or "h6" or
@@ -381,6 +412,13 @@ public static class StyleResolver
                 "first-line", viewportWidth, s => style.FirstLineStyle = s);
             ApplyPseudoStyle(style, pseudoNormalDecls, pseudoImportantDecls,
                 "first-letter", viewportWidth, s => style.FirstLetterStyle = s);
+            // CSS2 generated content — :before/:after declarations land in
+            // the GeneratedBefore/GeneratedAfter slots (same clone-apply
+            // shape as FirstLineStyle; the renderer lays the content out).
+            ApplyPseudoStyle(style, pseudoNormalDecls, pseudoImportantDecls,
+                "before", viewportWidth, s => style.GeneratedBefore = s);
+            ApplyPseudoStyle(style, pseudoNormalDecls, pseudoImportantDecls,
+                "after", viewportWidth, s => style.GeneratedAfter = s);
 
             foreach (var child in elem.Children)
                 ResolveNode(child, style, authorRules, doc, viewportWidth, ref activeBaseFontSize);
@@ -410,10 +448,10 @@ public static class StyleResolver
         var pseudo = baseStyle.Clone();
         if (normalList != null)
             foreach (var (decl, _, _) in normalList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight);
+                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight, baseStyle);
         if (importantList != null)
             foreach (var (decl, _, _) in importantList.OrderBy(x => x.Spec).ThenBy(x => x.Order))
-                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight);
+                pseudo.Apply(decl, baseStyle.FontSize, viewportWidth, baseStyle.FontWeight, baseStyle);
         assign(pseudo);
     }
 
@@ -436,8 +474,12 @@ public static class StyleResolver
                 break;
             case "body":
                 style.Display = DisplayValue.Block;
-                style.MarginTop = style.MarginBottom = 8f;
-                style.MarginLeft = style.MarginRight = 8f;
+                // Checklist §9: IE's default body margins are 10px left/right
+                // and 15px top/bottom; Navigator kept 8px. Persona-gated so
+                // the strict historical profiles match their screenshots.
+                bool ieBodyMargins = BrowserRuntime.IsInternetExplorer3 || BrowserRuntime.IsInternetExplorer5;
+                style.MarginTop = style.MarginBottom = ieBodyMargins ? 15f : 8f;
+                style.MarginLeft = style.MarginRight = ieBodyMargins ? 10f : 8f;
                 style.BackgroundColor = Color.White;
                 style.Color = Color.Black;
                 break;
@@ -467,6 +509,14 @@ public static class StyleResolver
             case "figcaption":
             case "fieldset":
                 style.Display = DisplayValue.Block;
+                break;
+            case "legend":
+                // IE5 renders the legend inset into the fieldset's top
+                // border: a block with a small left offset.
+                style.Display = DisplayValue.Block;
+                style.MarginLeft = 10f;
+                style.PaddingLeft = 2f;
+                style.PaddingRight = 2f;
                 break;
             case "center":
                 style.Display = DisplayValue.Block;
@@ -646,6 +696,44 @@ public static class StyleResolver
                 }
                 break;
             case "q":
+                // CSS2 UA stylesheet: Q:before { content: open-quote }
+                // Q:after { content: close-quote }. The quote keywords need
+                // a nesting-depth registry, so the UA default seeds literal
+                // string tokens instead (the era-simple rendering).
+                style.GeneratedBefore = new ComputedStyle
+                {
+                    Content = new List<ContentToken> { new ContentToken("string", "\u201c") }
+                };
+                style.GeneratedAfter = new ComputedStyle
+                {
+                    Content = new List<ContentToken> { new ContentToken("string", "\u201d") }
+                };
+                break;
+
+            // Ruby (IE5, §14a): ruby text renders inline after the base
+            // at half size; rp fallback punctuation is hidden because
+            // ruby IS supported.
+            case "ruby":
+                style.Display = DisplayValue.Inline;
+                break;
+            case "rt":
+                style.Display = DisplayValue.Inline;
+                style.FontSize = parentFontSize * 0.5f;
+                break;
+            case "rp":
+                style.Display = DisplayValue.None;
+                break;
+
+            // XML data islands (IE5): present in the DOM for script access,
+            // never rendered. Same for the concealment wrappers whose
+            // contents the parser already dropped.
+            case "xml":
+            case "comment":
+            case "noembed":
+            case "nolayer":
+            case "keygen":
+            case "server":
+                style.Display = DisplayValue.None;
                 break;
 
             // Non-rendering

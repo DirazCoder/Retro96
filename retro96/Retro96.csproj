@@ -30,7 +30,12 @@
     <!-- MAXIMUM HIGH-PERFORMANCE ENGINE TUNING     -->
     <!-- ========================================== -->
     <Configuration>Release</Configuration>
-    <PublishAot>true</PublishAot>
+    <!-- PublishAot implies SelfContained + a RID; without an explicit RID the SDK falls
+         back to the host RID (linux-x64) and the WinForms runtime pack does not exist
+         for it (NETSDK1082). AOT publishes are Windows-only, so default the RID to
+         win-x64; plain non-AOT builds on any OS stay RID-less. -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and '$(PublishAot)' == 'true' and '$(SelfContained)' != 'false'">win-x64</RuntimeIdentifier>
+    <PublishAot>false</PublishAot>
     <OptimizationPreference>Speed</OptimizationPreference>
 
     <!-- Partial trimming maintains critical WinForms drawing plumbing -->

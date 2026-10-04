@@ -1,0 +1,111 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>Tables Battery (1999)</title>
+<style type="text/css">
+  table.collapse { border-collapse: collapse; border-spacing: 0; }
+  table.spacing  { border-collapse: separate; border-spacing: 8px 4px; }
+  table.fixed    { table-layout: fixed; }
+  td.pad { padding: 6px; }
+  caption.bot { caption-side: bottom; }
+</style>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>Tables battery</h1>
+
+<h2>frame and rules attributes</h2>
+<table border="3" frame="hsides" rules="groups" cellpadding="4">
+  <caption>frame=hsides rules=groups</caption>
+  <colgroup span="2" align="center"></colgroup>
+  <thead><tr><th>H1</th><th>H2</th></tr></thead>
+  <tbody>
+    <tr><td>a</td><td>b</td></tr>
+    <tr><td>c</td><td>d</td></tr>
+  </tbody>
+  <tfoot><tr><td colspan="2">foot row</td></tr></tfoot>
+</table>
+
+<table border="2" frame="void" rules="all" cellpadding="4">
+  <caption>frame=void rules=all</caption>
+  <tbody><tr><td>1</td><td>2</td><td>3</td></tr></tbody>
+</table>
+
+<h2>Cell accessibility attributes (accepted)</h2>
+<table border="1" summary="accessibility battery">
+  <tbody>
+    <tr><th abbr="Yr" axis="time" scope="col">Year</th>
+        <th headers="h1" scope="col">Product</th></tr>
+    <tr><td>1998</td><td headers="h1">Browser</td></tr>
+  </tbody>
+</table>
+
+<h2>valign and align inheritance through row, column and section</h2>
+<table border="1" height="120" width="300">
+  <tbody valign="middle" align="center">
+    <tr valign="top">
+      <td>top/center (row overrides)</td>
+      <td valign="bottom">bottom/center (cell wins)</td>
+    </tr>
+    <tr>
+      <td align="left">left/middle (cell wins)</td>
+      <td>inherit middle/center</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>IE extras: bordercolor family, background, cols, height, caption valign</h2>
+<table border="2" bordercolor="#FF0000" bordercolorlight="#FFCCCC"
+       bordercolordark="#800000" background="../images/pixel-dot.gif"
+       cols="2" height="80" cellpadding="3">
+  <caption valign="top">IE border-color battery (caption at top)</caption>
+  <tr bgcolor="#FFFFEE"><td>light edge</td><td>dark edge</td></tr>
+  <tr background="../images/pixel-dot.gif"><td>row background</td>
+      <td bgcolor="#CCFFCC">cell background</td></tr>
+</table>
+
+<h2>nowrap vs width: cell width wins over nowrap</h2>
+<table border="1" cellpadding="2">
+  <tr><td width="60" nowrap>Nowrap cell with a narrow authored width — width wins.</td></tr>
+</table>
+<table border="1" cellpadding="2" width="90">
+  <tr><td nowrap>Nowrap cell inside a too-narrow table width — nowrap wins.</td></tr>
+</table>
+
+<h2>CSS2: border-collapse collapse</h2>
+<table class="collapse" border="1" cellpadding="4" rules="all">
+  <caption>border-collapse: collapse (spacing 0, shared edges)</caption>
+  <tbody>
+    <tr><td>shared</td><td>edges</td><td>drawn once</td></tr>
+    <tr><td>1</td><td>2</td><td>3</td></tr>
+  </tbody>
+</table>
+
+<h2>CSS2: border-spacing separate</h2>
+<table class="spacing" border="1" cellpadding="2">
+  <caption>border-spacing: 8px 4px</caption>
+  <tbody>
+    <tr><td>spaced</td><td>cells</td></tr>
+    <tr><td>keep</td><td>their gaps</td></tr>
+  </tbody>
+</table>
+
+<h2>CSS2: table-layout fixed + empty-cells</h2>
+<table class="fixed" border="1" width="280">
+  <colgroup><col width="120"><col></colgroup>
+  <tbody>
+    <tr><td>fixed column 120px</td><td width="40">40</td></tr>
+    <tr><td>content does not resize fixed columns</td><td>&nbsp;</td></tr>
+    <tr><td></td><td>empty cell (left visible)</td></tr>
+  </tbody>
+</table>
+
+<h2>Nested tables with rowspan/colspan</h2>
+<table border="1" cellpadding="3">
+  <tr><td rowspan="2">span 2 rows</td><td colspan="2">span 2 cols</td></tr>
+  <tr><td>a</td><td>b</td></tr>
+  <tr><td>
+    <table border="1" width="100%"><tr><td>nested</td><td>table</td></tr></table>
+  </td><td>outer</td></tr>
+</table>
+
+</body>
+</html>

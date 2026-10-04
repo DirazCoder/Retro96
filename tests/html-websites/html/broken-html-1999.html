@@ -1,0 +1,69 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>Deliberately Broken HTML 4.01 (error recovery battery)</title></head>
+<body bgcolor="#FFFFFF">
+
+<h1>Broken HTML recovery</h1>
+<p>This page is INTENTIONALLY malformed. A 1999 browser still renders it.
+
+<!-- unclosed <p> above; implied end before next block -->
+<p>Second paragraph (the previous p was never closed).
+
+<h2>Unclosed list items</h2>
+<ul>
+  <li>item one
+  <li>item two
+  <li>item three
+</ul>
+<dl>
+  <dt>term one
+  <dd>definition one
+  <dt>term two
+  <dd>definition two
+</dl>
+
+<h2>Tag soup table</h2>
+<table border="1">
+  <tr><td>cell one (implied tr AND implied tbody)
+  <tr><td>cell two
+      <td>cell three
+  <tr><td>row three, misnested <b>bold<i>bold-italic</b>italic</i> content
+</table>
+
+<h2>Unclosed option and select</h2>
+<form>
+<select name="broken">
+  <option value="1">one
+  <option value="2" selected>two
+  <option value="3">three
+</select>
+
+<h2>Missing quotes, minimized attributes</h2>
+<table border=1 cellspacing=0>
+  <tr><td bgcolor=#FFFFCC>unquoted values</td><td nowrap>nowrap cell</td></tr>
+  <tr><td colspan=2 align=center><input type=checkbox checked disabled></td></tr>
+</table>
+<img src=../images/pixel-dot.gif alt=unquoted width=16 height=16 border=1>
+
+<h2>Structural recovery</h2>
+No html/head/body wrapper after this point — implied.
+<title>stray title after body</title>
+<b>unclosed bold spanning a block
+<p>paragraph inside the unclosed bold — the formatting reconstructs.
+</b>
+
+<h2>Stray closers</h2>
+</p>
+</td>
+</table>
+<p>After the stray closers, content keeps flowing.
+
+<h2>Nested formatting reconstruction</h2>
+<p><b>bold <i>bold-italic <u>bold-italic-underline
+<p>paragraph break inside three unclosed inlines
+<p>fourth paragraph — reconstruction must reopen b/i/u.
+
+<h2>Unclosed textarea (eats the rest — era-correct)</h2>
+<form>
+<textarea rows="2" cols="20" wrap="hard">textarea body
+

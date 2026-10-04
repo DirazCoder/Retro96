@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace Retro96.Engine.Vbs;
 
 /// <summary>
-/// VBScript 1.0 recursive-descent parser.
+/// VBScript 5.0 recursive-descent parser.
 /// Precedence (high→low): ^, unary -, * /, \\, Mod, + -, &amp;, comparisons
 /// (+ Is), Not, And, Or, Xor, Eqv, Imp.
 /// Handles single-line vs block If, Select Case (Is/To/comma lists), all four
@@ -16,7 +16,9 @@ public sealed class VbsParser
     private readonly IReadOnlyList<VbsToken> _tokens;
     private int _pos;
     private bool _inProcedure;
-    private int _doDepth, _forDepth;
+    private int _doDepth, _forDepth, _withDepth;
+    private bool _inClass;
+    private int _propertyDepth;
 
     private VbsParser(IReadOnlyList<VbsToken> tokens) =>
         _tokens = tokens ?? throw new ArgumentNullException(nameof(tokens));
@@ -26,6 +28,24 @@ public sealed class VbsParser
         var lexer = new VbsLexer(source ?? throw new ArgumentNullException(nameof(source)));
         var parser = new VbsParser(lexer.Tokenize());
         return parser.ParseProgram();
+    }
+
+    /// <summary>Parses a single expression — Eval's argument. `=` inside
+    /// an expression is comparison-only, which is exactly Eval's documented
+    /// semantics (assignments cannot happen through Eval).</summary>
+    public static VbsExpr ParseExpressionText(string source)
+    {
+        var lexer = new VbsLexer(source ?? throw new ArgumentNullException(nameof(source)));
+        var parser = new VbsParser(lexer.Tokenize());
+        var expr = parser.ParseExpression();
+        parser.ConsumeSeparators();
+        if (!parser.IsAtEof())
+        {
+            var t = parser.Peek();
+            throw Syntax(VbsErrorNumbers.ExpectedEndOfStatement,
+                "Expected end of statement", t.Line, t.Column);
+        }
+        return expr;
     }
 
     // ── Token helpers ──────────────────────────────────────────────────────
@@ -151,6 +171,10 @@ public sealed class VbsParser
     {
         int line = Peek().Line, col = Peek().Column;
 
+        // `.Member` shorthand inside a With block (statement position).
+        if (CheckPunct(".") && _withDepth > 0)
+            return ParseWithQualifiedStatement(line, isSet: false);
+
         if (Peek() is VbsKeywordToken kw)
         {
             switch (kw.Keyword)
@@ -164,6 +188,15 @@ public sealed class VbsParser
                     Advance();
                     if (MatchKw("DIM")) return ParseDimDecls(line);
                     if (CheckKw("CONST")) return ParseConst(line);
+                    // VBScript 5.0: Public/Private on script-level procedures
+                    // (visibility is meaningless without modules — accepted,
+                    // not enforced). Properties are class-only.
+                    if (CheckKw("SUB")) return ParseProcedure(Peek().Line, isFunction: false);
+                    if (CheckKw("FUNCTION")) return ParseProcedure(Peek().Line, isFunction: true);
+                    if (CheckKw("CLASS")) return ParseClass(line);
+                    if (CheckKw("PROPERTY"))
+                        throw Syntax(VbsErrorNumbers.ExpectedStatement,
+                            "'Property' is only valid inside a Class block", line, col);
                     return ParseDimDecls(line);
                 case "CONST": return ParseConst(line);
                 case "REDIM": return ParseReDim(line);
@@ -173,13 +206,19 @@ public sealed class VbsParser
                 case "FOR": return ParseFor(line);
                 case "DO": return ParseDo(line);
                 case "WHILE": return ParseWhile(line);
+                case "WITH": return ParseWith(line);
+                case "CLASS": return ParseClass(line);
                 case "EXIT": return ParseExit(line, col);
                 case "ON": return ParseOnError(line);
                 case "OPTION": return ParseOption(line);
                 case "SUB": return ParseProcedure(line, isFunction: false);
                 case "FUNCTION": return ParseProcedure(line, isFunction: true);
                 case "CALL": return ParseCall(line, col);
-                case "SET": Advance(); return ParseCallOrAssignment(line, isSet: true);
+                case "SET":
+                    Advance();
+                    if (CheckPunct(".") && _withDepth > 0)
+                        return ParseWithQualifiedStatement(line, isSet: true);
+                    return ParseCallOrAssignment(line, isSet: true);
                 case "LET": Advance(); return ParseCallOrAssignment(line, isSet: false);
                 case "STOP": Advance(); return new VbsNopStatement(line);
                 default:
@@ -187,6 +226,12 @@ public sealed class VbsParser
                         $"Expected statement, found '{kw.Keyword}'", line, col);
             }
         }
+
+        // Directly inside a class body (not inside a method) members only.
+        if (_inClass && !_inProcedure)
+            throw Syntax(VbsErrorNumbers.ExpectedStatement,
+                "Class members must be Public or Private variables, Sub/Function " +
+                "or Property procedures", line, col);
 
         if (Peek() is VbsIdentifierToken)
             return ParseCallOrAssignment(line, isSet: false);
@@ -302,6 +347,11 @@ public sealed class VbsParser
                     throw Syntax(VbsErrorNumbers.ExpectedStatement,
                         "'Exit Function' is only valid inside a procedure", line, col);
                 Advance(); return new VbsExitStatement(line, VbsExitKind.Function);
+            case "PROPERTY":
+                if (_propertyDepth == 0)
+                    throw Syntax(VbsErrorNumbers.ExpectedStatement,
+                        "'Exit Property' is only valid inside a Property procedure", line, col);
+                Advance(); return new VbsExitStatement(line, VbsExitKind.Property);
             case "DO":
                 if (_doDepth == 0)
                     throw Syntax(VbsErrorNumbers.SyntaxError,
@@ -314,7 +364,7 @@ public sealed class VbsParser
                 Advance(); return new VbsExitStatement(line, VbsExitKind.For);
             default:
                 throw Syntax(VbsErrorNumbers.SyntaxError,
-                    "Expected 'Sub', 'Function', 'Do' or 'For' after 'Exit'", line, col);
+                    "Expected 'Sub', 'Function', 'Property', 'Do' or 'For' after 'Exit'", line, col);
         }
     }
 
@@ -324,7 +374,27 @@ public sealed class VbsParser
     {
         Advance();   // Sub / Function
         string name = ExpectIdentifierName();
+        var parameters = ParseParameters();
 
+        _inProcedure = true;
+        int savedDo = _doDepth, savedFor = _forDepth, savedWith = _withDepth;
+        _doDepth = _forDepth = _withDepth = 0;
+
+        ConsumeSeparators();
+        string endKw = isFunction ? "FUNCTION" : "SUB";
+        var body = ParseStatementList(() => CheckKwPair("END", endKw));
+        ExpectKw("END");
+        ExpectKw(endKw);
+
+        _inProcedure = false;
+        _doDepth = savedDo; _forDepth = savedFor; _withDepth = savedWith;
+        return new VbsSubStatement(line, name, parameters, body, isFunction);
+    }
+
+    /// <summary>`( [ByVal|ByRef] name [, …] )` — shared by Sub/Function and
+    /// Property Get/Let/Set declarations.</summary>
+    private List<VbsParam> ParseParameters()
+    {
         var parameters = new List<VbsParam>();
         if (MatchPunct("("))
         {
@@ -339,20 +409,198 @@ public sealed class VbsParser
             }
             ExpectPunct(")");
         }
+        return parameters;
+    }
 
-        _inProcedure = true;
+    // ── With ─────────────────────────────────────────────────────────────────
+
+    private VbsStmt ParseWith(int line)
+    {
+        int col = Peek().Column;
+        Advance();   // With
+        var obj = ParseExpression();
+        ConsumeSeparators();
+
         int savedDo = _doDepth, savedFor = _forDepth;
         _doDepth = _forDepth = 0;
-
-        ConsumeSeparators();
-        string endKw = isFunction ? "FUNCTION" : "SUB";
-        var body = ParseStatementList(() => CheckKwPair("END", endKw));
-        ExpectKw("END");
-        ExpectKw(endKw);
-
-        _inProcedure = false;
+        _withDepth++;
+        var body = ParseStatementList(() => CheckKwPair("END", "WITH"));
+        _withDepth--;
         _doDepth = savedDo; _forDepth = savedFor;
-        return new VbsSubStatement(line, name, parameters, body, isFunction);
+
+        ExpectKw("END");
+        ExpectKw("WITH", "Expected 'End With'");
+        if (_withDepth < 0)
+            throw Syntax(VbsErrorNumbers.SyntaxError,
+                "'End With' without a matching 'With'", line, col);
+        return new VbsWithStatement(line, obj, body);
+    }
+
+    /// <summary>`.Member…` at statement position inside With — call or
+    /// assignment against the With object.</summary>
+    private VbsStmt ParseWithQualifiedStatement(int line, bool isSet)
+    {
+        int col = Peek().Column;
+        Advance();   // leading '.'
+        VbsExpr callee = new VbsWithMemberExpr(line, ExpectMemberName());
+        while (CheckPunct("."))
+        {
+            Advance();
+            callee = new VbsMemberExpr(line, callee, ExpectMemberName());
+        }
+        return ParseCalleeTail(line, col, callee, isSet);
+    }
+
+    // ── Class ───────────────────────────────────────────────────────────────
+
+    private VbsStmt ParseClass(int line)
+    {
+        int col = Peek().Column;
+        if (_inClass)
+            throw Syntax(VbsErrorNumbers.SyntaxError,
+                "Class definitions cannot be nested", line, col);
+        if (_inProcedure)
+            throw Syntax(VbsErrorNumbers.ExpectedStatement,
+                "Class definitions are not valid inside procedures", line, col);
+        Advance();   // Class
+        string name = ExpectIdentifierName();
+        ConsumeSeparators();
+
+        var members = new List<VbsClassMemberDecl>();
+        var memberNames = new Dictionary<string, char>(StringComparer.OrdinalIgnoreCase);
+
+        bool wasInClass = _inClass;
+        _inClass = true;
+        int savedWith = _withDepth;
+        _withDepth = 0;
+
+        while (true)
+        {
+            if (IsAtEof())
+                throw Syntax(VbsErrorNumbers.SyntaxError, "Expected 'End Class'",
+                    Peek().Line, Peek().Column);
+            if (CheckKwPair("END", "CLASS")) { Advance(); Advance(); break; }
+
+            members.Add(ParseClassMember(Peek().Line, Peek().Column));
+            RegisterMemberNames(memberNames, members[^1]);
+            ConsumeSeparators();
+        }
+
+        _inClass = wasInClass;
+        _withDepth = savedWith;
+        return new VbsClassStatement(line, name, members);
+    }
+
+    /// <summary>One class member: visibility + field list / method /
+    /// property. Returns the AST node; duplicate-name detection is done by
+    /// the caller via RegisterMemberNames (compile error 1041).</summary>
+    private VbsClassMemberDecl ParseClassMember(int line, int col)
+    {
+        bool sawVisibility = false, isPublic = true;
+        if (CheckKw("PUBLIC") || CheckKw("PRIVATE"))
+        {
+            isPublic = CheckKw("PUBLIC");
+            sawVisibility = true;
+            Advance();
+        }
+
+        if (CheckKw("SUB") || CheckKw("FUNCTION"))
+        {
+            bool isFunction = CheckKw("FUNCTION");
+            // Methods/properties default to Public when the keyword is omitted
+            // (fields default to Private — see below).
+            var sub = (VbsSubStatement)ParseProcedure(Peek().Line, isFunction);
+            return new VbsClassMethodDecl(sub.Line, sub.Name, sub.Params, sub.Body,
+                sub.IsFunction, sawVisibility ? isPublic : true);
+        }
+
+        if (CheckKw("PROPERTY"))
+            return ParsePropertyDecl(line, sawVisibility ? isPublic : true);
+
+        // Field declarations: `Public X, Y` / `Private A()` / `Dim A`.
+        // A field without a visibility keyword is Private (VB6 module-level Dim).
+        if (sawVisibility || CheckKw("DIM"))
+        {
+            MatchKw("DIM");   // tolerated after Public/Private
+            var dim = (VbsDimStatement)ParseDimDecls(line);
+            return new VbsClassFieldDecl(line, dim.Decls, sawVisibility ? isPublic : false);
+        }
+
+        throw Syntax(VbsErrorNumbers.ExpectedStatement,
+            "Class members must be Public or Private variables, Sub/Function " +
+            "or Property procedures", line, col);
+    }
+
+    private VbsClassPropertyDecl ParsePropertyDecl(int line, bool isPublic)
+    {
+        Advance();   // Property
+
+        VbsPropertyKind kind;
+        if (Peek() is VbsIdentifierToken id &&
+            id.Name.Equals("GET", StringComparison.OrdinalIgnoreCase))
+        {
+            kind = VbsPropertyKind.Get;
+            Advance();
+        }
+        else if (MatchKw("LET")) kind = VbsPropertyKind.Let;
+        else if (MatchKw("SET")) kind = VbsPropertyKind.Set;
+        else
+            throw Syntax(VbsErrorNumbers.SyntaxError,
+                "Expected 'Get', 'Let' or 'Set' after 'Property'", Peek().Line, Peek().Column);
+
+        string name = ExpectIdentifierName();
+        var parameters = ParseParameters();
+
+        bool wasInProcedure = _inProcedure;
+        int savedDo = _doDepth, savedFor = _forDepth, savedWith = _withDepth;
+        _inProcedure = true;   // a property IS a procedure (bare statements OK)
+        _doDepth = _forDepth = _withDepth = 0;
+
+        _propertyDepth++;
+        ConsumeSeparators();
+        var body = ParseStatementList(() => CheckKwPair("END", "PROPERTY"));
+        ExpectKw("END");
+        ExpectKw("PROPERTY", "Expected 'End Property'");
+        _propertyDepth--;
+
+        _inProcedure = wasInProcedure;
+        _doDepth = savedDo; _forDepth = savedFor; _withDepth = savedWith;
+
+        // Property Get is function-like: the property name doubles as its
+        // implicit return variable. Let/Set take the value as last parameter.
+        return new VbsClassPropertyDecl(line, name, kind, parameters, body, isPublic);
+    }
+
+    /// <summary>Duplicate member detection (compile error 1041). Kind chars:
+    /// 'F' field, 'M' method, 'P' property accessor — a property may repeat
+    /// its name across Get/Let/Set, nothing else may repeat.</summary>
+    private static void RegisterMemberNames(Dictionary<string, char> names, VbsClassMemberDecl member)
+    {
+        void Add(string name, char kind)
+        {
+            if (names.TryGetValue(name, out char existing))
+            {
+                bool ok = existing == 'P' && kind == 'P';
+                if (!ok)
+                    throw Syntax(VbsErrorNumbers.NameRedefined,
+                        $"Name redefined: '{name}'", member.Line, 0);
+            }
+            else
+                names[name] = kind;
+        }
+
+        switch (member)
+        {
+            case VbsClassFieldDecl f:
+                foreach (var d in f.Fields) Add(d.Name, 'F');
+                break;
+            case VbsClassMethodDecl m:
+                Add(m.Name, 'M');
+                break;
+            case VbsClassPropertyDecl p:
+                Add(p.Name, 'P');
+                break;
+        }
     }
 
     // ── If ─────────────────────────────────────────────────────────────────
@@ -596,18 +844,6 @@ public sealed class VbsParser
         return new VbsCallStatement(line, expr, ForceByVal: false);
     }
 
-    /// <summary>
-    /// Parses `name[.member]*` then disambiguates:
-    ///   name = expr                → Let assignment
-    ///   name(i, …) = expr          → array-element assignment
-    ///   Set name = expr            → object assignment
-    ///   name arg1, arg2            → Sub call without parentheses (ByRef works)
-    ///   Call name(args)            → Sub call (ByRef works)
-    ///   name(arg)                  → Sub call — ONE parenthesized argument is
-    ///                                 forced ByVal (the classic quirk)
-    ///   name(arg, arg2)            → syntax error 1041
-    ///   name (arg), arg2           → bare call whose first arg is a paren group
-    /// </summary>
     private VbsStmt ParseCallOrAssignment(int line, bool isSet)
     {
         int col = Peek().Column;
@@ -617,7 +853,24 @@ public sealed class VbsParser
             Advance();
             callee = new VbsMemberExpr(line, callee, ExpectMemberName());
         }
+        return ParseCalleeTail(line, col, callee, isSet);
+    }
 
+    /// <summary>
+    /// The shared tail of statement parsing after a callee expression
+    /// (`name[.member]*` or a With-qualified `.member` chain):
+    ///   callee = expr                → Let assignment
+    ///   callee(i, …) = expr          → array-element assignment
+    ///   Set callee = expr            → object assignment
+    ///   callee arg1, arg2            → Sub call without parentheses (ByRef works)
+    ///   Call callee(args)            → Sub call (ByRef works)
+    ///   callee(arg)                  → Sub call — ONE parenthesized argument is
+    ///                                 forced ByVal (the classic quirk)
+    ///   callee(arg, arg2)            → syntax error 1041
+    ///   callee (arg), arg2           → bare call whose first arg is a paren group
+    /// </summary>
+    private VbsStmt ParseCalleeTail(int line, int col, VbsExpr callee, bool isSet)
+    {
         if (CheckPunct("("))
         {
             var args = ParseParenArgs();
@@ -902,6 +1155,11 @@ public sealed class VbsParser
                 Advance();
                 return new VbsLiteralExpr(t.Line, lit.Value);
 
+            // `.Member` in expression position inside a With block.
+            case VbsPunctToken { Text: "." } when _withDepth > 0:
+                Advance();
+                return new VbsWithMemberExpr(t.Line, ExpectMemberName());
+
             case VbsIdentifierToken id:
                 Advance();
                 return new VbsNameExpr(t.Line, id.Name);
@@ -914,6 +1172,15 @@ public sealed class VbsParser
                     case "NULL": Advance(); return new VbsLiteralExpr(t.Line, VbsVariant.Null);
                     case "EMPTY": Advance(); return new VbsLiteralExpr(t.Line, VbsVariant.Empty);
                     case "NOTHING": Advance(); return new VbsLiteralExpr(t.Line, VbsVariant.Nothing);
+                    case "ME":
+                        if (!_inClass)
+                            throw Syntax(VbsErrorNumbers.SyntaxError,
+                                "'Me' is only valid inside a class", t.Line, t.Column);
+                        Advance();
+                        return new VbsMeExpr(t.Line);
+                    case "NEW":
+                        Advance();
+                        return new VbsNewExpr(t.Line, ExpectIdentifierName());
                 }
                 break;
 

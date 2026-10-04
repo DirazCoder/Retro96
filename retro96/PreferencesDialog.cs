@@ -46,6 +46,7 @@ internal sealed class PreferencesDialog : Form
     private readonly CheckBox _jsDialogs = new();
     private readonly CheckBox _followRedirects = new();
     private readonly CheckBox _compressedResponses = new();
+    private readonly CheckBox _httpCache = new();
     private readonly CheckBox _metaRefresh = new();
     private readonly CheckBox _cookies = new();
     private readonly CheckBox _referrer = new();
@@ -227,6 +228,8 @@ internal sealed class PreferencesDialog : Form
         _engine.Items.Add("Retro96 Engine (all compatibility features)");
         _engine.Items.Add("Netscape Navigator 3");
         _engine.Items.Add("Internet Explorer 3");
+        _engine.Items.Add("Internet Explorer 5 (1999)");
+        _engine.Items.Add("Netscape Navigator 4.7 (1999)");
         _engine.SelectedIndexChanged += (_, _) => UpdateUserAgentHint();
 
         panel.Controls.Add(Group("Browser personality", new Control[]
@@ -235,9 +238,12 @@ internal sealed class PreferencesDialog : Form
             _engine,
             new Label
             {
-                Text = "Retro96 Engine is the default native mode and exposes the full compatibility union available in Retro96 " +
-                       "(IE-style document.all/events plus Navigator-era layers, while retaining later DOM/runtime extensions). " +
-                       "Netscape 3 and IE 3 remain strict historical personalities.",
+                Text = "Internet Explorer 5 is the 1999 default: JScript 5.0, DOM Level 1 + DHTML object model, " +
+                       "document.all, the IE5 box model and HTTP/1.1. " +
+                       "Netscape Navigator 4.7 is the 1999 Netscape personality: JavaScript 1.3, " +
+                       "the layer DOM and capture events, without document.all or getElementById. " +
+                       "Retro96 Engine is the native mode and exposes the full compatibility union. " +
+                       "Netscape 3 and IE 3 remain strict 1996 historical personalities.",
                 AutoSize = true,
                 MaximumSize = new Size(690, 0),
                 ForeColor = Color.FromArgb(90, 96, 104)
@@ -484,6 +490,8 @@ internal sealed class PreferencesDialog : Form
                 "Disable to omit the previous page URL from outgoing requests."),
             AdvancedToggle(_compressedResponses, "Request gzip-compressed responses",
                 "Advertises gzip support to servers; gzip responses are decoded before page content is processed."),
+            AdvancedToggle(_httpCache, "HTTP/1.1 validation cache (ETag / 304)",
+                "Revalidates cached pages and images with If-None-Match / If-Modified-Since and serves 304 responses from cache. Only applies to the 1999 engine profiles."),
             AdvancedNumber(_maxRedirects, "Maximum HTTP redirects", 0, 20,
                 "Maximum number of redirects followed for one request."),
             AdvancedNumber(_connectTimeoutSeconds, "Connection timeout (seconds)", 1, 120,
@@ -700,6 +708,8 @@ internal sealed class PreferencesDialog : Form
         _search.Text = _settings.SearchQueryUrl;
         _engine.SelectedIndex = _settings.EngineMode switch
         {
+            RetroEngineMode.InternetExplorer5 => 3,
+            RetroEngineMode.Netscape47 => 4,
             RetroEngineMode.InternetExplorer3 => 2,
             RetroEngineMode.Netscape3 => 1,
             _ => 0
@@ -731,6 +741,7 @@ internal sealed class PreferencesDialog : Form
         _jsDialogs.Checked = _settings.EnableJavaScriptDialogs;
         _followRedirects.Checked = _settings.FollowHttpRedirects;
         _compressedResponses.Checked = _settings.RequestCompressedResponses;
+        _httpCache.Checked = _settings.EnableHttpCache;
         _metaRefresh.Checked = _settings.FollowMetaRefresh;
         _cookies.Checked = _settings.EnableCookies;
         _referrer.Checked = _settings.SendReferrer;
@@ -759,6 +770,8 @@ internal sealed class PreferencesDialog : Form
     {
         target.EngineMode = _engine.SelectedIndex switch
         {
+            4 => RetroEngineMode.Netscape47,
+            3 => RetroEngineMode.InternetExplorer5,
             2 => RetroEngineMode.InternetExplorer3,
             1 => RetroEngineMode.Netscape3,
             _ => RetroEngineMode.Retro96
@@ -790,6 +803,7 @@ internal sealed class PreferencesDialog : Form
         target.EnableJavaScriptDialogs = _jsDialogs.Checked;
         target.FollowHttpRedirects = _followRedirects.Checked;
         target.RequestCompressedResponses = _compressedResponses.Checked;
+        target.EnableHttpCache = _httpCache.Checked;
         target.FollowMetaRefresh = _metaRefresh.Checked;
         target.EnableCookies = _cookies.Checked;
         target.SendReferrer = _referrer.Checked;
@@ -836,9 +850,11 @@ internal sealed class PreferencesDialog : Form
     {
         (string def, string engine) = _engine.SelectedIndex switch
         {
+            4 => (UserSettings.DefaultNetscape47UserAgent, "Netscape JavaScript 1.3"),
+            3 => (UserSettings.DefaultIe5UserAgent, "Microsoft JScript 5.0 (ES3)"),
             2 => (UserSettings.DefaultIe3UserAgent, "Microsoft JScript 1.0"),
             1 => (UserSettings.DefaultNetscapeUserAgent, "Netscape JavaScript 1.1"),
-            _ => (UserSettings.DefaultRetro96UserAgent, "Retro96 Script Engine (1.0/1.1 compatibility union)")
+            _ => (UserSettings.DefaultRetro96UserAgent, "Retro96 Script Engine (1999 compatibility union)")
         };
         _uaHint.Text = "Profile default: " + def + Environment.NewLine +
                        "Script engine personality: " + engine + ". The same User-Agent is sent in HTTP and exposed as navigator.userAgent.";

@@ -456,12 +456,18 @@ public static class InlineLayout
 
             case "select":
                 {
+                    // OPTGROUP-aware row model: group header labels are part
+                    // of the control's visible content and options inside a
+                    // group are indented — the natural width must reserve
+                    // room for both (Task 9).
                     float longest = 40f;
-                    foreach (var opt in el.ElementDescendants())
-                        if (opt.TagName == "option")
-                            longest = Math.Max(longest,
-                                MeasureTextWidth(Render.GlyphSubstitution.MapGlyphs(
-                                    (opt.InnerText ?? "").Trim()), style));
+                    foreach (var row in SelectRowModel.Build(el))
+                    {
+                        if (row.Label.Length == 0) continue;
+                        longest = Math.Max(longest,
+                            MeasureTextWidth(Render.GlyphSubstitution.MapGlyphs(
+                                row.Label), style) + row.Indent);
+                    }
                     width = Math.Max(60f, longest + 36f);
                     int visibleRows = Math.Max(1, el.GetAttrInt("size", 1));
                     if (el.HasAttr("multiple") && visibleRows == 1)
@@ -556,7 +562,15 @@ public static class InlineLayout
                 {
                     bool isSpace = frag.TextRun == " ";
                     if (isSpace && lastWasSpace)
+                    {
+                        // Collapsed duplicate space (or a space at stream
+                        // start): never rendered, but the box stays in the
+                        // tree for selection/copy — anchor it to the
+                        // container origin instead of a stale (0,0,0,0).
+                        frag.X = containerX;
+                        frag.Y = startY;
                         continue;
+                    }
                     MeasureBox(frag, out float w, out float h, out float asc,
                         out float contentHeight, out float leadingTop);
                     bool atomic = frag.Element?.TagName == "spacer"
@@ -626,7 +640,17 @@ public static class InlineLayout
             // new line was eaten — "the problem" wrapped as "theproblem",
             // "case-sensitive on" as "case-sensitiveon".
             if (lineItems.Count == 0 && it.Box.TextRun == " ")
+            {
+                // Leading spaces on an empty line vanish from the painted
+                // line, but they stay in the box tree for selection/copy —
+                // give them sane geometry instead of a stale (0,0,0,0)
+                // rect, the same contract wrap-dropped spaces follow.
+                it.Box.X = containerX;
+                it.Box.Y = currentY;
+                it.Box.Width = 0f;
+                it.Box.Height = it.H;
                 continue;
+            }
 
             if (it.Box.Element?.TagName == "br")
             {
@@ -987,6 +1011,12 @@ public static class InlineLayout
                     else if (cssVa == VerticalAlign.Sub || tag == "sub") box.Y += it.H * 0.25f;
                     if (elem?.Style?.VerticalAlignPercent is { } percent)
                         box.Y -= lineH * percent / 100f;
+                    // CSS2 vertical-align <length> (Task 9): a signed pixel
+                    // shift of the baseline — positive raises the box,
+                    // negative lowers it, stacked after the keyword/percent
+                    // adjustments like the spec's order of operations.
+                    if (elem?.Style?.VerticalAlignLength is { } lengthShift)
+                        box.Y -= lengthShift;
                     break;
             }
 
@@ -1229,6 +1259,75 @@ public static class InlineLayout
         if (string.IsNullOrEmpty(s)) return "";
         s = s.Replace("\n", "\\n");
         return s.Length <= 24 ? s : s[..24] + "…";
+    }
+}
+
+/// <summary>
+/// One renderable row of a SELECT control: either an option row or a
+/// non-selectable OPTGROUP header row (HTML 4.01, Task 9).  Shared by the
+/// renderer's listbox painting, the control's natural-size measurement and —
+/// via the shell — listbox click hit-testing, so all three agree on the row
+/// geometry: header rows carry the LABEL attribute (or the group's direct
+/// text content) with no indent, options inside a group indent by
+/// <see cref="GroupIndent"/> pixels.
+/// </summary>
+public sealed record SelectRow(DomElement? Option, string Label, float Indent, bool IsGroupHeader);
+
+public static class SelectRowModel
+{
+    /// <summary>Indentation of options inside an OPTGROUP (period-plausible
+    /// 12px gutter).</summary>
+    public const float GroupIndent = 12f;
+
+    /// <summary>
+    /// Builds the row list from the select's DIRECT children: optgroups
+    /// contribute a header row plus indented option rows, loose options
+    /// contribute plain rows (the parser keeps groups flat — options are
+    /// never nested deeper than one optgroup).
+    /// </summary>
+    public static List<SelectRow> Build(DomElement select)
+    {
+        var rows = new List<SelectRow>();
+        foreach (var node in select.Children)
+        {
+            if (node is not DomElement e)
+                continue;
+            switch (e.TagName)
+            {
+                case "optgroup":
+                    {
+                        string label = (e.GetAttr("label") ?? "").Trim();
+                        if (label.Length == 0)
+                            label = GroupTextContent(e);
+                        rows.Add(new SelectRow(null, label, 0f, IsGroupHeader: true));
+                        foreach (var child in e.Children)
+                            if (child is DomElement opt && opt.TagName == "option")
+                                rows.Add(new SelectRow(opt, OptionLabel(opt),
+                                    GroupIndent, IsGroupHeader: false));
+                        break;
+                    }
+                case "option":
+                    rows.Add(new SelectRow(e, OptionLabel(e), 0f, IsGroupHeader: false));
+                    break;
+            }
+        }
+        return rows;
+    }
+
+    private static string OptionLabel(DomElement opt) =>
+        (opt.InnerText ?? "").Trim();
+
+    /// <summary>
+    /// The optgroup's own text: its DIRECT text children only (an option's
+    /// text belongs to the option rows).
+    /// </summary>
+    private static string GroupTextContent(DomElement group)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var child in group.Children)
+            if (child is DomText t)
+                sb.Append(t.Data);
+        return sb.ToString().Trim();
     }
 }
 

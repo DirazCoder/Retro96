@@ -223,6 +223,12 @@ public class DomElement : DomNode
     public ComputedStyle? Style { get; set; }
     // Populated by the layout engine.
     public LayoutBox?    Box   { get; set; }
+    // Canonical DomElement → LayoutBox reference (Task 9 wiring): the
+    // element's PRINCIPAL box, reassigned on every BuildLayoutTree pass and
+    // cleared for elements that no longer generate one. `Box` above is the
+    // legacy public slot DomBindings reads today; the layout engine keeps
+    // the two in sync until the bindings migrate to this property.
+    public LayoutBox?    LayoutBox { get; internal set; }
     // Inline event handlers ("onclick" -> source), set by the HTML parser.
     public Dictionary<string, string> EventHandlers { get; } = [];
 

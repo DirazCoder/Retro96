@@ -1,0 +1,91 @@
+<!DOCTYPE HTML PUBLIC "-//Netscape//DTD HTML 4.0//EN">
+<html>
+<head><title>Navigator 4.7 Layer DOM Battery (1999)</title>
+<style type="text/css">
+  #box1 { position: absolute; top: 40px; left: 30px; width: 140px;
+          background-color: #CCDDFF; border: 1px solid #0000AA; }
+  #box2 { position: absolute; top: 80px; left: 90px; width: 140px;
+          background-color: #FFDDCC; border: 1px solid #AA0000;
+          visibility: show; }
+  #box3 { position: relative; top: 0px; left: 20px; width: 180px;
+          background-color: #DDEEDD; border: 1px dashed #006600; }
+</style>
+<script language="JavaScript1.2">
+function ns4Report() {
+  var out = [];
+  // ONLY positioned elements appear in document.layers.
+  out.push("layers-count=" + document.layers.length);
+  var box1 = document.layers["box1"];
+  out.push("layers[name]=" + (box1 ? "ok" : "NULL"));
+  out.push("non-positioned-in-layers=" +
+    (typeof document.layers["plainp"] == "undefined" ? "no" : "LEAKED"));
+
+  // layer properties
+  out.push("left=" + box1.left);
+  out.push("top=" + box1.top);
+  out.push("zIndex=" + box1.zIndex);
+  out.push("visibility=" + box1.visibility);
+
+  // movement
+  box1.moveTo(120, 60);
+  out.push("after-moveTo left=" + box1.left + "/top=" + box1.top);
+  box1.moveBy(10, -5);
+  out.push("after-moveBy left=" + box1.left + "/top=" + box1.top);
+  box1.moveTo(30, 40);
+
+  // stacking
+  var box2 = document.layers["box2"];
+  box1.moveAbove(box2);
+  out.push("moveAbove=" + (box1.zIndex >= box2.zIndex ? "ok" : "WRONG"));
+  box1.moveBelow(box2);
+  box1.moveAbove(box2);
+
+  // clip
+  out.push("clip.right=" + box1.clip.right);
+  box1.clip.right = 100;
+  out.push("clip-set=" + box1.clip.right);
+
+  // bgColor
+  box2.bgColor = "#FFFF99";
+  out.push("bgColor-set=ok");
+
+  // capture model
+  window.captureEvents(Event.MOUSEDOWN | Event.CLICK);
+  out.push("captureEvents=ok");
+
+  // sibling pages only need the event object shape:
+  out.push("Event.CLICK=" + Event.CLICK);
+
+  // page offsets
+  out.push("pageXOffset=" + window.pageXOffset);
+  out.push("innerWidth=" + (window.innerWidth > 0 ? "ok" : "ZERO"));
+
+  return out.join(" | ");
+}
+</script>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>Navigator 4.7 layer DOM battery</h1>
+<div id="box1">box1: position:absolute — a layer.</div>
+<div id="box2">box2: visibility:show — a layer.</div>
+<div id="box3">box3: position:relative — also a layer.</div>
+<p id="plainp">Plain paragraph: NOT positioned, so it never appears in
+document.layers.</p>
+<p>Load this page with the Netscape Navigator 4.7 engine profile: the
+page script probes document.layers, layer geometry (left/top/zIndex),
+visibility (show/hide/inherit), clip rects, bgColor, moveTo/moveBy,
+moveAbove/moveBelow, the capture-events model, Event.* masks and
+window.innerWidth/pageXOffset.</p>
+<p><b>Under the IE5 or union profile this page takes no layer branch at
+all — document.layers is undefined there.</b></p>
+<p><b id="report3">(running…)</b></p>
+<script language="JavaScript1.3">
+if (document.layers) document.layers["box1"].document.write(
+  "<p>LAYER-DOC-WRITE inside box1 (nested layer documents)</p>");
+if (document.layers) {
+  // report into the plain paragraph via DOM-0-free path
+  document.report3 = ns4Report();
+}
+</script>
+</body>
+</html>

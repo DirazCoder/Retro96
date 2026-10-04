@@ -169,7 +169,7 @@ public sealed class EngineRig
         if (result.IsFrameset)
         {
             using var surface = new Bitmap(Math.Max(1, _vw), Math.Max(1, _vh));
-            using (var g = Graphics.FromImage(surface))
+            using (var g = Graphics.FromBitmap(surface))
             {
                 g.Clear(Color.White);
                 g.InterpolationMode = InterpolationMode.NearestNeighbor;
@@ -388,7 +388,7 @@ public sealed class EngineRig
     private void CropAndSave(Bitmap full, string outPng)
     {
         using var view = new Bitmap(Math.Max(1, _vw), Math.Max(1, _vh));
-        using (var g = Graphics.FromImage(view))
+        using (var g = Graphics.FromBitmap(view))
         {
             g.Clear(Color.FromArgb(0xC0, 0xC0, 0xC0));
             g.InterpolationMode = InterpolationMode.NearestNeighbor;

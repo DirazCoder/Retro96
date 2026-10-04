@@ -1,0 +1,82 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>DOM Level 1 Battery (Oct 1998)</title>
+<script language="JavaScript1.3">
+function dom1Report() {
+  var out = [];
+  var b = document.getElementById("dom1body");
+
+  // Node properties
+  out.push("nodeType(body)=" + b.nodeType);
+  out.push("nodeName(body)=" + b.nodeName);
+  out.push("firstChild.nodeType=" + b.firstChild.nodeType);
+  out.push("ownerDocument=" + (b.ownerDocument == document ? "same" : "WRONG"));
+
+  // createElement / createTextNode / tree surgery
+  var p = document.createElement("P");
+  var t = document.createTextNode("created by ");
+  var t2 = document.createTextNode("DOM Level 1");
+  p.appendChild(t);
+  p.appendChild(t2);
+  b.appendChild(p);
+  out.push("createTextNode data=" + t.data);
+  out.push("appended=" + (p.lastChild.nodeValue == "DOM Level 1"));
+
+  // replaceChild / removeChild / cloneNode
+  var t3 = document.createTextNode("DOM Level 1 (replaced)");
+  p.replaceChild(t3, t2);
+  out.push("replaceChild=" + (p.lastChild.nodeValue.indexOf("replaced") > 0));
+  var clone = p.cloneNode(true);
+  out.push("cloneNode(deep)=" + (clone.childNodes.length == 2));
+  b.appendChild(clone);
+  b.removeChild(clone);
+
+  // getAttribute / setAttribute / removeAttribute / attributes map
+  var probe = document.getElementById("attr-probe");
+  probe.setAttribute("align", "center");
+  out.push("setAttribute=" + probe.getAttribute("align"));
+  probe.removeAttribute("align");
+  out.push("removeAttribute=" + (probe.getAttribute("align") == null ? "gone" : "STUCK"));
+  var img = document.getElementById("dom1img");
+  out.push("attributes.length>0=" + (img.attributes.length > 0));
+  var named = img.attributes.getNamedItem("width");
+  out.push("attributes.getNamedItem(width)=" + (named ? named.value : "NULL"));
+
+  // getElementsByTagName with * 
+  var all = document.getElementsByTagName("*");
+  out.push("getElementsByTagName(*)=" + (all.length > 10));
+  var heads = document.getElementsByTagName("H2");
+  out.push("H2 count=" + heads.length);
+
+  // element.style camelCase
+  var st = document.getElementById("style-probe");
+  st.style.backgroundColor = "#FFDDAA";
+  st.style.fontSize = "18px";
+  out.push("style.backgroundColor=" + st.style.backgroundColor);
+
+  return out.join(" | ");
+}
+</script>
+</head>
+<body id="dom1body" bgcolor="#FFFFFF">
+<h1>DOM Level 1 battery</h1>
+<h2>Tree surgery</h2>
+<p>Core node interfaces: nodeName, nodeType, nodeValue, parentNode,
+childNodes, firstChild, lastChild, previousSibling, nextSibling,
+attributes. Methods: getElementById, getElementsByTagName,
+createElement, createTextNode, appendChild, insertBefore,
+removeChild, replaceChild, cloneNode, getAttribute, setAttribute,
+removeAttribute.</p>
+<h2>Attribute probe</h2>
+<p id="attr-probe">set/remove attribute target</p>
+<h2>Style probe</h2>
+<div id="style-probe">style camelCase write target</div>
+<p><img id="dom1img" src="../images/dot16.png" width="16" height="16"
+  border="0" alt="attrs"></p>
+<h2>Report</h2>
+<p><b id="report1">(running…)</b></p>
+<script language="JavaScript1.3">
+document.getElementById("report1").innerText = dom1Report();
+</script>
+</body>
+</html>

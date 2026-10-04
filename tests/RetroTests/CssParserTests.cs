@@ -446,4 +446,631 @@ public class CssParserTests
             "<font color=#008000> applies green", s.Color.ToString());
         Check.Done();
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // CSS2 upgrade (Task 5) — selectors, values, properties, media
+    // ══════════════════════════════════════════════════════════════════
+
+    private static ComputedStyle StyleById(DomDocument doc, string id) =>
+        doc.ElementDescendants().First(e => e.GetAttr("id") == id).Style!;
+
+    // ── CSS2 selectors ───────────────────────────────────────────────
+
+    [Fact]
+    public void FirstChildPseudoClassMatchesFirstElementChild()
+    {
+        // Text nodes and comments before the <p> must not disqualify it —
+        // :first-child counts ELEMENT children only.
+        var doc = ParseAndResolve(
+            "<div>text<!--c--><p id='one'>a</p><p id='two'>b</p></div>" +
+            "<div><em>lead</em><p id='three'>c</p></div>",
+            "p:first-child { color: #ff0000 }");
+        var one = doc.ElementDescendants().First(e => e.GetAttr("id") == "one");
+        var two = doc.ElementDescendants().First(e => e.GetAttr("id") == "two");
+        var three = doc.ElementDescendants().First(e => e.GetAttr("id") == "three");
+        var sel = CssSelector.ParseSelector("p:first-child")[0];
+
+        Check.That(sel.Matches(one), "first ELEMENT child matches :first-child");
+        Check.That(!sel.Matches(two), "later siblings do not match :first-child");
+        Check.That(!sel.Matches(three), "an element after an <em> is not the first child");
+        Check.That(one.Style!.Color == Color.FromArgb(255, 0, 0),
+            ":first-child rule applies its declarations",
+            one.Style.Color.ToString());
+        Check.That(two.Style!.Color == Color.Black,
+            ":first-child rule does not apply to later siblings");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LangPseudoClassMatchesOwnAndInheritedLanguage()
+    {
+        var doc = ParseAndResolve(
+            "<div lang='en'><p id='a'>x</p></div>" +
+            "<p id='b' lang='fr'>y</p>" +
+            "<p id='c' lang='en-US'>z</p>" +
+            "<p id='d' lang='enx'>w</p>");
+        var a = doc.ElementDescendants().First(e => e.GetAttr("id") == "a");
+        var b = doc.ElementDescendants().First(e => e.GetAttr("id") == "b");
+        var c = doc.ElementDescendants().First(e => e.GetAttr("id") == "c");
+        var d = doc.ElementDescendants().First(e => e.GetAttr("id") == "d");
+        var en = CssSelector.ParseSelector("p:lang(en)")[0];
+        var fr = CssSelector.ParseSelector("p:lang(FR)")[0];
+
+        Check.That(en.Matches(a), ":lang(en) matches a descendant of lang='en' (inherited)");
+        Check.That(!en.Matches(b), ":lang(en) does not match lang='fr'");
+        Check.That(en.Matches(c), ":lang(en) prefix-matches lang='en-US'");
+        Check.That(!en.Matches(d), ":lang(en) does not match lang='enx' (needs hyphen)");
+        Check.That(fr.Matches(b), ":lang(FR) matches lang='fr' case-insensitively");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LinkAndVisitedCoexistWithActive()
+    {
+        // CSS2 §5.11.2: :link/:visited are no longer mutually exclusive
+        // with :active (a CSS1 restriction).
+        var doc = ParseAndResolve("<a id='go' href='/x'>go</a>");
+        var link = doc.AllTags("a")[0];
+        var linkActive = CssSelector.ParseSelector("a:link:active")[0];
+        var visitedActive = CssSelector.ParseSelector("a:visited:active")[0];
+
+        doc.ActiveElement = link;
+        Check.That(linkActive.Matches(link), ":link and :active co-exist on an unvisited link");
+        Check.That(!visitedActive.Matches(link), ":visited:active does not match an unvisited link");
+
+        doc.VisitedUrls.Add("http://x.test/x");
+        StyleResolver.Resolve(doc, 800);
+        Check.That(visitedActive.Matches(link), ":visited and :active co-exist once visited");
+        Check.That(!linkActive.Matches(link), ":link:active no longer matches after visiting");
+        doc.ActiveElement = null;
+        Check.Done();
+    }
+
+    // ── generated content ────────────────────────────────────────────
+
+    [Fact]
+    public void BeforeAndAfterPseudoElementsRouteGeneratedContent()
+    {
+        var doc = ParseAndResolve("<p id='x'>t</p>",
+            "p:before { content: '['; color: #ff0000 } " +
+            "p::after { content: ']'; color: #00ff00 }");
+        var s = doc.AllTags("p")[0].Style!;
+
+        Check.That(s.GeneratedBefore != null,
+            ":before (single colon) declarations land in GeneratedBefore");
+        Check.That(s.GeneratedAfter != null,
+            "::after (double colon) declarations land in GeneratedAfter");
+        Check.That(s.GeneratedBefore!.Content != null &&
+                   s.GeneratedBefore.Content.Count == 1 &&
+                   s.GeneratedBefore.Content[0] == new ContentToken("string", "["),
+            ":before content string token stored");
+        Check.That(s.GeneratedBefore.Color == Color.FromArgb(255, 0, 0),
+            ":before declarations apply to the generated slot",
+            s.GeneratedBefore.Color.ToString());
+        Check.That(s.GeneratedAfter!.Content != null &&
+                   s.GeneratedAfter.Content[0].Text == "]",
+            "::after content string token stored");
+        Check.That(s.Content == null,
+            "generated content does not leak onto the element's own style");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ContentPropertyParsesStringsAttrsAndCounters()
+    {
+        var doc = ParseAndResolve(
+            "<a id='l' href='/x'>go</a><q id='q'>x</q><span id='n'></span>",
+            "a { content: 'link: ' attr(href) } " +
+            "q:before { content: open-quote counter(chap, upper-roman) } " +
+            "#n { content: none }");
+        var l = StyleById(doc, "l");
+        var q = StyleById(doc, "q");
+        var n = StyleById(doc, "n");
+
+        Check.That(l.Content != null && l.Content.Count == 2 &&
+                   l.Content[0] == new ContentToken("string", "link: ") &&
+                   l.Content[1] == new ContentToken("attr", "href"),
+            "content: 'text' attr(href) parses into string + attr tokens");
+        Check.That(q.GeneratedBefore!.Content != null &&
+                   q.GeneratedBefore.Content.Count == 2 &&
+                   q.GeneratedBefore.Content[0] == new ContentToken("open-quote", "") &&
+                   q.GeneratedBefore.Content[1] == new ContentToken("counter", "chap, upper-roman"),
+            "quote keywords and counter() survive parsing with their arguments");
+        Check.That(n.Content == null, "content: none stores null");
+        Check.Done();
+    }
+
+    [Fact]
+    public void QuotesParseIntoPairs()
+    {
+        var doc = ParseAndResolve(
+            "<p id='q'></p><p id='odd'></p><p id='none'></p>",
+            "#q { quotes: '<' '>' '(' ')' } " +
+            "#odd { quotes: 'x' 'y' 'z' } " +
+            "#none { quotes: none }");
+        var q = StyleById(doc, "q");
+        var odd = StyleById(doc, "odd");
+        var none = StyleById(doc, "none");
+
+        Check.That(q.Quotes != null && q.Quotes.Count == 2 &&
+                   q.Quotes[0] == new QuotePair("<", ">") &&
+                   q.Quotes[1] == new QuotePair("(", ")"),
+            "quotes parses consecutive string pairs");
+        Check.That(odd.Quotes == null, "an odd number of quote strings is ignored");
+        Check.That(none.Quotes == null, "quotes: none keeps the default");
+        Check.Done();
+    }
+
+    [Fact]
+    public void CounterResetAndIncrementParse()
+    {
+        var doc = ParseAndResolve(
+            "<div id='a'></div><div id='b'></div>",
+            "#a { counter-reset: chap 3 item; counter-increment: section } " +
+            "#b { counter-reset: none; counter-increment: none }");
+        var a = StyleById(doc, "a");
+        var b = StyleById(doc, "b");
+
+        Check.That(a.CounterReset != null && a.CounterReset.Count == 2 &&
+                   a.CounterReset[0] == new CounterAction("chap", 3) &&
+                   a.CounterReset[1] == new CounterAction("item", 0),
+            "counter-reset parses names with default 0");
+        Check.That(a.CounterIncrement != null && a.CounterIncrement.Count == 1 &&
+                   a.CounterIncrement[0] == new CounterAction("section", 1),
+            "counter-increment defaults to 1");
+        Check.That(b.CounterReset == null && b.CounterIncrement == null,
+            "counter-*: none stores null");
+        Check.Done();
+    }
+
+    // ── 'inherit' ────────────────────────────────────────────────────
+
+    [Fact]
+    public void InheritKeywordPullsParentComputedValues()
+    {
+        var doc = ParseAndResolve(
+            "<div style='color: #ff0000; border-top: 5px solid black; margin-left: 30px'>" +
+            "<p id='k'>x</p></div>",
+            "p { color: inherit; border-top: inherit; margin-left: inherit }");
+        var k = StyleById(doc, "k");
+
+        Check.That(k.Color == Color.FromArgb(255, 0, 0),
+            "color: inherit routes to the parent's computed colour",
+            k.Color.ToString());
+        Check.That(k.BorderTopWidth == 5f && k.BorderTopStyle == BorderStyleValue.Solid,
+            "border-top: inherit pulls the parent's computed width AND style",
+            $"{k.BorderTopWidth}/{k.BorderTopStyle}");
+        Check.That(k.MarginLeft == 30f,
+            "margin-left: inherit pulls a non-inherited property's parent value",
+            k.MarginLeft.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void InheritKeywordWorksAtComputedStyleLevelIncludingShorthands()
+    {
+        var parent = new ComputedStyle();
+        parent.Color = Color.FromArgb(1, 2, 3);
+        parent.BorderTopWidth = 5f;
+        parent.BorderLeftWidth = 7f;
+        parent.MarginTop = 11f;
+        parent.MarginRight = 12f;
+        parent.MarginBottom = 13f;
+        parent.MarginLeft = 14f;
+
+        var child = ComputedStyle.Inherit(parent, new[]
+        {
+            new CssDeclaration("color", "inherit", false),
+            new CssDeclaration("border-top-width", "inherit", false),
+            new CssDeclaration("border-left-width", "INHERIT", false),
+            new CssDeclaration("margin", "inherit", false),
+        });
+
+        Check.That(child.Color == Color.FromArgb(1, 2, 3), "color inherit copies the parent colour");
+        Check.That(child.BorderTopWidth == 5f,
+            "border-top-width: inherit copies the parent's computed width (non-inherited property)",
+            child.BorderTopWidth.ToString());
+        Check.That(child.BorderLeftWidth == 7f, "inherit is case-insensitive",
+            child.BorderLeftWidth.ToString());
+        Check.That(child.MarginTop == 11f && child.MarginRight == 12f &&
+                   child.MarginBottom == 13f && child.MarginLeft == 14f,
+            "margin: inherit copies all four sides as a unit");
+        Check.Done();
+    }
+
+    // ── CSS2 size constraints / vertical-align ───────────────────────
+
+    [Fact]
+    public void MinMaxWidthHeightParseAndKeepPercentages()
+    {
+        var doc = ParseAndResolve(
+            "<div id='a' style='min-width: 100px; max-width: 50%'></div>" +
+            "<div id='b' style='min-height: 20px; max-height: none'></div>" +
+            "<div id='c' style='min-width: 25%; max-width: 300px'></div>");
+        var a = StyleById(doc, "a");
+        var b = StyleById(doc, "b");
+        var c = StyleById(doc, "c");
+
+        Check.That(a.MinWidth == 100f, "min-width: 100px parses");
+        Check.That(a.MaxWidth == null && a.MaxWidthPercent == 50f,
+            "max-width: 50% stays a percentage for layout to resolve");
+        Check.That(b.MinHeight == 20f, "min-height: 20px parses");
+        Check.That(b.MaxHeight == null, "max-height: none stores no maximum");
+        Check.That(c.MinWidthPercent == 25f && c.MinWidth == null,
+            "min-width: 25% stays a percentage");
+        Check.That(c.MaxWidth == 300f, "max-width: 300px parses");
+        Check.Done();
+    }
+
+    [Fact]
+    public void VerticalAlignAcceptsLengthValues()
+    {
+        var doc = ParseAndResolve(
+            "<span id='up' style='vertical-align: 3px'></span>" +
+            "<span id='down' style='vertical-align: -2px'></span>" +
+            "<span id='em' style='vertical-align: .25em'></span>" +
+            "<span id='kw' style='vertical-align: text-top'></span>");
+        var up = StyleById(doc, "up");
+        var down = StyleById(doc, "down");
+        var em = StyleById(doc, "em");
+        var kw = StyleById(doc, "kw");
+
+        Check.That(up.VerticalAlignLength == 3f, "vertical-align: 3px stores a length",
+            up.VerticalAlignLength?.ToString() ?? "(null)");
+        Check.That(down.VerticalAlignLength == -2f, "negative lengths keep their sign");
+        Check.That(Math.Abs(em.VerticalAlignLength!.Value - 4f) < 0.01f,
+            "em lengths resolve against the parent font size");
+        Check.That(kw.VerticalAlignLength == null && kw.VerticalAlign == VerticalAlign.TextTop,
+            "keywords still route to the enum");
+        Check.Done();
+    }
+
+    // ── cursor / outline ─────────────────────────────────────────────
+
+    [Fact]
+    public void CursorParsesKeywordsHandAliasAndUrlLists()
+    {
+        var doc = ParseAndResolve(
+            "<div id='hand' style='cursor: hand'></div>" +
+            "<div id='ptr' style='cursor: pointer'></div>" +
+            "<div id='url' style='cursor: url(x.cur), pointer'></div>" +
+            "<div id='wait' style='cursor: wait'></div>" +
+            "<div id='parent' style='cursor: wait'><span id='child'>x</span></div>");
+        var hand = StyleById(doc, "hand");
+        var ptr = StyleById(doc, "ptr");
+        var url = StyleById(doc, "url");
+        var wait = StyleById(doc, "wait");
+        var child = StyleById(doc, "child");
+
+        Check.That(hand.Cursor == CursorValue.Pointer, "cursor: hand maps to the IE pointer alias");
+        Check.That(ptr.Cursor == CursorValue.Pointer, "cursor: pointer parses");
+        Check.That(url.CursorUri == "x.cur" && url.Cursor == CursorValue.Pointer,
+            "cursor: url(x.cur), pointer keeps the URI and the fallback keyword",
+            url.CursorUri ?? "(null)");
+        Check.That(wait.Cursor == CursorValue.Wait, "cursor: wait parses");
+        Check.That(child.Cursor == CursorValue.Wait,
+            "cursor inherits to children (CSS2)");
+        Check.Done();
+    }
+
+    [Fact]
+    public void OutlineShorthandExpands()
+    {
+        var doc = ParseAndResolve(
+            "<div id='o' style='outline: 2px solid red'></div>" +
+            "<div id='inv' style='outline-color: invert'></div>" +
+            "<div id='w' style='outline-width: thin'></div>");
+        var o = StyleById(doc, "o");
+        var inv = StyleById(doc, "inv");
+        var w = StyleById(doc, "w");
+
+        Check.That(o.OutlineWidth == 2f && o.OutlineStyle == BorderStyleValue.Solid,
+            "outline shorthand: width + style");
+        Check.That(o.OutlineColor == Color.FromArgb(255, 0, 0) && !o.OutlineColorInvert,
+            "outline shorthand: colour switches off the invert default",
+            o.OutlineColor.ToString());
+        Check.That(inv.OutlineColorInvert, "outline-color: invert keeps the CSS2 initial");
+        Check.That(w.OutlineWidth == 1f, "outline-width: thin = 1px");
+        Check.Done();
+    }
+
+    // ── tables / NS4 aliases ─────────────────────────────────────────
+
+    [Fact]
+    public void TablePropertyStorage()
+    {
+        var doc = ParseAndResolve(
+            "<table id='t' style='border-collapse: collapse; border-spacing: 5px 10px; " +
+            "table-layout: fixed; caption-side: bottom; empty-cells: hide'></table>" +
+            "<table id='u' style='border-spacing: 7px'></table>");
+        var t = StyleById(doc, "t");
+        var u = StyleById(doc, "u");
+
+        Check.That(t.BorderCollapse == BorderCollapseValue.Collapse, "border-collapse: collapse");
+        Check.That(t.BorderSpacingX == 5f && t.BorderSpacingY == 10f,
+            "border-spacing takes horizontal + vertical lengths");
+        Check.That(u.BorderSpacingX == 7f && u.BorderSpacingY == 7f,
+            "single-value border-spacing applies to both axes");
+        Check.That(t.TableLayout == TableLayoutValue.Fixed, "table-layout: fixed");
+        Check.That(t.CaptionSide == CaptionSideValue.Bottom, "caption-side: bottom");
+        Check.That(t.EmptyCells == EmptyCellsValue.Hide, "empty-cells: hide");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LayerBackgroundAliasesStoreIntoBackgroundSlots()
+    {
+        var doc = ParseAndResolve(
+            "<div id='l' style='layer-background-color: #336699; " +
+            "layer-background-image: url(bg.gif)'></div>");
+        var l = StyleById(doc, "l");
+
+        Check.That(l.BackgroundColor == Color.FromArgb(0x33, 0x66, 0x99),
+            "layer-background-color aliases background-color (NS4)",
+            l.BackgroundColor.ToString());
+        Check.That(l.BackgroundImage == "bg.gif",
+            "layer-background-image aliases background-image",
+            l.BackgroundImage ?? "(null)");
+        Check.Done();
+    }
+
+    // ── media ────────────────────────────────────────────────────────
+
+    [Fact]
+    public void MediaAtRuleHonoursCommaListsAndSkipsPrint()
+    {
+        var doc = ParseAndResolve("<p id='a'>x</p><p id='b'>y</p>",
+            "@media screen, print { #a { color: #ff0000 } } " +
+            "@media print { #b { color: #0000ff } }");
+        var a = StyleById(doc, "a");
+        var b = StyleById(doc, "b");
+
+        Check.That(a.Color == Color.FromArgb(255, 0, 0),
+            "@media 'screen, print' applies on a screen renderer",
+            a.Color.ToString());
+        Check.That(b.Color == Color.Black,
+            "@media print rules are parsed but not applied on screen",
+            b.Color.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void StyleMediaAttributeFiltersSheets()
+    {
+        var doc = HtmlParser.Parse(
+            "<html><head>" +
+            "<style media='print'>p { color: #0000ff }</style>" +
+            "<style media='screen, print'>p { color: #ff0000 }</style>" +
+            "</head><body><p id='p'>x</p></body></html>",
+            ParsedUrl.Parse("http://x.test/"), new CookieStore());
+        StyleResolver.Resolve(doc, 800);
+        var p = doc.AllTags("p")[0];
+
+        Check.That(p.Style!.Color == Color.FromArgb(255, 0, 0),
+            "<style media> non-screen sheets are skipped, screen sheets apply",
+            p.Style.Color.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void ImportMediaDescriptorIsSurfaced()
+    {
+        var (_, imports) = CssParser.Parse(
+            "@import url(a.css) screen, print; " +
+            "@import 'b.css' print; " +
+            "@import url(c.css);");
+
+        Check.That(imports.Count == 3, "all three imports collected", imports.Count.ToString());
+        Check.That(imports[0].Media != null && imports[0].Media.Count == 2 &&
+                   imports[0].Media[0] == "screen" && imports[0].Media[1] == "print",
+            "the media descriptor after the import URL is captured");
+        Check.That(imports[0].AppliesTo("screen") && imports[0].AppliesTo("print"),
+            "a screen,print import applies to screen");
+        Check.That(!imports[1].AppliesTo("screen") && imports[1].AppliesTo("print"),
+            "a print-only import does not apply to screen");
+        Check.That(imports[1].Url == "b.css", "quoted import URL still parses", imports[1].Url);
+        Check.That(imports[2].Media == null && imports[2].AppliesTo("screen"),
+            "an import without a media descriptor applies to all media");
+        Check.Done();
+    }
+
+    // ── specificity / colours ────────────────────────────────────────
+
+    [Fact]
+    public void SpecificityCountsAttributesPseudoClassesAndPseudoElements()
+    {
+        Check.That(CssSelector.ParseSelector("div > p + span")[0].Specificity == (0, 0, 3),
+            "child/adjacent combinators count types only");
+        Check.That(CssSelector.ParseSelector(".cls:hover")[0].Specificity == (0, 2, 0),
+            "class + pseudo-class land in the (c) bucket");
+        Check.That(CssSelector.ParseSelector("#id[rel]")[0].Specificity == (1, 1, 0),
+            "attribute selectors land in the (c) bucket");
+        Check.That(CssSelector.ParseSelector("*")[0].Specificity == (0, 0, 0),
+            "the universal selector counts nothing");
+        Check.That(CssSelector.ParseSelector("p:first-child")[0].Specificity == (0, 1, 1),
+            ":first-child counts as a pseudo-class");
+        Check.That(CssSelector.ParseSelector("a:lang(en)")[0].Specificity == (0, 1, 1),
+            ":lang() counts as a pseudo-class");
+        Check.That(CssSelector.ParseSelector("p::before")[0].Specificity == (0, 0, 2),
+            ":before counts as a pseudo-ELEMENT (d bucket)");
+
+        var doc = ParseAndResolve("<a id='l' href='/x'>go</a>",
+            "a { color: #0000ff } [href] { color: #ff0000 }");
+        var l = doc.AllTags("a")[0];
+        Check.That(l.Style!.Color == Color.FromArgb(255, 0, 0),
+            "an attribute selector (c=1) outranks a bare type selector (d=1)",
+            l.Style.Color.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void RgbValuesAreClampedInCss2()
+    {
+        var doc = ParseAndResolve("<p style='color: rgb(300, -20, 150%)'>t</p>");
+        var s = doc.AllTags("p")[0].Style!;
+        Check.That(s.Color == Color.FromArgb(255, 0, 255),
+            "rgb() integers and percentages clamp to the 0-255 range",
+            s.Color.ToString());
+        Check.Done();
+    }
+
+    // ── display / fonts / bidi / raw storage ─────────────────────────
+
+    [Fact]
+    public void DisplayAcceptsCss2ValuesAndFallsBackToInline()
+    {
+        var doc = ParseAndResolve(
+            "<div id='it' style='display: inline-table'></div>" +
+            "<div id='ri' style='display: run-in'></div>" +
+            "<div id='cp' style='display: compact'></div>" +
+            "<div id='bad' style='display: frobnicate'></div>");
+        var it = StyleById(doc, "it");
+        var ri = StyleById(doc, "ri");
+        var cp = StyleById(doc, "cp");
+        var bad = StyleById(doc, "bad");
+
+        Check.That(it.Display == DisplayValue.InlineTable, "display: inline-table parses");
+        Check.That(ri.Display == DisplayValue.RunIn, "display: run-in parses");
+        Check.That(cp.Display == DisplayValue.Compact, "display: compact parses");
+        Check.That(bad.Display == DisplayValue.Inline,
+            "unknown display values fall back to the CSS2 initial value (inline)");
+        Check.Done();
+    }
+
+    [Fact]
+    public void SystemFontsResolveToPlausibleValues()
+    {
+        var doc = ParseAndResolve(
+            "<div id='cap' style='font: caption'></div>" +
+            "<div id='mb' style='font: message-box'></div>");
+        var cap = StyleById(doc, "cap");
+        var mb = StyleById(doc, "mb");
+
+        Check.That(cap.FontSize == 13f, "font: caption maps to a small control size",
+            cap.FontSize.ToString());
+        Check.That(cap.FontFamily.Count > 0 && cap.FontFamily[0] == "MS Sans Serif",
+            "system fonts map to the era UI family", string.Join(",", cap.FontFamily));
+        Check.That(cap.FontStyle == FontStyleValue.Normal &&
+                   cap.FontWeight == FontWeightValue.W400,
+            "system fonts map to normal style/weight");
+        Check.That(mb.FontSize == 14f, "font: message-box is one step up",
+            mb.FontSize.ToString());
+
+        // The ComputedStyle re-handling path (belt and braces).
+        var direct = new ComputedStyle();
+        direct.Apply(new CssDeclaration("font", "small-caption", false), 16f, 800f);
+        Check.That(direct.FontSize == 11f,
+            "font: small-caption resolves through ComputedStyle.ParseFontShorthand too",
+            direct.FontSize.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void FontSizeAdjustAndFontStretchStore()
+    {
+        var doc = ParseAndResolve(
+            "<div id='a' style='font-size-adjust: 0.58; font-stretch: condensed; " +
+            "font-variant: small-caps'></div>" +
+            "<div id='b' style='font-size-adjust: none; font-stretch: frob'></div>");
+        var a = StyleById(doc, "a");
+        var b = StyleById(doc, "b");
+
+        Check.That(Math.Abs(a.FontSizeAdjust!.Value - 0.58f) < 0.001f, "font-size-adjust number");
+        Check.That(a.FontStretch == "condensed", "font-stretch keyword");
+        Check.That(a.FontVariant == FontVariantValue.SmallCaps, "font-variant: small-caps still parses");
+        Check.That(b.FontSizeAdjust == null, "font-size-adjust: none");
+        Check.That(b.FontStretch == null, "unknown font-stretch values are ignored");
+        Check.Done();
+    }
+
+    [Fact]
+    public void DirectionUnicodeBidiAndTextShadowStore()
+    {
+        var doc = ParseAndResolve(
+            "<bdo id='b' dir='rtl' style='direction: rtl; unicode-bidi: bidi-override'></bdo>" +
+            "<p id='t' style='text-shadow: 2px 2px #808080'></p>" +
+            "<p id='n' style='text-shadow: none'></p>");
+        var b = StyleById(doc, "b");
+        var t = StyleById(doc, "t");
+        var n = StyleById(doc, "n");
+
+        Check.That(b.Direction == DirectionValue.Rtl, "direction: rtl parses");
+        Check.That(b.UnicodeBidi == "bidi-override", "unicode-bidi stores its keyword");
+        Check.That(t.TextShadow == "2px 2px #808080",
+            "text-shadow stores the raw value (parse-level only)",
+            t.TextShadow ?? "(null)");
+        Check.That(n.TextShadow == null, "text-shadow: none stores null");
+        Check.Done();
+    }
+
+    // ── modern selector extras kept for the union mode ───────────────
+
+    [Fact]
+    public void Beyond1999SelectorsDoNotRegress()
+    {
+        // ^= $= *= ~= |= attribute operators and the ~ sibling combinator
+        // are beyond 1999, but the union mode (Retro96 persona) wants them.
+        var doc = ParseAndResolve(
+            "<a id='one' href='http://x.test/page.htm'>a</a>" +
+            "<a id='two' href='/other'>b</a>" +
+            "<div><span id='s1'>1</span><em>x</em><span id='s2'>2</span><span id='s3'>3</span></div>",
+            "[href^='http'] { color: #ff0000 } " +
+            "[href$='.htm'] { text-decoration: underline } " +
+            "[href*='oth'] { font-weight: bold } " +
+            "span ~ span { background-color: #00ff00 }");
+
+        var one = doc.AllTags("a")[0];
+        var two = doc.AllTags("a")[1];
+        var s1 = StyleById(doc, "s1");
+        var s2 = StyleById(doc, "s2");
+        var s3 = StyleById(doc, "s3");
+
+        Check.That(one.Style!.Color == Color.FromArgb(255, 0, 0),
+            "attribute prefix ^= still matches");
+        Check.That(one.Style.TextDecoration.HasFlag(TextDecoration.Underline),
+            "attribute suffix $= still matches");
+        Check.That(two.Style!.FontWeight >= FontWeightValue.Bold,
+            "attribute substring *= still matches");
+        Check.That(s1.BackgroundColor == Color.Transparent,
+            "the ~ combinator needs an earlier sibling");
+        Check.That(s2.BackgroundColor == Color.FromArgb(0, 255, 0) &&
+                   s3.BackgroundColor == Color.FromArgb(0, 255, 0),
+            "the general sibling ~ combinator still matches later siblings");
+        Check.Done();
+    }
+
+    [Fact]
+    public void InlineStyleInheritShorthandWorks()
+    {
+        // Inline STYLE= goes through the same parse-time expansion, so the
+        // inherit passthrough must survive ParseInlineStyle too.
+        var doc = ParseAndResolve(
+            "<div style='padding: 4px 8px'><p id='k' style='padding: inherit'>x</p></div>");
+        var k = StyleById(doc, "k");
+
+        Check.That(k.PaddingTop == 4f && k.PaddingRight == 8f &&
+                   k.PaddingBottom == 4f && k.PaddingLeft == 8f,
+            "padding: inherit via inline STYLE= copies all four sides");
+        Check.Done();
+    }
+
+    [Fact]
+    public void UniversalAndBarePseudoClassSelectorsKeepMatching()
+    {
+        var doc = ParseAndResolve(
+            "<div><p id='one'>a</p><p id='two'>b</p></div>",
+            "*:first-child { color: #ff0000 } :first-child { text-decoration: underline }");
+        var one = StyleById(doc, "one");
+        var two = StyleById(doc, "two");
+
+        Check.That(one.Color == Color.FromArgb(255, 0, 0) &&
+                   one.TextDecoration.HasFlag(TextDecoration.Underline),
+            "*:first-child and bare :first-child both match the first element");
+        // NB: the wrapping <div> is itself body's first child, so its red
+        // colour legitimately INHERITS into the second <p> — only the
+        // non-inherited declaration proves the rule did not match it.
+        Check.That(two.TextDecoration == TextDecoration.None,
+            "later siblings match neither form");
+        Check.Done();
+    }
 }

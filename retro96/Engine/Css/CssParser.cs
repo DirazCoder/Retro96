@@ -10,10 +10,30 @@ public record CssDeclaration(string Property, string Value, bool Important);
 public record CssRule(IReadOnlyList<CssSelector> Selectors,
                IReadOnlyList<CssDeclaration> Declarations);
 
-public record CssImportRule(string Url);
+/// <summary>
+/// CSS2 @import record.  Media is the comma-separated media descriptor
+/// ("@import url(a.css) screen, print;"); null/empty means the sheet
+/// applies to ALL media per CSS2 §7.2.2.  The import-expansion layer
+/// (Form1.ExpandCssImportsAsync — outside the CSS engine's ownership)
+/// must consult AppliesTo("screen") before pulling a sheet in; as of the
+/// CSS2 upgrade it still imports print-only sheets.
+/// </summary>
+public record CssImportRule(string Url, IReadOnlyList<string>? Media = null)
+{
+    /// <summary>True when this import applies to the given media type
+    /// (an absent media descriptor means all media).</summary>
+    public bool AppliesTo(string mediaType)
+    {
+        if (Media is not { Count: > 0 })
+            return true;
+        return Media.Any(m =>
+            m.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+            m.Equals(mediaType, StringComparison.OrdinalIgnoreCase));
+    }
+}
 
 /// <summary>
-/// CSS1 parser.  Produces one CssRule per selector, with shorthands expanded
+/// CSS1/CSS2 parser.  Produces one CssRule per selector, with shorthands expanded
 /// into individual (property, value) declarations.  Unknown properties and
 /// malformed values are skipped without affecting the rest of the rule.
 /// </summary>
@@ -155,8 +175,14 @@ public static class CssParser
                 {
                     SkipWhitespace(css, ref pos);
                     string url = ParseUrlOrString(css, ref pos);
-                    importRules.Add(new CssImportRule(url));
+                    // CSS2: optional media descriptor after the URL
+                    // ("@import url(a.css) screen, print;").  The old code
+                    // DISCARDED it — captured here so the expansion layer
+                    // can skip non-screen sheets (CssImportRule.AppliesTo).
+                    int mediaStart = pos;
                     SkipToSemicolonOrBrace(css, ref pos);
+                    var media = ParseMediaList(css[mediaStart..pos]);
+                    importRules.Add(new CssImportRule(url, media));
                     break;
                 }
 
@@ -284,7 +310,7 @@ public static class CssParser
                     pos++;
                     var sb = new StringBuilder();
                     while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
-                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>' or '['))
                     {
                         sb.Append(css[pos]);
                         pos++;
@@ -297,7 +323,7 @@ public static class CssParser
                     pos++;
                     var sb = new StringBuilder();
                     while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
-                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>' or '['))
                     {
                         sb.Append(css[pos]);
                         pos++;
@@ -316,17 +342,20 @@ public static class CssParser
                     }
                     var sb = new StringBuilder();
                     while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
-                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>' or '['))
                     {
                         sb.Append(char.ToLowerInvariant(css[pos]));
                         pos++;
                     }
                     string name = sb.ToString();
-                    // CSS1 spells pseudo-elements with one colon. Accept the
-                    // later double-colon spelling too, but classify first-line
-                    // and first-letter correctly so their declarations reach the
-                    // inline layout path.
-                    bool css1PseudoElement = name is "first-line" or "first-letter";
+                    // CSS1/CSS2 spell pseudo-elements with one colon
+                    // (:first-line, :before, :after…).  Accept the later
+                    // double-colon spelling too, and classify them correctly
+                    // so their declarations reach the pseudo routing in
+                    // StyleResolver — :before used to fall through as a
+                    // pseudo-CLASS, which never matches anything.
+                    bool css1PseudoElement = name is "first-line" or "first-letter"
+                        or "before" or "after";
                     return isElement || css1PseudoElement
                         ? new SelectorPart(PartType.PseudoElement, name)
                         : new SelectorPart(PartType.PseudoClass, name);
@@ -366,7 +395,7 @@ public static class CssParser
                     }
                     var sb = new StringBuilder();
                     while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
-                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>'))
+                           css[pos] is not ('{' or ',' or '.' or '#' or ':' or '>' or '['))
                     {
                         sb.Append(char.ToLowerInvariant(css[pos]));
                         pos++;
@@ -379,6 +408,22 @@ public static class CssParser
     // ─────────────────────────────────────────────────────────────────────
     // Declarations
     // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Parse a comma-separated CSS2 media list ("screen, print") into
+    /// lowercase tokens.  Empty/whitespace → null (all media).
+    /// </summary>
+    private static IReadOnlyList<string>? ParseMediaList(string descriptor)
+    {
+        if (string.IsNullOrWhiteSpace(descriptor))
+            return null;
+        var parts = descriptor.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Trim().Trim(';', '}').Trim())
+            .Where(p => p.Length > 0)
+            .Select(p => p.ToLowerInvariant())
+            .ToList();
+        return parts.Count > 0 ? parts : null;
+    }
 
     private static List<CssDeclaration> ParseDeclarationBlock(string css, ref int pos)
     {
@@ -502,6 +547,15 @@ public static class CssParser
     /// </summary>
     private static IEnumerable<(string Prop, string Val)> ExpandShorthand(string property, string value)
     {
+        // CSS2 'inherit' on a shorthand must NOT be split into longhands —
+        // ComputedStyle.ApplyInherit copies every sub-property from the
+        // parent as a unit (border: inherit pulls the parent's computed
+        // width/style/color for all four sides).  Expanding here would
+        // keep only the pieces the per-shorthand expansion happens to
+        // recognise and reset the rest to initial values.
+        if (value.Trim().Equals("inherit", StringComparison.OrdinalIgnoreCase))
+            return new[] { (property, value) };
+
         switch (property)
         {
             case "margin":
@@ -629,6 +683,33 @@ public static class CssParser
     private static IEnumerable<(string, string)> ExpandFont(string value)
     {
         var parts = SplitTopLevel(value);
+
+        // CSS2 system fonts — font: caption | icon | menu | message-box |
+        // small-caption | status-bar.  Mapped to plausible Win98 desktop
+        // values (MS Sans Serif at the era control sizes).
+        if (parts.Count == 1)
+        {
+            string? sysSize = parts[0].ToLowerInvariant() switch
+            {
+                "caption" or "icon" or "menu" => "13px",
+                "message-box" => "14px",
+                "small-caption" => "11px",
+                "status-bar" => "12px",
+                _ => null
+            };
+            if (sysSize != null)
+            {
+                return new[]
+                {
+                    ("font-style", "normal"),
+                    ("font-variant", "normal"),
+                    ("font-weight", "normal"),
+                    ("font-size", sysSize),
+                    ("font-family", "MS Sans Serif, sans-serif")
+                };
+            }
+        }
+
         string fontStyle = "normal", fontVariant = "normal", fontWeight = "normal";
         string? size = null, lineHeight = null, family = null;
 

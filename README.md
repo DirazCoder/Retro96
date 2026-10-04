@@ -1,6 +1,8 @@
-# Retro96
+# Retro96 → 1999
 
-A from-scratch HTML 3.2 / CSS1 / ES3 browser engine that renders the web the way it looked in 1996. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, DOM-0 scripting, the whole cursed thing. It includes its own VBScript 1.0 engine and runs Java applets on a from-scratch JVM.
+A from-scratch browser engine that renders the web the way it looked in **1999** — upgraded from the original 1996 engine to the full IE5 / Netscape 4.7 era: HTML 4.01, CSS2, DOM Level 1, the IE5 DHTML object model AND the Navigator 4.7 layer DOM, JScript 5.0 / JavaScript 1.3 (ES3), a native VBScript 5.0 engine, and HTTP/1.1. Not "mostly." Not "quirks mode close enough." Actually correctly — frames, table layouts, the whole cursed thing. It runs Java applets on a from-scratch JVM (parked at 1996 compatibility on purpose).
+
+**The engine speaks in personas.** The default is Internet Explorer 5 (March 1999): `document.all`, the DHTML object model, the IE5 box model (width includes padding and border), JScript 5.0 and HTTP/1.1 with keep-alive and 304 validation caching. Switch to the Netscape Navigator 4.7 persona and `document.all` disappears while `document.layers`, the capture event model and JavaScript 1.3 take over — pages sniff `document.all` then `document.layers` then `getElementById`, and each persona exposes exactly one branch. The native Retro96 Engine mode keeps the compatibility union of everything.
 
 Built for fun. Runs on Windows. Has no chill.
 
@@ -42,7 +44,7 @@ Modern browsers in quirks mode still "helpfully" fix things they shouldn't touch
 
 `document.formName.fieldName`. `window.status`. The live clock JavaScript that was on every personal homepage in 1999. The Bravenet counter. The guestbook form. Retro96 implements the era's DOM-0 scripting and includes a separate VBScript 1.0 engine for classic `<script language="VBScript">` pages. wild concept
 
-The VBScript engine is a native parser and interpreter, not a VBScript-to-JavaScript translator. It supports classic procedures and functions, Variants, arrays, runtime error handling, and common intrinsic functions. Each document uses a persistent session so procedures and globals can be shared between VBScript blocks, and browser event handlers can call VBScript procedures. Browser-hosted scripts use browser dialogs and named document/form controls; Windows Script Host objects are intentionally not exposed to pages.
+The VBScript engine is a native parser and interpreter, not a VBScript-to-JavaScript translator, upgraded from 1.0 to the full IE5-era **5.0** surface: `Class` with `Property Get/Let/Set`, `Public`/`Private`, `Class_Initialize`/`Class_Terminate`, `Set x = New`, `Me`, `With..End With`, `Eval` (comparison semantics), `Execute`/`ExecuteGlobal`, `GetRef`, the `VBScript.RegExp` object (`Test`/`Replace`/`Execute` with Matches), `Array`/`Filter`, `Debug.Write`, `Err.HelpFile`/`HelpContext`, and the ScriptEngine* version probes reporting 5.0.6325. It supports classic procedures and functions, Variants, arrays, runtime error handling, and the full intrinsic function set. Each document uses a persistent session so procedures and globals can be shared between VBScript blocks, and browser event handlers can call VBScript procedures. Browser-hosted scripts use browser dialogs and named document/form controls; Windows Script Host objects are intentionally not exposed to pages.
 
 ---
 
@@ -134,7 +136,7 @@ here's what actually happened under the hood:
 
 **JavaScript engine** — both projects have a hand-written JS engine. the Rust engine is centered in a 2,399-line `javascript_engine.rs`. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, and scope — currently 7,160 tracked C# lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is currently 2,005 lines on its own
 
-**testing** — the Rust checkout has 144 `#[test]` annotations across 25 tracked Rust files. Its separate 137-line `test_js_engine.rs` is a standalone smoke-test program, not a Rust `#[test]` suite. The latest Retro96 xUnit run passed 236 tests, and the live JS page harness contains 29 contract checks. There are 54 hand-authored QA HTML files, a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests
+**testing** — the Rust checkout has 144 `#[test]` annotations across 25 tracked Rust files. Its separate 137-line `test_js_engine.rs` is a standalone smoke-test program, not a Rust `#[test]` suite. The latest Retro96 xUnit run passed 363 tests plus 54 VBScript 5.0 tests, the live JS page harness contains 28 contract checks across two browser personas, and the 1999 QA suite is 20 hand-authored pages with a 34-check headless battery on top. There is a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests
 
 **real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
 
@@ -162,7 +164,7 @@ the Rust checkout has about 29.6k lines across tracked text files (including abo
 
 ## Status
 
-Side project built for fun, not production software. The latest xUnit run passed 236 tests, and the live JavaScript page harness contains 29 contract checks. The repository includes 54 hand-authored QA HTML files, a layout lab, and a Playwright pixel-diff harness for selected pages in `tests/html-websites/` and `testdata/`.
+Side project built for fun, not production software. The latest full run on .NET 11: **363 xUnit engine tests** (including the 34-check `Retro99SuiteTests` battery that loads every 1999 QA page through parse → style → layout → script), **54 VBScript 5.0 tests**, the live JavaScript page harness (28 contract checks against real period pages, under both the IE5 and NS4.7 personas), and the layout lab (all checks). The repository includes a 20-page 1999 QA suite in `tests/html-websites/` (one page per checklist section plus Acid1, a Y2K battery and a broken-HTML torture page), the real-world regression corpus in `testdata/`, and a Playwright pixel-diff harness.
 
 ## Rendering stack
 
@@ -173,25 +175,25 @@ The whole engine draws through SkiaSharp. `Engine/Drawing/` is a `System.Drawing
 ```
 retro96/             the engine + WinForms shell (net11.0-windows)
   Engine/
-    Css/              CSS1 parser, selectors, style resolution
-    Dom/              DOM node tree
+    Css/              CSS2 parser, selectors (incl. attribute/[attr]/:first-child/:lang/:before), style resolution
+    Dom/              DOM node tree (+ LayoutBox wiring for offset geometry)
     Drawing/          SkiaSharp-backed drawing primitives
     Forms/            form submission, hit-testing
-    Html/             HTML tokenizer + parser
+    Html/             HTML 4.01 tokenizer + parser (implied tbody, concealment, 4.01 entities)
     Java/             Java 1.0/1.1 bytecode interpreter + selected later runtime APIs, AWT
-    Js/               hand-written ES3 lexer/parser/interpreter + DOM bindings
-    Vbs/              native VBScript 1.0 lexer/parser/interpreter + runtime
-    Layout/           block/inline/table layout engine
-    Network/          HTTP client, cookies, URL parsing, frame loading
+    Js/               hand-written ES3 lexer/parser/interpreter + DOM bindings (DOM1, IE5 DHTML, NS4 layers)
+    Vbs/              native VBScript 5.0 lexer/parser/interpreter + runtime (+ RegExp, Class)
+    Layout/           block/inline/table layout engine (positioning, z-order, min/max, optgroup)
+    Network/          HTTP/1.1 client (keep-alive pool, 304 validation cache), cookies, URL parsing, frame loading
     Plugins/          plugin host, .r96p loading, sandbox worker + broker protocol
-    Render/           renderer, font/image caches, glyph substitution
+    Render/           renderer, font/image caches, glyph substitution, marquee events
 tests/
-  RetroTests/         xUnit regression suite (engine, JS, DOM, forms, frames, CSS1)
-  VbsTests/           focused VBScript 1.0 semantic regression suite
-  JsPageTests/        live script-contract checks against real pages
+  RetroTests/         xUnit regression suite (engine, JS, DOM, forms, frames, CSS2 + the 1999 suite)
+  VbsTests/           VBScript 5.0 semantic regression suite (54 tests)
+  JsPageTests/        live script-contract checks against real pages (IE5 + NS4.7 personas)
   LayoutLab/          layout laboratory + PageProbe (renders a page, dumps diagnostics)
   VisualDiff/         Retro96-vs-Chromium pixel/geometry diff harness (Playwright)
-  html-websites/      hand-authored QA pages (HTML 3.2 + CSS1 + ES3)
+  html-websites/      the 1999 QA suite (one page per checklist section + Acid1 + Y2K + broken HTML)
 testdata/             real-world period pages + generated era assets
 docs/                 screenshots used in this README
 scripts/              helper scripts (visual_analysis.py)
@@ -200,21 +202,31 @@ Retro96.sln           solution file
 
 ## Building
 
-Requires the .NET 8/11 SDKs. Engine and tests run on Linux; the WinForms shell needs `EnableWindowsTargeting` to cross-compile from Linux, or just build it natively on Windows.
+Requires the .NET 11 SDK. Engine and tests run on Linux; the WinForms shell needs `EnableWindowsTargeting` to cross-compile from Linux, or just build it natively on Windows.
 
 ```
 cd retro96
-dotnet build -p:EnableWindowsTargeting=true
+dotnet build Retro96.sln
 ```
 
 ## Running the tests
 
 ```
-cd tests/RetroTests  && dotnet test      # engine/JS/DOM/forms/frames + CSS1 regressions
-cd tests/VbsTests    && dotnet test      # VBScript 1.0 semantics
-cd tests/JsPageTests && dotnet run       # live script-contract checks
+cd tests/RetroTests  && dotnet test      # engine/JS/DOM/forms/frames + CSS2 + the 1999 QA suite (363)
+cd tests/VbsTests    && dotnet test      # VBScript 5.0 semantics (54)
+cd tests/JsPageTests && dotnet run       # live script-contract checks (28, IE5 + NS4.7 personas)
 cd tests/LayoutLab   && dotnet run       # layout lab, all checks
+cd tests/VisualDiff  && dotnet run       # pixel diff vs Chromium (needs playwright install)
 ```
+
+Inspect a single page in detail:
+
+```
+cd tests/LayoutLab && dotnet run -- ../../testdata/voyagersisland.html 800 600 png
+```
+
+Browse the 1999 QA suite by opening `tests/html-websites/test-index.html` — every page
+self-reports its era contracts in-page (the same lines the xUnit suite asserts).
 
 Inspect a single page in detail:
 

@@ -37,6 +37,42 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private LayoutBox? _rootBox;
     private JsInterpreter? _jsInterpreter;
     private readonly ConditionalWeakTable<DomDocument, VbsPageState> _vbsSessions = new();
+
+    // The most recently constructed canvas acts as the marquee-event host
+    // (one browser shell per process; the era's single-window model).
+    private static BrowserCanvas? _activeCanvas;
+
+    static BrowserCanvas()
+    {
+        // Marquee events (checklist §11: onstart / onbounce / onfinish) fire
+        // from the renderer's animation state machine through the page's
+        // script interpreter. The hook is static (Renderer has no canvas
+        // reference); events marshal to the UI thread to avoid interpreter
+        // races with the paint path.
+        Renderer.MarqueeEventHook = (element, eventName) =>
+        {
+            try
+            {
+                var canvas = _activeCanvas;
+                var interp = canvas?._jsInterpreter;
+                if (canvas == null || interp == null) return;
+                if (canvas.InvokeRequired)
+                {
+                    canvas.BeginInvoke(new Action(() =>
+                    {
+                        try { interp.FireEvent(element, eventName); }
+                        catch { }
+                    }));
+                }
+                else
+                {
+                    try { interp.FireEvent(element, eventName); }
+                    catch { }
+                }
+            }
+            catch { /* marquee events are best-effort */ }
+        };
+    }
     private ImageCache? _imageCache;
     private ImageCache? _imageEventSource;
     private FontCache? _fontCache;
@@ -395,6 +431,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
     public BrowserCanvas()
     {
+        _activeCanvas = this;
         _javaApplets = new Retro96.Engine.Java.JavaAppletHost();
         _javaApplets.RepaintRequested = RequestRerender;
         _javaApplets.NavigateRequested = NavigateTo;
@@ -717,6 +754,21 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         ArgumentNullException.ThrowIfNull(doc);
         ArgumentNullException.ThrowIfNull(rootBox);
+
+        // Deterministic VBScript session teardown: the outgoing page's
+        // Class_Terminate procedures run at unload time (VBScript 5.0
+        // lifetime semantics) instead of waiting for GC of the
+        // ConditionalWeakTable entry.
+        if (_document != null)
+        {
+            try
+            {
+                if (_vbsSessions.TryGetValue(_document, out var endingPage) &&
+                    endingPage.Session is { } endingSession)
+                    endingSession.Terminate();
+            }
+            catch { /* page teardown must never abort navigation */ }
+        }
 
         // Dispose nested frame state before installing the new page.
         foreach (var frame in _frames.Values)
@@ -9600,9 +9652,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         var box = FindBoxForElement(layoutRoot, select);
         if (box == null) return;
 
-        var options = select.Descendants().OfType<DomElement>()
-            .Where(o => o.TagName == "option").ToList();
-        if (options.Count == 0) return;
+        // OPTGROUP-aware row model — identical geometry to the renderer's
+        // listbox painting: group headers occupy a row, are painted bold,
+        // and are NOT selectable. Clicks on them do nothing.
+        var rows = Engine.Layout.SelectRowModel.Build(select);
+        var options = rows.Where(r => r.Option != null).Select(r => r.Option!).ToList();
+        if (rows.Count == 0 || options.Count == 0) return;
 
         var font = ResolveFieldFont(select);
         if (font == null) return;
@@ -9610,9 +9665,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         int visibleRows = GetSelectVisibleRows(select);
         int scrollOffset = GetSelectScrollOffset(select);
         int index = scrollOffset + (int)Math.Floor((y - box.ContentRect.Y) / rowHeight);
-        if (index < scrollOffset || index >= Math.Min(scrollOffset + visibleRows, options.Count)) return;
+        if (index < scrollOffset || index >= Math.Min(scrollOffset + visibleRows, rows.Count)) return;
+        if (rows[index].IsGroupHeader) return;
 
-        var captured = options[index];
+        var captured = rows[index].Option!;
+        // Range selection works in OPTION index space, not row space.
+        int optionIndex = options.IndexOf(captured);
         bool toggle = (ModifierKeys & Keys.Control) == Keys.Control;
         int anchorIndex = 0;
         bool range = (ModifierKeys & Keys.Shift) == Keys.Shift &&
@@ -9621,8 +9679,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
         if (range)
         {
-            int lo = Math.Min(anchorIndex, index);
-            int hi = Math.Max(anchorIndex, index);
+            int lo = Math.Min(anchorIndex, optionIndex);
+            int hi = Math.Max(anchorIndex, optionIndex);
             foreach (var option in options)
                 option.SetAttr("selected", null);
             for (int i = lo; i <= hi; i++)
@@ -9640,7 +9698,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 captured.SetAttr("selected", "");
         }
 
-        _selectRangeAnchors[select] = index;
+        _selectRangeAnchors[select] = optionIndex;
         js?.FireEvent(select, "change");
         RequestRerender();
     }

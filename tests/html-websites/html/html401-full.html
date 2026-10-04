@@ -1,0 +1,112 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+  <title>HTML 4.01 Element Battery (1999)</title>
+  <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+  <meta name="description" content="HTML 4.01 element coverage page for the 1999 engine battery">
+</head>
+<body bgcolor="#FFFFFF" text="#000000" link="#0000FF" vlink="#800080" alink="#FF0000">
+
+<h1>HTML 4.01 Element Battery</h1>
+<p>Every element new in HTML 4.0/4.01 over 3.2, plus the deprecated set a
+1999 browser still renders. Doctype: Transitional, no mode switch.</p>
+
+<h2>New structural elements</h2>
+<div id="structural" class="block">
+  <span id="sp1">SPAN: generic inline container</span><br>
+  <abbr title="HyperText Markup Language">HTML</abbr> and
+  <acronym title="Cascading Style Sheets, Level 2">CSS2</acronym> inline.<br>
+  <q>Q gets quotation marks from the UA</q><br>
+  <ins datetime="1999-12-24T12:00:00Z">INS renders underlined</ins> and
+  <del>DEL renders struck</del>.<br>
+  <bdo dir="rtl">BDO with dir=rtl</bdo>
+</div>
+
+<h2>Forms: fieldset, legend, label, button, optgroup</h2>
+<form name="f401" action="/cgi/register" method="get">
+  <fieldset>
+    <legend>Shipping details (LEGEND inset in the FIELDSET border)</legend>
+    <label for="name401">Full name (click focuses the field):</label>
+    <input type="text" id="name401" name="name401" size="24" tabindex="1" accesskey="N"><br>
+    <label><input type="checkbox" name="wrap" value="1" checked tabindex="2"> wrapped LABEL</label><br>
+    <button type="button" name="b401" onclick="window.status='BUTTON pressed'"><b>Rich</b> <i>BUTTON</i></button>
+    <select name="os401" size="1" tabindex="3">
+      <optgroup label="Microsoft">
+        <option value="w98" selected>Windows 98</option>
+        <option value="w95">Windows 95</option>
+      </optgroup>
+      <optgroup label="Other">
+        <option value="os2">OS/2 Warp</option>
+        <option label="Linux" value="linux">Linux (label attr)</option>
+      </optgroup>
+    </select>
+  </fieldset>
+  <input type="submit" value="Submit" tabindex="4">
+</form>
+
+<h2>Table row groups: thead, tbody, tfoot, colgroup, col</h2>
+<table border="1" cellpadding="3" cellspacing="0" summary="row group battery">
+  <caption valign="bottom">Caption (bottom)</caption>
+  <colgroup span="1" width="120"></colgroup>
+  <colgroup><col width="80"><col align="right"></colgroup>
+  <thead>
+    <tr bgcolor="#CCCCCC"><th scope="col">Quarter</th><th>Units</th><th>Revenue</th></tr>
+  </thead>
+  <tfoot>
+    <tr><td>Total</td><td>4</td><td>&#165;1,024</td></tr>
+  </tfoot>
+  <tbody>
+    <tr><td>Q1</td><td align="right">1</td><td>256</td></tr>
+    <tr><td>Q2</td><td align="right">1</td><td>256</td></tr>
+  </tbody>
+  <tbody>
+    <tr><td>Q3</td><td align="right">1</td><td>256</td></tr>
+    <tr><td>Q4</td><td align="right">1</td><td>256</td></tr>
+  </tbody>
+</table>
+<p>Two explicit TBODY sections, a TFOOT declared before them, and
+CAPTION with valign. Rows appearing before any group get an implied
+TBODY.</p>
+
+<h2>Internationalisation (RFC 2070 folded into 4.0)</h2>
+<p lang="fr" dir="ltr">French paragraph, lang=fr. <span lang="de">German
+inline span, lang=de</span>.</p>
+<p title="tooltip text">title attribute on a paragraph (hover me).</p>
+
+<h2>Deprecated but still rendered (4.01 deprecates, 1999 keeps)</h2>
+<font face="Arial" color="#FF0000" size="+1">FONT face/color/size</font><br>
+<basefont size="3">
+<center>CENTER still centers</center>
+<u>U underline</u> <s>S strike</s> <strike>STRIKE too</strike><br>
+<dir compact><li>DIR list item</li></dir>
+<menu compact><li>MENU list item</li></menu>
+<isindex prompt="Search this directory:">
+<hr noshade size="4" width="50%" align="left" color="#808080">
+<p><big>BIG</big> <small>SMALL</small> <sub>sub</sub> <sup>sup</sup>
+<tt>TT</tt> <kbd>KBD</kbd> <var>VAR</var> <samp>SAMP</samp>
+<code>CODE</code> <cite>CITE</cite> <dfn>DFN</dfn> <em>EM</em>
+<strong>STRONG</strong> <address>ADDRESS block</address></p>
+<p nowrap>Paragraph with nowrap — width wins over wrapping.</p>
+
+<h2>Entities: HTML 4.01 full set</h2>
+<p>Greek: &Alpha; &Beta; &Gamma; &omega; &sigmaf; &thetasym; &piv; &upsih; &alefsym;<br>
+Typographic: &ensp;em&emsp;space&thinsp;thin &ndash; &mdash; &lsquo; &rsquo; &ldquo; &rdquo; &laquo; &raquo; &bull; &hellip; &dagger; &Dagger; &permil; &prime; &Prime; &oline; &frasl;<br>
+Marks and money: &trade; &copy; &reg; &euro; &larr; &uarr; &rarr; &darr; &harr;<br>
+Numeric: &#65; &#x42; &#960; (decimal A, hex B, numeric pi)</p>
+
+<h2>Concealment elements</h2>
+<comment>IE COMMENT: this text must never render</comment>
+<xml id="xmldata"><catalog><item id="1">XML data island content</item></catalog></xml>
+<noframes><p>NOFRAMES fallback (this frameset-less page still conceals it
+only inside a FRAMESET document).</p></noframes>
+
+<h2>ruby (IE5)</h2>
+<p><ruby>&#28450;&#23383;<rt>kanji</rt><rp>(</rp><rp>)</rp></ruby>
+ruby text renders half-size after the base; RP fallback is hidden.</p>
+
+<h2>Link targets and tabindex</h2>
+<p><a href="#structural" tabindex="5" accesskey="S">Jump to structural
+section (tabindex 5)</a></p>
+
+</body>
+</html>

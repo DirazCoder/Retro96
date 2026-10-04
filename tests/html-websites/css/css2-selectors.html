@@ -1,0 +1,102 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<title>CSS2 Selector Battery (1998 Recommendation)</title>
+<style type="text/css">
+  /* ── CSS2 structural selectors ─────────────────────────────── */
+  p.first-demo > span { color: #CC0000; }              /* child */
+  h4 + p { border-left: 3px solid #008000; padding-left: 6px; }  /* adjacent */
+  * { font-family: "Times New Roman", serif; }          /* universal */
+  li:first-child { font-weight: bold; }                 /* :first-child */
+  p:lang(fr) { font-style: italic; }                    /* :lang() */
+  a[href^="http"] { color: #0000CC; }                   /* (kept: beyond-era) */
+  a[lang] { text-decoration: overline; }                /* [attr] */
+  input[type="text"] { background-color: #FFFFEE; }     /* [attr=v] */
+  option[value~="beta"] { color: #808000; }             /* [attr~=v] */
+  *[dir|="ltr"] { border-bottom: 1px dotted #999999; }  /* [attr|=v] */
+
+  /* ── :link / :visited co-exist with :active (CSS2 change) ──── */
+  a:link { color: #0000FF; }
+  a:visited { color: #800080; }
+  a:link:active, a:visited:active { color: #FF0000; }
+
+  /* ── pseudo-elements ───────────────────────────────────────── */
+  p.gen:before { content: "[before] "; color: #008000; }
+  p.gen:after { content: " [after]"; color: #008000; }
+  p.content-attr:after { content: " (" attr(title) ")"; color: #808080; }
+  p.first-line-demo::first-line { font-weight: bold; }
+  p.first-letter-demo:first-letter { font-size: 200%; color: #CC0000; }
+
+  /* ── the inherit keyword ───────────────────────────────────── */
+  div.inherit-demo { color: #006600; border: 2px solid #006600; padding: 6px; }
+  div.inherit-demo p { border: inherit; color: inherit; }
+
+  /* ── @media and media-scoped rules ─────────────────────────── */
+  @media screen { p.media-screen { background-color: #EEFFEE; } }
+  @media print { p.media-print { font-weight: bold; } }
+  @media screen, print { p.media-both { text-decoration: underline; } }
+</style>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>CSS2 selector battery</h1>
+
+<h2>Child combinator</h2>
+<p class="first-demo"><span>child SPAN (red)</span> — <span>nested
+<span>grandchild stays black</span></span></p>
+
+<h2>Adjacent sibling</h2>
+<h4>Heading</h4>
+<p>Paragraph directly after the heading (green left border).</p>
+<p>Second paragraph — no border.</p>
+
+<h2>:first-child</h2>
+<ul>
+  <li>first LI (bold)</li>
+  <li>second LI (normal)</li>
+  <li>third LI (normal)</li>
+</ul>
+
+<h2>:lang()</h2>
+<p lang="fr">Paragraphe en francais (italic via :lang(fr)).</p>
+<p lang="en-US">English-US paragraph (en prefix does not match fr).</p>
+<div lang="de"><p lang="">Nested with own (empty) lang — no match,
+inheritance from de does not apply (lang="" resets).</p></div>
+
+<h2>Attribute selectors</h2>
+<p><a href="http://www.example.com/">http link</a> |
+<a href="local.html" lang="en">local link with lang (overlined)</a> |
+<a href="#">plain link</a></p>
+<form><input type="text" value="text input (pale yellow)">
+<input type="checkbox"> checkbox (no background)</form>
+<select size="4">
+  <option value="alpha gamma">alpha gamma</option>
+  <option value="beta">beta (olive via ~=)</option>
+  <option value="beta delta">beta delta</option>
+</select>
+<div dir="ltr">dir=ltr div (dotted underline)</div>
+
+<h2>Generated content :before / :after</h2>
+<p class="gen">this paragraph carries generated brackets</p>
+<p class="content-attr" title="the title attribute">attr() content reads the title</p>
+
+<h2>inherit keyword</h2>
+<div class="inherit-demo">
+  outer div (green text + border)
+  <p>inner paragraph inherits color AND border via `border: inherit`</p>
+</div>
+
+<h2>Media-scoped rules</h2>
+<p class="media-screen">screen rule (pale background on screen only)</p>
+<p class="media-print">print rule (bold on print only — plain here)</p>
+<p class="media-both">screen, print list (underlined on both)</p>
+
+<h2>Specificity sanity</h2>
+<p id="spec-p" class="c">id beats class beats type — this is red.</p>
+<style type="text/css">
+  p { color: #000000; }
+  p.c { color: #0000FF; }
+  #spec-p { color: #CC0000; }
+</style>
+
+</body>
+</html>

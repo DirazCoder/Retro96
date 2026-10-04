@@ -52,7 +52,41 @@ public sealed record VbsSubStatement(int Line, string Name, List<VbsParam> Param
     List<VbsStmt> Body, bool IsFunction) : VbsStmt(Line);
 public sealed record VbsParam(string Name, bool ByVal);   // ByRef is the default
 
-public enum VbsExitKind { Sub, Function, Do, For }
+// ── VBScript 5.0: With / Class ──────────────────────────────────────────────
+
+public sealed record VbsWithStatement(int Line, VbsExpr Object, List<VbsStmt> Body) : VbsStmt(Line);
+
+/// <summary>`.Member` shorthand inside a With block — resolved against the
+/// innermost With object that supports the member (outer blocks are consulted
+/// when the inner object doesn't have it).</summary>
+public sealed record VbsWithMemberExpr(int Line, string Member) : VbsExpr(Line);
+
+/// <summary>`Me` — the current class instance inside class code.</summary>
+public sealed record VbsMeExpr(int Line) : VbsExpr(Line);
+
+/// <summary>`New ClassName` — construction expression (Set x = New Foo).</summary>
+public sealed record VbsNewExpr(int Line, string ClassName) : VbsExpr(Line);
+
+public sealed record VbsClassStatement(int Line, string Name, List<VbsClassMemberDecl> Members) : VbsStmt(Line);
+
+public abstract record VbsClassMemberDecl(int Line);
+
+/// <summary>Public/Private field declarations (`Public X, Y` / `Private A()`).
+/// Dim without a visibility keyword is accepted as Private (VB6-style).</summary>
+public sealed record VbsClassFieldDecl(int Line, List<VbsDimDecl> Fields, bool IsPublic) : VbsClassMemberDecl(Line);
+
+public sealed record VbsClassMethodDecl(int Line, string Name, List<VbsParam> Params,
+    List<VbsStmt> Body, bool IsFunction, bool IsPublic) : VbsClassMemberDecl(Line);
+
+public enum VbsPropertyKind { Get, Let, Set }
+
+/// <summary>Property Get/Let/Set accessor. A Get is function-like: the property
+/// name is its implicit return variable. For Let/Set the value being assigned is
+/// the LAST parameter. `Exit Property` leaves the accessor.</summary>
+public sealed record VbsClassPropertyDecl(int Line, string Name, VbsPropertyKind Kind,
+    List<VbsParam> Params, List<VbsStmt> Body, bool IsPublic) : VbsClassMemberDecl(Line);
+
+public enum VbsExitKind { Sub, Function, Property, Do, For }
 public sealed record VbsExitStatement(int Line, VbsExitKind Kind) : VbsStmt(Line);
 
 public sealed record VbsOnErrorStatement(int Line, bool ResumeNext) : VbsStmt(Line);

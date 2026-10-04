@@ -31,25 +31,75 @@ public static class BrowserRuntime
     /// <summary>True when Preferences selected the historical Navigator 3 profile.</summary>
     public static bool IsNetscape3 => Settings.EngineMode == RetroEngineMode.Netscape3;
 
+    /// <summary>True when Preferences selected the 1999 IE5 / JScript 5.0 persona (the upgrade default).</summary>
+    public static bool IsInternetExplorer5 => Settings.EngineMode == RetroEngineMode.InternetExplorer5;
+
+    /// <summary>True when Preferences selected the 1999 Navigator 4.7 / JavaScript 1.3 persona.</summary>
+    public static bool IsNetscape47 => Settings.EngineMode == RetroEngineMode.Netscape47;
+
+    /// <summary>Any of the 1999-generation personas (IE5, NS4.7, the upgraded union).</summary>
+    public static bool Is1999Persona => IsInternetExplorer5 || IsNetscape47 || IsRetro96;
+
     /// <summary>True when the native engine exposes the IE-era host-object surface.</summary>
-    public static bool SupportsInternetExplorerLegacy => IsRetro96 || IsInternetExplorer3;
+    public static bool SupportsInternetExplorerLegacy => IsRetro96 || IsInternetExplorer3 || IsInternetExplorer5;
 
     /// <summary>True when the native engine exposes the Navigator-era surface.</summary>
-    public static bool SupportsNetscapeLegacy => IsRetro96 || IsNetscape3;
+    public static bool SupportsNetscapeLegacy => IsRetro96 || IsNetscape3 || IsNetscape47;
+
+    // ── 1999 persona capabilities (checklist §1/§10 profile logic) ──────
+    // Pages sniff document.all → document.layers → getElementById. An engine
+    // that exposes both all and layers takes the wrong branch on half the
+    // pages, so the historical personas expose exactly one surface.
+
+    /// <summary>document.all exists (IE3/IE5 and the native union).</summary>
+    public static bool SupportsDocumentAll => IsRetro96 || IsInternetExplorer3 || IsInternetExplorer5;
+
+    /// <summary>document.layers exists (NS3/NS4.7 and the native union).</summary>
+    public static bool SupportsDocumentLayers => IsRetro96 || IsNetscape3 || IsNetscape47;
+
+    /// <summary>getElementById exists. Navigator 4.x predates DOM Level 1
+    /// Core adoption in the wild — NS4.7 pages use document.layers or
+    /// document.ids instead, so the property is undefined there.</summary>
+    public static bool SupportsGetElementById => !IsNetscape3 && !IsNetscape47;
+
+    /// <summary>IE5 quirks-mode box model: width/height include padding and
+    /// border (checklist §9). Only the strict IE5 persona applies it.</summary>
+    public static bool UsesIe5BoxModel => IsInternetExplorer5;
+
+    /// <summary>Wire protocol: 1999 personas speak HTTP/1.1 (RFC 2616), the
+    /// 1996 historical personas stay on HTTP/1.0.</summary>
+    public static bool Http11Enabled => Is1999Persona;
+
+    /// <summary>Validation caching (ETag/304) is available in the 1999
+    /// personas and behind a preference for the historical ones.</summary>
+    public static bool HttpCacheEnabled => Is1999Persona && Settings.EnableHttpCache;
+
+    /// <summary>The era's PNG acceptance. IE3/NS3 never advertised
+    /// image/png (checklist §16), the 1999 personas do.</summary>
+    public static bool AdvertisesPngImages => !IsInternetExplorer3 && !IsNetscape3;
+
+    /// <summary>VBScript engine version this persona ships (§13).
+    /// IE3 shipped 1.0; the 1999 target is IE5's 5.0. VBScript 5.5
+    /// arrived with IE5.5 in 2000 — deliberately out of scope.</summary>
+    public static double VbScriptVersion => IsInternetExplorer3 ? 1.0 : 5.0;
 
     /// <summary>Human-readable script engine personality exposed by the compatibility mode.</summary>
     public static string JavaScriptEngineName => Settings.EngineMode switch
     {
         RetroEngineMode.Retro96 => "Retro96 Script Engine",
         RetroEngineMode.InternetExplorer3 => "Microsoft JScript 1.0",
+        RetroEngineMode.InternetExplorer5 => "Microsoft JScript 5.0",
+        RetroEngineMode.Netscape47 => "Netscape JavaScript 1.3",
         _ => "Netscape JavaScript 1.1"
     };
 
     /// <summary>Compatibility-era ECMAScript surface version used by the script runtime.</summary>
     public static string JavaScriptVersion => Settings.EngineMode switch
     {
-        RetroEngineMode.Retro96 => "1.0/1.1 + Retro96 extensions",
+        RetroEngineMode.Retro96 => "5.x/1.3 + Retro96 extensions",
         RetroEngineMode.InternetExplorer3 => "1.0",
+        RetroEngineMode.InternetExplorer5 => "5.0 (ES3)",
+        RetroEngineMode.Netscape47 => "1.3",
         _ => "1.1"
     };
 

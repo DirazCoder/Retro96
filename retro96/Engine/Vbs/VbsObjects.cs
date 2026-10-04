@@ -27,20 +27,27 @@ public interface IVbsDispatchObject
 }
 
 /// <summary>
-/// The VBScript Err object: Number / Description / Source / Raise / Clear.
-/// The interpreter writes the last error into it; scripts read and raise.
+/// The VBScript Err object: Number / Description / Source / HelpFile /
+/// HelpContext, Raise and Clear. The interpreter writes the last error into
+/// it; scripts read and raise.
 /// </summary>
 public sealed class VbsErrObject : IVbsDispatchObject
 {
     public int Number { get; set; }
     public string Description { get; set; } = "";
     public string Source { get; set; } = "";
+    /// <summary>Help file associated with the error (read/write).</summary>
+    public string HelpFile { get; set; } = "";
+    /// <summary>Help context ID associated with the error (read/write).</summary>
+    public int HelpContext { get; set; }
 
     public void Clear()
     {
         Number = 0;
         Description = "";
         Source = "";
+        HelpFile = "";
+        HelpContext = 0;
     }
 
     public string VbsTypeName => "ErrObject";
@@ -49,9 +56,11 @@ public sealed class VbsErrObject : IVbsDispatchObject
     {
         switch (name.ToLowerInvariant())
         {
-            case "number": value = VbsVariant.Of(Number); return true;
+            case "number": value = VbsVariant.FromLong(Number); return true;
             case "description": value = VbsVariant.Of(Description); return true;
             case "source": value = VbsVariant.Of(Source); return true;
+            case "helpfile": value = VbsVariant.Of(HelpFile); return true;
+            case "helpcontext": value = VbsVariant.FromLong(HelpContext); return true;
         }
         value = default;
         return false;
@@ -64,6 +73,8 @@ public sealed class VbsErrObject : IVbsDispatchObject
             case "number": Number = checked((int)value.ToLongMath()); return true;
             case "description": Description = value.ToStringVariant(); return true;
             case "source": Source = value.ToStringVariant(); return true;
+            case "helpfile": HelpFile = value.ToStringVariant(); return true;
+            case "helpcontext": HelpContext = checked((int)value.ToLongMath()); return true;
         }
         return false;
     }
@@ -77,6 +88,7 @@ public sealed class VbsErrObject : IVbsDispatchObject
                 Clear();
                 return true;
 
+            // Raise number, source, description, helpfile, helpcontext
             case "raise":
                 if (args.Length == 0)
                     throw new VbsRuntimeException(VbsErrorNumbers.InvalidProcedureCall,
@@ -86,9 +98,15 @@ public sealed class VbsErrObject : IVbsDispatchObject
                 string desc = args.Length > 2 && args[2].Type != VbVarType.Empty
                     ? args[2].ToStringVariant()
                     : VbsErrorNumbers.Describe(number);
+                string helpFile = args.Length > 3 && args[3].Type != VbVarType.Empty
+                    ? args[3].ToStringVariant() : "";
+                int helpContext = args.Length > 4 && args[4].Type != VbVarType.Empty
+                    ? checked((int)args[4].ToLongMath()) : 0;
                 Number = number;
                 Description = desc;
                 Source = source;
+                HelpFile = helpFile;
+                HelpContext = helpContext;
                 throw new VbsRuntimeException(number, desc, errSource: source);
         }
         return false;
@@ -154,6 +172,107 @@ public sealed class VbsQuitException : Exception
 {
     public int ExitCode { get; }
     public VbsQuitException(int exitCode) : base("WScript.Quit") => ExitCode = exitCode;
+}
+
+/// <summary>
+/// GetRef("procname") — a callable reference to a script procedure. Invoking
+/// the object (default dispatch) calls the procedure; a Function's result
+/// comes back. Callable via `f(args)`, `f arg`, `Call f(args)` and passable
+/// as an argument to other procedures.
+/// </summary>
+public sealed class VbsGetRefObject : IVbsDispatchObject
+{
+    private readonly VbsInterpreter _interpreter;
+    private readonly VbsProcedure _proc;
+
+    internal VbsGetRefObject(VbsInterpreter interpreter, VbsProcedure proc)
+    {
+        _interpreter = interpreter;
+        _proc = proc;
+    }
+
+    /// <summary>The referenced procedure's name.</summary>
+    public string ProcedureName => _proc.Name;
+
+    public string VbsTypeName => "Function";
+
+    public bool TryGetMember(string name, out VbsVariant value)
+    {
+        if (name.ToLowerInvariant() == "name")
+        {
+            value = VbsVariant.Of(_proc.Name);
+            return true;
+        }
+        value = default;
+        return false;
+    }
+
+    public bool TrySetMember(string name, VbsVariant value) => false;
+
+    public bool TryInvoke(string name, VbsVariant[] args, out VbsVariant result)
+    { result = default; return false; }
+
+    public bool TryGetDefault(out VbsVariant value) { value = default; return false; }
+    public bool TrySetDefault(VbsVariant value) => false;
+
+    public bool TryInvokeDefault(VbsVariant[] args, out VbsVariant result)
+    {
+        result = _interpreter.CallProcedure(_proc.Name, args);
+        return true;
+    }
+
+    public bool TryEnumerate(out IEnumerable<VbsVariant> items)
+    { items = Array.Empty<VbsVariant>(); return false; }
+}
+
+/// <summary>
+/// The VBScript Debug object: Write appends without a newline, WriteLine
+/// flushes the pending buffer plus the text as one host output line (no
+/// debugger attach — hosts route WriteLine to the console/document).
+/// Debug.Print is aliased to WriteLine, classic-VB style.
+/// </summary>
+public sealed class VbsDebugObject : IVbsDispatchObject
+{
+    private readonly IVbsScriptHost _host;
+    private readonly System.Text.StringBuilder _pending = new();
+
+    internal VbsDebugObject(IVbsScriptHost host) => _host = host;
+
+    public string VbsTypeName => "Debug";
+
+    private static string ArgText(VbsVariant[] args) =>
+        args.Length == 0 ? "" :
+        args[0].Type == VbVarType.Null ? "" : args[0].ToStringVariant();
+
+    public bool TryGetMember(string name, out VbsVariant value)
+    { value = default; return false; }
+
+    public bool TrySetMember(string name, VbsVariant value) => false;
+
+    public bool TryInvoke(string name, VbsVariant[] args, out VbsVariant result)
+    {
+        result = VbsVariant.Empty;
+        switch (name.ToLowerInvariant())
+        {
+            case "write":
+                _pending.Append(ArgText(args));
+                return true;
+            case "writeline":
+            case "print":   // Debug.Print = WriteLine in classic VB
+                _pending.Append(ArgText(args));
+                _host.WriteLine(_pending.ToString());
+                _pending.Clear();
+                return true;
+        }
+        return false;
+    }
+
+    public bool TryGetDefault(out VbsVariant value) { value = default; return false; }
+    public bool TrySetDefault(VbsVariant value) => false;
+    public bool TryInvokeDefault(VbsVariant[] args, out VbsVariant result)
+    { result = default; return false; }
+    public bool TryEnumerate(out IEnumerable<VbsVariant> items)
+    { items = Array.Empty<VbsVariant>(); return false; }
 }
 
 /// <summary>

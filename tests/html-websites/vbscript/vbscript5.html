@@ -1,0 +1,193 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>VBScript 5.0 Battery (1999)</title>
+<script language="VBScript">
+Option Explicit
+
+' ── VBScript 5.0 statements ──────────────────────────────────────────
+Dim SharedLog
+SharedLog = ""
+
+Class WebCounter
+    Private mHits
+    Private mLabel
+
+    Public Sub Class_Initialize()
+        mHits = 0
+        mLabel = "counter"
+    End Sub
+
+    Public Sub Class_Terminate()
+        ' deterministic teardown at page unload
+    End Sub
+
+    Public Property Get Hits()
+        Hits = mHits
+    End Property
+
+    Public Property Let Hits(ByVal v)
+        mHits = v
+    End Property
+
+    Public Property Get Label()
+        Label = mLabel
+    End Property
+
+    Public Sub Register()
+        mHits = mHits + 1
+    End Sub
+
+    Private Function HiddenCalc()
+        HiddenCalc = 7
+    End Function
+
+    Public Function VisibleCalc()
+        VisibleCalc = HiddenCalc() * 6
+    End Function
+End Class
+
+Function TestClass()
+    Dim c
+    Set c = New WebCounter
+    c.Register
+    c.Register
+    c.Hits = c.Hits + 10
+    TestClass = "hits=" & c.Hits & " label=" & c.Label & " calc=" & c.VisibleCalc
+End Function
+
+Function TestWith()
+    Dim d
+    d = "start"
+    With document
+        d = d & ":title=" & .title
+    End With
+    TestWith = d
+End Function
+
+Function TestArrayBuiltins()
+    Dim a, s, f
+    a = Array("alpha", "beta", "gamma")
+    s = Join(a, ",")
+    f = Filter(a, "a")           ' every element contains "a"
+    TestArrayBuiltins = "join=" & s & " filter=" & UBound(f) + 1
+End Function
+
+Function TestStrings()
+    TestStrings = Replace("one two one", "one", "1") & "|" & _
+                  InStrRev("abcabc", "b") & "|" & StrReverse("stressed")
+End Function
+
+Function TestEvalExecute()
+    Dim x
+    x = 5
+    ' Eval("x = 5") is a COMPARISON (evaluates to True), not an assignment
+    If Eval("x = 5") Then
+        Execute "x = 9"           ' Execute RUNS statements in caller scope
+        ExecuteGlobal "gExec = 42"
+    End If
+    TestEvalExecute = "x-after-execute=" & x & " global=" & gExec
+End Function
+
+Function TestRegExp()
+    Dim re, matches
+    Set re = New RegExp
+    re.Pattern = "\d+"
+    re.IgnoreCase = True
+    re.Global = True
+    If re.Test("hit 42 times") Then
+        Set matches = re.Execute("hit 42 times and 7 more")
+        TestRegExp = "count=" & matches.Count & " first=" & _
+                     matches(0).Value & " idx=" & matches(0).FirstIndex
+    Else
+        TestRegExp = "TEST-FAILED"
+    End If
+End Function
+
+Function TestGetRef()
+    Dim fn
+    Set fn = GetRef("ReferencedTarget")
+    TestGetRef = fn(4)
+End Function
+
+Function ReferencedTarget(ByVal n)
+    ReferencedTarget = n * 11
+End Function
+
+Function TestErrHelp()
+    On Error Resume Next
+    Err.Raise 5, "TestSource", "description", "help.hlp", 100
+    TestErrHelp = "num=" & Err.Number & " help=" & Err.HelpFile & ":" & Err.HelpContext
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function TestVersion()
+    TestVersion = ScriptEngine() & " " & ScriptEngineMajorVersion() & "." & _
+                   ScriptEngineMinorVersion() & "." & ScriptEngineBuildVersion()
+End Function
+
+Function TestEscape()
+    TestEscape = Escape("a b") & "|" & RGB(255, 128, 0)
+End Function
+
+Sub Btn_OnClick()
+    MsgBoxEvent "btn clicked via name_onclick convention"
+End Sub
+
+Sub MsgBoxEvent(ByVal text)
+    SharedLog = SharedLog & "[" & text & "]"
+End Sub
+</script>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>VBScript 5.0 battery</h1>
+<p>Statements: <tt>Class</tt> with Property Get/Let, Public/Private,
+<tt>Class_Initialize</tt>/<tt>Class_Terminate</tt>, <tt>Set x = New</tt>,
+<tt>Me</tt>, <tt>With..End With</tt>, <tt>Eval</tt> (comparison semantics),
+<tt>Execute</tt> (caller scope) vs <tt>ExecuteGlobal</tt>, <tt>GetRef</tt>,
+<tt>On Error</tt>.</p>
+<p>Builtins: Array, Filter, Replace, InStrRev, StrReverse, Escape, RGB,
+ScriptEngine* (5.0.6325), Err.HelpFile/HelpContext, and the
+<tt>VBScript.RegExp</tt> object (Pattern/IgnoreCase/Global, Test, Replace,
+Execute → Matches with FirstIndex/Length/Value).</p>
+
+<h2>Reports</h2>
+<dl>
+<dt>class</dt><dd id="v1">&nbsp;</dd>
+<dt>with</dt><dd id="v2">&nbsp;</dd>
+<dt>arrays</dt><dd id="v3">&nbsp;</dd>
+<dt>strings</dt><dd id="v4">&nbsp;</dd>
+<dt>eval/execute</dt><dd id="v5">&nbsp;</dd>
+<dt>regexp</dt><dd id="v6">&nbsp;</dd>
+<dt>getref</dt><dd id="v7">&nbsp;</dd>
+<dt>err</dt><dd id="v8">&nbsp;</dd>
+<dt>version</dt><dd id="v9">&nbsp;</dd>
+<dt>escape/rgb</dt><dd id="v10">&nbsp;</dd>
+</dl>
+
+<script language="VBScript">
+document.all("v1").innerText = TestClass()
+document.all("v2").innerText = TestWith()
+document.all("v3").innerText = TestArrayBuiltins()
+document.all("v4").innerText = TestStrings()
+document.all("v5").innerText = TestEvalExecute()
+document.all("v6").innerText = TestRegExp()
+document.all("v7").innerText = TestGetRef()
+document.all("v8").innerText = TestErrHelp()
+document.all("v9").innerText = TestVersion()
+document.all("v10").innerText = TestEscape()
+</script>
+
+<form name="vbsform">
+<input type="button" name="Btn" value="click me (Sub Btn_OnClick convention)">
+</form>
+
+<script language="JavaScript1.3">
+// Cross-language surface: VBScript procedures are visible to JScript.
+document.write("<p id='crosslang'>cross-language: " +
+  (typeof TestVersion == "function" || typeof TestVersion == "unknown" ||
+   typeof TestVersion == "object"
+     ? "VBScript functions visible to JScript" : "NOT VISIBLE") + "</p>");
+</script>
+</body>
+</html>

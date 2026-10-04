@@ -1169,7 +1169,9 @@ public class NamedBugHeadlessTests
                 "<script>document.write(\"<p>JS-RAN-IN-FRAME</p>\");</script>" +
                 "</body></html>");
 
-            string fileBase = "file:///" + outerPath.Replace('\\', '/');
+            // Canonical file URL on every OS (a raw "file:///" + POSIX path
+            // is a 4-slash URL; CanonicalFileUrl builds the correct form).
+            string fileBase = FileUrls.CanonicalFileUrl(outerPath);
 
             InlineLayout.SetFontCache(LayoutHarness.Fonts);
             var outerDoc = HtmlParser.Parse(

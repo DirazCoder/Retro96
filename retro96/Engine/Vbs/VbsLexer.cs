@@ -5,7 +5,7 @@ using System.Globalization;
 namespace Retro96.Engine.Vbs;
 
 /// <summary>
-/// VBScript 1.0 lexer. Line-oriented: newline ends a statement (unless the
+/// VBScript 5.0 lexer. Line-oriented: newline ends a statement (unless the
 /// previous line ended with the "_" continuation char), ":" separates
 /// statements on one line. Comments: ' anywhere, Rem at statement position.
 /// Strings use "" as an escaped quote. Numbers: decimal, exponent, &amp;H hex,

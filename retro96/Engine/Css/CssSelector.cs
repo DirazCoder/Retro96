@@ -133,6 +133,16 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
 
             if (c is '.' or '#' or ':')
             {
+                // "::" is ONE pseudo-element marker — flushing between the
+                // two colons used to emit a stray empty ":pseudo-class"
+                // part that never matched anything.
+                if (c == ':' && i + 1 < selector.Length && selector[i + 1] == ':')
+                {
+                    FlushPart(parts, ref current);
+                    current = "::";
+                    i += 2;
+                    continue;
+                }
                 // Start of a new simple selector on the same subject
                 FlushPart(parts, ref current);
                 current = c.ToString();
@@ -171,15 +181,27 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
         {
             '.' => new SelectorPart(PartType.Class, current[1..]),
             '#' => new SelectorPart(PartType.Id, current[1..]),
-            // "::before" is a pseudo-ELEMENT — the old flush only looked at
-            // the first ':' and parsed it as pseudo-class ":before".
+            // "::before" is a pseudo-ELEMENT; CSS1/CSS2 also spell
+            // first-line/first-letter/before/after with ONE colon, and
+            // those must classify as pseudo-elements too (the old flush
+            // parsed ":before" as a pseudo-class that never matched).
             ':' => current.Length > 1 && current[1] == ':'
-                ? new SelectorPart(PartType.PseudoElement, current[2..])
-                : new SelectorPart(PartType.PseudoClass, current[1..]),
+                ? new SelectorPart(PartType.PseudoElement, current[2..].ToLowerInvariant())
+                : IsPseudoElementName(current[1..])
+                    ? new SelectorPart(PartType.PseudoElement, current[1..].ToLowerInvariant())
+                    : new SelectorPart(PartType.PseudoClass, current[1..]),
             '*' => new SelectorPart(PartType.Universal, null),
             _ => new SelectorPart(PartType.Type, current.ToLowerInvariant())
         });
         current = "";
+    }
+
+    /// <summary>CSS1/CSS2 pseudo-element names — single-colon spelling
+    /// routes to PartType.PseudoElement.</summary>
+    private static bool IsPseudoElementName(string name)
+    {
+        string n = name.ToLowerInvariant();
+        return n is "first-line" or "first-letter" or "before" or "after";
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -356,7 +378,19 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
         if (string.IsNullOrEmpty(pseudoClass))
             return false;
 
-        switch (pseudoClass.ToLowerInvariant())
+        string pc = pseudoClass.ToLowerInvariant();
+
+        // :lang(xx) — CSS2: the element's language (its own lang attribute
+        // or the nearest ancestor's) matches the argument as a case-
+        // insensitive hyphen-separated prefix (:lang(en) matches "en"
+        // and "en-US", not "enx").
+        if (pc.StartsWith("lang(") && pc.EndsWith(")"))
+        {
+            string arg = pc[5..^1].Trim().Trim('\'', '"');
+            return MatchesLang(element, arg);
+        }
+
+        switch (pc)
         {
             case "link":
                 return element.TagName == "a" && element.HasAttr("href") &&
@@ -370,9 +404,36 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
                 return IsDynamicStateFor(element, element.OwnerDocument()?.ActiveElement);
             case "focus":
                 return IsDynamicStateFor(element, element.OwnerDocument()?.FocusedElement);
+            case "first-child":
+                // CSS2: the element is the first ELEMENT child of its parent
+                // (text/comment siblings do not count).
+                return element.Parent == null || PreviousElementSibling(element) == null;
             default:
                 return false;
         }
+    }
+
+    private static bool MatchesLang(DomElement element, string arg)
+    {
+        if (string.IsNullOrEmpty(arg))
+            return false;
+
+        for (DomNode? node = element; node != null; node = node.Parent)
+        {
+            if (node is DomElement e)
+            {
+                string? lang = e.GetAttr("lang") ?? e.GetAttr("xml:lang");
+                if (!string.IsNullOrEmpty(lang))
+                {
+                    string value = lang.Trim();
+                    return value.Equals(arg, StringComparison.OrdinalIgnoreCase) ||
+                           (value.Length > arg.Length &&
+                            value[arg.Length] == '-' &&
+                            value.StartsWith(arg, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+        }
+        return false;
     }
 
     private static bool IsDynamicStateFor(DomElement selectorElement, DomElement? stateElement)

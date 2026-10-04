@@ -37,6 +37,10 @@ public class ComputedStyle
     public WhiteSpaceValue WhiteSpace { get; set; } = WhiteSpaceValue.Normal;
     public VerticalAlign VerticalAlign { get; set; } = VerticalAlign.Baseline;
     public float? VerticalAlignPercent { get; set; }
+    /// <summary>CSS2: vertical-align &lt;length&gt; value in px (signed).
+    /// Non-null only when an authored length was given; keywords keep
+    /// VerticalAlign and % keeps VerticalAlignPercent.</summary>
+    public float? VerticalAlignLength { get; set; }
     public bool OwnVerticalAlign { get; set; }
 
     // === BACKGROUND ===
@@ -79,6 +83,18 @@ public class ComputedStyle
     public float? WidthPercent { get; set; }
     public float? HeightPercent { get; set; }
 
+    // CSS2 min/max size constraints.  Like width/height, percentages stay
+    // percentages (resolved at LAYOUT against the containing block).
+    // MinWidth null = 0 (the CSS2 initial value); MaxWidth null = none.
+    public float? MinWidth { get; set; }
+    public float? MaxWidth { get; set; }
+    public float? MinHeight { get; set; }
+    public float? MaxHeight { get; set; }
+    public float? MinWidthPercent { get; set; }
+    public float? MaxWidthPercent { get; set; }
+    public float? MinHeightPercent { get; set; }
+    public float? MaxHeightPercent { get; set; }
+
     // FIX: same story for top/left/right/bottom on positioned boxes.
     // "top:30%" on an absolutely positioned element resolves against its
     // CONTAINING BLOCK's height (left/right against width), never the page
@@ -115,6 +131,57 @@ public class ComputedStyle
     public ListStyleType ListStyleType { get; set; } = ListStyleType.Disc;
     public string? ListStyleImage { get; set; }
     public ListStylePosition ListStylePosition { get; set; } = ListStylePosition.Outside;
+
+    // === CSS2 CURSOR (inherited; rendering is the shell's job) ===
+    public CursorValue Cursor { get; set; } = CursorValue.Auto;
+    /// <summary>First url() of a cursor list (cursor: url(x.cur), pointer).
+    /// Null when the value has no URI part.</summary>
+    public string? CursorUri { get; set; }
+
+    // === CSS2 OUTLINE (non-inherited; layout/paint is the integrator's) ===
+    public float OutlineWidth { get; set; }              // px
+    public BorderStyleValue OutlineStyle { get; set; } = BorderStyleValue.None;
+    public Color OutlineColor { get; set; } = Color.Black;
+    /// <summary>outline-color: invert — the CSS2 initial value; true until
+    /// an explicit colour is authored.</summary>
+    public bool OutlineColorInvert { get; set; } = true;
+
+    // === CSS2 TABLE PROPERTIES (non-inherited) ===
+    public BorderCollapseValue BorderCollapse { get; set; } = BorderCollapseValue.Separate;
+    public float BorderSpacingX { get; set; }           // px
+    public float BorderSpacingY { get; set; }           // px (defaults to X when single value)
+    public TableLayoutValue TableLayout { get; set; } = TableLayoutValue.Auto;
+    public CaptionSideValue CaptionSide { get; set; } = CaptionSideValue.Top;
+    public EmptyCellsValue EmptyCells { get; set; } = EmptyCellsValue.Show;
+
+    // === CSS2 FONT EXTRAS ===
+    public float? FontSizeAdjust { get; set; }          // null = none
+    public string? FontStretch { get; set; }            // raw keyword
+
+    // === CSS2 BIDI / TEXT (stored; BDO rendering is later work) ===
+    public DirectionValue Direction { get; set; } = DirectionValue.Ltr;   // inherited
+    public string? UnicodeBidi { get; set; }            // raw keyword: normal|embed|bidi-override
+    public string? TextShadow { get; set; }             // raw value (parse-level only — nobody shipped it in 1999)
+
+    // === CSS2 GENERATED CONTENT ===
+    /// <summary>Parsed content value: (type, text) tokens — "string",
+    /// "attr", "uri", "counter", "counters", "open-quote"/"close-quote"/
+    /// "no-open-quote"/"no-close-quote".  Null = none/normal/unset.
+    /// Rendering is the integrator's job.</summary>
+    public List<ContentToken>? Content { get; set; }
+    /// <summary>quotes: pairs of open/close strings (inherited).
+    /// Null = default quotes.</summary>
+    public List<QuotePair>? Quotes { get; set; }
+    /// <summary>counter-reset list ([name, value] — value defaults to 0).</summary>
+    public List<CounterAction>? CounterReset { get; set; }
+    /// <summary>counter-increment list (value defaults to 1).</summary>
+    public List<CounterAction>? CounterIncrement { get; set; }
+
+    // Pseudo-element declaration slots, exactly like FirstLineStyle /
+    // FirstLetterStyle.  :before / ::before declarations land in
+    // GeneratedBefore; :after / ::after in GeneratedAfter.
+    public ComputedStyle? GeneratedBefore { get; set; }
+    public ComputedStyle? GeneratedAfter { get; set; }
 
     // Netscape 1–7 <font size> scale, in pixels.  Documented mapping.
     // Netscape's HTML font-size scale is in POINTS (1=8pt … 7=36pt+).
@@ -161,6 +228,14 @@ public class ComputedStyle
         child.TextTransform = parent.TextTransform;
         child.WhiteSpace = parent.WhiteSpace;
         child.Visibility = parent.Visibility;
+        // CSS2 inherited additions
+        child.FontSizeAdjust = parent.FontSizeAdjust;
+        child.FontStretch = parent.FontStretch;
+        child.Direction = parent.Direction;
+        child.Cursor = parent.Cursor;
+        child.CursorUri = parent.CursorUri;
+        child.TextShadow = parent.TextShadow;
+        child.Quotes = parent.Quotes == null ? null : new List<QuotePair>(parent.Quotes);
         // list-style-* is inherited in CSS1
         child.ListStyleType = parent.ListStyleType;
         child.ListStylePosition = parent.ListStylePosition;
@@ -172,20 +247,38 @@ public class ComputedStyle
         if (own != null)
         {
             foreach (var decl in own)
-                child.Apply(decl, parent.FontSize, 0f, parent.FontWeight);
+                child.Apply(decl, parent.FontSize, 0f, parent.FontWeight, parent);
         }
         child.ResolvePendingLineHeight();
 
         return child;
     }
 
-    /// <summary>Parse and apply a single declaration in place.</summary>
-    public void Apply(CssDeclaration decl, float parentFontSize, float viewportWidth, FontWeightValue parentFontWeight = FontWeightValue.Normal)
+    /// <summary>Parse and apply a single declaration in place.
+    /// parentStyle enables the CSS2 'inherit' keyword for NON-inherited
+    /// properties (border-width: inherit pulls the parent's computed
+    /// value); it is null for the root element, where 'inherit' resolves
+    /// to the initial value the style already carries.</summary>
+    public void Apply(CssDeclaration decl, float parentFontSize, float viewportWidth,
+        FontWeightValue parentFontWeight = FontWeightValue.Normal,
+        ComputedStyle? parentStyle = null)
     {
         if (decl == null) return;
 
         var property = decl.Property.ToLowerInvariant();
         var value = decl.Value.Trim();
+
+        // CSS2 'inherit' on ANY property routes to the parent's computed
+        // value — inherited properties get it naturally, non-inherited
+        // ones (border-width, margins, display, …) copy it explicitly
+        // (CSS2 §6.2.1).  Shorthands pass through unexpanded (see
+        // CssParser.ExpandShorthand) so every sub-property copies as a
+        // unit.
+        if (IsInheritToken(value))
+        {
+            ApplyInherit(property, parentStyle);
+            return;
+        }
 
         switch (property)
         {
@@ -211,7 +304,7 @@ public class ComputedStyle
             case "word-spacing": WordSpacing = ParseLength(value, parentFontSize, viewportWidth); break;
             case "text-transform": TextTransform = ParseTextTransform(value); break;
             case "white-space": WhiteSpace = ParseWhiteSpace(value); break;
-            case "vertical-align": SetVerticalAlign(value); break;
+            case "vertical-align": SetVerticalAlign(value, parentFontSize); break;
 
             // === BACKGROUND ===
             case "background-color": BackgroundColor = ParseColor(value, BackgroundColor); OwnBackground = true; break;
@@ -286,6 +379,58 @@ public class ComputedStyle
             case "width": (Width, WidthPercent) = ParseSize(value, parentFontSize, viewportWidth); break;
             case "height": (Height, HeightPercent) = ParseSize(value, parentFontSize, viewportWidth); break;
 
+            // === CSS2 SIZE CONSTRAINTS ===
+            case "min-width": (MinWidth, MinWidthPercent) = ParseSize(value, parentFontSize, viewportWidth); break;
+            case "max-width":
+                if (IsNoneKeyword(value)) { MaxWidth = null; MaxWidthPercent = null; }
+                else (MaxWidth, MaxWidthPercent) = ParseSize(value, parentFontSize, viewportWidth);
+                break;
+            case "min-height": (MinHeight, MinHeightPercent) = ParseSize(value, parentFontSize, viewportWidth); break;
+            case "max-height":
+                if (IsNoneKeyword(value)) { MaxHeight = null; MaxHeightPercent = null; }
+                else (MaxHeight, MaxHeightPercent) = ParseSize(value, parentFontSize, viewportWidth);
+                break;
+
+            // === CSS2 CURSOR ===
+            case "cursor": SetCursor(value); break;
+
+            // === CSS2 OUTLINE ===
+            case "outline-width": OutlineWidth = Math.Max(0f, ParseBorderWidth(value, parentFontSize, viewportWidth)); break;
+            case "outline-style": OutlineStyle = ParseBorderStyle(value); break;
+            case "outline-color": SetOutlineColor(value); break;
+            case "outline": ParseOutlineShorthand(value, parentFontSize, viewportWidth); break;
+
+            // === CSS2 TABLES ===
+            case "border-collapse": BorderCollapse = ParseBorderCollapse(value); break;
+            case "border-spacing": SetBorderSpacing(value, parentFontSize); break;
+            case "table-layout": TableLayout = ParseTableLayout(value); break;
+            case "caption-side": CaptionSide = ParseCaptionSide(value); break;
+            case "empty-cells": EmptyCells = ParseEmptyCells(value); break;
+
+            // === CSS2 FONT EXTRAS ===
+            case "font-size-adjust": FontSizeAdjust = ParseFontSizeAdjust(value); break;
+            case "font-stretch": FontStretch = ParseFontStretch(value); break;
+
+            // === CSS2 BIDI / TEXT ===
+            case "direction": Direction = ParseDirection(value); break;
+            case "unicode-bidi": UnicodeBidi = ParseUnicodeBidi(value); break;
+            case "text-shadow": TextShadow = IsNoneKeyword(value) ? null : value; break;
+
+            // === CSS2 GENERATED CONTENT ===
+            case "content": Content = ParseContent(value); break;
+            case "quotes": Quotes = ParseQuotes(value); break;
+            case "counter-reset": CounterReset = ParseCounterList(value, defaultValue: 0); break;
+            case "counter-increment": CounterIncrement = ParseCounterList(value, defaultValue: 1); break;
+
+            // === NS4 LAYER ALIASES (checklist §10) — store into the
+            // background slots so paint Just Works ===
+            case "layer-background-color": BackgroundColor = ParseColor(value, BackgroundColor); OwnBackground = true; break;
+            case "layer-background-image": BackgroundImage = ParseUrl(value); break;
+
+            // === LIST-STYLE (whole-shorthand form reaches Apply when the
+            // parser passes 'inherit' through unexpanded) ===
+            case "list-style": ParseListStyleShorthand(value); break;
+
             default:
                 // Unknown property: silently ignored (1996 behaviour — one
                 // bad property never breaks the rest of the rule).
@@ -298,6 +443,12 @@ public class ComputedStyle
     {
         var c = (ComputedStyle)MemberwiseClone();
         c.FontFamily = new List<string>(FontFamily);
+        // The generated-content lists are mutable — clone them so a
+        // pseudo-element clone (GeneratedBefore/…) can't alias the base.
+        c.Content = Content == null ? null : new List<ContentToken>(Content);
+        c.Quotes = Quotes == null ? null : new List<QuotePair>(Quotes);
+        c.CounterReset = CounterReset == null ? null : new List<CounterAction>(CounterReset);
+        c.CounterIncrement = CounterIncrement == null ? null : new List<CounterAction>(CounterIncrement);
         return c;
     }
 
@@ -416,6 +567,31 @@ public class ComputedStyle
     private void ParseFontShorthand(string value, float parentFontSize, FontWeightValue parentFontWeight)
     {
         var parts = SplitTopLevel(value);
+
+        // CSS2 system fonts — font: caption | icon | menu | message-box |
+        // small-caption | status-bar (kept in sync with CssParser.
+        // ExpandFont, which handles the parse-time path).
+        if (parts.Count == 1)
+        {
+            float? sysSize = parts[0].ToLowerInvariant() switch
+            {
+                "caption" or "icon" or "menu" => 13f,
+                "message-box" => 14f,
+                "small-caption" => 11f,
+                "status-bar" => 12f,
+                _ => (float?)null
+            };
+            if (sysSize.HasValue)
+            {
+                FontStyle = FontStyleValue.Normal;
+                FontVariant = FontVariantValue.Normal;
+                FontWeight = FontWeightValue.Normal;
+                FontSize = sysSize.Value;
+                FontFamily = ParseFontFamily("MS Sans Serif, sans-serif");
+                return;
+            }
+        }
+
         string? size = null, family = null;
 
         for (int i = 0; i < parts.Count; i++)
@@ -677,7 +853,7 @@ public class ComputedStyle
         };
     }
 
-    private void SetVerticalAlign(string value)
+    private void SetVerticalAlign(string value, float parentFontSize)
     {
         OwnVerticalAlign = true;
         string token = value.Trim();
@@ -685,10 +861,23 @@ public class ComputedStyle
         {
             VerticalAlignPercent = percent;
             VerticalAlign = VerticalAlign.Baseline;
+            VerticalAlignLength = null;
             return;
         }
 
         VerticalAlignPercent = null;
+
+        // CSS2: signed &lt;length&gt; values (vertical-align: 3px / -2px /
+        // 0.25em).  The old code only accepted keywords and %, so every
+        // length silently fell back to baseline.
+        if (LooksLikeLengthToken(token))
+        {
+            VerticalAlignLength = ParseLength(token, parentFontSize, 0f);
+            VerticalAlign = VerticalAlign.Baseline;
+            return;
+        }
+
+        VerticalAlignLength = null;
         VerticalAlign = ParseVerticalAlign(token);
     }
 
@@ -1108,6 +1297,10 @@ public class ComputedStyle
             "block" => DisplayValue.Block,
             "inline" => DisplayValue.Inline,
             "inline-block" => DisplayValue.InlineBlock,
+            // CSS2 additions
+            "inline-table" => DisplayValue.InlineTable,
+            "run-in" => DisplayValue.RunIn,
+            "compact" => DisplayValue.Compact,
             "none" => DisplayValue.None,
             "list-item" => DisplayValue.ListItem,
             "table" => DisplayValue.Table,
@@ -1207,8 +1400,601 @@ public class ComputedStyle
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Small utilities
+    // CSS2 helpers (cursor, outline, tables, generated content)
     // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>The CSS2 'inherit' value keyword (case-insensitive).</summary>
+    internal static bool IsInheritToken(string value) =>
+        value.Trim().Equals("inherit", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNoneKeyword(string value) =>
+        value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+
+    private void SetCursor(string value)
+    {
+        CursorUri = null;
+        // CSS2 cursor value: a comma list of url()s followed by a keyword
+        // (cursor: url(x.cur), url(y.cur), pointer).  The keyword is the
+        // fallback; URIs are a hint for the shell (actually CHANGING the
+        // pointer is the shell's job).
+        string keyword = "";
+        foreach (var part in value.Split(','))
+        {
+            var token = part.Trim();
+            if (token.Length == 0) continue;
+            var lower = token.ToLowerInvariant();
+            if (lower.StartsWith("url("))
+            {
+                if (CursorUri == null)
+                    CursorUri = ParseUrl(token);
+            }
+            else
+            {
+                keyword = lower; // last keyword wins
+            }
+        }
+
+        Cursor = keyword switch
+        {
+            "hand" => CursorValue.Pointer,   // IE alias for pointer (checklist §14a)
+            "pointer" => CursorValue.Pointer,
+            "crosshair" => CursorValue.Crosshair,
+            "default" => CursorValue.Default,
+            "move" => CursorValue.Move,
+            "e-resize" => CursorValue.EResize,
+            "ne-resize" => CursorValue.NeResize,
+            "nw-resize" => CursorValue.NwResize,
+            "n-resize" => CursorValue.NResize,
+            "se-resize" => CursorValue.SeResize,
+            "sw-resize" => CursorValue.SwResize,
+            "s-resize" => CursorValue.SResize,
+            "w-resize" => CursorValue.WResize,
+            "text" => CursorValue.Text,
+            "wait" => CursorValue.Wait,
+            "help" => CursorValue.Help,
+            _ => CursorValue.Auto
+        };
+    }
+
+    private void SetOutlineColor(string value)
+    {
+        if (value.Trim().Equals("invert", StringComparison.OrdinalIgnoreCase))
+        {
+            OutlineColorInvert = true;
+            return;
+        }
+        OutlineColor = ParseColor(value, OutlineColor);
+        OutlineColorInvert = false;
+    }
+
+    /// <summary>outline: [width] [style] [color] — any order, each optional;
+    /// omitted sub-properties reset to their CSS2 initial values.</summary>
+    private void ParseOutlineShorthand(string value, float fs, float vw)
+    {
+        OutlineWidth = 0f;
+        OutlineStyle = BorderStyleValue.None;
+        OutlineColorInvert = true;
+
+        foreach (var part in SplitTopLevel(value))
+        {
+            var lower = part.ToLowerInvariant();
+            if (lower is "none" or "hidden" or "dotted" or "dashed" or "solid" or
+                    "double" or "groove" or "ridge" or "inset" or "outset")
+                OutlineStyle = ParseBorderStyle(part);
+            else if (lower is "thin" or "medium" or "thick" || IsLengthToken(lower))
+                OutlineWidth = Math.Max(0f, ParseBorderWidth(part, fs, vw));
+            else
+                SetOutlineColor(part); // colour or the 'invert' keyword
+        }
+    }
+
+    private static BorderCollapseValue ParseBorderCollapse(string value) =>
+        value.Trim().ToLowerInvariant() == "collapse"
+            ? BorderCollapseValue.Collapse
+            : BorderCollapseValue.Separate;
+
+    /// <summary>border-spacing: one length (both axes) or two (horizontal,
+    /// vertical).  Percentages are invalid for border-spacing.</summary>
+    private void SetBorderSpacing(string value, float parentFontSize)
+    {
+        var parts = SplitTopLevel(value);
+        if (parts.Count == 0) return;
+        BorderSpacingX = Math.Max(0f, ParseLength(parts[0], parentFontSize, 0f));
+        BorderSpacingY = parts.Count > 1
+            ? Math.Max(0f, ParseLength(parts[1], parentFontSize, 0f))
+            : BorderSpacingX;
+    }
+
+    private static TableLayoutValue ParseTableLayout(string value) =>
+        value.Trim().ToLowerInvariant() == "fixed" ? TableLayoutValue.Fixed : TableLayoutValue.Auto;
+
+    private static CaptionSideValue ParseCaptionSide(string value) =>
+        value.Trim().ToLowerInvariant() switch
+        {
+            "bottom" => CaptionSideValue.Bottom,
+            "left" => CaptionSideValue.Left,
+            "right" => CaptionSideValue.Right,
+            _ => CaptionSideValue.Top
+        };
+
+    private static EmptyCellsValue ParseEmptyCells(string value) =>
+        value.Trim().ToLowerInvariant() == "hide" ? EmptyCellsValue.Hide : EmptyCellsValue.Show;
+
+    private static float? ParseFontSizeAdjust(string value)
+    {
+        string v = value.Trim();
+        if (v.Length == 0 || v.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return null;
+        return TryParseFloat(v, out float n) && n >= 0f ? n : null;
+    }
+
+    private static string? ParseFontStretch(string value)
+    {
+        string v = value.Trim().ToLowerInvariant();
+        return v is "normal" or "wider" or "narrower" or
+                 "ultra-condensed" or "extra-condensed" or "condensed" or "semi-condensed" or
+                 "semi-expanded" or "expanded" or "extra-expanded" or "ultra-expanded"
+            ? v
+            : null;
+    }
+
+    private static DirectionValue ParseDirection(string value) =>
+        value.Trim().ToLowerInvariant() == "rtl" ? DirectionValue.Rtl : DirectionValue.Ltr;
+
+    private static string? ParseUnicodeBidi(string value)
+    {
+        string v = value.Trim().ToLowerInvariant();
+        return v is "normal" or "embed" or "bidi-override" ? v : null;
+    }
+
+    /// <summary>
+    /// Parse a CSS2 content value into (type, text) tokens.  Accepts
+    /// strings, attr(x), url(), counter()/counters(), the quote keywords
+    /// and tolerates anything else as an identifier token.  none/normal →
+    /// null.  Rendering is the integrator's job — this is parse-and-store.
+    /// </summary>
+    private static List<ContentToken>? ParseContent(string value)
+    {
+        string v = value.Trim();
+        if (v.Length == 0 ||
+            v.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+            v.Equals("normal", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var tokens = new List<ContentToken>();
+        int i = 0;
+        while (i < v.Length)
+        {
+            if (char.IsWhiteSpace(v[i]) || v[i] == ',') { i++; continue; }
+
+            if (v[i] is '"' or '\'')
+            {
+                tokens.Add(new ContentToken("string", ReadQuoted(v, ref i)));
+                continue;
+            }
+
+            // One identifier/function token — parenthesised groups stay
+            // together so counter(item, upper-roman) survives intact.
+            int start = i;
+            int depth = 0;
+            while (i < v.Length)
+            {
+                char ch = v[i];
+                if (ch == '(') depth++;
+                else if (ch == ')') depth = Math.Max(0, depth - 1);
+                if (depth == 0 && (char.IsWhiteSpace(ch) || ch == ',')) break;
+                i++;
+            }
+            string word = v[start..i];
+            if (word.Length == 0) continue;
+
+            int paren = word.IndexOf('(');
+            if (paren < 0)
+            {
+                string name = word.ToLowerInvariant();
+                switch (name)
+                {
+                    case "open-quote": tokens.Add(new ContentToken("open-quote", "")); break;
+                    case "close-quote": tokens.Add(new ContentToken("close-quote", "")); break;
+                    case "no-open-quote": tokens.Add(new ContentToken("no-open-quote", "")); break;
+                    case "no-close-quote": tokens.Add(new ContentToken("no-close-quote", "")); break;
+                    default:
+                        tokens.Add(new ContentToken("identifier", word)); break;
+                }
+            }
+            else
+            {
+                string name = word[..paren].ToLowerInvariant();
+                string arg = word[(paren + 1)..].TrimEnd(')').Trim();
+                switch (name)
+                {
+                    case "attr": tokens.Add(new ContentToken("attr", arg.Trim('\'', '"'))); break;
+                    case "url": tokens.Add(new ContentToken("uri", arg.Trim('\'', '"'))); break;
+                    case "counter": tokens.Add(new ContentToken("counter", arg)); break;
+                    case "counters": tokens.Add(new ContentToken("counters", arg)); break;
+                    default: tokens.Add(new ContentToken(name, arg)); break;
+                }
+            }
+        }
+        return tokens;
+    }
+
+    /// <summary>
+    /// Read a quoted CSS string starting at s[i] (the quote character),
+    /// advancing i past the closing quote.  \" \' \\ \n \t are unescaped.
+    /// </summary>
+    private static string ReadQuoted(string s, ref int i)
+    {
+        char quote = s[i];
+        i++;
+        var sb = new System.Text.StringBuilder();
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '\\' && i + 1 < s.Length)
+            {
+                char next = s[i + 1];
+                sb.Append(next switch
+                {
+                    '"' or '\'' or '\\' => next.ToString(),
+                    'n' => "\n",
+                    't' => "\t",
+                    _ => ""   // other escapes: dropped (era-tolerant)
+                });
+                i += 2;
+                continue;
+            }
+            if (c == quote) { i++; break; }
+            sb.Append(c);
+            i++;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// quotes: pairs of quoted strings (\"«\" \"»\" …).  none / an odd
+    /// count → null (default quotes).
+    /// </summary>
+    private static List<QuotePair>? ParseQuotes(string value)
+    {
+        string v = value.Trim();
+        if (v.Length == 0 || v.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var strings = new List<string>();
+        int i = 0;
+        while (i < v.Length)
+        {
+            if (char.IsWhiteSpace(v[i])) { i++; continue; }
+            if (v[i] is '"' or '\'')
+            {
+                strings.Add(ReadQuoted(v, ref i));
+                continue;
+            }
+            while (i < v.Length && !char.IsWhiteSpace(v[i])) i++; // skip junk
+        }
+
+        if (strings.Count < 2 || strings.Count % 2 != 0)
+            return null;
+
+        var pairs = new List<QuotePair>();
+        for (int p = 0; p + 1 < strings.Count; p += 2)
+            pairs.Add(new QuotePair(strings[p], strings[p + 1]));
+        return pairs;
+    }
+
+    /// <summary>
+    /// counter-reset / counter-increment: a space-separated list of
+    /// identifier + optional integer (default 0 for reset, 1 for
+    /// increment).  none → null.
+    /// </summary>
+    private static List<CounterAction>? ParseCounterList(string value, int defaultValue)
+    {
+        string v = value.Trim();
+        if (v.Length == 0 || v.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var parts = SplitTopLevel(v);
+        var result = new List<CounterAction>();
+        for (int i = 0; i < parts.Count; i++)
+        {
+            string name = parts[i].Trim();
+            if (name.Length == 0) continue;
+            int val = defaultValue;
+            if (i + 1 < parts.Count &&
+                int.TryParse(parts[i + 1].Trim(), NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out int parsed))
+            {
+                val = parsed;
+                i++;
+            }
+            result.Add(new CounterAction(name, val));
+        }
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>list-style: [type] [position] [image] (mirrors the
+    /// parse-time expansion in CssParser.ExpandShorthand).</summary>
+    private void ParseListStyleShorthand(string value)
+    {
+        foreach (var part in SplitTopLevel(value))
+        {
+            var lower = part.ToLowerInvariant();
+            if (lower is "disc" or "circle" or "square" or "decimal" or
+                    "lower-alpha" or "upper-alpha" or "lower-roman" or "upper-roman" or "none")
+            {
+                ListStyleType = ParseListStyleType(part);
+                OwnListStyleType = true;
+            }
+            else if (lower is "inside" or "outside")
+                ListStylePosition = ParseListStylePosition(part);
+            else if (lower.StartsWith("url("))
+            {
+                ListStyleImage = ParseUrl(part);
+                OwnListStyleImage = true;
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CSS2 'inherit' routing
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The 'inherit' keyword: copy the parent's COMPUTED value for the
+    /// named property (including every sub-property of a shorthand, and
+    /// for NON-inherited properties — border-width: inherit pulls the
+    /// parent's computed border width, CSS2 §6.2.1).  A null parent (the
+    /// root element) means the current value already IS the initial one.
+    /// </summary>
+    private void ApplyInherit(string property, ComputedStyle? parent)
+    {
+        if (parent == null)
+            return;
+
+        switch (property)
+        {
+            // === FONT ===
+            case "font-family": FontFamily = new List<string>(parent.FontFamily); break;
+            case "font-size": FontSize = parent.FontSize; OwnFontSize = true; break;
+            case "font-weight": FontWeight = parent.FontWeight; break;
+            case "font-style": FontStyle = parent.FontStyle; break;
+            case "font-variant": FontVariant = parent.FontVariant; break;
+            case "font-size-adjust": FontSizeAdjust = parent.FontSizeAdjust; break;
+            case "font-stretch": FontStretch = parent.FontStretch; break;
+            case "font":
+                FontFamily = new List<string>(parent.FontFamily);
+                FontSize = parent.FontSize; OwnFontSize = true;
+                FontWeight = parent.FontWeight;
+                FontStyle = parent.FontStyle;
+                FontVariant = parent.FontVariant;
+                break;
+
+            // === TEXT ===
+            case "color": Color = parent.Color; OwnColor = true; break;
+            case "text-decoration": TextDecoration = parent.TextDecoration; break;
+            case "text-align": TextAlign = parent.TextAlign; OwnTextAlign = true; break;
+            case "text-indent":
+                TextIndent = parent.TextIndent;
+                TextIndentPercent = parent.TextIndentPercent;
+                break;
+            case "line-height":
+                LineHeightMode = parent.LineHeightMode;
+                LineHeight = parent.LineHeight;
+                LineHeightPixels = parent.LineHeightPixels;
+                PendingLineHeight = null;
+                break;
+            case "letter-spacing": LetterSpacing = parent.LetterSpacing; break;
+            case "word-spacing": WordSpacing = parent.WordSpacing; break;
+            case "text-transform": TextTransform = parent.TextTransform; break;
+            case "white-space": WhiteSpace = parent.WhiteSpace; break;
+            case "vertical-align":
+                VerticalAlign = parent.VerticalAlign;
+                VerticalAlignPercent = parent.VerticalAlignPercent;
+                VerticalAlignLength = parent.VerticalAlignLength;
+                OwnVerticalAlign = true;
+                break;
+            case "text-shadow": TextShadow = parent.TextShadow; break;
+            case "direction": Direction = parent.Direction; break;
+            case "unicode-bidi": UnicodeBidi = parent.UnicodeBidi; break;
+
+            // === BACKGROUND ===
+            case "background-color": BackgroundColor = parent.BackgroundColor; OwnBackground = true; break;
+            case "background-image": BackgroundImage = parent.BackgroundImage; break;
+            case "background-repeat": BackgroundRepeat = parent.BackgroundRepeat; break;
+            case "background-attachment": BackgroundFixed = parent.BackgroundFixed; break;
+            case "background-position":
+                BackgroundPosition = parent.BackgroundPosition;
+                BackgroundPositionXLength = parent.BackgroundPositionXLength;
+                BackgroundPositionYLength = parent.BackgroundPositionYLength;
+                break;
+            case "background":
+                BackgroundColor = parent.BackgroundColor; OwnBackground = true;
+                BackgroundImage = parent.BackgroundImage;
+                BackgroundRepeat = parent.BackgroundRepeat;
+                BackgroundFixed = parent.BackgroundFixed;
+                BackgroundPosition = parent.BackgroundPosition;
+                BackgroundPositionXLength = parent.BackgroundPositionXLength;
+                BackgroundPositionYLength = parent.BackgroundPositionYLength;
+                break;
+            case "layer-background-color": BackgroundColor = parent.BackgroundColor; OwnBackground = true; break;
+            case "layer-background-image": BackgroundImage = parent.BackgroundImage; break;
+
+            // === BOX MODEL ===
+            case "margin-top":
+                MarginTop = parent.MarginTop; MarginTopPercent = parent.MarginTopPercent; break;
+            case "margin-right":
+                MarginRight = parent.MarginRight; MarginRightPercent = parent.MarginRightPercent;
+                MarginRightAuto = parent.MarginRightAuto;
+                break;
+            case "margin-bottom":
+                MarginBottom = parent.MarginBottom; MarginBottomPercent = parent.MarginBottomPercent; break;
+            case "margin-left":
+                MarginLeft = parent.MarginLeft; MarginLeftPercent = parent.MarginLeftPercent;
+                MarginLeftAuto = parent.MarginLeftAuto; OwnMarginLeft = true;
+                break;
+            case "margin":
+                MarginTop = parent.MarginTop; MarginTopPercent = parent.MarginTopPercent;
+                MarginRight = parent.MarginRight; MarginRightPercent = parent.MarginRightPercent;
+                MarginBottom = parent.MarginBottom; MarginBottomPercent = parent.MarginBottomPercent;
+                MarginLeft = parent.MarginLeft; MarginLeftPercent = parent.MarginLeftPercent;
+                MarginLeftAuto = parent.MarginLeftAuto;
+                MarginRightAuto = parent.MarginRightAuto;
+                OwnMarginLeft = true;
+                break;
+            case "padding-top":
+                PaddingTop = parent.PaddingTop; PaddingTopPercent = parent.PaddingTopPercent; break;
+            case "padding-right":
+                PaddingRight = parent.PaddingRight; PaddingRightPercent = parent.PaddingRightPercent; break;
+            case "padding-bottom":
+                PaddingBottom = parent.PaddingBottom; PaddingBottomPercent = parent.PaddingBottomPercent; break;
+            case "padding-left":
+                PaddingLeft = parent.PaddingLeft; PaddingLeftPercent = parent.PaddingLeftPercent;
+                OwnPaddingLeft = true;
+                break;
+            case "padding":
+                PaddingTop = parent.PaddingTop; PaddingTopPercent = parent.PaddingTopPercent;
+                PaddingRight = parent.PaddingRight; PaddingRightPercent = parent.PaddingRightPercent;
+                PaddingBottom = parent.PaddingBottom; PaddingBottomPercent = parent.PaddingBottomPercent;
+                PaddingLeft = parent.PaddingLeft; PaddingLeftPercent = parent.PaddingLeftPercent;
+                OwnPaddingLeft = true;
+                break;
+
+            // === BORDERS ===
+            case "border-top-width": BorderTopWidth = parent.BorderTopWidth; break;
+            case "border-right-width": BorderRightWidth = parent.BorderRightWidth; break;
+            case "border-bottom-width": BorderBottomWidth = parent.BorderBottomWidth; break;
+            case "border-left-width": BorderLeftWidth = parent.BorderLeftWidth; break;
+            case "border-top-style":
+                BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true; break;
+            case "border-right-style":
+                BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true; break;
+            case "border-bottom-style":
+                BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true; break;
+            case "border-left-style":
+                BorderLeftStyle = parent.BorderLeftStyle; OwnBorderLeftStyle = true; break;
+            case "border-top-color": BorderTopColor = parent.BorderTopColor; break;
+            case "border-right-color": BorderRightColor = parent.BorderRightColor; break;
+            case "border-bottom-color": BorderBottomColor = parent.BorderBottomColor; break;
+            case "border-left-color": BorderLeftColor = parent.BorderLeftColor; break;
+            case "border-width":
+                BorderTopWidth = parent.BorderTopWidth;
+                BorderRightWidth = parent.BorderRightWidth;
+                BorderBottomWidth = parent.BorderBottomWidth;
+                BorderLeftWidth = parent.BorderLeftWidth;
+                break;
+            case "border-style":
+                BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
+                BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true;
+                BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true;
+                BorderLeftStyle = parent.BorderLeftStyle; OwnBorderLeftStyle = true;
+                break;
+            case "border-color":
+                BorderTopColor = parent.BorderTopColor;
+                BorderRightColor = parent.BorderRightColor;
+                BorderBottomColor = parent.BorderBottomColor;
+                BorderLeftColor = parent.BorderLeftColor;
+                break;
+            case "border-top":
+                BorderTopWidth = parent.BorderTopWidth;
+                BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
+                BorderTopColor = parent.BorderTopColor;
+                break;
+            case "border-right":
+                BorderRightWidth = parent.BorderRightWidth;
+                BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true;
+                BorderRightColor = parent.BorderRightColor;
+                break;
+            case "border-bottom":
+                BorderBottomWidth = parent.BorderBottomWidth;
+                BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true;
+                BorderBottomColor = parent.BorderBottomColor;
+                break;
+            case "border-left":
+                BorderLeftWidth = parent.BorderLeftWidth;
+                BorderLeftStyle = parent.BorderLeftStyle; OwnBorderLeftStyle = true;
+                BorderLeftColor = parent.BorderLeftColor;
+                break;
+            case "border":
+                BorderTopWidth = parent.BorderTopWidth;
+                BorderRightWidth = parent.BorderRightWidth;
+                BorderBottomWidth = parent.BorderBottomWidth;
+                BorderLeftWidth = parent.BorderLeftWidth;
+                BorderTopStyle = parent.BorderTopStyle; OwnBorderTopStyle = true;
+                BorderRightStyle = parent.BorderRightStyle; OwnBorderRightStyle = true;
+                BorderBottomStyle = parent.BorderBottomStyle; OwnBorderBottomStyle = true;
+                BorderLeftStyle = parent.BorderLeftStyle; OwnBorderLeftStyle = true;
+                BorderTopColor = parent.BorderTopColor;
+                BorderRightColor = parent.BorderRightColor;
+                BorderBottomColor = parent.BorderBottomColor;
+                BorderLeftColor = parent.BorderLeftColor;
+                break;
+
+            // === DISPLAY / POSITIONING ===
+            case "display": Display = parent.Display; break;
+            case "visibility": Visibility = parent.Visibility; break;
+            case "overflow": Overflow = parent.Overflow; break;
+            case "position": Position = parent.Position; break;
+            case "top": Top = parent.Top; TopPercent = parent.TopPercent; break;
+            case "right": Right = parent.Right; RightPercent = parent.RightPercent; break;
+            case "bottom": Bottom = parent.Bottom; BottomPercent = parent.BottomPercent; break;
+            case "left": Left = parent.Left; LeftPercent = parent.LeftPercent; break;
+            case "float": Float = parent.Float; break;
+            case "clear": Clear = parent.Clear; break;
+            case "z-index": ZIndex = parent.ZIndex; break;
+
+            // === LISTS ===
+            case "list-style-type":
+                ListStyleType = parent.ListStyleType; OwnListStyleType = true; break;
+            case "list-style-image":
+                ListStyleImage = parent.ListStyleImage; OwnListStyleImage = true; break;
+            case "list-style-position": ListStylePosition = parent.ListStylePosition; break;
+            case "list-style":
+                ListStyleType = parent.ListStyleType; OwnListStyleType = true;
+                ListStyleImage = parent.ListStyleImage; OwnListStyleImage = true;
+                ListStylePosition = parent.ListStylePosition;
+                break;
+
+            // === SIZE ===
+            case "width": Width = parent.Width; WidthPercent = parent.WidthPercent; break;
+            case "height": Height = parent.Height; HeightPercent = parent.HeightPercent; break;
+            case "min-width": MinWidth = parent.MinWidth; MinWidthPercent = parent.MinWidthPercent; break;
+            case "max-width": MaxWidth = parent.MaxWidth; MaxWidthPercent = parent.MaxWidthPercent; break;
+            case "min-height": MinHeight = parent.MinHeight; MinHeightPercent = parent.MinHeightPercent; break;
+            case "max-height": MaxHeight = parent.MaxHeight; MaxHeightPercent = parent.MaxHeightPercent; break;
+
+            // === CSS2 MISC ===
+            case "cursor": Cursor = parent.Cursor; CursorUri = parent.CursorUri; break;
+            case "outline-width": OutlineWidth = parent.OutlineWidth; break;
+            case "outline-style": OutlineStyle = parent.OutlineStyle; break;
+            case "outline-color":
+                OutlineColor = parent.OutlineColor;
+                OutlineColorInvert = parent.OutlineColorInvert;
+                break;
+            case "outline":
+                OutlineWidth = parent.OutlineWidth;
+                OutlineStyle = parent.OutlineStyle;
+                OutlineColor = parent.OutlineColor;
+                OutlineColorInvert = parent.OutlineColorInvert;
+                break;
+            case "border-collapse": BorderCollapse = parent.BorderCollapse; break;
+            case "border-spacing":
+                BorderSpacingX = parent.BorderSpacingX; BorderSpacingY = parent.BorderSpacingY; break;
+            case "table-layout": TableLayout = parent.TableLayout; break;
+            case "caption-side": CaptionSide = parent.CaptionSide; break;
+            case "empty-cells": EmptyCells = parent.EmptyCells; break;
+            case "content": Content = parent.Content; break;
+            case "quotes":
+                Quotes = parent.Quotes == null ? null : new List<QuotePair>(parent.Quotes); break;
+            case "counter-reset":
+                CounterReset = parent.CounterReset == null ? null : new List<CounterAction>(parent.CounterReset); break;
+            case "counter-increment":
+                CounterIncrement = parent.CounterIncrement == null ? null : new List<CounterAction>(parent.CounterIncrement); break;
+
+            // Unknown property: nothing to inherit (the property itself is
+            // ignored, matching the 1996 tolerance rule).
+        }
+    }
 
     private static bool TryParseFloat(string s, out float f) =>
         float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out f);
@@ -1271,7 +2057,9 @@ public enum DisplayValue
     Block, Inline, InlineBlock, None, ListItem,
     Table, TableRow, TableCell, TableCaption,
     TableRowGroup, TableColumnGroup, TableColumn,
-    TableHeaderGroup, TableFooterGroup
+    TableHeaderGroup, TableFooterGroup,
+    // CSS2 additions
+    InlineTable, RunIn, Compact
 }
 
 public enum VisibilityValue { Visible, Hidden, Collapse }
@@ -1292,3 +2080,33 @@ public enum ListStyleType
 }
 
 public enum ListStylePosition { Inside, Outside }
+
+// ── CSS2 additions ──────────────────────────────────────────────────────
+
+/// <summary>cursor keywords (CSS2 §18.1). 'hand' maps to Pointer — the IE
+/// alias. Actual pointer changes are the shell's job.</summary>
+public enum CursorValue
+{
+    Auto, Crosshair, Default, Pointer, Move,
+    EResize, NeResize, NwResize, NResize,
+    SeResize, SwResize, SResize, WResize,
+    Text, Wait, Help
+}
+
+public enum BorderCollapseValue { Separate, Collapse }
+public enum TableLayoutValue { Auto, Fixed }
+public enum CaptionSideValue { Top, Bottom, Left, Right }
+public enum EmptyCellsValue { Show, Hide }
+public enum DirectionValue { Ltr, Rtl }
+
+/// <summary>One parsed content value token. Type ∈ "string", "attr",
+/// "uri", "counter", "counters", "open-quote", "close-quote",
+/// "no-open-quote", "no-close-quote", "identifier"; Text carries the
+/// string body / attribute name / counter spec.</summary>
+public record ContentToken(string Type, string Text);
+
+/// <summary>One quotes pair: open then close string.</summary>
+public record QuotePair(string Open, string Close);
+
+/// <summary>counter-reset / counter-increment entry.</summary>
+public record CounterAction(string Name, int Value);

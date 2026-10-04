@@ -104,5 +104,6 @@
     <Compile Include="ExtendedCorpusRegressionTests.cs" />
     <Compile Include="ScratchDiag.cs" />
     <Compile Include="UserSettingsTests.cs" />
+    <Compile Include="Retro99SuiteTests.cs" />
   </ItemGroup>
 </Project>

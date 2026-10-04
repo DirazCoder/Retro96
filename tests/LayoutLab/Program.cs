@@ -101,6 +101,8 @@ void DumpAndVerifyErrorPage(string name, Func<string> html)
 
     // 6. Dropped-space boxes are never at (0,0)
     var originBoxes = boxes.Where(b => b.TextRun == " " && b.X == 0 && b.Y == 0 && b.Width == 0).ToList();
+    foreach (var ob in originBoxes.Take(4))
+        Console.WriteLine($"      ORIGIN-SPACE: tag={ob.Element?.TagName} parent={ob.Parent?.Element?.TagName ?? ob.Parent?.BoxType.ToString()} h={ob.Height}");
     Check("wrap-dropped spaces positioned", originBoxes.Count == 0, $"{originBoxes.Count} at origin");
 }
 
@@ -128,7 +130,10 @@ Console.WriteLine("\n=== Glyph substitution (CyberSpace-style) ===");
     Check("block char substituted", !all.Contains('\u2588'));
     Check("note substituted", !all.Contains('\u266A'));
     Check("em dash kept", all.Contains('\u2014'), $"'{all}'");
-    Check("bullet kept", all.Contains('\u2022'));
+    // The bullet reaches layout as the engine's private-use sentinel
+    // (GlyphSubstitution.LegacyBulletMarker) — the raw U+2022 never
+    // survives MapGlyphs by design.
+    Check("bullet kept", all.Contains('\uE000'));
     Console.WriteLine($"      runs: {all}");
 }
 

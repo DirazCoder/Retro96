@@ -20,17 +20,25 @@ public delegate string InlineScriptExecutor(DomDocument document, string scriptS
 public delegate string? ExternalScriptLoader(DomDocument document, string sourceUrl);
 
 /// <summary>
-/// HTML 3.2-era tag-soup parser.  Builds a DOM from a token stream while
-/// recovering from everything a real 1996 page contains:
+/// HTML 3.2/4.01-era tag-soup parser.  Builds a DOM from a token stream while
+/// recovering from everything a real 1996/1999 page contains:
 ///
 ///   - missing HTML/HEAD/BODY (structure inferred lazily)
-///   - unclosed P, LI, TD, TR, DT, DD, OPTION (implied end tags BEFORE insert)
+///   - unclosed P, LI, TD, TR, DT, DD, OPTION, OPTGROUP (implied end tags
+///     BEFORE insert)
+///   - implied &lt;tbody&gt; wrappers for rows written directly in &lt;table&gt;
+///     and implied end of an open row group before a new thead/tbody/tfoot
 ///   - mismatched/overlapping inline tags (stray end tags ignored)
 ///   - HEAD content after BODY started
 ///   - multiple BODY tags (attributes merged into one body)
 ///   - FRAMESET documents (body replaced, NOFRAMES kept for fallback)
 ///   - inline &lt;script&gt; execution with document.write() token splicing
 ///     (including scripts that write further script tags — chained content)
+///   - IE5/NS4 concealment tags: &lt;comment&gt;, &lt;noembed&gt; and
+///     &lt;nolayer&gt; swallow their content as raw text that never
+///     reaches the DOM as markup or visible text; &lt;noscript&gt; does the
+///     same only while scripting is enabled; &lt;xml&gt; data islands keep
+///     their payload as a raw text child for scripts
 ///   - raw &lt;/PRE&gt; first-newline quirk, &amp;nbsp; not collapsed
 /// </summary>
 public static class HtmlParser
@@ -79,17 +87,23 @@ public static class HtmlParser
                                     InlineScriptExecutor? onScript = null,
                                     ExternalScriptLoader? loadExternalScript = null)
     {
+        // A live script executor means scripting is on — <noscript>
+        // content must not render (era NN behaviour).  The runtime
+        // scripting toggle also gates it: the shell only hands over an
+        // executor when BrowserRuntime.ScriptingEnabled, and consulting
+        // the runtime here as well keeps direct parser callers honest.
+        bool scripting = onScript != null &&
+                         global::Retro96.BrowserRuntime.ScriptingEnabled;
+
         var doc = new DomDocument(cookies)
         {
             BaseUrl = baseUrl,
             Charset = "iso-8859-1",
-            // A live script executor means scripting is on — <noscript>
-            // content must not render (era NN behaviour).
-            ScriptingEnabled = onScript != null
+            ScriptingEnabled = scripting
         };
 
         var builder = new TreeBuilder(doc, onScript, loadExternalScript);
-        builder.Build(HtmlTokenizer.Tokenize(html ?? "").ToList());
+        builder.Build(HtmlTokenizer.Tokenize(html ?? "", scripting).ToList());
 
         // Everything from here on is post-parse: document.write calls made
         // by event handlers and timers take the implicit-open/replace path
@@ -160,7 +174,9 @@ public static class HtmlParser
                         // merged stream keeps parsing from the same spot.
                         if (written.Length > 0)
                         {
-                            var spliced = HtmlTokenizer.Tokenize(written).ToList();
+                            var spliced = HtmlTokenizer
+                                .Tokenize(written, _doc.ScriptingEnabled)
+                                .ToList();
                             if (spliced.Count > 0 &&
                                 splicedTokens + spliced.Count <= BrowserRuntime.MaxScriptSpliceTokens)
                             {
@@ -331,8 +347,24 @@ public static class HtmlParser
                     break;
 
                 case "option":
+                    // An option left open (or an option with stray inline
+                    // elements inside it) closes before the next one —
+                    // never crossing out of the optgroup/select.
+                    if (IsOpenInStack("option"))
+                        PopUpTo("option", extraStop: "select optgroup");
+                    break;
+
+                case "optgroup":
+                    // HTML 4.01 §13.6 error recovery: an <optgroup> start
+                    // implies the end of the previous option AND the
+                    // previous optgroup — groups are siblings inside the
+                    // select, never nested.  (The 3.2 parser had no rule
+                    // here, so a second <optgroup> nested inside the first
+                    // and its options scattered between the two.)
                     if (IsOpen("option"))
                         PopOne();
+                    if (IsOpenInStack("optgroup"))
+                        PopUpTo("optgroup", extraStop: "select");
                     break;
 
                 case "p":
@@ -868,7 +900,9 @@ public static class HtmlParser
 
         /// <summary>
         /// Table-structure recovery: auto-close cells/rows and synthesize
-        /// missing &lt;tr&gt; wrappers so every cell lands inside a row.
+        /// missing &lt;tr&gt; wrappers so every cell lands inside a row, and
+        /// implied &lt;tbody&gt; wrappers so rows written directly inside
+        /// &lt;table&gt; land in a row group (HTML 4.01 error recovery).
         /// </summary>
         private void HandleTableStructure(StartTag tag)
         {
@@ -881,11 +915,13 @@ public static class HtmlParser
                 case "caption":
                 case "colgroup":
                     CloseImpliedCellsAndRows();
+                    CloseOpenRowGroup();
                     InsertElementNormally(tag);
                     return;
 
                 case "col":
                     CloseImpliedCellsAndRows();
+                    CloseOpenRowGroup();
                     InsertVoid(Create(tag));
                     return;
 
@@ -895,11 +931,19 @@ public static class HtmlParser
                     CloseImpliedCellsAndRows();
                     if (IsOpen("tr"))
                         PopOne();
+                    // A row-group start tag implies the end of any open row
+                    // group (explicit or implied): groups are siblings of
+                    // <table>, never children of each other.  Without this,
+                    // <table><tr>…<tfoot> would nest the tfoot INSIDE the
+                    // implied tbody — and TableLayout's row-group walk would
+                    // drop the tfoot's rows from the grid entirely.
+                    CloseOpenRowGroup();
                     InsertElementNormally(tag);
                     return;
 
                 case "tr":
                     CloseImpliedCellsAndRows();
+                    OpenImpliedTbodyIfNeeded();
                     InsertElementNormally(tag);
                     return;
 
@@ -912,10 +956,15 @@ public static class HtmlParser
                         CloseImpliedCellOnly();
 
                         // If we are directly under table/tbody/thead/tfoot (no
-                        // <tr> was written), synthesize one.
+                        // <tr> was written), synthesize one — and when we are
+                        // directly under the TABLE, synthesize the implied
+                        // <tbody> row group first (HTML 4.01 §11.2.1 error
+                        // recovery: rows are never direct table children).
                         if (_current != null &&
                             _current.TagName is "table" or "tbody" or "thead" or "tfoot")
                         {
+                            if (_current.TagName == "table")
+                                OpenImpliedTbodyIfNeeded();
                             var tr = new DomElement("tr");
                             _current.AppendChild(tr);
                             Push(tr);
@@ -933,6 +982,39 @@ public static class HtmlParser
                         return;
                     }
             }
+        }
+
+        /// <summary>
+        /// HTML 4.01 implied TBODY: a row (or cell) arriving while the
+        /// insertion point is the &lt;table&gt; itself — no open row group —
+        /// gets a synthesized &lt;tbody&gt; wrapper, exactly as if the author
+        /// had written one.  Only the FIRST such row synthesizes the group;
+        /// it then stays open (an explicit &lt;/tbody&gt; never comes) and
+        /// every following row nests inside it.  A later explicit
+        /// thead/tbody/tfoot start (or a closed group followed by more rows)
+        /// closes it first and starts a fresh group, matching the row-group
+        /// bucketing TableLayout already performs for authored markup.
+        /// </summary>
+        private void OpenImpliedTbodyIfNeeded()
+        {
+            if (_current != null && _current.TagName == "table")
+            {
+                var tbody = new DomElement("tbody");
+                _current.AppendChild(tbody);
+                Push(tbody);
+            }
+        }
+
+        /// <summary>
+        /// Implied end of an open row group: fired when a new
+        /// thead/tbody/tfoot/caption/colgroup starts.  Row groups never
+        /// nest in valid HTML, and the 1999 browsers closed the open group
+        /// before inserting the new one.
+        /// </summary>
+        private void CloseOpenRowGroup()
+        {
+            if (_current != null && _current.TagName is "tbody" or "thead" or "tfoot")
+                PopOne();
         }
 
         private void CloseImpliedCellsAndRows()
@@ -1162,6 +1244,24 @@ public static class HtmlParser
                 type.StartsWith("application/", StringComparison.Ordinal))
                 javaScript = false;
 
+            // ── JavaScript version gating (checklist §12) ─────────────────
+            // Netscape SKIPPED blocks tagged with a language version it did
+            // not support: Navigator 3 ran JavaScript 1.1 and ignored
+            // JavaScript1.2+ blocks; Navigator 4.7 ran 1.3 and ignored
+            // 1.4/1.5. Internet Explorer ignored the version suffixes and
+            // ran every JavaScript* block, and the Retro96 union mode keeps
+            // the permissive behaviour.
+            if (javaScript && language.StartsWith("javascript1.", StringComparison.Ordinal) &&
+                language.Length > 12 && char.IsDigit(language[12]))
+            {
+                int minor = language[12] - '0';
+                int maxMinor = global::Retro96.BrowserRuntime.IsNetscape47 ? 3
+                             : global::Retro96.BrowserRuntime.IsNetscape3 ? 1
+                             : int.MaxValue;
+                if (minor > maxMinor)
+                    return "";
+            }
+
             if (!vbScript && !javaScript)
                 return "";
 
@@ -1268,6 +1368,35 @@ public static class HtmlParser
                 case "style":
                     {
                         parent.AppendChild(new DomText(data));
+                        return;
+                    }
+
+                case "noscript":
+                case "xml":
+                    {
+                        // Reached only while scripting is enabled (raw-text
+                        // mode): append the raw source verbatim.  The
+                        // noscript subtree is hidden by the style resolver
+                        // (display:none while doc.ScriptingEnabled); the
+                        // <xml> data island keeps its payload for scripts —
+                        // document.all(id).innerHTML — and needs the
+                        // renderer's UA default (display:none) to stay
+                        // invisible (integrator note).
+                        parent.AppendChild(new DomText(data));
+                        return;
+                    }
+
+                case "comment":
+                case "noembed":
+                case "nolayer":
+                    {
+                        // IE5/NS4-era concealment, parser-level equivalent
+                        // of display:none: the tokenizer swallowed the
+                        // content as raw text and the parser DROPS it — no
+                        // text node, no markup, nothing for the renderer
+                        // (or InnerText walks) to ever show.  The element
+                        // itself stays in the tree so scripts can still find
+                        // it in document.all.
                         return;
                     }
             }
@@ -1413,7 +1542,12 @@ public static class HtmlParser
         {
             "img" or "br" or "hr" or "input" or "param" or "wbr" or "area"
             or "col" or "basefont" or "frame" or "isindex" or "link"
-            or "meta" or "base" or "spacer" or "bgsound" or "embed" => true,
+            or "meta" or "base" or "spacer" or "bgsound" or "embed"
+            // HTML 4.01 KEYGEN: a form control emitted as a self-contained
+            // challenge/key pair — never has content.  SERVER is the old
+            // Netscape Commerce-server side-include tag: same shape, parse
+            // and ignore.
+            or "keygen" or "server" => true,
             _ => false
         };
     }
@@ -1435,7 +1569,18 @@ public static class HtmlParser
             return "html20";
         if (upper.Contains("HTML 4.01") || upper.Contains("HTML 4.0") ||
             upper.Contains("XHTML"))
+        {
+            // HTML 4.0/4.01 come in three DTD flavours.  Strict earns the
+            // standards label; Transitional and Frameset — the loose DTDs
+            // that keep the presentational 3.2-era attributes, which is
+            // what the 1999 pages actually copied — render in quirks mode
+            // in every period browser (IE5 and NS4.7 both switched layouts
+            // for them, especially without the system identifier).
+            if (upper.Contains("TRANSITIONAL") || upper.Contains("FRAMESET") ||
+                upper.Contains("LOOSE"))
+                return "quirks";
             return "strict";
+        }
         // "<!DOCTYPE html>" and friends
         if (upper.Contains("<!DOCTYPE HTML>") && !upper.Contains("DTD"))
             return "strict";

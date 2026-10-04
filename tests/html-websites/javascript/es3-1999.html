@@ -1,0 +1,153 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head><title>JavaScript / JScript Battery (1999: ES3 + JS 1.3 + JScript 5)</title>
+<script language="JavaScript1.3">
+function es3Report() {
+  var out = [];
+
+  // try/catch/finally/throw with error object types
+  try {
+    var boom = null;
+    boom.x;
+  } catch (e) {
+    out.push("catch=" + (e && e.name ? e.name : "NO-NAME"));
+  } finally {
+    out.push("finally=ok");
+  }
+
+  // switch with fallthrough
+  function sw(x) {
+    var r = "";
+    switch (x) {
+      case 1: r += "one ";
+      case 2: r += "two "; break;
+      default: r += "other";
+    }
+    return r;
+  }
+  out.push("switch-fallthrough=" + sw(1));
+  out.push("switch-break=" + sw(2));
+
+  // do..while and labels
+  var n = 0;
+  do { n++; } while (n < 3);
+  out.push("dowhile=" + n);
+  var total = 0;
+  outerLoop: for (var i = 0; i < 5; i++) {
+    for (var j = 0; j < 5; j++) {
+      if (j == 2) continue outerLoop;
+      if (i == 3) break outerLoop;
+      total++;
+    }
+  }
+  out.push("labels=" + total);
+
+  // strict equality / in / instanceof / delete / void / typeof
+  out.push("===" + (1 === 1.0 ? "num" : "BAD") + "," + ("1" === 1 ? "LOOSE" : "strict"));
+  out.push("in=" + ("length" in [] ? "ok" : "BAD"));
+  out.push("instanceof=" + ([] instanceof Object ? "ok" : "BAD"));
+  var obj = { a: 1, b: 2 };
+  delete obj.a;
+  out.push("delete=" + ("a" in obj ? "STUCK" : "gone"));
+  out.push("void=" + (typeof void 0));
+  out.push("typeof-undef=" + (typeof notDefinedAnywhere));
+
+  // regex literals + String regex methods
+  var re = /(\w+)\s(\d+)/;
+  var m = "answer 42".match(re);
+  out.push("match=" + (m ? m[1] + ":" + m[2] : "NULL"));
+  out.push("replace=" + "a1b2".replace(/\d/g, "#"));
+  out.push("search=" + "hello".search(/l+/));
+  out.push("split=" + "a,b,,c".split(/,/).length);
+  var greedy = /a+?/.compile ? /a+/.source : "n/a";
+  out.push("regex-source=" + (/(\w+)/.source == "(\\w+)" ? "ok" : "BAD"));
+
+  // function expressions
+  var square = function (x) { return x * x; };
+  out.push("fn-expr=" + square(7));
+
+  // Array methods
+  var arr = [3, 1, 2];
+  arr.push(4);
+  out.push("push=" + arr.length + "," + arr[arr.length - 1]);
+  out.push("pop=" + arr.pop());
+  out.push("shift=" + arr.shift());
+  arr.unshift(0);
+  out.push("unshift=" + arr[0]);
+  out.push("splice=" + arr.splice(1, 1).length);
+  out.push("concat=" + arr.concat([9]).length);
+  out.push("slice=" + arr.slice(0, 1).length);
+  out.push("join=" + [1, 2, 3].join("-"));
+  out.push("sort=" + [3, 1, 2].sort().join(""));
+
+  // Number formatting (ES3)
+  out.push("toFixed=" + (3.14159).toFixed(2));
+  out.push("toFixed-round=" + (2.5).toFixed(0));
+  out.push("toExponential=" + (1234.5).toExponential(2));
+  out.push("toPrecision=" + (1234.5).toPrecision(3));
+
+  // Date Y2K family
+  var d = new Date(2000, 0, 1);
+  out.push("getYear=" + d.getYear());
+  out.push("getFullYear=" + d.getFullYear());
+  out.push("getUTCFullYear=" + d.getUTCFullYear());
+  d.setFullYear(2010);
+  out.push("setFullYear=" + d.getFullYear());
+  out.push("toDateString-has-year=" + (d.toDateString().indexOf("2010") >= 0));
+
+  // JS 1.2 vs 1.3 semantics: push returns the NEW length in 1.3
+  var ret = [1].push(9);
+  out.push("push-returns=" + ret);
+
+  return out.join(" | ");
+}
+</script>
+</head>
+<body bgcolor="#FFFFFF">
+<h1>JavaScript / JScript 1999 battery</h1>
+<p>ES3 (December 1999): try/catch/finally, regex literals, switch,
+do-while, labelled break/continue, strict equality, in/instanceof,
+delete/void, function expressions, the full Array method set, and the
+Number formatting trio. Netscape 4.7 (JavaScript 1.3) and IE5 (JScript
+5.0) both accepted all of it; only ES3+ syntax is used here.</p>
+<p><b id="r1">(running…)</b></p>
+<script language="JavaScript1.3">
+document.getElementById("r1").innerText = es3Report();
+</script>
+
+<h2>Language version gating</h2>
+<p>This block is tagged <tt>JavaScript1.2</tt> — every 1999 browser runs it:</p>
+<script language="JavaScript1.2">
+window.gate12 = "ran-1.2";
+</script>
+<p>This block is tagged <tt>JavaScript1.5</tt> — Navigator 4.7 SKIPS it
+(JavaScript 1.3 is its ceiling); IE5 runs it anyway:</p>
+<script language="JavaScript1.5">
+window.gate15 = "ran-1.5";
+</script>
+
+<h2>Host objects</h2>
+<script language="JavaScript1.3">
+function hostReport() {
+  var out = [];
+  out.push("userAgent=" + navigator.userAgent);
+  out.push("appName=" + navigator.appName);
+  out.push("javaEnabled=" + navigator.javaEnabled());
+  out.push("plugins=" + navigator.plugins.length);
+  out.push("screen=" + screen.width + "x" + screen.height + "/" + screen.colorDepth);
+  out.push("setTimeout-fn=" + (typeof setTimeout));
+  setTimeout(function () { window.status = "timeout-fn"; }, 50);
+  setTimeout("window.status = 'timeout-str'", 100);
+  out.push("escape=" + escape("a b&c"));
+  out.push("cookie-write=" + (document.cookie = "es3=yes; path=/"));
+  var img = new Image();
+  img.src = "../images/pixel-dot.gif";
+  return out.join(" | ");
+}
+</script>
+<p><b id="r2">(running…)</b></p>
+<script language="JavaScript1.3">
+document.getElementById("r2").innerText = hostReport();
+</script>
+</body>
+</html>
