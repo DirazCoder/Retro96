@@ -1277,6 +1277,36 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void RepaintingScrolledInputTextPreservesItsSunkenBezel()
+    {
+        using var bitmap = new Bitmap(48, 32);
+        var rect = new RectangleF(4, 4, 40, 24);
+        var background = Color.White;
+        using var graphics = Graphics.FromBitmap(bitmap);
+        using (var face = new SolidBrush(background))
+            graphics.FillRectangle(face, rect);
+
+        Renderer.PaintSunkenRect(graphics, rect, 2, background);
+
+        // Horizontal input scrolling repaints the live text face on top of the
+        // cached page. Repaint the native frame after that face repaint too.
+        using (var face = new SolidBrush(background))
+            graphics.FillRectangle(face, rect.Left + 2, rect.Top + 2,
+                rect.Width - 4, rect.Height - 4);
+        Renderer.PaintSunkenRect(graphics, rect, 2, background);
+
+        var topEdge = bitmap.GetPixel(24, 4);
+        var bottomEdge = bitmap.GetPixel(24, 27);
+        Check.That(topEdge.R < 150 && topEdge.G < 150 && topEdge.B < 150 &&
+                   bottomEdge.R > topEdge.R + 60 &&
+                   bottomEdge.G > topEdge.G + 60 &&
+                   bottomEdge.B > topEdge.B + 60,
+            "repainting a horizontally scrolled input restores the dark/light 3D bezel edges",
+            $"top={topEdge}, bottom={bottomEdge}");
+        Check.Done();
+    }
+
+    [Fact]
     public void ControlOverlayTextDoesNotUseLegacyStrokeBoost()
     {
         var previousSettings = BrowserRuntime.Settings.Clone();
@@ -1500,6 +1530,8 @@ public class EngineRegressionTests
         Check.That(Sub("x\u2022y") == "x" + Retro96.Engine.Render.GlyphSubstitution.LegacyBulletMarker + "y",
             "bullet is mapped to the renderer's stable legacy-bullet marker");
         Check.That(Sub("caf\u00E9") == "caf\u00E9", "Latin-1 accented preserved");
+        Check.That(Sub("\u6F22\u5B57") == "\u6F22\u5B57",
+            "CJK text remains intact for text-aware font fallback");
         Check.That(Sub("plain text 123") == "plain text 123", "ASCII untouched");
         Check.That(Sub(Sub("\u25B6\u266A")) == Sub("\u25B6\u266A"), "idempotent");
         Check.That(Sub("[X]\u2588") == "[X]#", "panel-title block substitutes");
@@ -1609,6 +1641,73 @@ public class EngineRegressionTests
               "marquee attributes survive (behavior/scrollamount/bgcolor)");
         Check.That((marquee?.InnerText ?? "").Contains("Welcome to The Old Net!"),
             "marquee content present");
+        Check.Done();
+    }
+
+    [Fact]
+    public void MarqueeInTableCellUsesSingleLineHeight()
+    {
+        string text = string.Concat(Enumerable.Repeat("WELCOME TO CYBER-REALM ONLINE! ", 20));
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table style='width:180px;table-layout:fixed'><tr><td>" +
+            "<font face='Courier New, Courier, monospace' size='2' color='#FFFF00'>" +
+            "<marquee behavior='scroll' direction='left' scrollamount='4'>" +
+            text + "</marquee></font></td></tr></table></body></html>");
+        var marqueeElement = doc.ElementDescendants().First(e => e.TagName == "marquee");
+        var cellElement = doc.ElementDescendants().First(e => e.TagName == "td");
+        var marquee = LayoutHarness.BoxOf(root, marqueeElement);
+        var cell = LayoutHarness.BoxOf(root, cellElement);
+
+        Check.That(marqueeElement.Style?.WhiteSpace == WhiteSpaceValue.Nowrap,
+            "marquee content uses non-wrapping white-space");
+        Check.That(marqueeElement.Style?.Overflow == OverflowValue.Hidden,
+            "marquee clips its non-wrapping text to the banner width");
+        Check.That(marquee != null && marquee.Height < 30f,
+            "long marquee contributes one line to its table cell",
+            $"marquee height={marquee?.Height}");
+        Check.That(cell != null && cell.Height < 40f,
+            "marquee table cell remains a single-line row",
+            $"cell height={cell?.Height}");
+        Check.That(root.Width <= 800.5f,
+            "overflow-clipped marquee does not expand the document canvas",
+            $"root width={root.Width}");
+        Check.That(root.Descendants().Max(box => box.ScrollableRight) <= 800.5f,
+            "marquee text does not expand the page's horizontal scroll extent",
+            $"scrollable right={root.Descendants().Max(box => box.ScrollableRight)}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void SvgImagesDecodeToTheirIntrinsicSize()
+    {
+        const string svg = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='120' viewBox='0 0 100 120'>" +
+            "<rect width='100' height='120' fill='#000066'/>" +
+            "<rect x='10' y='10' width='80' height='100' fill='#00ff00'/>" +
+            "</svg>";
+        var decoded = ImageDecoder.Decode(
+            System.Text.Encoding.UTF8.GetBytes(svg), "image/svg+xml");
+        Check.That(!decoded.IsBroken && decoded.Frames.Count == 1,
+            "valid SVG image decodes as one frame");
+        if (decoded.Frames.Count == 1)
+        {
+            using var image = decoded.Frames[0];
+            Check.That(image.Width == 100 && image.Height == 120,
+                "SVG intrinsic dimensions are preserved",
+                $"decoded size={image.Width}x{image.Height}");
+            var raster = image.GetSkImage();
+            Check.That(raster.Width == 400 && raster.Height == 480,
+                "SVG is rasterized at high resolution without changing layout size",
+                $"raster size={raster.Width}x{raster.Height}");
+            var background = image.GetPixel(5, 5);
+            var foreground = image.GetPixel(50, 60);
+            Check.That(background.B == 102 && foreground.G == 255,
+                "SVG vector content is rasterized into pixels",
+                $"background={background}, foreground={foreground}");
+        }
+        else
+        {
+            foreach (var frame in decoded.Frames) frame.Dispose();
+        }
         Check.Done();
     }
 
@@ -1952,6 +2051,10 @@ public class EngineRegressionTests
         Check.That(rows[0].IsGroupHeader && rows[0].Option == null && rows[0].Label == "Colors",
             "the OPTGROUP header row carries the LABEL attribute and is non-selectable",
             $"label='{rows[0].Label}'");
+        Check.That(SelectRowModel.FindSelectableRow(rows, 0, 1) == 1 &&
+                   SelectRowModel.FindSelectableRow(rows, 3, 1) == 3 &&
+                   SelectRowModel.FindSelectableRow(rows, 0, -1) == -1,
+            "forward and backward keyboard navigation skips group headers");
         Check.That(!rows[1].IsGroupHeader && rows[1].Option != null &&
                    Math.Abs(rows[1].Indent - SelectRowModel.GroupIndent) < 0.01f,
             "options inside a group indent by 12px");
@@ -2174,22 +2277,106 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void AutoTableLayoutHonorsColgroupAndColumnWidthHints()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table id='auto' border='1' cellpadding='3' cellspacing='0'>" +
+            "<colgroup span='1' width='120'></colgroup>" +
+            "<colgroup><col width='80'><col align='right'></colgroup>" +
+            "<thead><tr><th>Quarter</th><th>Units</th><th>Revenue</th></tr></thead>" +
+            "<tbody><tr><td>Q1</td><td>1</td><td>256</td></tr></tbody></table>" +
+            "</body></html>");
+        var cells = doc.FirstTag("table")!.ElementDescendants()
+            .Where(e => e.TagName is "td" or "th")
+            .Select(cell => LayoutHarness.BoxOf(root, cell)!.BorderRect.Width)
+            .ToArray();
+
+        Check.That(cells.Length == 6, "the table has three columns across header and body");
+        Check.That(cells.Length == 6 && cells[0] >= 119f && cells[3] >= 119f,
+            "a colgroup width hint applies to its unwrapped column",
+            cells.Length > 3 ? $"header={cells[0]:0.#}, body={cells[3]:0.#}" : "");
+        Check.That(cells.Length == 6 && cells[1] >= 79f && cells[4] >= 79f,
+            "a col width hint applies in auto table layout",
+            cells.Length > 4 ? $"header={cells[1]:0.#}, body={cells[4]:0.#}" : "");
+        Check.Done();
+    }
+
+    [Fact]
+    public void BdoRtlOverridesInlineTextDirection()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><p>before <bdo id='forced' dir='rtl'>BDO with dir=rtl</bdo> after</p></body></html>");
+        var bdo = doc.ElementDescendants().First(e => e.GetAttr("id") == "forced");
+        string visualText = string.Concat(root.Descendants()
+            .Where(box => ReferenceEquals(box.Element, bdo) && !string.IsNullOrEmpty(box.TextRun))
+            .OrderBy(box => box.X)
+            .Select(box => box.TextRun));
+
+        Check.That(bdo.Style?.Direction == Retro96.Engine.Css.DirectionValue.Rtl &&
+                   bdo.Style.UnicodeBidi == "bidi-override",
+            "dir=rtl activates the BDO directional override");
+        Check.That(visualText == "ltr=rid htiw ODB",
+            "the BDO text paints in forced right-to-left order", visualText);
+        Check.Done();
+    }
+
+    [Fact]
     public void VerticalAlignLengthShiftsBaselineByPixels()
     {
         var (doc, root) = LayoutHarness.Parse(
-            "<html><body><div style='font-size:30px;line-height:40px'>Base " +
-            "<span id='up' style='font-size:10px;vertical-align:8px'>up</span> " +
-            "<span id='down' style='font-size:10px;vertical-align:-8px'>down</span></div></body></html>");
+            "<html><head><style>body{margin:0}p{margin:0}</style></head><body>" +
+            "<p id='line'>baseline <span id='down' style='vertical-align:-6px'>sub -6px</span> and " +
+            "<span id='up' style='vertical-align:8px'>super +8px</span> by length.</p>" +
+            "<p id='following'>following line</p><p id='normal'>ordinary baseline line</p></body></html>");
 
         float TextY(string id)
         {
             var el = doc.ElementDescendants().First(e => e.GetAttr("id") == id);
             return root.Descendants().First(b => b.Element == el && b.TextRun != null).Y;
         }
+        var line = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "line"))!;
+        var following = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "following"))!;
+        var normal = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "normal"))!;
+        var baselineY = root.Descendants().First(b =>
+            b.Element?.GetAttr("id") == "line" && b.TextRun == "baseline").Y;
 
-        Check.That(Math.Abs((TextY("down") - TextY("up")) - 16f) < 1.5f,
-            "+8px and −8px vertical-align lengths sit 16px apart",
-            $"Δ={TextY("down") - TextY("up"):0.#}");
+        Check.That(Math.Abs((TextY("down") - baselineY) - 6f) < 1.5f &&
+                   Math.Abs((TextY("up") - baselineY) + 8f) < 1.5f,
+            "signed vertical-align lengths position sub/super text relative to the baseline",
+            $"baseline={baselineY:0.#}, down={TextY("down"):0.#}, up={TextY("up"):0.#}");
+        Check.That(line.Height >= normal.Height + 10f &&
+                   following.Y >= line.Y + line.Height - 0.5f,
+            "the line box reserves the raised and lowered vertical-align extents",
+            $"aligned={line.Height:0.#}, normal={normal.Height:0.#}, " +
+            $"followingY={following.Y:0.#}, lineBottom={line.Y + line.Height:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void TableCellSpansOutsideTableRowsFlowSideBySide()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            "table.bt{border-collapse:separate;border-spacing:0}" +
+            ".tblcell{display:table-cell;border:1px solid #999;padding:4px}" +
+            "</style></head><body>" +
+            "<div id='cells'><span id='cell-one' class='tblcell'>table-cell one</span>" +
+            "<span id='cell-two' class='tblcell'>table-cell two</span></div>" +
+            "</body></html>");
+        var first = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(element => element.GetAttr("id") == "cell-one"))!;
+        var second = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(element => element.GetAttr("id") == "cell-two"))!;
+
+        Check.That(first.BoxType == BoxType.InlineBlock &&
+                   second.BoxType == BoxType.InlineBlock &&
+                   Math.Abs(first.Y - second.Y) < 0.5f &&
+                   second.X >= first.BorderRect.Right - 0.5f,
+            "table-cell spans without a table row stay side-by-side in the inline flow",
+            $"types={first.BoxType}/{second.BoxType}, rects={first.BorderRect}/{second.BorderRect}");
         Check.Done();
     }
 

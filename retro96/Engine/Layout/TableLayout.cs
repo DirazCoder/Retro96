@@ -284,6 +284,8 @@ public static class TableLayout
             }
         }
 
+        ApplyAutoColumnWidthHints(tableElem, minW, prefW, tableAvail);
+
         // Give an intrinsic colspan deficit to columns that already have
         // intrinsic width.  If every column is otherwise empty, keep the
         // width in the first column; the cell itself still spans the entire
@@ -717,33 +719,45 @@ public static class TableLayout
     {
         var colW = new float[colCount];
         var specified = new bool[colCount];
+        int nextColumn = 0;
 
         void ApplyColWidth(DomElement col)
         {
-            int span = Math.Clamp(col.GetAttrInt("span", 1), 1, Math.Max(1, colCount));
+            int span = Math.Clamp(col.GetAttrInt("span", 1), 1,
+                Math.Max(1, colCount - nextColumn));
             float? w = ResolveWidth(col, "width", innerWidth);
-            if (!w.HasValue) return;
-            float per = Math.Max(0f, w.Value / span);
-            for (int c = 0; c < Math.Min(span, colCount); c++)
+            if (w.HasValue)
             {
-                colW[c] = Math.Max(colW[c], per);
-                specified[c] = true;
+                float per = Math.Max(0f, w.Value / span);
+                for (int c = nextColumn; c < Math.Min(nextColumn + span, colCount); c++)
+                {
+                    colW[c] = Math.Max(colW[c], per);
+                    specified[c] = true;
+                }
+            }
+            nextColumn = Math.Min(colCount, nextColumn + span);
+        }
+
+        void ApplyColumnGroup(DomElement group)
+        {
+            var columns = group.Children.OfType<DomElement>()
+                .Where(child => child.TagName == "col").ToList();
+            if (columns.Count > 0)
+            {
+                foreach (var col in columns)
+                    ApplyColWidth(col);
+            }
+            else
+            {
+                ApplyColWidth(group);
             }
         }
 
         foreach (var node in tableElem.Children)
         {
             if (node is not DomElement e) continue;
-            if (e.TagName == "colgroup")
-            {
-                foreach (var sub in e.Children)
-                    if (sub is DomElement col && col.TagName == "col")
-                        ApplyColWidth(col);
-            }
-            else if (e.TagName == "col")
-            {
-                ApplyColWidth(e);
-            }
+            if (e.TagName == "colgroup") ApplyColumnGroup(e);
+            else if (e.TagName == "col") ApplyColWidth(e);
         }
 
         // First-row cell widths pin their column(s).
@@ -785,6 +799,52 @@ public static class TableLayout
         }
 
         return colW;
+    }
+
+    private static void ApplyAutoColumnWidthHints(
+        DomElement tableElem, float[] minWidths, float[] preferredWidths, float available)
+    {
+        int column = 0;
+
+        void ApplyHint(DomElement element)
+        {
+            int span = Math.Clamp(element.GetAttrInt("span", 1), 1,
+                Math.Max(1, preferredWidths.Length - column));
+            float? width = ResolveWidth(element, "width", available);
+            if (width.HasValue)
+            {
+                for (int i = 0; i < span && column + i < preferredWidths.Length; i++)
+                    preferredWidths[column + i] =
+                        Math.Max(preferredWidths[column + i], width.Value);
+            }
+            column += span;
+        }
+
+        foreach (var node in tableElem.Children)
+        {
+            if (node is not DomElement element) continue;
+            if (element.TagName == "colgroup")
+            {
+                var columns = element.Children.OfType<DomElement>()
+                    .Where(child => child.TagName == "col").ToList();
+                if (columns.Count > 0)
+                {
+                    foreach (var col in columns)
+                        ApplyHint(col);
+                }
+                else
+                {
+                    ApplyHint(element);
+                }
+            }
+            else if (element.TagName == "col")
+            {
+                ApplyHint(element);
+            }
+        }
+
+        for (int i = 0; i < minWidths.Length; i++)
+            preferredWidths[i] = Math.Max(preferredWidths[i], minWidths[i]);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -967,7 +1027,10 @@ public static class TableLayout
         if (containerStyle.TextAlign == TextAlign.Left && box.Element != null &&
             box.Element.TagName != "center" && !box.Element.HasAttr("align") &&
             !blockStyle.OwnTextAlign)
-            blockStyle = containerStyle;
+        {
+            blockStyle = blockStyle.Clone();
+            blockStyle.TextAlign = containerStyle.TextAlign;
+        }
         float contentW = Math.Max(0f,
             outerWidth - box.BorderLeft - box.BorderRight
                        - box.PaddingLeft - box.PaddingRight);
@@ -1516,6 +1579,13 @@ public static class TableLayout
     internal static float MeasureInlineCellPreferredWidth(LayoutBox cell) =>
         Math.Max(1f, MeasurePref(cell)) + cell.PaddingLeft + cell.PaddingRight
         + cell.BorderLeft + cell.BorderRight;
+
+    internal static float MeasureShrinkToFitContentWidth(LayoutBox box, float availableWidth)
+    {
+        float minimum = MeasureMin(box);
+        float preferred = MeasurePref(box);
+        return Math.Min(Math.Max(minimum, Math.Max(0f, availableWidth)), preferred);
+    }
 
     /// <summary>
     /// Minimum width: the widest unbreakable word (SkiaSharp measurement).

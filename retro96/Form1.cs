@@ -3378,216 +3378,245 @@ public partial class Form1 : Form
             "</center></body></html>";
     }
 
-        private static string Retro96WelcomePageHtml() => """
-<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+    private static string Retro96WelcomePageHtml() => """
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
 <html>
 <head>
 <title>Welcome to Retro96</title>
 <style type="text/css">
 body {
-    background-color: #c0c0c0;
-    color: #000000;
-    font-family: "Times New Roman", Times, serif;
-    margin: 0;
-    padding: 0;
+    background-color: #008080;
+    color: #20242A;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 10pt;
+    margin: 24px;
 }
 
 .page {
-    width: 580px;
-    margin-left: auto;
-    margin-right: auto;
-    margin-top: 32px;
-    margin-bottom: 32px;
-    background-color: #ffffff;
-    border: 2px solid #808080;
-    padding: 32px 40px 40px 40px;
+    width: 740px;
+    margin: 0 auto;
+    padding: 0;
+    background-color: #FFFFFF;
+    border: 2px solid #202020;
 }
 
-h1 {
-    font-family: "Times New Roman", Times, serif;
-    font-size: 28pt;
+.masthead {
+    padding: 20px 24px;
+    background-color: #000080;
+    color: #FFFFFF;
+    border-bottom: 4px solid #FFCC33;
+}
+
+.masthead h1 {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 25pt;
+    color: #FFFFFF;
+}
+
+.tagline {
+    margin: 5px 0 0 0;
+    color: #DDE8FF;
+    font-size: 10pt;
+}
+
+.content {
+    padding: 20px 24px 16px 24px;
+}
+
+.intro {
+    margin-top: 0;
+    font-size: 12pt;
+    line-height: 1.5;
+}
+
+.section-title {
+    margin: 22px 0 8px 0;
+    padding-bottom: 5px;
+    border-bottom: 2px solid #C8D5E8;
+    color: #000080;
+    font-size: 15pt;
+}
+
+.steps {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid #AAB6C5;
+}
+
+.steps td {
+    padding: 9px;
+    border-bottom: 1px solid #D5DCE5;
+    vertical-align: top;
+}
+
+.steps .step-name {
+    width: 115px;
+    background-color: #EEF3FA;
+    color: #000080;
+}
+
+.tip {
+    margin: 12px 0;
+    padding: 10px 12px;
+    background-color: #EAF5E8;
+    border: 1px solid #A8C79F;
+    line-height: 1.45;
+}
+
+.shortcut {
+    font-family: "Courier New", Courier, monospace;
     font-weight: bold;
     color: #000080;
-    margin-top: 0;
-    margin-bottom: 4px;
-    letter-spacing: -1px;
+    white-space: nowrap;
 }
 
-.subtitle {
-    font-family: Arial, Helvetica, sans-serif;
+.small-note {
+    color: #555555;
     font-size: 9pt;
-    color: #808080;
-    margin-bottom: 24px;
 }
 
-hr {
-    border: none;
-    border-top: 1px solid #808080;
-    margin-top: 0;
-    margin-bottom: 24px;
+.home-link {
+    margin: 14px 0;
+    padding: 12px;
+    background-color: #E8F1FF;
+    border: 1px solid #9BB6DA;
 }
 
-h2 {
-    font-family: Arial, Helvetica, sans-serif;
-    font-size: 11pt;
+.home-link a {
+    color: #000080;
+    font-size: 12pt;
     font-weight: bold;
-    color: #000000;
-    margin-top: 24px;
-    margin-bottom: 8px;
-    border-bottom: 1px solid #c0c0c0;
-    padding-bottom: 2px;
 }
 
-p {
-    font-family: "Times New Roman", Times, serif;
-    font-size: 11pt;
-    line-height: 1.55;
-    margin-top: 0;
-    margin-bottom: 12px;
-    color: #000000;
+a:hover {
+    color: #CC3300;
 }
 
-.note {
-    background-color: #ffffcc;
-    border: 1px solid #c0c000;
-    padding: 10px 14px;
-    font-family: Arial, Helvetica, sans-serif;
-    font-size: 9pt;
-    line-height: 1.5;
-    margin-bottom: 20px;
-    color: #333300;
-}
-
-ul {
-    font-family: "Times New Roman", Times, serif;
-    font-size: 11pt;
-    line-height: 1.6;
-    margin-top: 0;
-    margin-bottom: 12px;
-    padding-left: 20px;
-    color: #000000;
-}
-
-li {
-    margin-bottom: 4px;
+.notice {
+    margin-top: 18px;
+    padding: 10px 12px;
+    background-color: #FFF6D8;
+    border: 1px solid #D5B85C;
+    line-height: 1.45;
 }
 
 .footer {
-    font-family: Arial, Helvetica, sans-serif;
-    font-size: 8pt;
-    color: #808080;
-    text-align: center;
-    margin-top: 28px;
-    border-top: 1px solid #c0c0c0;
-    padding-top: 12px;
-}
-
-a {
-    color: #000080;
-}
-
-a:visited {
-    color: #800080;
-}
-
-code {
-    font-family: "Courier New", Courier, monospace;
+    margin-top: 20px;
+    padding-top: 10px;
+    border-top: 1px solid #D0D0D0;
+    color: #666666;
     font-size: 9pt;
-    background-color: #f0f0f0;
-    padding: 1px 3px;
+    text-align: center;
 }
 </style>
 </head>
 <body>
-
 <div class="page">
-
-    <h1>Retro96</h1>
-    <div class="subtitle">Version: I have no idea &mdash; Beta &mdash; Not production software</div>
-
-    <hr>
-
-    <div class="note">
-        <b>Beta notice:</b> It works well right now, but I'm still finding and fixing bugs.
-        Not polished yet. Not ready for production.
-    </div>
-
-    <div class="note" style="border-color: #c00000; background-color: #fff0f0; color: #330000;">
-        <b>Windows only.</b> The security model, sandboxing, plugin isolation, and everything else
-        are built for Windows and staying that way. I can smell you, backporters. Do not.
-    </div>
-
-    <p>
-        Retro96 renders the web the way it looked in 1996. Not "quirks mode close enough" &mdash;
-        actually correctly. The target is 1996, but it covers some 1997&ndash;1998 features on
-        purpose, to handle later retro sites without breaking.
-    </p>
-
-    <p>
-        Almost everything is hand-written C#. The HTML tokenizer and parser, CSS parser,
-        selector engine, style resolver, layout engine, ES3 JavaScript and VBScript 1.0
-        interpreters, DOM bindings, a Java applet interpreter with hand-written
-        java.* natives and AWT, networking, and the plugin sandbox. SkiaSharp provides the
-        rendering surface.
-    </p>
-
-    <p>
-        This checkout contains about 87,000 lines across tracked text files, including
-        about 78,000 lines in source-code files.
-    </p>
-
-    <h2>What it does</h2>
-
-    <ul>
-        <li>HTML tokenizer and parser, written from scratch (HTML 3.2)</li>
-        <li>CSS1 parser, selector engine, and style resolver</li>
-        <li>Block, inline, and table layout &mdash; period-accurate, no silent fixes</li>
-        <li>ES3 JavaScript with DOM-0 scripting (<code>document.formName.fieldName</code>, <code>window.status</code>, live clocks)</li>
-        <li>A separate native VBScript 1.0 engine for classic VBScript blocks and event procedures</li>
-        <li>Frames and nested iframes that actually load and run correctly</li>
-        <li><code>&lt;blink&gt;</code>, <code>text-decoration: blink</code>, and <code>String.prototype.blink()</code></li>
-        <li>Java applets via a built-in interpreter: Java 1.0/1.1 bytecode, lifecycle and AWT support, with no JRE needed</li>
-        <li>Applet audio for WAVE, AU, AIFF/AIFC, and Standard MIDI; MIDI playback uses Windows MCI</li>
-        <li>LiveConnect through named applets, supported public members, and <code>netscape.javascript.JSObject</code>; applets can find and call one another across page frames</li>
-        <li>Plugin system with sandboxed, permission-gated <code>.r96p</code> packages</li>
-    </ul>
-
-    <h2>What it doesn't do</h2>
-
-    <ul>
-        <li>HTML 4, CSS2, ES5, or anything past the late 1990s</li>
-        <li>Java 1.2+ bytecode, Swing, or the collections framework (selected later runtime APIs are supported separately)</li>
-        <li>Every historical JVM class, browser-plugin quirk, audio codec, or LiveConnect conversion; support focuses on common Java 1.0/1.1 applets and the documented bridge</li>
-        <li>macOS or Linux &mdash; see the Windows notice above</li>
-    </ul>
-
-    <h2>Status</h2>
-
-    <p>
-        The latest xUnit run passed 236 tests. The live JavaScript page harness contains 29
-        contract checks, and the repository includes 54 hand-authored QA HTML files. There is
-        also a layout lab and a Chromium pixel-diff harness. Retro96 loads actual 1996 sites.
-        It's a side project built for fun, and that's what it'll stay.
-    </p>
-
-    <h2>Building</h2>
-
-    <p>Requires .NET 8 or 11. From the <code>retro96/</code> directory:</p>
-
-    <p><code>dotnet build -p:EnableWindowsTargeting=true</code></p>
-
-    <p>
-        Full instructions, project layout, and the plugin SDK are in the
-        <a href="https://github.com/DirazCoder/Retro96">README on GitHub</a>
-        &mdash; open that in a modern browser.
-    </p>
-
-    <div class="footer">
-        Retro96 &mdash; MIT License &mdash; <a href="https://github.com/DirazCoder/Retro96">github.com/DirazCoder/Retro96</a> (open in a modern browser)
-    </div>
-
+<div class="masthead">
+<h1>Welcome to Retro96</h1>
+<p class="tagline">A browser for exploring the classic web</p>
 </div>
 
+<div class="content">
+<p class="intro">You're ready to browse. Enter a web address in the bar above and press
+<b>Go</b> or Enter. You can also type a few words there to search.</p>
+
+<div class="tip"><b>Quick start:</b> Try a full address such as
+<b>https://example.com</b>, or enter a topic to search with your selected search provider.
+Use <b>retro96:home</b> in the address bar any time to return to Retro96's home page.</div>
+
+<h2 class="section-title">Getting started</h2>
+<table class="steps" border="0" cellpadding="0" cellspacing="0">
+<tr>
+<td class="step-name"><b>Visit a site</b></td>
+<td>Type a site's address in the address bar, then press <b>Go</b> or Enter.
+Addresses beginning with <b>www.</b> and local HTML file paths are recognized too.</td>
+</tr>
+<tr>
+<td class="step-name"><b>Search</b></td>
+<td>Type words instead of an address and press Enter. Retro96 sends the query to the
+search URL configured in <b>File &gt; Preferences</b>.</td>
+</tr>
+<tr>
+<td class="step-name"><b>Go back</b></td>
+<td>Use <b>&larr;</b> and <b>&rarr;</b> to move through this window's page history.
+Use the <b>History</b> menu to revisit a recent page or open the full history list.</td>
+</tr>
+<tr>
+<td class="step-name"><b>Make it yours</b></td>
+<td>Open <b>File &gt; Preferences</b> to set your home page and search provider,
+choose an engine profile, and adjust appearance, compatibility, and security.</td>
+</tr>
+<tr>
+<td class="step-name"><b>Save a favorite</b></td>
+<td>Choose <b>Bookmarks &gt; Add Bookmark</b> or press
+<span class="shortcut">Ctrl+D</span>. Use the Bookmarks menu to revisit or manage saved pages.</td>
+</tr>
+</table>
+
+<h2 class="section-title">The toolbar and menus</h2>
+<table class="steps" border="0" cellpadding="0" cellspacing="0">
+<tr><td class="step-name"><b>Back / Forward</b></td><td>Move through pages visited in this window.</td></tr>
+<tr><td class="step-name"><b>Reload / Stop</b></td><td>Reload the current page, or stop a page that is still loading.</td></tr>
+<tr><td class="step-name"><b>Find</b></td><td>Search for text on the current page. Press <b>F3</b> for the next match or <b>Shift+F3</b> for the previous one.</td></tr>
+<tr><td class="step-name"><b>Zoom</b></td><td>Use the <b>−</b>, percentage, and <b>+</b> toolbar buttons to change page zoom. Keyboard: <span class="shortcut">Ctrl+Plus</span>, <span class="shortcut">Ctrl+Minus</span>, and <span class="shortcut">Ctrl+0</span> to reset.</td></tr>
+<tr><td class="step-name"><b>Print</b></td><td>Open the print dialog for the current page.</td></tr>
+<tr><td class="step-name"><b>Bookmarks</b></td><td>Add or remove the current page, open a saved page, or choose <b>Manage Bookmarks</b>.</td></tr>
+<tr><td class="step-name"><b>History</b></td><td>Reopen recent pages, show all history, or clear browsing history.</td></tr>
+</table>
+
+<p class="small-note">For the complete shortcut list, choose <b>Help &gt; Keyboard Shortcuts</b>.
+For example, <span class="shortcut">Ctrl+F</span> opens Find and <span class="shortcut">Ctrl+J</span> opens Downloads.</p>
+
+<h2 class="section-title">Open, save, and revisit pages</h2>
+<p>Open <b>File</b> for more page actions:</p>
+<ul>
+<li><b>Open Local HTML</b> loads an .html or .htm file from your computer.</li>
+<li><b>Open New Window</b> starts another Retro96 window.</li>
+<li><b>Save As</b> saves the currently displayed document as an HTML file.</li>
+<li><b>Send Page</b> opens your computer's email composer with the page address.</li>
+<li><b>Text Size</b> changes text size; page zoom changes the scale of the whole page.</li>
+</ul>
+<p>Bookmarks are for pages you choose to keep. History records pages you've visited;
+open <b>History &gt; Show All History</b> to browse the full list.</p>
+
+<h2 class="section-title">Tune a page to your liking</h2>
+<p>In <b>File &gt; Preferences</b>, the tabs offer controls for different needs:</p>
+<ul>
+<li><b>General:</b> choose the home page and address-bar search provider, toggle images or scripted pop-ups, and set the default zoom.</li>
+<li><b>Compatibility:</b> select <b>Retro96 Engine</b>, <b>Internet Explorer 5</b>, or <b>Netscape Navigator 4.7</b>. Some older sites work better with a particular profile; reload after changing it.</li>
+<li><b>Appearance:</b> set the canvas background. Page-authored background colors remain in effect when using the default option.</li>
+<li><b>Security:</b> choose a trust level. High is strictest and blocks some legacy features; Medium is balanced; Low is intended for trusted pages and allows broader compatibility.</li>
+<li><b>Advanced:</b> independently tune stylesheets, frames, forms, scripts, applets, networking, and legacy effects. Settings that conflict with the selected security level may still be blocked.</li>
+</ul>
+<p>Choose <b>Apply</b> to keep preference changes. If a site looks different after changing its engine or loading options, reload the page.</p>
+
+<h2 class="section-title">If a page doesn't look right</h2>
+<ul>
+<li>Try another engine profile in <b>Preferences &gt; Compatibility</b>, then reload.</li>
+<li>If a page is slow or its images are not needed, turn on <b>File &gt; Text-Only mode</b>. This stops image loading; turn it off to restore images.</li>
+<li>Choose <b>Tools &gt; Reload Without Cache</b> to request the page and images again without the current cached resources.</li>
+<li>Some older pages need JavaScript, VBScript, frames, or applets enabled in Preferences. These options are configurable, but security settings can take precedence.</li>
+<li>Retro96 targets classic web technology. Modern sites may depend on features it does not implement, so they may be incomplete or unusable.</li>
+</ul>
+
+<h2 class="section-title">Take a look around</h2>
+<div class="home-link">
+<a href="retro96://home">Open the Retro96 home page</a><br>
+Search the web or explore preserved sites from the 1990s.
+</div>
+
+<div class="notice">
+<b>Privacy and site behavior:</b> Review the Security and Advanced tabs in Preferences
+to control site capabilities such as scripting, cookies, and page requests. Use
+<b>Tools &gt; Clear Browser Data</b> to clear browsing history, cookies, and cached page resources.
+</div>
+
+<p class="footer">Have fun exploring the web, one old page at a time.<br>
+Choose <b>Help &gt; About Retro96</b> for browser information.</p>
+</div>
+</div>
 </body>
 </html>
 """;

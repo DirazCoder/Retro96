@@ -407,6 +407,7 @@ public class JsFunction : JsObject
     {
         Native = native ?? throw new ArgumentNullException(nameof(native));
         ClosureScope = closureScope ?? throw new ArgumentNullException(nameof(closureScope));
+        Prototype = JsInterpreter.FunctionPrototype;
         Params = Array.Empty<string>();
         Body = null;
         Name = name;
@@ -420,9 +421,17 @@ public class JsFunction : JsObject
         Body = body ?? throw new ArgumentNullException(nameof(body));
         Params = @params ?? throw new ArgumentNullException(nameof(@params));
         ClosureScope = closureScope ?? throw new ArgumentNullException(nameof(closureScope));
+        Prototype = JsInterpreter.FunctionPrototype;
         Native = null;
         Name = name ?? body.Id?.Name;
         Class = "Function";
         Set("name", JsValue.From(Name ?? ""));
+        var instancePrototype = new JsObject
+        {
+            Class = "Object",
+            Prototype = JsInterpreter.ObjectPrototype
+        };
+        instancePrototype.Set("constructor", JsValue.FromFunction(this));
+        Set("prototype", JsValue.FromObject(instancePrototype));
     }
 }

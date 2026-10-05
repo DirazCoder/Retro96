@@ -764,6 +764,8 @@ public static class StyleResolver
                 break;
             case "marquee":
                 style.Display = DisplayValue.Block;
+                style.WhiteSpace = WhiteSpaceValue.Nowrap;
+                style.Overflow = OverflowValue.Hidden;
                 break;
             case "multicol":
                 style.Display = DisplayValue.Block;
@@ -1095,6 +1097,16 @@ public static class StyleResolver
                 {
                     int baseSize = ParseHtmlFontSize(bf, 3, doc.BaseFontSize);
                     doc.BaseFontSize = Math.Clamp(baseSize, 1, 7);
+                }
+                break;
+
+            case "bdo":
+                if (elem.GetAttr("dir")?.Trim().ToLowerInvariant() is "ltr" or "rtl")
+                {
+                    style.Direction = elem.GetAttr("dir")!.Trim().ToLowerInvariant() == "rtl"
+                        ? DirectionValue.Rtl
+                        : DirectionValue.Ltr;
+                    style.UnicodeBidi = "bidi-override";
                 }
                 break;
 

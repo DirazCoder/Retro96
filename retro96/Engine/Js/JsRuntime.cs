@@ -23,7 +23,11 @@ public static class JsRuntime
 
     public static void PopulateGlobalScope(JsScope globalScope)
     {
+        var functionProto = new JsObject { Class = "Function" };
+        JsInterpreter.FunctionPrototype = functionProto;
         var objectProto = RegisterObject(globalScope);
+        functionProto.Prototype = objectProto;
+        RegisterFunction(globalScope, functionProto, objectProto);
         var arrayProto  = RegisterArray(globalScope, objectProto);
         var stringProto = RegisterString(globalScope, objectProto);
         var numberProto = RegisterNumber(globalScope, objectProto);
@@ -112,6 +116,21 @@ public static class JsRuntime
             return JsValue.From(self.GetObjectOrFunction().HasOwn(args[0].ToJsString()));
         }));
 
+        objProto.Set("isPrototypeOf", Fn(scope, "isPrototypeOf", (self, args) =>
+        {
+            if (args.Length == 0 ||
+                self.Type is not (JsType.Object or JsType.Function) ||
+                args[0].Type is not (JsType.Object or JsType.Function))
+                return JsValue.From(false);
+
+            var targetPrototype = self.GetObjectOrFunction();
+            for (var prototype = args[0].GetObjectOrFunction().Prototype;
+                 prototype != null; prototype = prototype.Prototype)
+                if (ReferenceEquals(prototype, targetPrototype))
+                    return JsValue.From(true);
+            return JsValue.From(false);
+        }));
+
         var objectCtor = new JsFunction((self, args) =>
         {
             if (args.Length > 0 && args[0].Type == JsType.Object)
@@ -134,6 +153,30 @@ public static class JsRuntime
         scope.Define("Object", JsValue.FromFunction(objectCtor));
 
         return objProto;
+    }
+
+    private static void RegisterFunction(
+        JsScope scope, JsObject functionProto, JsObject objectProto)
+    {
+        var constructor = new JsFunction((self, args) =>
+        {
+            int parameterCount = Math.Max(0, args.Length - 1);
+            string parameters = string.Join(",", args.Take(parameterCount)
+                .Select(argument => argument.ToJsString()));
+            string body = args.Length > 0 ? args[^1].ToJsString() : "";
+            var program = JsParser.Parse($"function anonymous({parameters}){{{body}}}");
+            var declaration = program.Body.OfType<FunctionDeclaration>().FirstOrDefault()
+                ?? throw new JsInterpreterException("Invalid Function constructor body");
+            var functionBody = new FunctionExpr(
+                declaration.Id, declaration.Params, declaration.Body);
+            var parameterNames = declaration.Params.Select(parameter => parameter.Name).ToArray();
+            return JsValue.FromFunction(new JsFunction(
+                functionBody, parameterNames, scope, "anonymous"));
+        }, scope, "Function");
+        constructor.Prototype = functionProto;
+        constructor.Set("prototype", JsValue.FromObject(functionProto));
+        functionProto.Set("constructor", JsValue.FromFunction(constructor));
+        scope.Define("Function", JsValue.FromFunction(constructor));
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1463,9 +1506,9 @@ public static class JsRuntime
 
     private static void RegisterError(JsScope scope, JsObject objectProto)
     {
-        JsValue MakeErrorCtor(string name)
+        JsValue MakeErrorCtor(string name, JsObject parentPrototype)
         {
-            var proto = new JsObject { Class = "Error", Prototype = objectProto };
+            var proto = new JsObject { Class = "Error", Prototype = parentPrototype };
             proto.Set("toString", Fn(scope, "toString", (self, args) =>
             {
                 var target = self.GetObjectOrFunction();
@@ -1494,14 +1537,21 @@ public static class JsRuntime
                 return JsValue.FromObject(plain);
             }, scope, name);
             fn.Set("prototype", JsValue.FromObject(proto));
+            proto.Set("constructor", JsValue.FromFunction(fn));
             return JsValue.FromFunction(fn);
         }
 
-        scope.Define("Error",      MakeErrorCtor("Error"));
-        scope.Define("TypeError",  MakeErrorCtor("TypeError"));
-        scope.Define("RangeError", MakeErrorCtor("RangeError"));
-        scope.Define("EvalError",  MakeErrorCtor("EvalError"));
-        scope.Define("ReferenceError", MakeErrorCtor("ReferenceError"));
+        JsValue errorCtor = MakeErrorCtor("Error", objectProto);
+        scope.Define("Error", errorCtor);
+        JsObject errorPrototype = errorCtor.GetObjectOrFunction()
+            .Get("prototype").GetObject();
+
+        scope.Define("TypeError", MakeErrorCtor("TypeError", errorPrototype));
+        scope.Define("RangeError", MakeErrorCtor("RangeError", errorPrototype));
+        scope.Define("EvalError", MakeErrorCtor("EvalError", errorPrototype));
+        scope.Define("ReferenceError", MakeErrorCtor("ReferenceError", errorPrototype));
+        scope.Define("SyntaxError", MakeErrorCtor("SyntaxError", errorPrototype));
+        scope.Define("URIError", MakeErrorCtor("URIError", errorPrototype));
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1674,9 +1724,39 @@ public static class JsRuntime
             return JsValue.From(sb.ToString());
         }));
 
+        scope.Define("encodeURI", Fn(scope, "encodeURI", (self, args) =>
+            JsValue.From(EncodeUri(args.Length > 0 ? args[0].ToJsString() : "", component: false))));
+
+        scope.Define("encodeURIComponent", Fn(scope, "encodeURIComponent", (self, args) =>
+            JsValue.From(EncodeUri(args.Length > 0 ? args[0].ToJsString() : "", component: true))));
+
+        scope.Define("decodeURI", Fn(scope, "decodeURI", (self, args) =>
+            JsValue.From(Uri.UnescapeDataString(args.Length > 0 ? args[0].ToJsString() : ""))));
+
+        scope.Define("decodeURIComponent", Fn(scope, "decodeURIComponent", (self, args) =>
+            JsValue.From(Uri.UnescapeDataString(args.Length > 0 ? args[0].ToJsString() : ""))));
+
         // NaN / Infinity globals (NN3 allowed them bare)
         scope.Define("NaN", JsValue.From(double.NaN));
         scope.Define("Infinity", JsValue.From(double.PositiveInfinity));
+    }
+
+    private static string EncodeUri(string value, bool component)
+    {
+        const string componentSafe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+        const string uriSafe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'();,/?:@&=+$#";
+        string safe = component ? componentSafe : uriSafe;
+        var bytes = Encoding.UTF8.GetBytes(value);
+        var result = new StringBuilder(bytes.Length);
+        foreach (byte b in bytes)
+        {
+            char c = (char)b;
+            if (b < 0x80 && safe.IndexOf(c) >= 0)
+                result.Append(c);
+            else
+                result.Append('%').Append(b.ToString("X2", CultureInfo.InvariantCulture));
+        }
+        return result.ToString();
     }
 
     private static bool TryHex(string s, int start, int count, out int value)

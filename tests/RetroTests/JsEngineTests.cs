@@ -9,6 +9,23 @@ namespace RetroTests;
 
 public class JsEngineTests
 {
+    [Fact]
+    public void FutureReservedWordsCanBeUsedAsFunctionNames()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><body><script>" +
+            "function long(value) { return value + 'ms'; }" +
+            "function short(value) { return value + 's'; }" +
+            "window.duration = long(12) + ' ' + short(3);" +
+            "</script></body></html>");
+
+        Check.That(page.EvalString("window.duration") == "12ms 3s",
+            "sloppy JavaScript allows the webchat bundle's long() and short() helper names",
+            page.EvalString("window.duration"));
+        Check.Done();
+    }
+
     // ── document object ──────────────────────────────────────────────
 
     [Fact]
@@ -541,6 +558,14 @@ public class JsEngineTests
         // catch arm runs and e.message carries the era message.
         Check.That(text.StartsWith("ERR:'x' is null or not an object"),
             "null.x throws a catchable TypeError with the era message", text);
+        Check.That(page.EvalString("(function() { try { null.x; } catch(e) { return e.name; } })()") == "TypeError",
+            "null.x catch value is named TypeError");
+        Check.That(page.EvalString("(function() { try { null.x; } catch(e) { return e instanceof TypeError; } })()") == "true",
+            "null.x catch value inherits from TypeError.prototype");
+        Check.That(page.EvalString("(function() { try { null.x; } catch(e) { return e instanceof Error; } })()") == "true",
+            "TypeError catch value also inherits from Error.prototype");
+        Check.That(page.EvalString("(function() { try { undefined.x; } catch(e) { return e.name; } })()") == "TypeError",
+            "undefined property access also yields a TypeError");
         Check.Done();
     }
 
@@ -586,6 +611,36 @@ public class JsEngineTests
             page.EvalString("0 === false"));
         Check.That(page.EvalString("'5' == 5") == "true", "'5' == 5 is true");
         Check.That(page.EvalString("'5' === 5") == "false", "'5' === 5 is false");
+        Check.Done();
+    }
+
+    [Fact]
+    public void EcmaScript3FunctionUriAndErrorBuiltins()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><script>;</script></body></html>");
+
+        Check.That(page.EvalString(
+                "typeof URIError === 'function' && typeof ReferenceError === 'function' && typeof SyntaxError === 'function'") == "true",
+            "ES3 error constructors are available");
+        Check.That(page.EvalString(
+                "function calc(a,b){return (this.base||0)+a+b;} var ctx={base:10}; calc.call(ctx,1,2)+','+calc.apply(ctx,[1,2])") == "13,13",
+            "Function.prototype.call and apply preserve this and pass arguments");
+        Check.That(page.EvalString(
+                "function testCal(){return arguments.length===2 && arguments.callee===testCal;} testCal(10,20)") == "true",
+            "arguments.callee refers to the active function");
+        Check.That(page.EvalString(
+                "var raw='http://site.com/a b'; encodeURI(raw)==='http://site.com/a%20b' && decodeURI(encodeURI(raw))===raw") == "true",
+            "encodeURI and decodeURI round-trip URI text");
+        Check.That(page.EvalString(
+                "encodeURIComponent('a&b')") == "a%26b",
+            "encodeURIComponent escapes reserved delimiters");
+        Check.That(page.EvalString(
+                "function Base(){} function Derived(){} Derived.prototype=new Base(); var obj=new Derived(); Base.prototype.isPrototypeOf(obj)") == "true",
+            "Object.prototype.isPrototypeOf walks the full prototype chain");
+        Check.That(page.EvalString(
+                "var makeSum=Function('a','b','return a+b;'); makeSum(2,3)") == "5",
+            "Function constructor creates a callable function");
         Check.Done();
     }
 
@@ -657,6 +712,37 @@ public class JsEngineTests
             page.EvalString("document.getElementById('d').innerText"));
         Check.That(page.EvalString("document.getElementById('d').firstChild.nodeValue") == "changed",
             "nodeValue reads reflect the write");
+        Check.Done();
+    }
+
+    [Fact]
+    public void TableInsertRowAppendsAndInsertsRows()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><table id='results'><tbody>" +
+            "<tr id='existing'><td>Existing</td></tr>" +
+            "</tbody></table></body></html>");
+
+        Check.That(page.EvalString("typeof document.getElementById('results').insertRow") == "function",
+            "table exposes insertRow()");
+        page.Eval("var table = document.getElementById('results');" +
+            "var appended = table.insertRow(-1);" +
+            "appended.innerHTML = '<td id=\"appended-cell\">Appended</td>';" +
+            "window.appendedRow = appended;" +
+            "var inserted = table.insertRow(0);" +
+            "inserted.innerHTML = '<td>Inserted</td>';" +
+            "window.insertedRow = inserted;");
+
+        Check.That(page.EvalString("table.getElementsByTagName('tr').length") == "3",
+            "insertRow adds rows to the table");
+        Check.That(page.EvalString("table.getElementsByTagName('tr')[0].innerText") == "Inserted",
+            "insertRow(index) inserts before the indexed row",
+            page.EvalString("table.getElementsByTagName('tr')[0].innerText"));
+        Check.That(page.EvalString("appendedRow.parentNode.tagName") == "TBODY",
+            "appending a table row places it in a tbody");
+        Check.That(page.EvalString("appendedRow.getElementsByTagName('td').length") == "1" &&
+                   page.EvalString("document.getElementById('appended-cell').innerText") == "Appended",
+            "insertRow return value supports populating the row");
         Check.Done();
     }
 
@@ -837,21 +923,30 @@ public class JsEngineTests
     [Fact]
     public void OffsetGeometryFromStyledDiv()
     {
-        var page = new PageHarness();
-        page.LoadHtml("<html><body><div id='d' style='width:220px; padding:10px; border:5px solid black'>box</div></body></html>");
-        // Style resolution installs the ComputedStyle the geometry reads
-        Retro96.Engine.Css.StyleResolver.Resolve(page.Document, 800);
-        Check.That(page.EvalString("document.getElementById('d').offsetWidth") == "250",
-            "offsetWidth = width + padding + border for the styled div",
-            page.EvalString("document.getElementById('d').offsetWidth"));
-        Check.That(page.EvalString("document.getElementById('d').clientWidth") == "240",
-            "clientWidth = width + padding (border excluded)",
-            page.EvalString("document.getElementById('d').clientWidth"));
-        Check.That(page.EvalString("document.getElementById('d').offsetParent.tagName") == "BODY" ||
-                  page.EvalString("document.getElementById('d').offsetParent.id") == "d",
-            "offsetParent resolves to an ancestor (body fallback)");
-        Check.That(page.EvalString("document.getElementById('d').offsetHeight > 0") == "true",
-            "offsetHeight is positive for rendered content");
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+            var page = new PageHarness();
+            page.LoadHtml("<html><body><div id='d' style='width:220px; padding:10px; border:5px solid black'>box</div></body></html>");
+            // Style resolution installs the ComputedStyle the geometry reads
+            Retro96.Engine.Css.StyleResolver.Resolve(page.Document, 800);
+            Check.That(page.EvalString("document.getElementById('d').offsetWidth") == "250",
+                "offsetWidth = width + padding + border for the styled div",
+                page.EvalString("document.getElementById('d').offsetWidth"));
+            Check.That(page.EvalString("document.getElementById('d').clientWidth") == "240",
+                "clientWidth = width + padding (border excluded)",
+                page.EvalString("document.getElementById('d').clientWidth"));
+            Check.That(page.EvalString("document.getElementById('d').offsetParent.tagName") == "BODY" ||
+                      page.EvalString("document.getElementById('d').offsetParent.id") == "d",
+                "offsetParent resolves to an ancestor (body fallback)");
+            Check.That(page.EvalString("document.getElementById('d').offsetHeight > 0") == "true",
+                "offsetHeight is positive for rendered content");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
         Check.Done();
     }
 
@@ -1153,6 +1248,10 @@ public class JsEngineTests
                 "Event constants are available in the Retro96 union persona");
             Check.That(page.EvalString("typeof window.captureEvents") == "function",
                 "window.captureEvents is available in the Retro96 union persona");
+            Check.That(page.EvalString("navigator.appName") == "Microsoft Internet Explorer",
+                "the Retro96 union uses the IE-compatible appName for 1999 site sniffers");
+            Check.That(page.EvalString("navigator.userAgent") == UserSettings.DefaultIe5UserAgent,
+                "the Retro96 union uses a historically plausible IE5 User-Agent");
 
             page.Eval("window.unionCapture = 0; window.captureEvents(Event.CLICK);" +
                       "window.onclick = function() { window.unionCapture++; };");

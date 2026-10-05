@@ -22,9 +22,9 @@ namespace Retro96.Engine.Render;
 /// Latin-1 and typographic-punctuation code point the core fonts DO have
 /// (— – ‘ ’ “ ” • … ™ © ® ° ± × ÷ ¼ ½ ¾ ¹ ² ³) passes through untouched.
 ///
-/// Idempotent: substitutions are ordinary western text or engine-private
-/// sentinels, and a second pass over already-mapped text is a no-op — safe
-/// to apply at both the layout (TextRun creation) and paint sides.
+/// CJK glyphs are left intact so text-aware font resolution can select an
+/// installed fallback family. Idempotent: substitutions are ordinary western
+/// text or engine-private sentinels, so a second pass is safe.
 /// </summary>
 public static class GlyphSubstitution
 {
@@ -127,7 +127,6 @@ public static class GlyphSubstitution
                 continue;
             }
             if (c >= '\u2190' && c <= '\u27BF') { needsMapping = true; break; }
-            if (c >= '\u2E80') { needsMapping = true; break; }   // CJK etc.
         }
 
         if (!needsMapping)
@@ -144,10 +143,8 @@ public static class GlyphSubstitution
                 sb.Append(sub);
             else if (c < '\u2190')
                 sb.Append(c);
-            else if (c >= '\u2E80')
-                sb.Append('?');            // genuinely foreign glyph
             else
-                sb.Append(c);              // ← ↑ → ↓ ↔ etc. — core fonts carry these
+                sb.Append(c);              // keep unlisted glyphs available for font fallback
         }
         return sb.ToString();
     }

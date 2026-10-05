@@ -689,7 +689,11 @@ public static class HtmlParser
 
         private void InsertElementNormally(StartTag tag)
         {
-            CloseImpliedBefore(tag.Name);
+            var formattingToReopen = tag.Name == "p"
+                ? CloseParagraphAndGetFormattingChain()
+                : null;
+            if (tag.Name != "p")
+                CloseImpliedBefore(tag.Name);
             EnsureBody();
             var element = Create(tag);
 
@@ -710,10 +714,55 @@ public static class HtmlParser
                 _doc.AppendChild(element);
 
             if (!IsVoidElement(tag.Name) && !tag.SelfClosing)
+            {
                 Push(element);
+                if (formattingToReopen != null)
+                {
+                    foreach (var source in formattingToReopen)
+                    {
+                        var clone = CloneFormattingElement(source);
+                        _current!.AppendChild(clone);
+                        Push(clone);
+                    }
+                }
+            }
             // A "self-closing" non-void tag (<div/>) — period browsers
             // actually treated it as an open tag, but tolerating the XML-ish
             // syntax here is harmless and matches IE-era behaviour.
+        }
+
+        private List<DomElement>? CloseParagraphAndGetFormattingChain()
+        {
+            var snapshot = _open.ToArray();
+            int paragraphDepth = -1;
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                if (StopBoundaries.Contains(snapshot[i].TagName))
+                    break;
+                if (snapshot[i].TagName == "p")
+                {
+                    paragraphDepth = i;
+                    break;
+                }
+            }
+
+            List<DomElement>? formattingChain = null;
+            if (paragraphDepth > 0)
+            {
+                formattingChain = new List<DomElement>(paragraphDepth);
+                for (int i = paragraphDepth - 1; i >= 0; i--)
+                {
+                    if (!ReconstructibleFormattingTags.Contains(snapshot[i].TagName))
+                    {
+                        formattingChain = null;
+                        break;
+                    }
+                    formattingChain.Add(snapshot[i]);
+                }
+            }
+
+            CloseImpliedBefore("p");
+            return formattingChain;
         }
 
         private void InsertIntoHeadOrCurrent(DomElement element)
@@ -920,7 +969,7 @@ public static class HtmlParser
                     return;
 
                 case "col":
-                    CloseImpliedCellsAndRows();
+                    CloseImpliedCellsAndRows(stopAtColGroup: true);
                     CloseOpenRowGroup();
                     InsertVoid(Create(tag));
                     return;
@@ -1017,7 +1066,7 @@ public static class HtmlParser
                 PopOne();
         }
 
-        private void CloseImpliedCellsAndRows()
+        private void CloseImpliedCellsAndRows(bool stopAtColGroup = false)
         {
             // Pop cells/rows/captions and their unclosed content, but never
             // cross into an OUTER table (nested-table safety) and never pop
@@ -1029,7 +1078,8 @@ public static class HtmlParser
             {
                 string t = _open.Peek().TagName;
                 if (t is "table" or "body" or "html" or "frameset" or
-                       "tbody" or "thead" or "tfoot")
+                       "tbody" or "thead" or "tfoot" ||
+                    (stopAtColGroup && t == "colgroup"))
                     break;
                 if (t is "td" or "th" or "tr" or "caption" or "colgroup")
                 {

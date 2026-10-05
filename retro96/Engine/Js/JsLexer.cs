@@ -45,16 +45,13 @@ public class JsLexer
     private JsToken? _previousToken;
     private bool _pendingNewline;
 
-    /// <summary>JS 1.1 reserved words (the ES1-era set).</summary>
+    /// <summary>Words that the parser handles as JavaScript syntax tokens.</summary>
     private static readonly HashSet<string> _keywords = new(StringComparer.Ordinal)
     {
-        "abstract", "boolean", "break", "byte", "case", "catch", "char", "class", "const",
-        "continue", "debugger", "default", "delete", "do", "double", "else", "enum", "export",
-        "extends", "false", "final", "finally", "float", "for", "function", "goto", "if",
-        "implements", "import", "in", "instanceof", "int", "interface", "long", "native", "new",
-        "null", "package", "private", "protected", "public", "return", "short", "static", "super",
-        "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try",
-        "typeof", "var", "void", "volatile", "while", "with"
+        "break", "case", "catch", "continue", "debugger", "default", "delete", "do", "else",
+        "false", "finally", "for", "function", "if", "in", "instanceof", "new", "null",
+        "return", "switch", "this", "throw", "true", "try", "typeof", "var", "void",
+        "while", "with"
     };
 
     public JsLexer(string source)

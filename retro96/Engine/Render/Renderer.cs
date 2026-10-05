@@ -202,18 +202,21 @@ public class Renderer
         public void DrawImage(Image image, RectangleF destRect, SKSamplingOptions? sampling = null)
         {
             if (image == null || destRect.Width <= 0f || destRect.Height <= 0f) return;
-            Canvas.DrawImage(image.GetGpuImage(_gpuContext),
+            var raster = image.GetGpuImage(_gpuContext);
+            Canvas.DrawImage(raster,
                 SKRect.Create(destRect.X, destRect.Y, destRect.Width, destRect.Height),
-                sampling ?? GetImageSampling(image.Width, image.Height, destRect.Width, destRect.Height));
+                sampling ?? GetImageSampling(raster.Width, raster.Height,
+                    destRect.Width, destRect.Height));
         }
 
         public void DrawImage(Image image, float x, float y, float width, float height,
                               SKSamplingOptions? sampling = null)
         {
             if (image == null || width <= 0f || height <= 0f) return;
-            Canvas.DrawImage(image.GetGpuImage(_gpuContext),
+            var raster = image.GetGpuImage(_gpuContext);
+            Canvas.DrawImage(raster,
                 SKRect.Create(x, y, width, height),
-                sampling ?? GetImageSampling(image.Width, image.Height, width, height));
+                sampling ?? GetImageSampling(raster.Width, raster.Height, width, height));
         }
 
         private SKSamplingOptions GetImageSampling(float sourceWidth, float sourceHeight,
@@ -225,9 +228,19 @@ public class Renderer
             return scaleX > 1f || scaleY > 1f ? CubicSampling : LinearSampling;
         }
 
-        public void DrawImageNearest(Image image, float x, float y, float width, float height) =>
+        public void DrawImageNearest(Image image, float x, float y, float width, float height)
+        {
+            if (image == null) return;
+            var raster = image.GetGpuImage(_gpuContext);
+            if (raster.Width != image.Width || raster.Height != image.Height)
+            {
+                DrawImage(image, x, y, width, height,
+                    GetImageSampling(raster.Width, raster.Height, width, height));
+                return;
+            }
             DrawImage(image, x, y, width, height,
                 new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
+        }
 
         public void DrawString(string? text, Font font, SKPaint paint, float x, float y,
                                SkiaTextOptions options)
@@ -2339,7 +2352,6 @@ public class Renderer
         var style = box.StyleOverride ?? elemForStyle.Style ?? FallbackStyle(elemForStyle);
         if (style == null) return;
 
-        var font = ResolveFont(fonts, style);
         Color textColor = EffectiveTextColor(style);
 
         var linkAnchor = FindAncestorElement(elemForStyle, "a");
@@ -2403,6 +2415,15 @@ public class Renderer
             !float.IsFinite(box.Width) || !float.IsFinite(box.Height))
             return;
 
+        string text = style.TextTransform switch
+        {
+            TextTransform.Uppercase => box.TextRun.ToUpperInvariant(),
+            TextTransform.Lowercase => box.TextRun.ToLowerInvariant(),
+            TextTransform.Capitalize => CapitalizeWords(box.TextRun),
+            _ => box.TextRun
+        };
+        var font = ResolveFontForText(fonts, style, text);
+
         float textY = contentRect.Y;
         if (style.LineHeightMode != LineHeightMode.Normal)
             textY += Math.Max(0f, (contentRect.Height - font.GetHeight()) / 2f);
@@ -2412,14 +2433,6 @@ public class Renderer
         // every repaint (the caret blink repaints twice a second).
         var brush = FillPaintFor(textColor);
         var sf = TypographicText;
-
-        string text = style.TextTransform switch
-        {
-            TextTransform.Uppercase => box.TextRun.ToUpperInvariant(),
-            TextTransform.Lowercase => box.TextRun.ToLowerInvariant(),
-            TextTransform.Capitalize => CapitalizeWords(box.TextRun),
-            _ => box.TextRun
-        };
 
         PaintTextShadows(g, contentRect.X, textY, text, font, style, fonts, sf);
 
@@ -3099,6 +3112,32 @@ public class Renderer
         {
             using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
             g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
+        }
+        for (int i = 0; i < size; i++)
+        {
+            float x0 = rect.Left + i, y0 = rect.Top + i;
+            float x1 = rect.Right - i - 1, y1 = rect.Bottom - i - 1;
+            if (x1 < x0 || y1 < y0) break;
+            g.DrawLine(penDark, x0, y0, x1, y0);
+            g.DrawLine(penDark, x0, y0, x0, y1);
+            g.DrawLine(penLight, x0, y1, x1, y1);
+            g.DrawLine(penLight, x1, y0, x1, y1);
+        }
+    }
+
+    internal static void PaintSunkenRect(Graphics g, RectangleF rect, int size, Color background = default)
+    {
+        if (background == Color.Empty || background == Color.Transparent)
+            background = Color.White;
+        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
+        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
+        using var penDark = new Pen(dark, 1);
+        using var penLight = new Pen(light, 1);
+        if (NeedsStrongBevelOutline(background))
+        {
+            using var outline = new Pen(BevelOutlineColor(background), 1);
+            g.DrawRectangle(outline, rect.Left, rect.Top,
+                Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
         }
         for (int i = 0; i < size; i++)
         {

@@ -319,6 +319,12 @@ public static class LayoutEngine
                         }
 
                         var boxType = DetermineBoxType(elem, style);
+                        if (style.Display == DisplayValue.TableCell &&
+                            elem.TagName is not ("td" or "th") &&
+                            !IsTableFormattingParent(parentBox))
+                        {
+                            boxType = BoxType.InlineBlock;
+                        }
                         if (elem.TagName == "object" &&
                             elem.GetAttr("classid")?.StartsWith("clsid:", StringComparison.OrdinalIgnoreCase) == true)
                         {
@@ -778,6 +784,19 @@ public static class LayoutEngine
     // ─────────────────────────────────────────────────────────────────────────
     // Style helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    private static bool IsTableFormattingParent(LayoutBox box)
+    {
+        if (box.BoxType is BoxType.Table or BoxType.TableRow)
+            return true;
+
+        if (box.Element?.TagName is "table" or "tr" or "thead" or "tbody" or "tfoot")
+            return true;
+
+        return box.Element?.Style?.Display is DisplayValue.Table or
+            DisplayValue.TableRow or DisplayValue.TableRowGroup or
+            DisplayValue.TableHeaderGroup or DisplayValue.TableFooterGroup;
+    }
 
     private static BoxType DetermineBoxType(DomElement elem, ComputedStyle style)
     {
@@ -1362,7 +1381,11 @@ public static class LayoutEngine
                 s.Display = DisplayValue.Inline;
                 s.WhiteSpace = WhiteSpaceValue.Nowrap; break;
             case "wbr": s.Display = DisplayValue.Inline; break;
-            case "marquee": s.Display = DisplayValue.Block; break;  // IE-MARQUEE
+            case "marquee":
+                s.Display = DisplayValue.Block;
+                s.WhiteSpace = WhiteSpaceValue.Nowrap;
+                s.Overflow = OverflowValue.Hidden;
+                break;  // IE-MARQUEE
             case "multicol": s.Display = DisplayValue.Block; break; // NN25
             case "layer": case "ilayer": s.Display = DisplayValue.Block; break;
 
@@ -2105,7 +2128,15 @@ public static class LayoutEngine
         else
         {
             if (box.Width <= 0f)
-                box.Width = Math.Max(20f, containingWidth / 3f);
+            {
+                float availableContentWidth = Math.Max(0f,
+                    containingWidth
+                    - box.MarginLeft - box.MarginRight
+                    - box.BorderLeft - box.BorderRight
+                    - box.PaddingLeft - box.PaddingRight);
+                box.Width = TableLayout.MeasureShrinkToFitContentWidth(
+                    box, availableContentWidth);
+            }
 
             float floatContainerW = box.Width
                                   + box.MarginLeft + box.MarginRight
@@ -2544,7 +2575,8 @@ public static class LayoutEngine
         foreach (var b in root.Descendants())
         {
             var mr = b.MarginRect;
-            if (mr.Right > maxRight) maxRight = mr.Right;
+            float scrollableRight = b.ScrollableMarginRight;
+            if (scrollableRight > maxRight) maxRight = scrollableRight;
             if (mr.Bottom > maxBottom) maxBottom = mr.Bottom;
         }
 

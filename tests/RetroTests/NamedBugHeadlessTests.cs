@@ -156,6 +156,74 @@ public class NamedBugHeadlessTests
         Check.Done();
     }
 
+    [Fact]
+    public void FloatAutoWidthFitsItsInlineControlsWithoutWrapping()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><form>" +
+            "<div id='search' style='float:left'><a>wiby</a>&nbsp;" +
+            "<input id='query' size='35' type='text' value='hello'>" +
+            "<input id='submit' type='submit' value='Search'></div>" +
+            "<div id='settings' style='float:right'>Settings</div>" +
+            "</form></body></html>", 900);
+        var query = doc.ElementDescendants().First(e => e.GetAttr("id") == "query");
+        var submit = doc.ElementDescendants().First(e => e.GetAttr("id") == "submit");
+        var search = doc.ElementDescendants().First(e => e.GetAttr("id") == "search");
+        var queryBox = LayoutHarness.BoxOf(root, query)!;
+        var submitBox = LayoutHarness.BoxOf(root, submit)!;
+        var searchBox = LayoutHarness.BoxOf(root, search)!;
+        var settingsBox = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "settings"))!;
+
+        Check.That(Math.Abs(queryBox.Y - submitBox.Y) < 0.5f,
+            "an auto-width left float keeps its query field and submit control on one line",
+            $"queryY={queryBox.Y:0.#}, submitY={submitBox.Y:0.#}");
+        Check.That(submitBox.BorderRect.Right <= searchBox.BorderRect.Right + 0.5f,
+            "the shrink-to-fit float contains its inline controls",
+            $"submitRight={submitBox.BorderRect.Right:0.#}, floatRight={searchBox.BorderRect.Right:0.#}");
+        Check.That(Math.Abs(settingsBox.Y - searchBox.Y) < 0.5f &&
+                   settingsBox.X > searchBox.X,
+            "the opposing auto-width float remains beside the search group");
+        Check.Done();
+    }
+
+    [Theory]
+    [InlineData(450)]
+    [InlineData(800)]
+    public void WibyResultsSearchControlsStayTogetherInsideFloats(int viewportWidth)
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            "a:link { font-size:17px; text-decoration:none; }" +
+            "a.title:link { font-weight:bold; font-size:29px; text-decoration:none; font-family:Georgia; }" +
+            "a.tiny { font-size:17px; }" +
+            "p { font-size:17px; margin-bottom:0px; margin-top:0px; }" +
+            "blockquote { max-width:680px; }" +
+            "</style></head><body>" +
+            "<form method='get'><div id='search' style='float:left'>" +
+            "<a class='title' href='../'>wiby</a>&nbsp;&nbsp;" +
+            "<input type='text' size='35' name='q' id='q' value='hello'/>    " +
+            "<input type='submit' value='Search' id='submit'/>" +
+            "</div><div style='float:right'><a class='tiny' href='/settings/'>Settings</a></div>" +
+            "<br><br></form><p class='pin'><br></p>" +
+            "<blockquote><a class='tlink'>Hello, world</a><br><p class='url'>http://example.com/</p>" +
+            "<p>Search result snippet text.</p></blockquote>" +
+            "</body></html>", viewportWidth);
+        var query = doc.ElementDescendants().First(e => e.GetAttr("id") == "q");
+        var submit = doc.ElementDescendants().First(e => e.GetAttr("id") == "submit");
+        var queryBox = LayoutHarness.BoxOf(root, query)!;
+        var submitBox = LayoutHarness.BoxOf(root, submit)!;
+
+        Check.That(Math.Abs(queryBox.Y - submitBox.Y) < 0.5f,
+            "the Wiby query field and submit control stay on the same line",
+            $"queryY={queryBox.Y:0.#}, submitY={submitBox.Y:0.#}");
+        Check.That(submitBox.X >= queryBox.BorderRect.Right - 0.5f &&
+                   submitBox.X - queryBox.BorderRect.Right < 20f,
+            "the Wiby results-page submit control follows the query field with only inline whitespace",
+            $"queryRight={queryBox.BorderRect.Right:0.#}, submitX={submitBox.X:0.#}");
+        Check.Done();
+    }
+
     // 1 ───────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_ImagesInTableCellZeroHeight()
@@ -1650,7 +1718,9 @@ public class BonusContractTests
         Check.That(TextY("bottom") > baselineY, "vertical-align:bottom lowers the label");
         Check.That(TextY("text-top") < baselineY, "vertical-align:text-top raises the label");
         Check.That(TextY("text-bottom") > baselineY, "vertical-align:text-bottom lowers the label");
-        Check.That(TextY("percent") > TextY("bottom"), "negative vertical-align percentage lowers the label");
+        Check.That(TextY("percent") > TextY("bottom"),
+            "negative vertical-align percentage lowers the label",
+            $"percent={TextY("percent"):0.##}, bottom={TextY("bottom"):0.##}");
 
         var capitalizeElement = doc.ElementDescendants().First(e => e.GetAttr("id") == "capitalize");
         var capitalizedWord = root.Descendants().First(b => b.Element == capitalizeElement && b.TextRun == "these");

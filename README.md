@@ -8,7 +8,7 @@ Built for fun. Runs on Windows. Has no chill.
 
 ![Retro96 home page](docs/retro96-homepage.png)
 
-> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This checkout contains about 87k lines across tracked text files, including about 78k lines in source-code files — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
+> ⚠️ **WARNING: this is a big, real browser engine, not a toy.** This checkout contains about 99k lines across tracked text files, including about 92k lines in source-code files — a hand-written HTML tokenizer/parser, CSS parser + selector engine + style resolver, block/inline/table layout, ES3 JavaScript and VBScript 1.0 engines, a Java applet interpreter with selected later-runtime compatibility, networking, and a Skia-backed renderer. If you don't already know C# and have never touched how a browser turns HTML into pixels, this is not a good first project to jump into — you'll spend most of your time lost in `Layout/`, `Js/`, `Vbs/` and `Java/` instead of shipping anything. Poke around the code out of curiosity, sure, but come in expecting a real codebase, not a weekend script.
 
 ## Why does this exist
 
@@ -136,7 +136,7 @@ here's what actually happened under the hood:
 
 **JavaScript engine** — both projects have a hand-written JS engine. the Rust engine is centered in a 2,399-line `javascript_engine.rs`. Retro96's is split across a lexer, parser, interpreter, runtime, DOM bindings, AST types, and scope — currently 7,160 tracked C# lines total, each piece doing one job. the Rust DOM bindings had `getElementById`, `createElement`, `write`, `writeln`, `window.status`, `window.location`. that's roughly it. Retro96's `DomBindings.cs` is currently 2,005 lines on its own
 
-**testing** — the Rust checkout has 144 `#[test]` annotations across 25 tracked Rust files. Its separate 137-line `test_js_engine.rs` is a standalone smoke-test program, not a Rust `#[test]` suite. The latest Retro96 xUnit run passed 363 tests plus 54 VBScript 5.0 tests, the live JS page harness contains 28 contract checks across two browser personas, and the 1999 QA suite is 20 hand-authored pages with a 34-check headless battery on top. There is a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests
+**testing** — the Rust checkout has 144 `#[test]` annotations across 25 tracked Rust files. Its separate 137-line `test_js_engine.rs` is a standalone smoke-test program, not a Rust `#[test]` suite. The latest Retro96 xUnit run passed all 410 tests. The VBScript suite has 54 tests, the live JS page harness has 28 passing contract checks across two browser personas, and the 1999 QA suite is 20 hand-authored pages with a 34-check headless battery on top. There is a layout lab, and a Playwright visual-diff harness. i tested Retro96 with my eyes AND with actual tests
 
 **real websites** — Retro96 renders theoldnet.com. it renders spacejam.com/1996/. it renders period Geocities pages. the Rust version rendered 0% of 1996 websites correctly — the layout was broken enough that nothing looked right, and the JS engine was broken enough that nothing ran. the bookmarks and downloads worked great though. the thing they were supposed to navigate to did not render
 
@@ -160,11 +160,11 @@ and here's frogfind.com in Retro96, loaded instantly, no drama:
 
 ![frogfind.com in Retro96](docs/retro96-frogfind.png)
 
-the Rust checkout has about 29.6k lines across tracked text files (including about 22.9k Rust source lines). Retro96 has about 87k tracked text lines, including about 78k source-code lines. one of them works
+the Rust checkout has about 29.6k lines across tracked text files (including about 22.9k Rust source lines). Retro96 has about 99k tracked text lines, including about 92k source-code lines. one of them works
 
 ## Status
 
-Side project built for fun, not production software. The latest full run on .NET 11: **363 xUnit engine tests** (including the 34-check `Retro99SuiteTests` battery that loads every 1999 QA page through parse → style → layout → script), **54 VBScript 5.0 tests**, the live JavaScript page harness (28 contract checks against real period pages, under both the IE5 and NS4.7 personas), and the layout lab (all checks). The repository includes a 20-page 1999 QA suite in `tests/html-websites/` (one page per checklist section plus Acid1, a Y2K battery and a broken-HTML torture page), the real-world regression corpus in `testdata/`, and a Playwright pixel-diff harness.
+Side project built for fun, not production software. The latest .NET 11 xUnit run passed all **410 tests**. The suite includes the 34-check `Retro99SuiteTests` battery that loads the 1999 QA pages through parse → style → layout → script. Also: **54 VBScript 5.0 tests**, **28 passing** live JavaScript page contract checks against real period pages under both IE5 and NS4.7 personas, and the layout lab. The repository includes a 20-page 1999 QA suite in `tests/html-websites/` (one page per checklist section plus Acid1, a Y2K battery and a broken-HTML torture page), the real-world regression corpus in `testdata/`, and a Playwright pixel-diff harness.
 
 ## Rendering stack
 
@@ -212,7 +212,7 @@ dotnet build Retro96.sln
 ## Running the tests
 
 ```
-cd tests/RetroTests  && dotnet test      # engine/JS/DOM/forms/frames + CSS2 + the 1999 QA suite (363)
+cd tests/RetroTests  && dotnet test      # engine/JS/DOM/forms/frames + CSS2 + the 1999 QA suite (410)
 cd tests/VbsTests    && dotnet test      # VBScript 5.0 semantics (54)
 cd tests/JsPageTests && dotnet run       # live script-contract checks (28, IE5 + NS4.7 personas)
 cd tests/LayoutLab   && dotnet run       # layout lab, all checks

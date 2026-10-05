@@ -81,6 +81,28 @@ public class LayoutBox
         Width + PaddingLeft + PaddingRight + BorderLeft + BorderRight + MarginLeft + MarginRight,
         Height + PaddingTop + PaddingBottom + BorderTop + BorderBottom + MarginTop + MarginBottom);
 
+    public float ScrollableRight
+    {
+        get => ClipRightToAncestors(X + Math.Max(0f, Width));
+    }
+
+    public float ScrollableMarginRight => ClipRightToAncestors(MarginRect.Right);
+
+    private float ClipRightToAncestors(float right)
+    {
+        for (var ancestor = Parent; ancestor != null; ancestor = ancestor.Parent)
+        {
+            var style = ancestor.Element?.Style ?? ancestor.StyleOverride;
+            if (style == null || style.Overflow == OverflowValue.Visible)
+                continue;
+
+            float clipRight = ancestor.X + ancestor.BorderLeft + ancestor.Width
+                + ancestor.PaddingLeft + ancestor.PaddingRight;
+            right = Math.Min(right, clipRight);
+        }
+        return right;
+    }
+
     // Float state
     public bool IsFloated { get; set; }
     public FloatValue FloatSide { get; set; }

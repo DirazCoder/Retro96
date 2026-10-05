@@ -27,6 +27,19 @@ public static class Program
         if (cond) _passed++; else _failed++;
     }
 
+    private static string TestdataFile(string name)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory != null; directory = directory.Parent)
+        {
+            string path = Path.Combine(directory.FullName, "testdata", name);
+            if (File.Exists(path))
+                return path;
+        }
+        throw new DirectoryNotFoundException(
+            $"Could not locate testdata/{name} above {AppContext.BaseDirectory}.");
+    }
+
     public static int Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -45,7 +58,7 @@ public static class Program
     private static int Diag()
     {
         var page = new PageHarness();
-        page.Load("/home/z/my-project/retro96/testdata/voyagersisland.html");
+        page.Load(TestdataFile("voyagersisland.html"));
 
         void P(string label, string code)
         {
@@ -73,7 +86,7 @@ public static class Program
 
         Console.WriteLine("\n— acme clock diagnostics —");
         var acme = new PageHarness();
-        acme.Load("/home/z/my-project/retro96/testdata/acme-cybercorp.html");
+        acme.Load(TestdataFile("acme-cybercorp.html"));
         try { Console.WriteLine("  typeof document.clockForm = " + acme.Eval("typeof document.clockForm").ToJsString()); } catch (Exception ex) { Console.WriteLine("  THREW " + ex.Message); }
         try { Console.WriteLine("  typeof document.forms.clockForm = " + acme.Eval("typeof document.forms.clockForm").ToJsString()); } catch (Exception ex) { Console.WriteLine("  THREW " + ex.Message); }
         try { Console.WriteLine("  document.clockForm.digits = " + acme.Eval("typeof document.forms.clockForm.digits").ToJsString()); } catch (Exception ex) { Console.WriteLine("  THREW " + ex.Message); }
@@ -140,7 +153,7 @@ public static class Program
     {
         Console.WriteLine("\n— Acme CyberCorp scripts —");
         var page = new PageHarness();
-        page.Load("/home/z/my-project/retro96/testdata/acme-cybercorp.html");
+        page.Load(TestdataFile("acme-cybercorp.html"));
 
         Check(page.ScriptErrors.Count == 0, "all inline scripts execute without fatal error",
             page.ScriptErrors.Count > 0 ? string.Join(" | ", page.ScriptErrors.Take(3)) : "");
@@ -238,7 +251,7 @@ public static class Program
         try
         {
             var page = new PageHarness();
-            page.Load("/home/z/my-project/retro96/testdata/acme-cybercorp.html");
+            page.Load(TestdataFile("acme-cybercorp.html"));
 
             // Persona contract: layers exists, all does not, getElementById does not.
             string sniff = page.Eval(
@@ -288,7 +301,7 @@ public static class Program
     {
         Console.WriteLine("\n— Voyager's Island counter scripts —");
         var page = new PageHarness();
-        page.Load("/home/z/my-project/retro96/testdata/voyagersisland.html");
+        page.Load(TestdataFile("voyagersisland.html"));
 
         Check(page.ScriptErrors.Count == 0,
             "counter scripts execute (screen.* defined, no fatal errors)",
@@ -334,7 +347,7 @@ public static class Program
     {
         Console.WriteLine("\n— Nintendo Hallway frameset —");
         var doc = HtmlParser.Parse(
-            File.ReadAllText("/home/z/my-project/retro96/testdata/nintendo-hallway.html"),
+            File.ReadAllText(TestdataFile("nintendo-hallway.html")),
             ParsedUrl.Parse("file:///hallway/index.html"), new CookieStore());
 
         var frames = doc.ElementDescendants().Where(e => e.TagName == "frame").ToList();

@@ -295,7 +295,7 @@ public static class InlineLayout
         if (string.IsNullOrEmpty(text) || _fontCache == null)
             return text is null ? 0f : text.Length * 8f;
 
-        var font = ResolveRunFont(style);
+        var font = ResolveRunFont(style, text);
         var key = new TextWidthKey(
             text, font, style.LetterSpacing, style.WordSpacing, style.FontVariant);
         if (_textWidthCache.TryGetValue(key, out float cachedWidth))
@@ -358,7 +358,10 @@ public static class InlineLayout
 
             string run = text[start..i];
             string draw = lower ? run.ToUpperInvariant() : run;
-            var runFont = lower ? smallFont : fullFont;
+            var runFont = lower
+                ? _fontCache!.ResolveForText(family, smallSize, (int)style.FontWeight,
+                    italic, oblique, draw)
+                : fullFont;
             width += _measureG.MeasureString(draw, runFont, int.MaxValue, _sf).Width;
         }
 
@@ -374,6 +377,62 @@ public static class InlineLayout
         bool italic = style.FontStyle == FontStyleValue.Italic;
         bool oblique = style.FontStyle == FontStyleValue.Oblique;
         return _fontCache!.Resolve(family, size, (int)style.FontWeight, italic, oblique);
+    }
+
+    private static Font ResolveRunFont(ComputedStyle style, string text)
+    {
+        var family = style.FontFamily is { Count: > 0 } ? style.FontFamily : DefaultFontFamily;
+        float size = style.FontSize > 0f ? style.FontSize : 16f;
+        bool italic = style.FontStyle == FontStyleValue.Italic;
+        bool oblique = style.FontStyle == FontStyleValue.Oblique;
+        return _fontCache!.ResolveForText(family, size, (int)style.FontWeight,
+            italic, oblique, text);
+    }
+
+    private static void ApplyBdoOverrides(List<LayoutBox> source)
+    {
+        int index = 0;
+        while (index < source.Count)
+        {
+            var bdo = FindBdoOverride(source[index].Element);
+            if (bdo == null)
+            {
+                index++;
+                continue;
+            }
+
+            int end = index + 1;
+            while (end < source.Count &&
+                   ReferenceEquals(FindBdoOverride(source[end].Element), bdo))
+                end++;
+
+            int left = index;
+            int right = end - 1;
+            while (left <= right)
+            {
+                if (source[left].TextRun is { Length: > 0 } leftText)
+                    source[left].TextRun = ReverseTextElements(leftText);
+                if (left != right && source[right].TextRun is { Length: > 0 } rightText)
+                    source[right].TextRun = ReverseTextElements(rightText);
+                (source[left], source[right]) = (source[right], source[left]);
+                left++;
+                right--;
+            }
+
+            index = end;
+        }
+    }
+
+    private static DomElement? FindBdoOverride(DomElement? element)
+    {
+        for (var current = element; current != null; current = current.Parent as DomElement)
+        {
+            if (current.TagName == "bdo" &&
+                current.Style?.UnicodeBidi == "bidi-override" &&
+                current.Style.Direction == DirectionValue.Rtl)
+                return current;
+        }
+        return null;
     }
 
     /// <summary>
@@ -485,7 +544,7 @@ public static class InlineLayout
                 {
                     int cols = el.GetAttrInt("cols", 0);
                     if (cols > 0)
-                        width = MeasureTextWidth(new string('0', cols), style) + 12f;
+                        width = cols * 8f;
                     int rows = Math.Max(1, el.GetAttrInt("rows", 4));
                     height = (float)Math.Ceiling(font.GetHeight(_measureG)) * rows + 4f;
                     return true;
@@ -598,6 +657,7 @@ public static class InlineLayout
             $"firstItemText=\"{Truncate(inlineChildren[0].TextRun)}\"");
 
         var source = inlineChildren.ToList();
+        ApplyBdoOverrides(source);
         floats ??= new FloatContext();
 
         // ── Fragment + measure, collapsing adjacent spaces across run
@@ -853,7 +913,9 @@ public static class InlineLayout
                 }
             }
 
-            if (!nowrap && lineItems.Count > 0 && lineW + outerW > availW)
+            bool keepSearchSubmitTogether = IsSubmitFollowingSearchField(it, lineItems);
+            if (!nowrap && lineItems.Count > 0 && lineW + outerW > availW &&
+                !keepSearchSubmitTogether)
             {
                 LayoutTrace.Log($"  WRAP at y={currentY:F1}: lineW={lineW:F1} + outerW={outerW:F1} " +
                     $"> availW={availW:F1} (word=\"{Truncate(it.Box.TextRun)}\")");
@@ -918,6 +980,45 @@ public static class InlineLayout
             if (ancestor.BoxType == BoxType.TableCell)
                 return true;
         return false;
+    }
+
+    private static bool IsSubmitFollowingSearchField(
+        MeasuredItem candidate, IReadOnlyList<MeasuredItem> precedingItems)
+    {
+        var submit = candidate.Box.Element;
+        if (submit?.TagName != "input" ||
+            !submit.GetAttrOrDefault("type", "text").Trim()
+                .Equals("submit", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        DomElement? query = null;
+        for (int i = precedingItems.Count - 1; i >= 0; i--)
+        {
+            var box = precedingItems[i].Box;
+            if (box.TextRun == " ")
+                continue;
+            query = box.Element;
+            break;
+        }
+
+        if (query?.TagName != "input")
+            return false;
+
+        string queryType = query.GetAttrOrDefault("type", "text").Trim();
+        if (!queryType.Equals("text", StringComparison.OrdinalIgnoreCase) &&
+            !queryType.Equals("search", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        DomElement? queryForm = GetAncestorForm(query);
+        return queryForm != null && ReferenceEquals(queryForm, GetAncestorForm(submit));
+    }
+
+    private static DomElement? GetAncestorForm(DomElement element)
+    {
+        for (var node = element.Parent; node != null; node = node.Parent)
+            if (node is DomElement ancestor && ancestor.TagName == "form")
+                return ancestor;
+        return null;
     }
 
     private static List<MeasuredItem> SplitOversizedText(LayoutBox box)
@@ -1059,6 +1160,15 @@ public static class InlineLayout
             minLeadingTop = Math.Min(minLeadingTop, it.LeadingTop);
         }
         float lineH = Math.Max(maxAscent + maxDescent, 1f);
+        float unshiftedLineH = lineH;
+        foreach (var it in items)
+        {
+            if (it.VA != VAlignMode.Baseline) continue;
+            float shift = GetBaselineShift(it, lineH);
+            maxAscent = Math.Max(maxAscent, it.Asc + shift);
+            maxDescent = Math.Max(maxDescent, it.H - it.Asc - shift);
+        }
+        lineH = Math.Max(maxAscent + maxDescent, 1f);
 
         float containerRight = containerX + containerWidth;
         float leftEdge = containerX;
@@ -1130,26 +1240,13 @@ public static class InlineLayout
                     box.Y = y + minLeadingTop - it.LeadingTop;
                     break;
                 case VAlignMode.Middle:
-                    box.Y = y + (lineH - it.ContentHeight) / 2f - it.LeadingTop;
+                    box.Y = y + (unshiftedLineH - it.ContentHeight) / 2f - it.LeadingTop;
                     break;
                 case VAlignMode.Bottom:
-                    box.Y = y + lineH - minLeadingTop - it.ContentHeight - it.LeadingTop;
+                    box.Y = y + unshiftedLineH - minLeadingTop - it.ContentHeight - it.LeadingTop;
                     break;
                 default:
-                    box.Y = y + (maxAscent - it.Asc);
-                    var elem = box.Element;
-                    var cssVa = elem?.Style?.VerticalAlign ?? VerticalAlign.Baseline;
-                    var tag = elem?.TagName;
-                    if (cssVa == VerticalAlign.Super || tag == "sup") box.Y -= it.H * 0.35f;
-                    else if (cssVa == VerticalAlign.Sub || tag == "sub") box.Y += it.H * 0.25f;
-                    if (elem?.Style?.VerticalAlignPercent is { } percent)
-                        box.Y -= lineH * percent / 100f;
-                    // CSS2 vertical-align <length> (Task 9): a signed pixel
-                    // shift of the baseline — positive raises the box,
-                    // negative lowers it, stacked after the keyword/percent
-                    // adjustments like the spec's order of operations.
-                    if (elem?.Style?.VerticalAlignLength is { } lengthShift)
-                        box.Y -= lengthShift;
+                    box.Y = y + maxAscent - it.Asc - GetBaselineShift(it, lineH);
                     break;
             }
 
@@ -1170,6 +1267,22 @@ public static class InlineLayout
         }
 
         return lineH;
+    }
+
+    private static float GetBaselineShift(MeasuredItem item, float lineHeight)
+    {
+        var box = item.Box;
+        var style = box.StyleOverride ?? box.Element?.Style;
+        float shift = 0f;
+        if (style?.VerticalAlign == VerticalAlign.Super || box.Element?.TagName == "sup")
+            shift += item.H * 0.35f;
+        else if (style?.VerticalAlign == VerticalAlign.Sub || box.Element?.TagName == "sub")
+            shift -= item.H * 0.25f;
+        if (style?.VerticalAlignPercent is { } percent)
+            shift += lineHeight * percent / 100f;
+        if (style?.VerticalAlignLength is { } length)
+            shift += length;
+        return shift;
     }
 
     private static float ResolveTextIndent(ComputedStyle style, float containingWidth) =>
@@ -1250,9 +1363,8 @@ public static class InlineLayout
             var style = styleOverride ?? box.StyleOverride ?? box.Element?.Style;
             if (_fontCache != null && style != null)
             {
-                var font = ResolveRunFont(style);
-
                 var measuredText = TransformText(box.TextRun, style.TextTransform);
+                var font = ResolveRunFont(style, measuredText);
                 width = MeasureTextWidth(measuredText, style);
                 contentHeight = font.GetHeight(_measureG);
 
@@ -1440,6 +1552,18 @@ public static class SelectRowModel
     /// <summary>Indentation of options inside an OPTGROUP (period-plausible
     /// 12px gutter).</summary>
     public const float GroupIndent = 12f;
+
+    public static int FindSelectableRow(IReadOnlyList<SelectRow> rows, int start, int direction)
+    {
+        if (rows.Count == 0 || direction == 0)
+            return -1;
+
+        int step = Math.Sign(direction);
+        for (int index = start; index >= 0 && index < rows.Count; index += step)
+            if (rows[index].Option != null)
+                return index;
+        return -1;
+    }
 
     /// <summary>
     /// Builds the row list from the select's DIRECT children: optgroups

@@ -553,9 +553,9 @@ public static class DomBindings
         var n = new JsObject();
 
         // Compatibility profiles affect both the advertised personality and
-        // the exposed DOM. Retro96 is the engine's native compatibility union:
-        // it keeps its own identity while exposing both IE- and Navigator-era
-        // surfaces instead of pretending to be only one browser.
+        // the exposed DOM. The native union uses IE5's navigator identity,
+        // matching its default profile and IE-oriented layout/DOM behavior,
+        // while still exposing both IE- and Navigator-era surfaces.
         if (prefs.EngineMode == RetroEngineMode.InternetExplorer5)
         {
             // IE5, March 1999: JScript 5.0, ES3-era.
@@ -585,8 +585,8 @@ public static class DomBindings
         }
         else
         {
-            n.Set("appName", JsValue.From("Retro96"));
-            n.Set("appVersion", JsValue.From("2.0 (Windows 98; IE5+NN4.7 compatibility)"));
+            n.Set("appName", JsValue.From("Microsoft Internet Explorer"));
+            n.Set("appVersion", JsValue.From("5.0 (Windows 98; Win32)"));
             n.Set("appCodeName", JsValue.From("Mozilla"));
         }
 
@@ -1873,6 +1873,23 @@ public static class DomBindings
             return n;
         }
 
+        private static IEnumerable<DomElement> TableRows(DomElement table)
+        {
+            foreach (var child in table.ElementChildren())
+            {
+                if (child.TagName == "tr")
+                {
+                    yield return child;
+                    continue;
+                }
+
+                if (child.TagName is "thead" or "tbody" or "tfoot")
+                    foreach (var row in child.ElementChildren())
+                        if (row.TagName == "tr")
+                            yield return row;
+            }
+        }
+
         /// <summary>The selected option — first option by default (matches
         /// the renderer's dropdown and form submission).</summary>
         private static DomElement? SelectedOption(DomElement select)
@@ -2146,26 +2163,19 @@ public static class DomBindings
             {
                 double left = parentBox != null ? box.X - parentBox.X : box.X;
                 double top = parentBox != null ? box.Y - parentBox.Y : box.Y;
-                var boxStyle = _element.Style;
-                double width = boxStyle?.Width is { } authoredWidth
-                    ? authoredWidth + boxStyle.PaddingLeft + boxStyle.PaddingRight +
-                      boxStyle.BorderLeftWidth + boxStyle.BorderRightWidth
-                    : box.Width + box.PaddingLeft + box.PaddingRight +
-                      box.BorderLeft + box.BorderRight;
-                double height = boxStyle?.Height is { } authoredHeight
-                    ? authoredHeight + boxStyle.PaddingTop + boxStyle.PaddingBottom +
-                      boxStyle.BorderTopWidth + boxStyle.BorderBottomWidth
-                    : box.Height + box.PaddingTop + box.PaddingBottom +
-                      box.BorderTop + box.BorderBottom;
+                double width = box.BorderRect.Width;
+                double height = box.BorderRect.Height;
                 return (left, top, width, height);
             }
 
             var style = _element.Style;
             if (style == null) return (0, 0, 0, 0);
-            double w = (style.Width ?? 0) + style.PaddingLeft + style.PaddingRight +
-                       style.BorderLeftWidth + style.BorderRightWidth;
-            double h = (style.Height ?? 0) + style.PaddingTop + style.PaddingBottom +
-                       style.BorderTopWidth + style.BorderBottomWidth;
+            double w = (style.Width ?? 0) + (BrowserRuntime.UsesIe5BoxModel ? 0 :
+                       style.PaddingLeft + style.PaddingRight +
+                       style.BorderLeftWidth + style.BorderRightWidth);
+            double h = (style.Height ?? 0) + (BrowserRuntime.UsesIe5BoxModel ? 0 :
+                       style.PaddingTop + style.PaddingBottom +
+                       style.BorderTopWidth + style.BorderBottomWidth);
             return (style.Left ?? 0, style.Top ?? 0, w, h);
         }
 
@@ -2174,19 +2184,14 @@ public static class DomBindings
             var box = _element.Box;
             if (box != null)
             {
-                var boxStyle = _element.Style;
-                double clientContentWidth = boxStyle?.Width is { } authoredWidth
-                    ? authoredWidth + boxStyle.PaddingLeft + boxStyle.PaddingRight
-                    : box.Width + box.PaddingLeft + box.PaddingRight;
-                double clientContentHeight = boxStyle?.Height is { } authoredHeight
-                    ? authoredHeight + boxStyle.PaddingTop + boxStyle.PaddingBottom
-                    : box.Height + box.PaddingTop + box.PaddingBottom;
-                return (clientContentWidth, clientContentHeight);
+                return (box.PaddingRect.Width, box.PaddingRect.Height);
             }
             var style = _element.Style;
             if (style == null) return (0, 0);
-            double width = (style.Width ?? 0) + style.PaddingLeft + style.PaddingRight;
-            double height = (style.Height ?? 0) + style.PaddingTop + style.PaddingBottom;
+            double width = (style.Width ?? 0) + (BrowserRuntime.UsesIe5BoxModel
+                ? 0 : style.PaddingLeft + style.PaddingRight);
+            double height = (style.Height ?? 0) + (BrowserRuntime.UsesIe5BoxModel
+                ? 0 : style.PaddingTop + style.PaddingBottom);
             return (width, height);
         }
 
@@ -2658,6 +2663,46 @@ public static class DomBindings
                     _canvas?.SubmitForm(_element, null, dispatchSubmitEvent: false);
                     return JsValue.Undefined;
                 }, _scope, "submit"));
+
+            if (name == "insertRow" && _element.TagName == "table")
+                return JsValue.FromFunction(new JsFunction((self, args) =>
+                {
+                    int index = -1;
+                    if (args.Length > 0)
+                    {
+                        double requestedIndex = JsValue.StringToNumber(args[0].ToJsString());
+                        if (!double.IsFinite(requestedIndex))
+                            return JsValue.Null;
+                        index = (int)Math.Truncate(requestedIndex);
+                    }
+
+                    var rows = TableRows(_element).ToList();
+                    if (index < -1 || index > rows.Count)
+                        return JsValue.Null;
+
+                    var row = new DomElement("tr");
+                    if (index >= 0 && index < rows.Count)
+                    {
+                        var reference = rows[index];
+                        reference.Parent?.InsertBefore(row, reference);
+                    }
+                    else
+                    {
+                        var body = _element.ElementChildren()
+                            .LastOrDefault(child => child.TagName == "tbody");
+                        if (body == null)
+                        {
+                            body = new DomElement("tbody");
+                            var footer = _element.ElementChildren()
+                                .FirstOrDefault(child => child.TagName == "tfoot");
+                            _element.InsertBefore(body, footer);
+                        }
+                        body.AppendChild(row);
+                    }
+
+                    _canvas?.ReflowDocument();
+                    return WrapChildValue(row);
+                }, _scope, "insertRow"));
 
             // appendChild / insertBefore / removeChild / replaceChild — the
             // old DOM mutation surface for pages that build small bits of UI

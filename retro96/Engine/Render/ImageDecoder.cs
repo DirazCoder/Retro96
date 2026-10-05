@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Retro96.Drawing;
 using SkiaSharp;
+using Svg.Skia;
 
 namespace Retro96.Engine.Render;
 
@@ -27,14 +28,16 @@ public record DecodedImage(
 /// GIF87a/GIF89a (multi-frame, per-frame delay, disposal, interlaced,
 /// transparency) decode through Skia's SKCodec — each frame is composited
 /// onto the running canvas with its disposal method applied, exactly what
-/// legacy frame-selection code previously did; JPEG baseline/progressive, PNG, BMP, ICO and other Skia-supported
-/// formats decode directly into immutable SKImage objects; XBM (the era's other icon
-/// format) through a hand parser.  Anything unrecognised or truncated
-/// yields the broken-image icon so layout keeps a stable box instead of
-/// collapsing.
+/// legacy frame-selection code previously did; SVGs are rasterized through
+/// Svg.Skia; JPEG, PNG, BMP, ICO and other Skia-supported formats decode
+/// directly into immutable SKImage objects; XBM (the era's other icon
+/// format) uses a hand parser. Anything unrecognised or truncated yields
+/// the broken-image icon so layout keeps a stable box instead of collapsing.
 /// </summary>
 public static class ImageDecoder
 {
+    private const int SvgRasterScale = 4;
+
     public static DecodedImage Decode(byte[] data, string contentType)
     {
         if (data == null || data.Length == 0)
@@ -47,6 +50,9 @@ public static class ImageDecoder
 
             if (IsXbm(data, contentType))
                 return DecodeXbm(data);
+
+            if (IsSvg(data, contentType))
+                return DecodeSvg(data);
 
             // JPEG / PNG / BMP / ICO / WebP / AVIF — keep the decoded web
             // resource as an immutable SKImage. Skia can decode lazily and
@@ -83,6 +89,59 @@ public static class ImageDecoder
         // XBM files are C source — start with #define
         var start = Encoding.ASCII.GetString(data, 0, Math.Min(32, data.Length));
         return start.Contains("#define");
+    }
+
+    private static bool IsSvg(byte[] data, string contentType)
+    {
+        if (contentType?.Contains("image/svg+xml", StringComparison.OrdinalIgnoreCase) == true)
+            return true;
+        if (contentType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true)
+            return false;
+
+        string prefix = Encoding.UTF8.GetString(data, 0, Math.Min(512, data.Length));
+        return prefix.Contains("<svg", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static DecodedImage DecodeSvg(byte[] data)
+    {
+        using var stream = new MemoryStream(data, writable: false);
+        using var svg = new SKSvg();
+        var picture = svg.Load(stream);
+        if (picture == null)
+            return Broken();
+
+        var bounds = picture.CullRect;
+        if (!float.IsFinite(bounds.Left) || !float.IsFinite(bounds.Top) ||
+            !float.IsFinite(bounds.Right) || !float.IsFinite(bounds.Bottom) ||
+            bounds.Width <= 0 || bounds.Height <= 0 ||
+            bounds.Width > 8192 || bounds.Height > 8192 ||
+            bounds.Width * bounds.Height > 32_000_000)
+            return Broken();
+
+        float scale = Math.Min(SvgRasterScale, Math.Min(
+            8192f / bounds.Width,
+            Math.Min(8192f / bounds.Height,
+                MathF.Sqrt(32_000_000f / (bounds.Width * bounds.Height)))));
+        int logicalWidth = (int)MathF.Ceiling(bounds.Width);
+        int logicalHeight = (int)MathF.Ceiling(bounds.Height);
+        int width = (int)MathF.Ceiling(bounds.Width * scale);
+        int height = (int)MathF.Ceiling(bounds.Height * scale);
+        using var bitmap = new SKBitmap(new SKImageInfo(
+            width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(bitmap))
+        {
+            canvas.Clear(SKColors.Transparent);
+            var matrix = SKMatrix.CreateScaleTranslation(
+                scale, scale, -bounds.Left * scale, -bounds.Top * scale);
+            canvas.DrawPicture(picture, in matrix);
+            canvas.Flush();
+        }
+        bitmap.SetImmutable();
+        var rasterized = SKImage.FromBitmap(bitmap);
+        return rasterized == null
+            ? Broken()
+            : new DecodedImage(
+                [new Bitmap(rasterized, logicalWidth, logicalHeight)], [0], false);
     }
 
     /// <summary>

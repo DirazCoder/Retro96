@@ -41,6 +41,11 @@ public class JsInterpreterException : Exception
     public JsInterpreterException(string message) : base(message) { }
 }
 
+public sealed class JsTypeErrorException : JsInterpreterException
+{
+    public JsTypeErrorException(string message) : base(message) { }
+}
+
 /// <summary>
 /// Tree-walking interpreter for JavaScript 1.1/1.2.
 ///
@@ -49,8 +54,8 @@ public class JsInterpreterException : Exception
 ///   • plain calls get the global object as 'this'
 ///   • timers (setTimeout/setInterval) take script functions OR the era's
 ///     string-code form — the callback runs through CallFunction
-///   • runtime errors convert to catchable Error objects inside try/catch,
-///     and any script error stops only that script, never the renderer
+///   • runtime errors convert to catchable Error/TypeError objects inside
+///     try/catch, and any script error stops only that script, never the renderer
 ///   • recursion depth, execution time, and string-allocation totals are
 ///     all capped so hostile pages cannot hang the browser
 /// </summary>
@@ -200,6 +205,7 @@ public class JsInterpreter
     public static JsObject? BooleanPrototype { get; set; }
     public static JsObject? ArrayPrototype { get; set; }
     public static JsObject? ObjectPrototype { get; set; }
+    public static JsObject? FunctionPrototype { get; set; }
 
     // ─────────────────────────────────────────────────────────────────────
 
@@ -1397,8 +1403,14 @@ public class JsInterpreter
             // Runtime errors are catchable, period-style
             if (tr.Handler != null)
             {
-                var err = new JsObject { Class = "Error" };
-                err.Set("name", JsValue.From("Error"));
+                string errorName = ex is JsTypeErrorException ? "TypeError" : "Error";
+                JsValue constructor = _currentScope.Get(errorName);
+                JsObject? prototype = constructor.Type == JsType.Function &&
+                    constructor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } prototypeValue
+                        ? prototypeValue.GetObject()
+                        : null;
+                var err = new JsObject { Class = "Error", Prototype = prototype };
+                err.Set("name", JsValue.From(errorName));
                 err.Set("message", JsValue.From(ex.Message));
                 RunCatchHandler(tr.Handler, JsValue.FromObject(err));
             }
@@ -1925,6 +1937,7 @@ public class JsInterpreter
             for (int i = 0; i < args.Length; i++)
                 argsObj.Set(i.ToString(), args[i]);
             argsObj.Set("length", JsValue.From(args.Length));
+            argsObj.Set("callee", JsValue.FromFunction(func));
             funcScope.Define("arguments", JsValue.FromObject(argsObj));
 
             var body = func.Body ?? throw new JsInterpreterException("Function body is missing");
@@ -2009,7 +2022,7 @@ public class JsInterpreter
                 // undefined is a catchable TypeError ("'x' is null or not
                 // an object", in IE5's words).
                 if (target.Type is JsType.Null or JsType.Undefined)
-                    throw new JsInterpreterException(
+                    throw new JsTypeErrorException(
                         $"'{name}' is null or not an object");
                 return JsValue.Undefined;
         }

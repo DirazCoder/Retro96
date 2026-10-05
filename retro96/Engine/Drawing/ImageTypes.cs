@@ -45,6 +45,8 @@ public abstract class Image : IDisposable
     private SKImage? _skImage;
     private SKImage? _gpuImage;
     private IntPtr _gpuContextHandle;
+    private int _logicalWidth;
+    private int _logicalHeight;
     private readonly object _imageLock = new();
 
     // Mutable raster storage is kept only for compatibility pixel APIs.
@@ -59,12 +61,25 @@ public abstract class Image : IDisposable
         _skImage = image ?? throw new ArgumentNullException(nameof(image));
     }
 
+    protected Image(SKImage image, int logicalWidth, int logicalHeight)
+        : this(image)
+    {
+        _logicalWidth = logicalWidth;
+        _logicalHeight = logicalHeight;
+    }
+
+    protected void SetLogicalSize(int width, int height)
+    {
+        _logicalWidth = width;
+        _logicalHeight = height;
+    }
+
     public int Width
     {
         get
         {
             lock (_imageLock)
-                return _skImage?.Width ?? Sk?.Width ?? 0;
+                return _logicalWidth > 0 ? _logicalWidth : _skImage?.Width ?? Sk?.Width ?? 0;
         }
     }
 
@@ -73,7 +88,7 @@ public abstract class Image : IDisposable
         get
         {
             lock (_imageLock)
-                return _skImage?.Height ?? Sk?.Height ?? 0;
+                return _logicalHeight > 0 ? _logicalHeight : _skImage?.Height ?? Sk?.Height ?? 0;
         }
     }
 
@@ -236,13 +251,22 @@ public sealed class Bitmap : Image
     {
     }
 
+    /// <summary>Wraps a high-resolution raster while preserving its CSS-pixel size.</summary>
+    public Bitmap(SKImage image, int logicalWidth, int logicalHeight)
+        : base(image, logicalWidth, logicalHeight)
+    {
+    }
+
     /// <summary>Copies an existing image (legacy clone semantics).</summary>
     public Bitmap(Image image)
     {
         ArgumentNullException.ThrowIfNull(image);
+        int logicalWidth = image.Width;
+        int logicalHeight = image.Height;
         var source = image.GetSkImage();
         Sk = SKBitmap.FromImage(source)
             ?? throw new InvalidOperationException("Could not copy source image.");
+        SetLogicalSize(logicalWidth, logicalHeight);
     }
 
     public Bitmap Clone() => new(this);
@@ -255,13 +279,21 @@ public sealed class Bitmap : Image
 
         if (Sk is { } writableBitmap)
         {
-            var current = writableBitmap.GetPixel(x, y);
+            int pixelX = Math.Min(writableBitmap.Width - 1,
+                (int)(x * writableBitmap.Width / (float)Width));
+            int pixelY = Math.Min(writableBitmap.Height - 1,
+                (int)(y * writableBitmap.Height / (float)Height));
+            var current = writableBitmap.GetPixel(pixelX, pixelY);
             return Color.FromArgb(current.Alpha, current.Red, current.Green, current.Blue);
         }
 
         using var snapshot = SKBitmap.FromImage(GetSkImage());
         if (snapshot == null) return Color.Empty;
-        var c = snapshot.GetPixel(x, y);
+        int snapshotX = Math.Min(snapshot.Width - 1,
+            (int)(x * snapshot.Width / (float)Width));
+        int snapshotY = Math.Min(snapshot.Height - 1,
+            (int)(y * snapshot.Height / (float)Height));
+        var c = snapshot.GetPixel(snapshotX, snapshotY);
         return Color.FromArgb(c.Alpha, c.Red, c.Green, c.Blue);
     }
 

@@ -35,7 +35,7 @@ public enum TrustMode
 public sealed class UserSettings
 {
     public const string DefaultSearchUrl = "https://www.frogfind.com/?q=%s";
-    public const string DefaultRetro96UserAgent = "Mozilla/5.0 (Retro96/2.0; Windows 98; IE5+NN4.7 compatibility)";
+    public const string DefaultRetro96UserAgent = DefaultIe5UserAgent;
     // Navigator 3 used the Mozilla/3.0 product token with platform and
     // security fields in the parenthesized comment. Keep the default
     // historical rather than carrying the Retro96 product marker.

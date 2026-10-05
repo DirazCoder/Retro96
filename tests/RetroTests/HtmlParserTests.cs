@@ -187,6 +187,46 @@ public class HtmlParserTests
         Check.Done();
     }
 
+    [Fact]
+    public void ImpliedParagraphBreakReconstructsOpenFormattingChain()
+    {
+        var doc = Parse("<html><body><p><b>bold <i>bold-italic <u>bold-italic-underline" +
+                        "<p>paragraph break inside three unclosed inlines" +
+                        "<p>fourth paragraph — reconstruction must reopen b/i/u.</body></html>");
+        Retro96.Engine.Css.StyleResolver.Resolve(doc, 800);
+        var paragraphs = doc.AllTags("p").ToList();
+
+        Check.That(paragraphs.Count == 3, "each implied paragraph break creates a sibling paragraph",
+            paragraphs.Count.ToString());
+
+        string[] expectedText =
+        [
+            "bold bold-italic bold-italic-underline",
+            "paragraph break inside three unclosed inlines",
+            "fourth paragraph — reconstruction must reopen b/i/u."
+        ];
+        for (int i = 0; i < Math.Min(paragraphs.Count, expectedText.Length); i++)
+        {
+            var bold = paragraphs[i].ElementChildren().FirstOrDefault(e => e.TagName == "b");
+            var italic = bold?.ElementChildren().FirstOrDefault(e => e.TagName == "i");
+            var underline = italic?.ElementChildren().FirstOrDefault(e => e.TagName == "u");
+            Check.That(bold != null && italic != null && underline != null,
+                $"paragraph {i + 1} reconstructs the b/i/u chain");
+            Check.That(bold?.Style?.FontWeight == Retro96.Engine.Css.FontWeightValue.Bold &&
+                       italic?.Style?.FontStyle == Retro96.Engine.Css.FontStyleValue.Italic &&
+                       underline?.Style?.TextDecoration.HasFlag(Retro96.Engine.Css.TextDecoration.Underline) == true,
+                $"paragraph {i + 1} retains bold, italic, and underline styling");
+            Check.That(paragraphs[i].InnerText.Trim() == expectedText[i],
+                $"paragraph {i + 1} retains all of its text",
+                paragraphs[i].InnerText.Trim());
+            if (i > 0)
+                Check.That(underline?.InnerText.Trim() == expectedText[i],
+                    $"paragraph {i + 1} text remains inside the reconstructed formatting chain",
+                    underline?.InnerText.Trim() ?? "(no underline chain)");
+        }
+        Check.Done();
+    }
+
     // ── attribute quoting ────────────────────────────────────────────
 
     [Fact]

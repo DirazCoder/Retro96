@@ -1795,7 +1795,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         foreach (var box in rootBox.Descendants())
         {
             if (ReferenceEquals(box, rootBox)) continue;
-            width = Math.Max(width, box.X + Math.Max(0f, box.Width));
+            width = Math.Max(width, box.ScrollableRight);
             height = Math.Max(height, box.Y + Math.Max(0f, box.Height));
         }
 
@@ -4025,6 +4025,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
         g.Restore(oldClip);
 
+        if (paintLiveFieldText && el.TagName == "input")
+        {
+            var screenBorder = new RectangleF(
+                box.BorderRect.X - scrollX, box.BorderRect.Y - scrollY,
+                box.BorderRect.Width, box.BorderRect.Height);
+            Renderer.PaintSunkenRect(g, screenBorder, 2, fieldBackground);
+        }
+
         using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
         g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
             face.Width - 1, face.Height - 1);
@@ -4663,7 +4671,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             foreach (var box in _rootBox.Descendants())
             {
                 if (ReferenceEquals(box, _rootBox)) continue;
-                width = Math.Max(width, box.X + Math.Max(0f, box.Width));
+                width = Math.Max(width, box.ScrollableRight);
                 height = Math.Max(height, box.Y + Math.Max(0f, box.Height));
             }
             _documentContentExtent = new SizeF(width, height);
@@ -9575,7 +9583,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         foreach (var box in rootBox.Descendants())
         {
             if (ReferenceEquals(box, rootBox)) continue;
-            width = Math.Max(width, box.X + Math.Max(0f, box.Width));
+            width = Math.Max(width, box.ScrollableRight);
             height = Math.Max(height, box.Y + Math.Max(0f, box.Height));
         }
 
@@ -10801,24 +10809,41 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             int selectedRow = rows.FindIndex(row =>
                 ReferenceEquals(row.Option, currentOpt));
             list.SelectedIndex = Math.Max(0, selectedRow);
+            int lastSelectableRow = list.SelectedIndex;
+            bool restoringSelection = false;
+            list.SelectedIndexChanged += (_, _) =>
+            {
+                if (restoringSelection) return;
+                int index = list.SelectedIndex;
+                if (index >= 0 && rows[index].Option != null)
+                {
+                    lastSelectableRow = index;
+                    return;
+                }
+
+                restoringSelection = true;
+                list.SelectedIndex = lastSelectableRow;
+                restoringSelection = false;
+            };
             list.DrawItem += (_, e) =>
             {
                 if (e.Index < 0 || e.Index >= rows.Count) return;
                 var row = rows[e.Index];
-                e.DrawBackground();
                 float left = e.Bounds.Left + 3f + row.Indent;
-                var drawFont = row.IsGroupHeader
-                    ? new System.Drawing.Font(list.Font, System.Drawing.FontStyle.Bold)
-                    : list.Font;
-                try
+                if (row.IsGroupHeader)
                 {
+                    e.Graphics.FillRectangle(System.Drawing.SystemBrushes.Window, e.Bounds);
+                    using var headerFont = new System.Drawing.Font(
+                        list.Font, System.Drawing.FontStyle.Bold);
                     e.Graphics.DrawString((string)list.Items[e.Index]!,
-                        drawFont, System.Drawing.Brushes.Black, left, e.Bounds.Top + 1f);
+                        headerFont, System.Drawing.SystemBrushes.WindowText,
+                        left, e.Bounds.Top + 1f);
+                    return;
                 }
-                finally
-                {
-                    if (row.IsGroupHeader) drawFont.Dispose();
-                }
+
+                e.DrawBackground();
+                e.Graphics.DrawString((string)list.Items[e.Index]!,
+                    list.Font, System.Drawing.Brushes.Black, left, e.Bounds.Top + 1f);
                 e.DrawFocusRectangle();
             };
             list.MouseClick += (_, e) =>
@@ -10827,9 +10852,37 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (rowIndex >= 0 && rowIndex < rows.Count &&
                     rows[rowIndex].Option is { } option)
                     ApplySelectedOption(options.IndexOf(option));
+                else if (rowIndex >= 0 && rowIndex < rows.Count)
+                    list.SelectedIndex = lastSelectableRow;
             };
             list.KeyDown += (_, e) =>
             {
+                int direction = e.KeyCode switch
+                {
+                    Keys.Up or Keys.Home or Keys.PageUp => -1,
+                    Keys.Down or Keys.End or Keys.PageDown => 1,
+                    _ => 0
+                };
+                if (direction != 0)
+                {
+                    int start = e.KeyCode switch
+                    {
+                        Keys.Home => 0,
+                        Keys.End => rows.Count - 1,
+                        Keys.PageUp => Math.Max(0, list.SelectedIndex -
+                            Math.Max(1, list.ClientSize.Height / Math.Max(1, list.ItemHeight))),
+                        Keys.PageDown => Math.Min(rows.Count - 1, list.SelectedIndex +
+                            Math.Max(1, list.ClientSize.Height / Math.Max(1, list.ItemHeight))),
+                        _ => list.SelectedIndex + direction
+                    };
+                    int next = Engine.Layout.SelectRowModel.FindSelectableRow(rows, start, direction);
+                    if (next >= 0)
+                        list.SelectedIndex = next;
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    return;
+                }
+
                 if (e.KeyCode != Keys.Enter || list.SelectedIndex < 0) return;
                 if (rows[list.SelectedIndex].Option is { } option)
                     ApplySelectedOption(options.IndexOf(option));

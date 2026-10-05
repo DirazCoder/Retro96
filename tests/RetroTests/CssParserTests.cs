@@ -45,6 +45,25 @@ public class CssParserTests
     }
 
     [Fact]
+    public void QuotedLegacyLinkColorsDoNotSuppressBodyLinkColor()
+    {
+        var doc = HtmlParser.Parse(
+            "<html><head><style>A:link {color:\"#003399\";} " +
+            "A:visited {color:\"#003399\";} A:hover {color:\"red\";}</style></head>" +
+            "<body link=\"#003399\" vlink=\"#003399\" alink=\"#003399\">" +
+            "<a href=\"/target\">target</a></body></html>",
+            ParsedUrl.Parse("http://example.test/"), new CookieStore());
+        StyleResolver.Resolve(doc);
+
+        var link = doc.AllTags("a").Single();
+        Check.That(link.Style?.Color == Color.FromArgb(0x00, 0x33, 0x99),
+            "BODY LINK color survives quoted, invalid CSS color values",
+            $"resolvedLink={StyleResolver.GetLinkColor(doc)}, bodyLink={doc.BodyLinkColor}, href={link.GetAttr("href")}, " +
+            $"ownColor={link.Style?.OwnColor}, color={link.Style?.Color}");
+        Check.Done();
+    }
+
+    [Fact]
     public void DynamicPseudoClassesUseDocumentInteractionState()
     {
         var doc = ParseAndResolve("<a id='go' href='/x'><span>go</span></a>");

@@ -100,6 +100,16 @@ public class Retro99SuiteTests
         Check.That(doc.AllTags("tbody").Count >= 2, "explicit tbody sections parse");
         Check.That(doc.AllTags("colgroup").Count >= 1 && doc.AllTags("col").Count >= 1,
             "colgroup + col parse");
+        var caption = doc.FirstTag("caption");
+        var captionBox = caption == null ? null : LayoutHarness.BoxOf(root, caption);
+        float tableGridBottom = doc.FirstTag("table")!.ElementDescendants()
+            .Where(e => e.TagName is "td" or "th")
+            .Select(cell => LayoutHarness.BoxOf(root, cell)?.BorderRect.Bottom ?? 0f)
+            .DefaultIfEmpty(0f).Max();
+        Check.That(caption?.GetAttr("align") == "bottom" &&
+                   captionBox != null && captionBox.Y >= tableGridBottom,
+            "the bottom caption is positioned after the table grid",
+            $"captionY={captionBox?.Y:0.#}, gridBottom={tableGridBottom:0.#}");
         Check.That(doc.AllTags("q").Count == 1, "Q parses");
         Check.That(doc.AllTags("ins").Count == 1 && doc.AllTags("del").Count == 1,
             "ins + del parse");
@@ -107,8 +117,30 @@ public class Retro99SuiteTests
             "abbr + acronym parse");
         Check.That(doc.AllTags("bdo").Count == 1 && doc.AllTags("span").Count >= 1,
             "bdo + span parse");
+        var bdo = doc.FirstTag("bdo");
+        string bdoText = bdo == null ? "" : string.Concat(root.Descendants()
+            .Where(box => ReferenceEquals(box.Element, bdo) && !string.IsNullOrEmpty(box.TextRun))
+            .OrderBy(box => box.X)
+            .Select(box => box.TextRun));
+        Check.That(bdo?.Style?.Direction == DirectionValue.Rtl &&
+                   bdo.Style.UnicodeBidi == "bidi-override",
+            "bdo dir=rtl resolves to a directional override");
+        Check.That(bdoText == "ltr=rid htiw ODB",
+            "bdo text is laid out in right-to-left visual order",
+            bdoText);
         Check.That(doc.AllTags("ruby").Count == 1 && doc.AllTags("rt").Count == 1,
             "ruby + rt parse");
+        var ruby = doc.FirstTag("ruby");
+        var rubyBase = LayoutHarness.TextBoxContaining(root, "\u6F22\u5B57");
+        var rubyFont = ruby?.Style == null ? null : LayoutHarness.Fonts.ResolveForText(
+            ruby.Style.FontFamily, ruby.Style.FontSize, (int)ruby.Style.FontWeight,
+            ruby.Style.FontStyle == FontStyleValue.Italic,
+            ruby.Style.FontStyle == FontStyleValue.Oblique, "\u6F22\u5B57");
+        Check.That(rubyBase?.TextRun == "\u6F22\u5B57",
+            "ruby base CJK characters are retained instead of replaced with question marks",
+            rubyBase?.TextRun ?? "(no ruby base text run)");
+        Check.That(rubyFont?.SkFont.ContainsGlyphs("\u6F22\u5B57") == true,
+            "text-aware font fallback resolves a font containing both ruby base glyphs");
         Check.That(doc.AllTags("button").Count == 1, "button with rich content parses");
         Check.That(doc.ElementDescendants().Any(e => e.TagName == "input" && e.GetAttr("name") == "terms"),
             "isindex synthesizes its search form (spec behaviour)");
@@ -129,6 +161,8 @@ public class Retro99SuiteTests
             "Greek entities decode");
         Check.That(body.Contains("\u2014") && body.Contains("\u2022") && body.Contains("\u20AC"),
             "mdash, bull and euro entities decode");
+        Check.That(body.Contains("Paragraph with nowrap \u2014 width wins over wrapping."),
+            "the declared Latin-1 fixture uses an entity for its em dash");
         Check.That(body.Contains("AB"), "numeric decimal/hex refs decode");
 
         // DOCTYPE recorded, quirks for transitional
@@ -572,7 +606,7 @@ public class Retro99SuiteTests
             "es3 scripts run clean",
             string.Join(" | ", page.ScriptErrors.Take(3)));
         string report = TextOf(page.Document, "r1") ?? "";
-        Check.That(report.Contains("catch=Error"), "try/catch yields an Error object");
+        Check.That(report.Contains("catch=TypeError"), "null property access yields a TypeError");
         Check.That(report.Contains("finally=ok"), "finally runs");
         Check.That(report.Contains("switch-fallthrough=one two"), "switch fallthrough works");
         Check.That(report.Contains("dowhile=3"), "do-while works");

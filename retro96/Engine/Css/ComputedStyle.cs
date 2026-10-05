@@ -719,7 +719,8 @@ public class ComputedStyle
         // Named colour
         try
         {
-            return ColorTranslator.FromHtml(v.ToLowerInvariant());
+            var parsed = ColorTranslator.FromHtml(v.ToLowerInvariant());
+            return parsed == Color.Empty ? fallback : parsed;
         }
         catch
         {
