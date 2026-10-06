@@ -393,7 +393,8 @@ public static class LayoutEngine
                         // IMG quirk: an img lays out as margin+border+width+
                         // border+margin — padding never participates at all,
                         // so it is dropped from the box itself.
-                        if (BrowserRuntime.UsesIe5BoxModel && elem.TagName == "img" &&
+                        if (BrowserRuntime.UsesIe5BoxModelFor(elem.OwnerDocument()) &&
+                            elem.TagName == "img" &&
                             (style.Width is > 0f || style.Height is > 0f))
                         {
                             box.PaddingLeft = 0f;
@@ -1595,7 +1596,7 @@ public static class LayoutEngine
     private static float AuthoredContentExtent(DomElement elem, float authored,
         float paddingExtent, float borderExtent)
     {
-        if (!BrowserRuntime.UsesIe5BoxModel)
+        if (!BrowserRuntime.UsesIe5BoxModelFor(elem.OwnerDocument()))
             return authored;
         float pad = elem.TagName == "img" ? 0f : paddingExtent;
         return Math.Max(0f, authored - pad - borderExtent);
@@ -1623,7 +1624,7 @@ public static class LayoutEngine
             (style.MaxWidthPercent is { } xp ? basis * xp / 100f : float.MaxValue);
         if (max < min) max = min;
 
-        if (BrowserRuntime.UsesIe5BoxModel)
+        if (BrowserRuntime.UsesIe5BoxModelFor(box.Element?.OwnerDocument()))
         {
             float chrome = box.BorderLeft + box.BorderRight
                          + box.PaddingLeft + box.PaddingRight;
@@ -1660,7 +1661,7 @@ public static class LayoutEngine
             (style.MaxHeightPercent is { } xp ? basis * xp / 100f : float.MaxValue);
         if (max < min) max = min;
 
-        if (BrowserRuntime.UsesIe5BoxModel)
+        if (BrowserRuntime.UsesIe5BoxModelFor(box.Element?.OwnerDocument()))
         {
             float chrome = box.BorderTop + box.BorderBottom
                          + box.PaddingTop + box.PaddingBottom;
@@ -2252,18 +2253,19 @@ public static class LayoutEngine
         var style = box.Element?.Style;
         if (style == null) return;
 
-        float cbContentX = containingBlock.X
-                         + containingBlock.BorderLeft + containingBlock.PaddingLeft;
-        float cbContentY = containingBlock.Y
-                         + containingBlock.BorderTop + containingBlock.PaddingTop;
+        // CSS2 positions absolute descendants against the containing block's
+        // padding box: the origin is the inner border edge, and its size
+        // includes the containing block's padding.
+        float cbPaddingX = containingBlock.X + containingBlock.BorderLeft;
+        float cbPaddingY = containingBlock.Y + containingBlock.BorderTop;
         float cbWidth = style.Position == PositionValue.Fixed &&
             containingBlock.ViewportWidth > 0f
                 ? containingBlock.ViewportWidth
-                : containingBlock.Width;
+                : containingBlock.Width + containingBlock.PaddingLeft + containingBlock.PaddingRight;
         float cbHeight = style.Position == PositionValue.Fixed &&
             containingBlock.ViewportHeight > 0f
                 ? containingBlock.ViewportHeight
-                : containingBlock.Height;
+                : containingBlock.Height + containingBlock.PaddingTop + containingBlock.PaddingBottom;
 
         // FIX: top/left/right/bottom percentages used to be flattened to
         // pixels back in ComputedStyle.Apply, against the page viewport
@@ -2290,17 +2292,17 @@ public static class LayoutEngine
         float targetY = box.Y;
 
         if (left.HasValue)
-            targetX = cbContentX + left.Value + box.MarginLeft;
+            targetX = cbPaddingX + left.Value + box.MarginLeft;
         else if (right.HasValue)
-            targetX = cbContentX + cbWidth
+            targetX = cbPaddingX + cbWidth
                     - right.Value
                     - box.MarginRight - box.BorderLeft - box.BorderRight
                     - box.PaddingLeft - box.PaddingRight - box.Width;
 
         if (top.HasValue)
-            targetY = cbContentY + top.Value + box.MarginTop;
+            targetY = cbPaddingY + top.Value + box.MarginTop;
         else if (bottom.HasValue)
-            targetY = cbContentY + cbHeight
+            targetY = cbPaddingY + cbHeight
                     - bottom.Value
                     - box.MarginBottom - box.BorderTop - box.BorderBottom
                     - box.PaddingTop - box.PaddingBottom - box.Height;

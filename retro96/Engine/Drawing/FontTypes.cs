@@ -289,7 +289,6 @@ public sealed class Font : IDisposable
     public bool Oblique { get; }
     public GraphicsUnit Unit { get; }
     internal bool LegacyStrokeBoost { get; }
-    internal bool LegacyMonospaceStrokeBoost { get; }
 
     private readonly float _lineHeight;
     private readonly float _ascent;
@@ -378,13 +377,14 @@ public sealed class Font : IDisposable
 
         // IE-era GDI text was noticeably darker than a modern grayscale
         // antialiased regular face at small sizes. Keep the requested weight
-        // and metrics intact, but add a tiny glyph embolden for normal/medium
-        // web text at the sizes where the difference is most visible.
-        LegacyStrokeBoost = legacyRaster && Weight >= 400 && Weight <= 700 && px <= 16f;
-        LegacyMonospaceStrokeBoost = LegacyStrokeBoost &&
-            (Typeface.FamilyName.Contains("mono", StringComparison.OrdinalIgnoreCase) ||
-             Typeface.FamilyName.Contains("courier", StringComparison.OrdinalIgnoreCase) ||
-             Typeface.FamilyName.Contains("console", StringComparison.OrdinalIgnoreCase));
+        // and metrics intact, but add a tiny glyph embolden for proportional
+        // normal/medium web text at the sizes where the difference is most
+        // visible. Courier-style faces already have dense, fixed-width strokes.
+        bool isMonospace = Typeface.FamilyName.Contains("mono", StringComparison.OrdinalIgnoreCase) ||
+            Typeface.FamilyName.Contains("courier", StringComparison.OrdinalIgnoreCase) ||
+            Typeface.FamilyName.Contains("console", StringComparison.OrdinalIgnoreCase);
+        LegacyStrokeBoost = legacyRaster && !isMonospace &&
+            Weight >= 400 && Weight <= 700 && px <= 16f;
 
         // Families without a real bold face get Skia's synthetic embolden —
         // the equivalent of automatic bold synthesis.

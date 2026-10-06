@@ -6,13 +6,14 @@ namespace Retro96.Engine.Js;
 /// Lexical scope chain for the interpreter.  JS 1.1 semantics: var is
 /// function-scoped (blocks share their function's scope), assignment to an
 /// undeclared name becomes a property of the global object, and reading an
-/// undeclared name yields undefined rather than an error.
+/// undeclared identifier raises ReferenceError (except under typeof).
 ///
 /// The ROOT scope can carry a GlobalFallback object (the window): in real
 /// JS the global scope and the window object are the same thing, so bare
 /// alert()/confirm()/status reads resolve through the fallback, and
 /// implicit global writes (status = "…") land on it where both window.status
-/// and bare reads find them.
+/// and bare reads find them. The interpreter distinguishes missing bindings
+/// from declared bindings whose value is undefined when evaluating identifiers.
 /// </summary>
 public class JsScope
 {
@@ -35,7 +36,8 @@ public class JsScope
     /// The fallback is checked BEFORE the root's own dictionary so a direct
     /// window.foo write (which bypasses the scope) stays authoritative for
     /// both bare and window-qualified reads; scope writes keep the two in
-    /// sync anyway (see Set/Define).
+    /// sync anyway (see Set/Define). Unresolved names return Undefined here;
+    /// identifier evaluation applies the JavaScript ReferenceError rule.
     /// </summary>
     public JsValue Get(string name)
     {

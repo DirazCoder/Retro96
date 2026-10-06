@@ -92,11 +92,37 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private TopScrollbarAxis? _topScrollbarDragAxis;
     private float _topScrollbarGrabOffset;
 
-    // Display lists make scrolling a transform-only operation: the document is
-    // recorded once as an SKPicture and the GPU replays that command stream at
-    // the current scroll offset. No page raster is rebuilt per wheel tick.
+    // Display lists retain vector commands for invalidation and fallback; a
+    // bounded GPU raster is reused across frames and scroll transforms.
+    private sealed class RasterizedDisplayList : IDisposable
+    {
+        public RasterizedDisplayList(SKImage image, float width, float height, float zoom)
+        {
+            Image = image;
+            Width = width;
+            Height = height;
+            Zoom = zoom;
+        }
+
+        public SKImage Image { get; }
+        public float Width { get; }
+        public float Height { get; }
+        public float Zoom { get; }
+
+        public void Dispose() => Image.Dispose();
+    }
+
+    private const int MaxRasterizedDisplayListDimension = 8192;
+    private const long MaxRasterizedDisplayListPixels = 16_777_216;
     private SKPicture? _rootDisplayList;
+    private RasterizedDisplayList? _rootRasterizedDisplayList;
+    private SizeF _rootDisplayListSize;
     private readonly Dictionary<FrameView, SKPicture> _frameDisplayLists = new();
+    private readonly Dictionary<FrameView, RasterizedDisplayList> _frameRasterizedDisplayLists = new();
+    private readonly Dictionary<FrameView, SizeF> _frameDisplayListSizes = new();
+    private readonly List<LayoutBox> _rootFixedBoxes = new();
+    private bool _rootFixedBoxesCached;
+    private readonly Dictionary<FrameView, List<LayoutBox>> _frameFixedBoxes = new();
     private readonly List<LayoutBox> _rootDynamicEmbeds = new();
     private bool _rootDynamicEmbedsCached;
     private readonly List<LayoutBox> _rootAnimatedSubtrees = new();
@@ -618,9 +644,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         _rootDisplayList?.Dispose();
         _rootDisplayList = null;
+        _rootRasterizedDisplayList?.Dispose();
+        _rootRasterizedDisplayList = null;
         foreach (var picture in _frameDisplayLists.Values)
             picture.Dispose();
         _frameDisplayLists.Clear();
+        foreach (var raster in _frameRasterizedDisplayLists.Values)
+            raster.Dispose();
+        _frameRasterizedDisplayLists.Clear();
+        _frameDisplayListSizes.Clear();
         _rootDynamicEmbeds.Clear();
         _rootDynamicEmbedsCached = false;
         _rootAnimatedSubtrees.Clear();
@@ -630,6 +662,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _frameDynamicEmbeds.Clear();
         _frameAnimatedSubtrees.Clear();
         _frameAnimatedImages.Clear();
+        _rootFixedBoxes.Clear();
+        _rootFixedBoxesCached = false;
+        _frameFixedBoxes.Clear();
         _displayListsDirty = true;
         _documentContentExtentDirty = true;
     }
@@ -638,9 +673,15 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         _rootDisplayList?.Dispose();
         _rootDisplayList = null;
+        _rootRasterizedDisplayList?.Dispose();
+        _rootRasterizedDisplayList = null;
         foreach (var picture in _frameDisplayLists.Values)
             picture.Dispose();
         _frameDisplayLists.Clear();
+        foreach (var raster in _frameRasterizedDisplayLists.Values)
+            raster.Dispose();
+        _frameRasterizedDisplayLists.Clear();
+        _frameDisplayListSizes.Clear();
         _rootDynamicEmbeds.Clear();
         _rootDynamicEmbedsCached = false;
         _rootAnimatedSubtrees.Clear();
@@ -650,6 +691,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _frameDynamicEmbeds.Clear();
         _frameAnimatedSubtrees.Clear();
         _frameAnimatedImages.Clear();
+        _rootFixedBoxes.Clear();
+        _rootFixedBoxesCached = false;
+        _frameFixedBoxes.Clear();
         _displayListsDirty = true;
         _documentContentExtentDirty = true;
     }
@@ -1636,9 +1680,13 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         if (_frameDisplayLists.Remove(view, out var picture))
             picture.Dispose();
+        if (_frameRasterizedDisplayLists.Remove(view, out var raster))
+            raster.Dispose();
+        _frameDisplayListSizes.Remove(view);
         _frameDynamicEmbeds.Remove(view);
         _frameAnimatedSubtrees.Remove(view);
         _frameAnimatedImages.Remove(view);
+        _frameFixedBoxes.Remove(view);
     }
 
     public bool HasFrames => _frames.Count > 0;
@@ -1959,10 +2007,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         ArgumentNullException.ThrowIfNull(childBox);
         ArgumentNullException.ThrowIfNull(childView);
         UpdateFrameMetrics(childBox, childView);
-        if (_frameDisplayLists.Remove(childView, out var oldPicture))
-            oldPicture.Dispose();
-        _frameDynamicEmbeds.Remove(childView);
-        _frameAnimatedSubtrees.Remove(childView);
+        InvalidateFrameDisplayList(childView);
         Invalidate();
     }
 
@@ -1999,6 +2044,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         _rootDynamicEmbeds.Clear();
         _rootDynamicEmbeds.AddRange(CollectDynamicEmbeddedContent(_rootBox));
         _rootDynamicEmbedsCached = true;
+        _rootFixedBoxes.Clear();
+        _rootFixedBoxes.AddRange(Renderer.CollectTopLevelFixedBoxes(_rootBox));
+        _rootFixedBoxesCached = true;
         _rootAnimatedSubtrees.Clear();
         _rootAnimatedSubtrees.AddRange(CollectAnimatedSubtrees(_rootBox));
         _rootAnimatedSubtreesCached = true;
@@ -2009,6 +2057,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         var logicalViewport = GetLayoutViewportSize();
         float width = Math.Max(1f, Math.Max(_rootBox.Width, logicalViewport.Width));
         float height = Math.Max(1f, Math.Max(_rootBox.Height, logicalViewport.Height));
+        _rootDisplayListSize = new SizeF(width, height);
         using var recorder = new SKPictureRecorder();
         var canvas = recorder.BeginRecording(SKRect.Create(0f, 0f, width, height));
         renderer.RenderToCanvas(canvas, _rootBox, _document,
@@ -2029,6 +2078,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         if (renderer == null) return null;
 
         _frameDynamicEmbeds[view] = CollectDynamicEmbeddedContent(view.RootBox);
+        _frameFixedBoxes[view] = Renderer.CollectTopLevelFixedBoxes(view.RootBox);
         _frameAnimatedSubtrees[view] = CollectAnimatedSubtrees(view.RootBox);
         _frameAnimatedImages[view] = CollectAnimatedImageBoxes(view.RootBox, view.Document);
 
@@ -2036,6 +2086,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             Math.Max(1f, view.RootBox.Width), Math.Max(1f, view.RootBox.Height));
         float width = Math.Max(1f, Math.Max(view.RootBox.Width, size.Width));
         float height = Math.Max(1f, Math.Max(view.RootBox.Height, size.Height));
+        _frameDisplayListSizes[view] = new SizeF(width, height);
         using var recorder = new SKPictureRecorder();
         var canvas = recorder.BeginRecording(SKRect.Create(0f, 0f, width, height));
         renderer.RenderToCanvas(canvas, view.RootBox, view.Document,
@@ -2047,6 +2098,58 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             skipAnimatedContent: true, skipAnimatedImages: true,
             skipFixedPositioned: true);
         return recorder.EndRecording();
+    }
+
+    private static bool DrawRasterizedDisplayList(
+        SKCanvas canvas,
+        SKPicture picture,
+        GRContext? gpuContext,
+        float width,
+        float height,
+        float zoom,
+        ref RasterizedDisplayList? rasterized)
+    {
+        if (gpuContext == null)
+            return false;
+
+        if (rasterized == null || rasterized.Zoom != zoom)
+        {
+            rasterized?.Dispose();
+            rasterized = null;
+
+            double scaledWidth = Math.Ceiling(width * zoom);
+            double scaledHeight = Math.Ceiling(height * zoom);
+            if (scaledWidth < 1 || scaledHeight < 1 ||
+                scaledWidth > MaxRasterizedDisplayListDimension ||
+                scaledHeight > MaxRasterizedDisplayListDimension ||
+                scaledWidth * scaledHeight > MaxRasterizedDisplayListPixels)
+                return false;
+
+            int pixelWidth = (int)scaledWidth;
+            int pixelHeight = (int)scaledHeight;
+            var info = new SKImageInfo(pixelWidth, pixelHeight,
+                SKColorType.Bgra8888, SKAlphaType.Premul);
+            var surface = SKSurface.Create(gpuContext, true, info, 0);
+            if (surface == null)
+                return false;
+
+            using (surface)
+            {
+                var rasterCanvas = surface.Canvas;
+                rasterCanvas.Clear(SKColors.White);
+                rasterCanvas.Scale(pixelWidth / width, pixelHeight / height);
+                rasterCanvas.DrawPicture(picture);
+                rasterCanvas.Flush();
+                var image = surface.Snapshot();
+                if (image == null)
+                    return false;
+                rasterized = new RasterizedDisplayList(image, width, height, zoom);
+            }
+        }
+
+        canvas.DrawImage(rasterized.Image,
+            SKRect.Create(0f, 0f, rasterized.Width, rasterized.Height));
+        return true;
     }
 
     private SKPicture? GetRootDisplayList(GRContext? gpuContext = null)
@@ -2258,7 +2361,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 canvas.Translate(-scrollX, -scrollY);
                 var picture = GetRootDisplayList(currentGpuContext);
                 if (picture != null)
-                    canvas.DrawPicture(picture);
+                {
+                    if (!DrawRasterizedDisplayList(canvas, picture, currentGpuContext,
+                            _rootDisplayListSize.Width, _rootDisplayListSize.Height,
+                            zoom, ref _rootRasterizedDisplayList))
+                        canvas.DrawPicture(picture);
+                }
                 var rootContentViewport = new RectangleF(
                     scrollX, scrollY, logicalVw, logicalVh);
                 if (_rootBox != null)
@@ -2307,24 +2415,25 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             }
 
             if (_rootBox != null && _document != null && _fontCache != null &&
-                _imageCache != null && _resourceLoader != null)
+                _imageCache != null && _resourceLoader != null &&
+                animationRendererForPaint != null)
             {
-                var fixedRenderer = CreateRenderer();
-                if (fixedRenderer != null)
+                if (!_rootFixedBoxesCached)
                 {
-                    int fixedState = canvas.Save();
-                    try
-                    {
-                        canvas.Translate(-scrollX, -scrollY);
-                        fixedRenderer.RenderFixedToCanvas(canvas, _rootBox, _document,
-                            _fontCache, _imageCache, logicalVw, logicalVh,
-                            scrollX, scrollY, _lastHoveredElement, _blinkVisible,
-                            _focusedInput, currentGpuContext);
-                    }
-                    finally
-                    {
-                        canvas.RestoreToCount(fixedState);
-                    }
+                    _rootFixedBoxes.AddRange(Renderer.CollectTopLevelFixedBoxes(_rootBox));
+                    _rootFixedBoxesCached = true;
+                }
+                int fixedState = canvas.Save();
+                try
+                {
+                    animationRendererForPaint.RenderFixedToCanvas(canvas, _rootBox, _document,
+                        _fontCache, _imageCache, logicalVw, logicalVh,
+                        0f, 0f, _lastHoveredElement, _blinkVisible,
+                        _focusedInput, currentGpuContext, _rootFixedBoxes);
+                }
+                finally
+                {
+                    canvas.RestoreToCount(fixedState);
                 }
             }
 
@@ -2385,40 +2494,72 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             canvas.ClipRect(SKRect.Create(visible.X, visible.Y, visible.Width, visible.Height), SKClipOperation.Intersect);
             canvas.Translate(destRect.X, destRect.Y);
             canvas.ClipRect(SKRect.Create(0, 0, frameBox.Width, frameBox.Height), SKClipOperation.Intersect);
-            canvas.Translate(-view.Scroll.X, -view.Scroll.Y);
+            int contentState = canvas.Save();
+            try
+            {
+                canvas.Translate(-view.Scroll.X, -view.Scroll.Y);
 
-            var picture = GetFrameDisplayList(view, gpuContext);
-            if (picture != null)
-                canvas.DrawPicture(picture);
-            var frameContentViewport = new RectangleF(
-                view.Scroll.X, view.Scroll.Y, frameBox.Width, frameBox.Height);
-            if (view.RootBox != null)
-                PaintDynamicEmbeddedContent(
-                    canvas, GetFrameDynamicEmbeddedContent(view), frameContentViewport);
-            if (view.RootBox != null && animationRenderer != null)
-            {
-                if (!_frameAnimatedSubtrees.TryGetValue(view, out var animatedBoxes))
+                var picture = GetFrameDisplayList(view, gpuContext);
+                if (picture != null)
                 {
-                    animatedBoxes = CollectAnimatedSubtrees(view.RootBox);
-                    _frameAnimatedSubtrees[view] = animatedBoxes;
+                    _frameRasterizedDisplayLists.TryGetValue(view, out var rasterized);
+                    if (_frameDisplayListSizes.TryGetValue(view, out var pictureSize) &&
+                        DrawRasterizedDisplayList(canvas, picture, gpuContext,
+                            pictureSize.Width, pictureSize.Height, EffectiveZoom,
+                            ref rasterized))
+                    {
+                        _frameRasterizedDisplayLists[view] = rasterized!;
+                    }
+                    else
+                    {
+                        if (rasterized != null)
+                            _frameRasterizedDisplayLists[view] = rasterized;
+                        else
+                            _frameRasterizedDisplayLists.Remove(view);
+                        canvas.DrawPicture(picture);
+                    }
                 }
-                PaintAnimatedSubtrees(canvas, animationRenderer, animatedBoxes, view.Document,
-                    view.Document.HoveredElement, _blinkVisible,
-                    _focusedInputFrame == view ? _focusedInput : null, gpuContext);
+                var frameContentViewport = new RectangleF(
+                    view.Scroll.X, view.Scroll.Y, frameBox.Width, frameBox.Height);
+                if (view.RootBox != null)
+                    PaintDynamicEmbeddedContent(
+                        canvas, GetFrameDynamicEmbeddedContent(view), frameContentViewport);
+                if (view.RootBox != null && animationRenderer != null)
+                {
+                    if (!_frameAnimatedSubtrees.TryGetValue(view, out var animatedBoxes))
+                    {
+                        animatedBoxes = CollectAnimatedSubtrees(view.RootBox);
+                        _frameAnimatedSubtrees[view] = animatedBoxes;
+                    }
+                    PaintAnimatedSubtrees(canvas, animationRenderer, animatedBoxes, view.Document,
+                        view.Document.HoveredElement, _blinkVisible,
+                        _focusedInputFrame == view ? _focusedInput : null, gpuContext);
+                }
+                if (animationRenderer != null && _frameAnimatedImages.TryGetValue(view, out var animatedImages) &&
+                    animatedImages.Count > 0)
+                {
+                    PaintAnimatedImages(canvas, animationRenderer, animatedImages,
+                        view.Document, gpuContext, frameContentViewport);
+                }
             }
-            if (animationRenderer != null && _frameAnimatedImages.TryGetValue(view, out var animatedImages) &&
-                animatedImages.Count > 0)
+            finally
             {
-                PaintAnimatedImages(canvas, animationRenderer, animatedImages,
-                    view.Document, gpuContext, frameContentViewport);
+                canvas.RestoreToCount(contentState);
             }
+
             if (animationRenderer != null && view.RootBox != null)
             {
+                if (!_frameFixedBoxes.TryGetValue(view, out var fixedBoxes))
+                {
+                    fixedBoxes = Renderer.CollectTopLevelFixedBoxes(view.RootBox);
+                    _frameFixedBoxes[view] = fixedBoxes;
+                }
                 animationRenderer.RenderFixedToCanvas(canvas, view.RootBox, view.Document,
                     _fontCache!, _imageCache!, frameBox.Width, frameBox.Height,
-                    view.Scroll.X, view.Scroll.Y,
+                    0f, 0f,
                     view.Document.HoveredElement, _blinkVisible,
-                    _focusedInputFrame == view ? _focusedInput : null, gpuContext);
+                    _focusedInputFrame == view ? _focusedInput : null, gpuContext,
+                    fixedBoxes);
             }
         }
         finally
@@ -2574,10 +2715,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             float offsetX = destRect.X - frameView.Scroll.X;
             float offsetY = destRect.Y - frameView.Scroll.Y;
 
-            var selectedSpans = new List<(LayoutBox Box, RectangleF Span)>();
+            var selectedSpans = new List<(LayoutBox Box, RectangleF Span, float OffsetX, float OffsetY)>();
             for (int i = firstIndex; i <= lastIndex; i++)
             {
                 var box = ordered[i];
+                float boxOffsetX = offsetX;
+                float boxOffsetY = offsetY;
+                if (IsInsideFixedPositionedBox(box))
+                {
+                    boxOffsetX = destRect.X;
+                    boxOffsetY = destRect.Y;
+                }
                 int len = GetSelectionBoxTextLength(box);
                 if (len == 0) continue;
                 if (box.BoxType == BoxType.Replaced && IsPageSelectableControl(box.Element))
@@ -2596,7 +2744,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     if (b0 > a0 &&
                         TryGetSelectionAnimationOffset(box, frameView.RootBox, out float controlAnimatedX))
                     {
-                        PaintSelectionControl(g, box, offsetX + controlAnimatedX, offsetY, selBrush, a0, b0);
+                        PaintSelectionControl(g, box, boxOffsetX + controlAnimatedX,
+                            boxOffsetY, selBrush, a0, b0);
                     }
                     continue;
                 }
@@ -2619,13 +2768,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
 
                 foreach (var span in SelectionVisualSpans(g, box, a, b))
                     selectedSpans.Add((box,
-                        new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height)));
+                        new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height),
+                        boxOffsetX, boxOffsetY));
             }
 
-            foreach (var (box, span) in selectedSpans)
+            foreach (var (box, span, boxOffsetX, boxOffsetY) in selectedSpans)
             {
                 foreach (var visible in VisibleOverlayRects(
-                             box, span, offsetX, offsetY, contentRect))
+                             box, span, boxOffsetX, boxOffsetY, contentRect))
                     g.FillRectangle(selBrush, visible.X, visible.Y,
                         visible.Width, visible.Height);
             }
@@ -3156,10 +3306,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             offsetY = frameDest.Y - _selectionFrame.Scroll.Y;
         }
 
-        var selectedSpans = new List<(LayoutBox Box, RectangleF Span)>();
+        var selectedSpans = new List<(LayoutBox Box, RectangleF Span, float OffsetX, float OffsetY)>();
         for (int i = firstIndex; i <= lastIndex; i++)
         {
             var box = ordered[i];
+            float boxOffsetX = offsetX;
+            float boxOffsetY = offsetY;
+            if (_selectionFrame == null && IsInsideFixedPositionedBox(box))
+            {
+                boxOffsetX = 0f;
+                boxOffsetY = 0f;
+            }
             int len = GetSelectionBoxTextLength(box);
             if (len == 0) continue;
             if (box.BoxType == BoxType.Replaced && IsPageSelectableControl(box.Element))
@@ -3178,7 +3335,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (b0 > a0 &&
                     TryGetSelectionAnimationOffset(box, selectionRoot, out float controlAnimatedX))
                 {
-                    PaintSelectionControl(g, box, offsetX + controlAnimatedX, offsetY, selBrush, a0, b0);
+                    PaintSelectionControl(g, box, boxOffsetX + controlAnimatedX,
+                        boxOffsetY, selBrush, a0, b0);
                 }
                 continue;
             }
@@ -3199,11 +3357,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             if (b <= a) continue;
             foreach (var span in SelectionVisualSpans(g, box, a, b))
                 selectedSpans.Add((box,
-                    new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height)));
+                    new RectangleF(span.X + animatedX, span.Y, span.Width, span.Height),
+                    boxOffsetX, boxOffsetY));
         }
-        foreach (var (box, span) in selectedSpans)
+        foreach (var (box, span, boxOffsetX, boxOffsetY) in selectedSpans)
         {
-            foreach (var visible in VisibleOverlayRects(box, span, offsetX, offsetY))
+            foreach (var visible in VisibleOverlayRects(box, span, boxOffsetX, boxOffsetY))
                 g.FillRectangle(selBrush, visible.X, visible.Y,
                     visible.Width, visible.Height);
         }
@@ -3320,7 +3479,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         float totalScrollY = 0f;
         foreach (var ancestor in clippingAncestors)
         {
-            if (ancestor.Element?.Style?.Overflow == OverflowValue.Scroll)
+            if (ancestor.Element?.Style?.Overflow is OverflowValue.Scroll or OverflowValue.Auto)
             {
                 totalScrollX += ancestor.ScrollOffsetX;
                 totalScrollY += ancestor.ScrollOffsetY;
@@ -3352,12 +3511,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             {
                 var clip = ancestor.PaddingRect;
                 clip.Offset(offsetX - outerScrollX, offsetY - outerScrollY);
-                if (style.Overflow == OverflowValue.Scroll)
+                if (style.Overflow is OverflowValue.Scroll or OverflowValue.Auto)
                 {
-                    bool hasHorizontalOverflow = ancestor.Descendants()
-                        .Any(child => child.BorderRect.Right > ancestor.PaddingRect.Right + 0.5f);
-                    clip.Width = Math.Max(0f, clip.Width - 14f);
-                    if (hasHorizontalOverflow)
+                    var metrics = ancestor.GetOverflowScrollMetrics();
+                    if (metrics.HasVerticalScrollbar)
+                        clip.Width = Math.Max(0f, clip.Width - 14f);
+                    if (metrics.HasHorizontalScrollbar)
                         clip.Height = Math.Max(0f, clip.Height - 14f);
                 }
                 rect = IntersectRect(rect, clip);
@@ -3365,7 +3524,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     return RectangleF.Empty;
             }
 
-            if (style.Overflow == OverflowValue.Scroll)
+            if (style.Overflow is OverflowValue.Scroll or OverflowValue.Auto)
             {
                 outerScrollX += ancestor.ScrollOffsetX;
                 outerScrollY += ancestor.ScrollOffsetY;
@@ -5338,41 +5497,27 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         foreach (var box in root.Descendants().Reverse())
         {
             if (box.Element is not { } element ||
-                element.Style?.Overflow != OverflowValue.Scroll ||
+                element.Style?.Overflow is not (OverflowValue.Scroll or OverflowValue.Auto) ||
                 !ReferenceEquals(element.LayoutBox, box) ||
                 !box.HitTest(x, y))
                 continue;
 
-            var viewport = box.PaddingRect;
-            float contentRight = box.Descendants()
-                .Select(child => child.BorderRect.Right)
-                .DefaultIfEmpty(viewport.Right)
-                .Max();
-            float contentBottom = box.Descendants()
-                .Select(child => child.BorderRect.Bottom)
-                .DefaultIfEmpty(viewport.Bottom)
-                .Max();
-            bool hasHorizontalOverflow = contentRight > viewport.Right + 0.5f;
-            float viewportWidth = Math.Max(1f, viewport.Width - 14f);
-            float viewportHeight = Math.Max(1f,
-                viewport.Height - (hasHorizontalOverflow ? 14f : 0f));
-            float maxX = Math.Max(0f, contentRight - viewport.Left - viewportWidth);
-            float maxY = Math.Max(0f, contentBottom - viewport.Top - viewportHeight);
+            var metrics = box.GetOverflowScrollMetrics();
             float amount = wheelDelta / 120f * 40f;
             if (Math.Abs(amount) < 0.01f)
                 amount = Math.Sign(wheelDelta) * 2f;
 
-            if (horizontal && hasHorizontalOverflow && maxX > 0f)
+            if (horizontal && metrics.HasHorizontalScrollbar && metrics.MaxScrollX > 0f)
             {
-                float next = Math.Clamp(box.ScrollOffsetX - amount, 0f, maxX);
+                float next = Math.Clamp(box.ScrollOffsetX - amount, 0f, metrics.MaxScrollX);
                 if (Math.Abs(next - box.ScrollOffsetX) < 0.01f) continue;
                 box.ScrollOffsetX = next;
                 InvalidateDisplayLists();
                 return true;
             }
-            if (!horizontal && maxY > 0f)
+            if (!horizontal && metrics.HasVerticalScrollbar && metrics.MaxScrollY > 0f)
             {
-                float next = Math.Clamp(box.ScrollOffsetY - amount, 0f, maxY);
+                float next = Math.Clamp(box.ScrollOffsetY - amount, 0f, metrics.MaxScrollY);
                 if (Math.Abs(next - box.ScrollOffsetY) < 0.01f) continue;
                 box.ScrollOffsetY = next;
                 InvalidateDisplayLists();
@@ -5386,10 +5531,16 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         foreach (var box in root.Descendants().Reverse())
         {
-            if (box.Element is { } element &&
-                element.Style?.Overflow == OverflowValue.Scroll &&
-                ReferenceEquals(element.LayoutBox, box) &&
-                box.HitTest(x, y))
+            if (box.Element is not { } element ||
+                element.Style is not { } style ||
+                style.Overflow is not (OverflowValue.Scroll or OverflowValue.Auto) ||
+                !ReferenceEquals(element.LayoutBox, box) ||
+                !box.HitTest(x, y))
+                continue;
+
+            if (style.Overflow == OverflowValue.Scroll ||
+                box.GetOverflowScrollMetrics() is
+                    { HasVerticalScrollbar: true } or { HasHorizontalScrollbar: true })
                 return element;
         }
         return null;
@@ -7310,7 +7461,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
 
         _focusedFrame = null;
-        var deepest = HitTestDeepestBox(_rootBox, x, y);
+        var fixedHit = HitTestFixedPositionedBox(_rootBox,
+            x - PaintScrollX, y - PaintScrollY);
+        if (fixedHit != null)
+        {
+            x -= PaintScrollX;
+            y -= PaintScrollY;
+        }
+        var deepest = fixedHit ?? HitTestDeepestBox(_rootBox, x, y);
         var el = deepest?.Element;
         var linkAnchor = el != null && el.TagName == "a"
             ? el
@@ -7908,6 +8066,16 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             float x = e.X / EffectiveZoom + PaintScrollX;
             float y = e.Y / EffectiveZoom + PaintScrollY;
             LayoutBox? f = null;
+            LayoutBox selectionRoot = _rootBox!;
+            var fixedSelectionRoot = HitTestFixedPositionedBox(_rootBox!,
+                x - PaintScrollX, y - PaintScrollY);
+            if (fixedSelectionRoot != null)
+            {
+                x -= PaintScrollX;
+                y -= PaintScrollY;
+                selectionRoot = FindTopLevelFixedPositionedBox(fixedSelectionRoot) ??
+                    fixedSelectionRoot;
+            }
             var oldFocus = _selFocus;
             int oldFocusOffset = _selFocusOffset;
             var selectionView = _selectionFrame ?? _pendingSelectionFrame;
@@ -7953,7 +8121,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             }
             else if (_rootBox != null)
             {
-                var pageHit = HitTestTextPosition(_rootBox, x, y);
+                var pageHit = HitTestTextPosition(selectionRoot, x, y);
                 if (pageHit != null)
                 {
                     f = pageHit.Value.Box;
@@ -7973,7 +8141,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     }
                     else
                     {
-                        var nearest = FindNearestSelectionPosition(_rootBox, x, y);
+                        var nearest = FindNearestSelectionPosition(selectionRoot, x, y);
                         if (nearest != null)
                         {
                             f = nearest.Value.Box;
@@ -8588,6 +8756,17 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         "h1" or "h2" or "h3" or "h4" or "h5" or "h6" or
         "td" or "th" or "dt" or "dd" or "center";
 
+    private static bool IsInsideFixedPositionedBox(LayoutBox box)
+    {
+        for (var current = box; current != null; current = current.Parent)
+        {
+            if (current.Element?.Style?.Position == PositionValue.Fixed &&
+                ReferenceEquals(current.Element.LayoutBox, current))
+                return true;
+        }
+        return false;
+    }
+
     private static bool IsTripleClickInlineFallbackTag(string tag) => tag is
         "font" or "b" or "strong" or "i" or "em" or "u" or "small" or
         "big" or "tt" or "s" or "strike" or "a";
@@ -8695,6 +8874,52 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             return new TextSelectionHit(box, GetTextOffsetAtPoint(box, x - boxAnimationX));
         }
 
+        return null;
+    }
+
+    private static LayoutBox? FindTopLevelFixedPositionedBox(LayoutBox box)
+    {
+        for (var current = box; current != null; current = current.Parent)
+        {
+            if (current.Element?.Style?.Position == PositionValue.Fixed &&
+                ReferenceEquals(current.Element.LayoutBox, current))
+                box = current;
+        }
+        return box;
+    }
+
+    private static LayoutBox? HitTestFixedPositionedBox(
+        LayoutBox root, float viewportX, float viewportY)
+    {
+        var fixedRoots = new List<LayoutBox>();
+        foreach (var candidate in root.Descendants())
+        {
+            if (candidate.Element?.Style?.Position != PositionValue.Fixed ||
+                !ReferenceEquals(candidate.Element.LayoutBox, candidate))
+                continue;
+
+            bool insideFixedAncestor = false;
+            for (var ancestor = candidate.Parent; ancestor != null; ancestor = ancestor.Parent)
+            {
+                if (ancestor.Element?.Style?.Position == PositionValue.Fixed &&
+                    ReferenceEquals(ancestor.Element.LayoutBox, ancestor))
+                {
+                    insideFixedAncestor = true;
+                    break;
+                }
+            }
+            if (!insideFixedAncestor)
+                fixedRoots.Add(candidate);
+        }
+
+        // Fixed boxes paint above the scrolled document. Test them back-to-front
+        // so hit-testing follows that same stacking order.
+        for (int i = fixedRoots.Count - 1; i >= 0; i--)
+        {
+            var hit = HitTestDeepestBox(fixedRoots[i], viewportX, viewportY);
+            if (hit != null)
+                return hit;
+        }
         return null;
     }
 

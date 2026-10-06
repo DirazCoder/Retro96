@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using Retro96.Engine.Dom;
 
 namespace Retro96.Engine.Js;
@@ -46,6 +47,21 @@ public sealed class JsTypeErrorException : JsInterpreterException
     public JsTypeErrorException(string message) : base(message) { }
 }
 
+public sealed class JsReferenceErrorException : JsInterpreterException
+{
+    public JsReferenceErrorException(string message) : base(message) { }
+}
+
+public sealed class JsRangeErrorException : JsInterpreterException
+{
+    public JsRangeErrorException(string message) : base(message) { }
+}
+
+public sealed class JsUriErrorException : JsInterpreterException
+{
+    public JsUriErrorException(string message) : base(message) { }
+}
+
 /// <summary>
 /// Tree-walking interpreter for JavaScript 1.1/1.2.
 ///
@@ -63,6 +79,8 @@ public class JsInterpreter
 {
     public sealed record ConsoleEntry(string Level, string Message, DateTime Timestamp);
     public event Action<ConsoleEntry>? ConsoleMessage;
+    public event Action? ScriptExecutionCompleted;
+    public bool IsExecuting => _isExecuting;
     private readonly JsScope _globalScope;
     private JsScope _currentScope;
     private readonly Action<string> _onNavigate;
@@ -75,6 +93,8 @@ public class JsInterpreter
 
     private int _callDepth;
     private readonly int _maxCallDepth;
+    private int _timeoutPauseDepth;
+    private bool _timeoutWasRunningBeforePause;
 
     // Guards against re-entering the interpreter while a call is already
     // in progress on this instance. This isn't multi-threading — WinForms
@@ -88,6 +108,46 @@ public class JsInterpreter
     // elapsed time depending on whether a timer happened to fire while the
     // dialog was open — this is the "random" script-timeout bug.
     private bool _isExecuting;
+
+    private void CompleteExecution(bool isOutermost)
+    {
+        if (!isOutermost) return;
+        _isExecuting = false;
+        ScriptExecutionCompleted?.Invoke();
+    }
+
+    private sealed class TimeoutBudgetPause : IDisposable
+    {
+        private JsInterpreter? _interpreter;
+
+        public TimeoutBudgetPause(JsInterpreter interpreter) =>
+            _interpreter = interpreter;
+
+        public void Dispose()
+        {
+            var interpreter = _interpreter;
+            _interpreter = null;
+            interpreter?.ResumeTimeoutBudget();
+        }
+    }
+
+    internal IDisposable PauseTimeoutBudget()
+    {
+        if (_timeoutPauseDepth++ == 0)
+        {
+            _timeoutWasRunningBeforePause = _stopwatch.IsRunning;
+            _stopwatch.Stop();
+        }
+        return new TimeoutBudgetPause(this);
+    }
+
+    private void ResumeTimeoutBudget()
+    {
+        if (_timeoutPauseDepth <= 0)
+            throw new InvalidOperationException("Unbalanced JavaScript timeout pause.");
+        if (--_timeoutPauseDepth == 0 && _timeoutWasRunningBeforePause)
+            _stopwatch.Start();
+    }
 
     // DOM-0 event-property handlers belong to the DOM element, not to a
     // particular JavaScript wrapper object. Wrappers can be recreated by
@@ -224,6 +284,7 @@ public class JsInterpreter
 
         // Object stringification (array join, date toString) for "" + obj
         JsObject.Stringifier = StringifyObject;
+        InstallPrimitiveConversion();
     }
 
     /// <summary>The global window object, if DOM bindings registered one.</summary>
@@ -261,6 +322,36 @@ public class JsInterpreter
         if (value.Type == JsType.Object)
             return $"object:{DescribeJsObject(value.GetObjectOrFunction())}";
         return $"{value.Type}:{value.ToJsString()}";
+    }
+
+    private void InstallPrimitiveConversion()
+    {
+        JsValue objectConstructor = _globalScope.Get("Object");
+        if (objectConstructor.Type == JsType.Function &&
+            objectConstructor.GetFunction().Get("prototype") is { Type: JsType.Object } prototype)
+            prototype.GetObject().PrimitiveConverter = ConvertToPrimitive;
+    }
+
+    private JsValue ConvertToPrimitive(JsObject obj, bool preferString)
+    {
+        JsValue receiver = obj is JsFunction function
+            ? JsValue.FromFunction(function)
+            : JsValue.FromObject(obj);
+        string firstMethod = preferString ? "toString" : "valueOf";
+        string secondMethod = preferString ? "valueOf" : "toString";
+
+        foreach (string methodName in new[] { firstMethod, secondMethod })
+        {
+            JsValue method = GetProperty(receiver, methodName);
+            if (method.Type != JsType.Function)
+                continue;
+
+            JsValue result = CallFunction(method.GetFunction(), receiver, Array.Empty<JsValue>());
+            if (result.Type is not (JsType.Object or JsType.Function))
+                return result;
+        }
+
+        throw new JsTypeErrorException("Cannot convert object to primitive value");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -333,7 +424,7 @@ public class JsInterpreter
         catch (JsReturnException) { return JsValue.Undefined; }
         finally
         {
-            if (isOutermost) _isExecuting = false;
+            CompleteExecution(isOutermost);
         }
     }
 
@@ -365,13 +456,15 @@ public class JsInterpreter
         try { program = JsParser.Parse(source); }
         catch (JsParserException ex)
         {
-            string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
-            if (!ReportWindowOnError(message))
-            {
-                _setStatus($"Script error: {ex.Message}");
-                PublishConsole("error", message);
-            }
-            return JsValue.Undefined;
+            var syntaxErrorConstructor = scope.Get("SyntaxError");
+            JsObject? prototype = syntaxErrorConstructor.Type == JsType.Function &&
+                syntaxErrorConstructor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } prototypeValue
+                    ? prototypeValue.GetObject()
+                    : null;
+            var error = new JsObject { Class = "Error", Prototype = prototype };
+            error.Set("name", JsValue.From("SyntaxError"));
+            error.Set("message", JsValue.From(ex.Message));
+            throw new JsThrownException(JsValue.FromObject(error));
         }
         var old = _currentScope;
         _currentScope = scope;
@@ -739,7 +832,7 @@ public class JsInterpreter
                     else
                         windowObject.Set("event", priorWindowEvent);
                 }
-                if (isOutermost) _isExecuting = false;
+                CompleteExecution(isOutermost);
             }
         }
         catch (JsReturnException retEx)
@@ -948,7 +1041,7 @@ public class JsInterpreter
                 else
                     windowObject.Set("event", priorWindowEvent);
             }
-            if (isOutermost) _isExecuting = false;
+            CompleteExecution(isOutermost);
         }
     }
 
@@ -1062,7 +1155,7 @@ public class JsInterpreter
             }
             finally
             {
-                _isExecuting = false;
+                CompleteExecution(isOutermost: true);
             }
 
             if (timer.Repeat)
@@ -1403,7 +1496,14 @@ public class JsInterpreter
             // Runtime errors are catchable, period-style
             if (tr.Handler != null)
             {
-                string errorName = ex is JsTypeErrorException ? "TypeError" : "Error";
+                string errorName = ex switch
+                {
+                    JsTypeErrorException => "TypeError",
+                    JsReferenceErrorException => "ReferenceError",
+                    JsRangeErrorException => "RangeError",
+                    JsUriErrorException => "URIError",
+                    _ => "Error"
+                };
                 JsValue constructor = _currentScope.Get(errorName);
                 JsObject? prototype = constructor.Type == JsType.Function &&
                     constructor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } prototypeValue
@@ -1529,14 +1629,15 @@ public class JsInterpreter
 
     private JsValue ExecuteAssignment(AssignmentExpr a)
     {
-        // Compound operators read the current value first
-        JsValue rightVal = ExecuteExpression(a.Right);
-
         if (a.Left is Identifier ident)
         {
+            JsValue oldValue = a.Operator == "="
+                ? JsValue.Undefined
+                : _currentScope.Get(ident.Name);
+            JsValue rightVal = ExecuteExpression(a.Right);
             JsValue newValue = a.Operator == "="
                 ? rightVal
-                : ApplyCompound(_currentScope.Get(ident.Name), rightVal, a.Operator);
+                : ApplyCompound(oldValue, rightVal, a.Operator);
 
             // `location = "url"` — the era's #1 script navigation idiom
             // (openpowerstart/switch_page/setTimeout("location='...'"))
@@ -1560,12 +1661,16 @@ public class JsInterpreter
         {
             JsValue objVal = ExecuteExpression(member.Object);
             string name = GetMemberPropertyName(member);
+            JsValue oldValue = a.Operator == "="
+                ? JsValue.Undefined
+                : GetProperty(objVal, name);
+            JsValue rightVal = ExecuteExpression(a.Right);
             if (Retro96.DebugLog.JsEnabled)
                 Retro96.DebugLog.JsWrite($"ASSIGN member='{name}' operator='{a.Operator}' target={DescribeJsValue(objVal)}");
 
             JsValue newValue = a.Operator == "="
                 ? rightVal
-                : ApplyCompound(GetProperty(objVal, name), rightVal, a.Operator);
+                : ApplyCompound(oldValue, rightVal, a.Operator);
 
             // window.location = "url" / document.location = "url" — same
             // story as the bare identifier: a plain Set replaced the slot
@@ -1755,8 +1860,8 @@ public class JsInterpreter
         // Object.prototype — {}.toString() used to be undefined. Resolve the
         // realm's prototype rather than the shared static field so frames
         // don't chain to a foreign page's Object.prototype.
-        newObj.Prototype = constructor.Get("prototype") is { Type: JsType.Object } proto
-            ? proto.GetObject()
+        newObj.Prototype = constructor.Get("prototype") is { Type: JsType.Object or JsType.Function } proto
+            ? proto.GetObjectOrFunction()
             : GetRealmObjectPrototype();
 
         var result = CallFunction(constructor, JsValue.FromObject(newObj), args);
@@ -1773,6 +1878,8 @@ public class JsInterpreter
 
     private JsValue ReadIdentifierWithDebug(string name)
     {
+        if (!_currentScope.Has(name))
+            throw new JsReferenceErrorException($"'{name}' is not defined");
         var value = _currentScope.Get(name);
         DebugVariableRead(name, value);
         return value;
@@ -1827,11 +1934,12 @@ public class JsInterpreter
         regexObj.Set("flags", JsValue.From(rx.Flags));
         regexObj.Set("global", JsValue.From(rx.Flags.Contains('g')));
         regexObj.Set("ignoreCase", JsValue.From(rx.Flags.Contains('i')));
+        regexObj.Set("multiline", JsValue.From(rx.Flags.Contains('m')));
         regexObj.Set("lastIndex", JsValue.From(0));
         // RegExp prototype is installed by JsRuntime
         regexObj.Prototype = _globalScope.Get("RegExp") is { Type: JsType.Function } re
-            && re.GetFunction().Get("prototype") is { Type: JsType.Object } proto
-            ? proto.GetObject()
+            && re.GetFunction().Get("prototype") is { Type: JsType.Object or JsType.Function } proto
+            ? proto.GetObjectOrFunction()
             : null;
         return JsValue.FromObject(regexObj);
     }
@@ -1917,7 +2025,16 @@ public class JsInterpreter
             Retro96.DebugLog.JsWrite($"CALL_FUNCTION name='{func.Name ?? "<anonymous>"}' native={(func.Native != null ? "yes" : "no")} this={DescribeJsValue(thisValue)} argc={args.Length}");
 
         if (func.Native != null)
-            return func.Native(thisValue, args);
+        {
+            try
+            {
+                return func.Native(thisValue, args);
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                throw new JsTimeoutException();
+            }
+        }
 
         if (++_callDepth > _maxCallDepth)
         {
@@ -1928,17 +2045,16 @@ public class JsInterpreter
         try
         {
             var funcScope = func.ClosureScope.NewChild();
-            for (int i = 0; i < func.Params.Count; i++)
-                funcScope.Define(func.Params[i],
-                    i < args.Length ? args[i] : JsValue.Undefined);
-            funcScope.Define("this", thisValue);
-
             var argsObj = new JsObject { Class = "arguments" };
             for (int i = 0; i < args.Length; i++)
                 argsObj.Set(i.ToString(), args[i]);
             argsObj.Set("length", JsValue.From(args.Length));
             argsObj.Set("callee", JsValue.FromFunction(func));
             funcScope.Define("arguments", JsValue.FromObject(argsObj));
+            for (int i = 0; i < func.Params.Count; i++)
+                funcScope.Define(func.Params[i],
+                    i < args.Length ? args[i] : JsValue.Undefined);
+            funcScope.Define("this", thisValue);
 
             var body = func.Body ?? throw new JsInterpreterException("Function body is missing");
             Hoist(body.Body.Body, funcScope);
@@ -2284,6 +2400,8 @@ public class JsInterpreter
 
     public void RegisterRuntimeBuiltins()
     {
+        InstallPrimitiveConversion();
+
         // Developer consoles are not part of the strict IE3/JScript 1.0 surface.
         // Retro96 and Navigator retain the broader runtime surface.
         if (!BrowserRuntime.IsInternetExplorer3)
@@ -2317,9 +2435,9 @@ public class JsInterpreter
         // Retro96 retains the broader compatibility runtime.
         if (!BrowserRuntime.IsInternetExplorer3 &&
             _globalScope.Get("Function") is { Type: JsType.Function } funcCtor &&
-            funcCtor.GetFunction().Get("prototype") is { Type: JsType.Object } fp)
+            funcCtor.GetFunction().Get("prototype") is { Type: JsType.Object or JsType.Function } fp)
         {
-            var funcProto = fp.GetObject();
+            var funcProto = fp.GetObjectOrFunction();
 
             funcProto.Set("call", Native((self, args) =>
             {

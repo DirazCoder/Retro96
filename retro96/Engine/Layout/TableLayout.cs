@@ -53,6 +53,8 @@ public static class TableLayout
         var floats = inheritedFloats?.Clone() ?? new FloatContext();
 
         var tableElem = tableBox.Element;
+        tableBox.TableGridTopInset = 0f;
+        tableBox.TableGridBottomInset = 0f;
         var tableStyle = tableElem.Style;
         bool isCssTable = !tableElem.TagName.Equals("table", StringComparison.OrdinalIgnoreCase);
 
@@ -128,7 +130,7 @@ public static class TableLayout
                 ? authoredWidth
                 : MeasureCellPref(captionBox,
                     captionBox.PaddingLeft + captionBox.PaddingRight +
-                    captionBox.BorderLeft + captionBox.BorderRight, borderWidth);
+                    captionBox.BorderLeft + captionBox.BorderRight, 0f);
         float SideCaptionOuterWidth(LayoutBox captionBox) =>
             Math.Max(1f, SideCaptionContentWidth(captionBox)) +
             captionBox.PaddingLeft + captionBox.PaddingRight +
@@ -157,9 +159,14 @@ public static class TableLayout
                     caption.Y = captionY;
                     caption.Width = Math.Max(1f, avail);
                     LayoutCellContent(caption, avail, null, floats);
-                    captionY += CaptionOuterHeight(caption);
+                    float captionHeight = CaptionOuterHeight(caption);
+                    captionY += captionHeight;
                 }
                 tableBox.Height = Math.Max(0f, captionY - tableBox.Y);
+                tableBox.TableGridTopInset = tableBox.Height +
+                    tableBox.PaddingTop + tableBox.PaddingBottom +
+                    tableBox.BorderTop + tableBox.BorderBottom;
+                tableBox.TableGridBottomInset = 0f;
             }
             else
             {
@@ -201,11 +208,13 @@ public static class TableLayout
                 int col = cell.Col;
                 var padding = ResolveCellPadding(cell.Box, cellPadding);
                 float horizontalPadding = padding.Left + padding.Right;
-                float minC = MeasureCellMin(cell.Box, horizontalPadding, borderWidth);
-                float prefC = MeasureCellPref(cell.Box, horizontalPadding, borderWidth);
+                var cellBorders = ResolveCellBorderWidths(cell.Box, borderWidth);
+                float horizontalBorders = cellBorders.Left + cellBorders.Right;
+                float minC = MeasureCellMin(cell.Box, horizontalPadding, horizontalBorders);
+                float prefC = MeasureCellPref(cell.Box, horizontalPadding, horizontalBorders);
 
                 float? expl = ResolveCellWidth(cell.Box.Element, percentBase,
-                    horizontalPadding, borderWidth);
+                    horizontalPadding, horizontalBorders);
                 if (expl.HasValue)
                 {
                     // An explicit WIDTH is a hard constraint in the 1996
@@ -246,11 +255,13 @@ public static class TableLayout
 
                 var padding = ResolveCellPadding(cell.Box, cellPadding);
                 float horizontalPadding = padding.Left + padding.Right;
-                float minC = MeasureCellMin(cell.Box, horizontalPadding, borderWidth);
-                float prefC = MeasureCellPref(cell.Box, horizontalPadding, borderWidth);
+                var cellBorders = ResolveCellBorderWidths(cell.Box, borderWidth);
+                float horizontalBorders = cellBorders.Left + cellBorders.Right;
+                float minC = MeasureCellMin(cell.Box, horizontalPadding, horizontalBorders);
+                float prefC = MeasureCellPref(cell.Box, horizontalPadding, horizontalBorders);
 
                 float? expl = ResolveCellWidth(cell.Box.Element, percentBase,
-                    horizontalPadding, borderWidth);
+                    horizontalPadding, horizontalBorders);
                 if (expl.HasValue)
                 {
                     // Pinned colspan width (same rule as pass 1).
@@ -481,20 +492,12 @@ public static class TableLayout
 
                 // Keep CSS borders declared on the cell. The table border is
                 // only the fallback for cells without their own CSS border.
-                var cellStyle = box.Element?.Style;
                 var cellPaddingSides = ResolveCellPadding(box, cellPadding);
-                float cellBorderLeft = cellStyle?.OwnBorderLeftStyle == true &&
-                                       cellStyle.BorderLeftStyle == BorderStyleValue.None
-                    ? 0f : (box.BorderLeft > 0f ? box.BorderLeft : borderWidth);
-                float cellBorderRight = cellStyle?.OwnBorderRightStyle == true &&
-                                        cellStyle.BorderRightStyle == BorderStyleValue.None
-                    ? 0f : (box.BorderRight > 0f ? box.BorderRight : borderWidth);
-                float cellBorderTop = cellStyle?.OwnBorderTopStyle == true &&
-                                      cellStyle.BorderTopStyle == BorderStyleValue.None
-                    ? 0f : (box.BorderTop > 0f ? box.BorderTop : borderWidth);
-                float cellBorderBottom = cellStyle?.OwnBorderBottomStyle == true &&
-                                         cellStyle.BorderBottomStyle == BorderStyleValue.None
-                    ? 0f : (box.BorderBottom > 0f ? box.BorderBottom : borderWidth);
+                var cellBorders = ResolveCellBorderWidths(box, borderWidth);
+                float cellBorderLeft = cellBorders.Left;
+                float cellBorderRight = cellBorders.Right;
+                float cellBorderTop = cellBorders.Top;
+                float cellBorderBottom = cellBorders.Bottom;
 
                 if (collapsed)
                 {
@@ -597,6 +600,13 @@ public static class TableLayout
         for (int r = 0; r < nRows; r++)
         {
             var row = rows[r];
+            if (row.RowBox != null)
+            {
+                row.RowBox.X = tableBox.X;
+                row.RowBox.Y = y;
+                row.RowBox.Width = tableBox.Width;
+                row.RowBox.Height = rowH[r];
+            }
 
             foreach (var cell in row.Cells)
             {
@@ -704,6 +714,10 @@ public static class TableLayout
         // minus the borders — Height is the CONTENT height per the box model.
         float borderBoxH = (y + cellSpacingY + bottomCaptionH) - tableBox.Y + tableFrameBottom;
         tableBox.Height = Math.Max(0f, borderBoxH - tableFrameHeight);
+        tableBox.TableGridTopInset = topCaptionH;
+        tableBox.TableGridBottomInset = bottomCaptions.Count > 0
+            ? cellSpacingY + bottomCaptionH + tableFrameBottom
+            : 0f;
     }
 
     /// <summary>
@@ -1522,9 +1536,9 @@ public static class TableLayout
     // Column width measurement
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static float MeasureCellMin(LayoutBox cell, float cellPadding, float borderWidth)
+    private static float MeasureCellMin(LayoutBox cell, float cellPadding, float horizontalBorderWidth)
     {
-        float v = Math.Max(1f, MeasureMin(cell)) + cellPadding + 2f * borderWidth;
+        float v = Math.Max(1f, MeasureMin(cell)) + cellPadding + horizontalBorderWidth;
         if (TableDbg == "1" && v > 200f)
         {
             Console.WriteLine($"[cellmin] cell <{cell.Element?.TagName} width={cell.Element?.GetAttr("width")}> = {v:0.#}");
@@ -1562,8 +1576,24 @@ public static class TableLayout
     // cheaper than chasing the last fraction of a pixel of "exactness".
     private const float PrefWidthSlack = 2f;
 
-    private static float MeasureCellPref(LayoutBox cell, float cellPadding, float borderWidth) =>
-        Math.Max(1f, MeasurePref(cell)) + PrefWidthSlack + cellPadding + 2f * borderWidth;
+    private static float MeasureCellPref(LayoutBox cell, float cellPadding, float horizontalBorderWidth) =>
+        Math.Max(1f, MeasurePref(cell)) + PrefWidthSlack + cellPadding + horizontalBorderWidth;
+
+    private static (float Top, float Right, float Bottom, float Left)
+        ResolveCellBorderWidths(LayoutBox cell, float tableBorderWidth)
+    {
+        var style = cell.Element?.Style;
+        return (
+            Resolve(style?.OwnBorderTopStyle, style?.BorderTopStyle, cell.BorderTop),
+            Resolve(style?.OwnBorderRightStyle, style?.BorderRightStyle, cell.BorderRight),
+            Resolve(style?.OwnBorderBottomStyle, style?.BorderBottomStyle, cell.BorderBottom),
+            Resolve(style?.OwnBorderLeftStyle, style?.BorderLeftStyle, cell.BorderLeft));
+
+        float Resolve(bool? ownsStyle, BorderStyleValue? borderStyle, float layoutWidth) =>
+            ownsStyle == true && borderStyle == BorderStyleValue.None
+                ? 0f
+                : layoutWidth > 0f ? layoutWidth : tableBorderWidth;
+    }
 
     private static (float Top, float Right, float Bottom, float Left) ResolveCellPadding(
         LayoutBox cell, float tablePadding)
@@ -2007,14 +2037,15 @@ public static class TableLayout
     }
 
     private static float? ResolveCellWidth(
-        DomElement? element, float available, float horizontalPadding, float borderWidth)
+        DomElement? element, float available, float horizontalPadding,
+        float horizontalBorderWidth)
     {
         var style = element?.Style;
         if (style?.Width is { } cssWidth)
-            return Math.Max(0f, cssWidth) + horizontalPadding + 2f * borderWidth;
+            return Math.Max(0f, cssWidth) + horizontalPadding + horizontalBorderWidth;
         if (style?.WidthPercent is { } cssPercent)
             return Math.Max(0f, available * cssPercent / 100f)
-                + horizontalPadding + 2f * borderWidth;
+                + horizontalPadding + horizontalBorderWidth;
         return ResolveWidth(element, "width", available);
     }
 }

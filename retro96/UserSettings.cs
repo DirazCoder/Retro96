@@ -52,11 +52,10 @@ public sealed class UserSettings
     public string HomePageUrl { get; set; } = "retro96:home";
     public bool WelcomeDismissed { get; set; }
 
-    // The 1999 upgrade defaults fresh installs to the IE5 persona
-    // (checklist decision #1: pages sniff document.all first, then
-    // document.layers, then getElementById — a persona exposes exactly
-    // one of the first two). Existing installs keep their saved mode.
-    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.InternetExplorer5;
+    // Fresh installs use the Retro96 compatibility union. Historical browser
+    // personas, including IE5's box-model behavior, remain selectable.
+    // Existing installs keep their saved mode.
+    public RetroEngineMode EngineMode { get; set; } = RetroEngineMode.Retro96;
     public string UserAgentOverride { get; set; } = "";
     public BackgroundMode BackgroundMode { get; set; } = BackgroundMode.PageDefault;
     public string ForcedBackgroundColor { get; set; } = DefaultBackgroundColor;

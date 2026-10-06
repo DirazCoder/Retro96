@@ -29,6 +29,10 @@ namespace Retro96.Engine.Render;
 /// </summary>
 public class Renderer
 {
+    private HashSet<LayoutBox>? _deferredNegativeZIndexBoxes;
+    private bool _paintingDeferredNegativeZIndexBoxes;
+    private HashSet<LayoutBox>? _deferredOverflowTextBoxes;
+
     private static readonly List<string> DefaultFontFamily = ["Times New Roman", "serif"];
     private static readonly List<string> MonospaceFamily = ["Courier New", "monospace"];
 
@@ -305,28 +309,13 @@ public class Renderer
         private void DrawSingleLine(string text, Font font, SKPaint paint,
                                     float x, float baseline, SKTextAlign align)
         {
-            // Small monospace glyphs (such as inline <code>) are rasterized
-            // directly by this Skia renderer, bypassing Graphics' legacy text
-            // rendering adjustment. Apply the narrow monospace correction
-            // here without emboldening every regular page-font run.
-            bool previousEmbolden = font.SkFont.Embolden;
-            if (font.LegacyMonospaceStrokeBoost)
-                font.SkFont.Embolden = true;
-
-            try
+            if (text.IndexOf(LegacyBulletMarker) >= 0)
             {
-                if (text.IndexOf(LegacyBulletMarker) >= 0)
-                {
-                    DrawTextWithSpecialGlyphs(text, font, paint, x, baseline);
-                    return;
-                }
+                DrawTextWithSpecialGlyphs(text, font, paint, x, baseline);
+                return;
+            }
 
-                Canvas.DrawText(text, x, baseline, align, font.SkFont, paint);
-            }
-            finally
-            {
-                font.SkFont.Embolden = previousEmbolden;
-            }
+            Canvas.DrawText(text, x, baseline, align, font.SkFont, paint);
         }
 
         private void DrawTextWithSpecialGlyphs(string text, Font font, SKPaint paint,
@@ -503,7 +492,7 @@ public class Renderer
 
         try
         {
-            PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement);
+            PaintDocument(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement);
 
             if (showBoxOutlines)
                 PaintBoxOutlines(g, rootBox);
@@ -579,7 +568,7 @@ public class Renderer
             try
             {
                 canvas.Translate(-_scrollX, -_scrollY);
-                PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement,
+                PaintDocument(g, rootBox, fonts, images, hoveredElement, blinkVisible, focusedElement,
                     skipAnimatedContent, skipAnimatedImages, skipFixedPositioned);
                 if (showBoxOutlines)
                     PaintBoxOutlines(g, rootBox);
@@ -617,7 +606,8 @@ public class Renderer
                                     float scrollX, float scrollY,
                                     DomElement? hoveredElement, bool blinkVisible,
                                     DomElement? focusedElement = null,
-                                    GRContext? gpuContext = null)
+                                    GRContext? gpuContext = null,
+                                    IReadOnlyList<LayoutBox>? fixedBoxes = null)
     {
         ArgumentNullException.ThrowIfNull(canvas);
         ArgumentNullException.ThrowIfNull(rootBox);
@@ -641,8 +631,16 @@ public class Renderer
                 float.IsFinite(scrollX) ? Math.Max(0f, scrollX) : 0f,
                 float.IsFinite(scrollY) ? Math.Max(0f, scrollY) : 0f);
             using var g = new SkiaRenderContext(canvas, gpuContext);
-            foreach (var box in TopLevelFixedBoxes(rootBox))
-                PaintBox(g, box, fonts, images, hoveredElement, blinkVisible, focusedElement);
+            if (fixedBoxes != null)
+            {
+                foreach (var box in fixedBoxes)
+                    PaintBox(g, box, fonts, images, hoveredElement, blinkVisible, focusedElement);
+            }
+            else
+            {
+                foreach (var box in TopLevelFixedBoxes(rootBox))
+                    PaintBox(g, box, fonts, images, hoveredElement, blinkVisible, focusedElement);
+            }
         }
         finally
         {
@@ -669,6 +667,9 @@ public class Renderer
                 yield return nested;
         }
     }
+
+    internal static List<LayoutBox> CollectTopLevelFixedBoxes(LayoutBox root) =>
+        TopLevelFixedBoxes(root).ToList();
 
     private static bool IsFixedPrincipalBox(LayoutBox box) =>
         box.Element is { } element &&
@@ -769,26 +770,201 @@ public class Renderer
         if (children.Count < 2)
             return children;
 
-        int previousZIndex = children[0].Element?.Style?.ZIndex ?? 0;
+        static (int Phase, int ZIndex) StackingOrder(LayoutBox child)
+        {
+            var style = child.Element?.Style;
+            bool positioned = style?.Position is PositionValue.Absolute or
+                PositionValue.Fixed or PositionValue.Relative;
+            int zIndex = style?.ZIndex ?? 0;
+            int phase = !positioned ? 1 :
+                zIndex < 0 ? 0 :
+                zIndex == 0 ? 2 : 3;
+            return (phase, positioned ? zIndex : 0);
+        }
+
+        var previousOrder = StackingOrder(children[0]);
         bool alreadyOrdered = true;
         for (int i = 1; i < children.Count; i++)
         {
-            int zIndex = children[i].Element?.Style?.ZIndex ?? 0;
-            if (zIndex < previousZIndex)
+            var order = StackingOrder(children[i]);
+            if (order.CompareTo(previousOrder) < 0)
             {
                 alreadyOrdered = false;
                 break;
             }
-            previousZIndex = zIndex;
+            previousOrder = order;
         }
 
         if (alreadyOrdered)
             return children;
 
         return children.Select((child, index) => (child, index))
-            .OrderBy(p => p.child.Element?.Style?.ZIndex ?? 0)
+            .OrderBy(p => StackingOrder(p.child).Phase)
+            .ThenBy(p => StackingOrder(p.child).ZIndex)
             .ThenBy(p => p.index)
             .Select(p => p.child);
+    }
+
+    private void PaintDocument(SkiaRenderContext g, LayoutBox rootBox, FontCache fonts,
+                               ImageCache images, DomElement? hoveredElement,
+                               bool blinkVisible, DomElement? focusedElement = null,
+                               bool skipAnimatedContent = false, bool skipAnimatedImages = false,
+                               bool skipFixedPositioned = false)
+    {
+        var previousDeferred = _deferredNegativeZIndexBoxes;
+        bool previousPass = _paintingDeferredNegativeZIndexBoxes;
+        var previousOverflowText = _deferredOverflowTextBoxes;
+        var deferred = CollectRootNegativeZIndexBoxes(rootBox);
+        var overflowText = CollectOverflowTextBoxes(rootBox, blinkVisible,
+            skipAnimatedContent, skipFixedPositioned);
+        try
+        {
+            _deferredNegativeZIndexBoxes = deferred;
+            _deferredOverflowTextBoxes = overflowText;
+            if (deferred.Count > 0)
+            {
+                _paintingDeferredNegativeZIndexBoxes = true;
+                foreach (var box in deferred.OrderBy(
+                    box => box.Element?.Style?.ZIndex ?? 0))
+                    PaintBox(g, box, fonts, images, hoveredElement, blinkVisible,
+                        focusedElement, skipAnimatedContent, skipAnimatedImages,
+                        skipFixedPositioned);
+                _paintingDeferredNegativeZIndexBoxes = false;
+            }
+
+            PaintBox(g, rootBox, fonts, images, hoveredElement, blinkVisible,
+                focusedElement, skipAnimatedContent, skipAnimatedImages,
+                skipFixedPositioned);
+
+            foreach (var box in overflowText)
+                PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
+        }
+        finally
+        {
+            _deferredNegativeZIndexBoxes = previousDeferred;
+            _paintingDeferredNegativeZIndexBoxes = previousPass;
+            _deferredOverflowTextBoxes = previousOverflowText;
+        }
+    }
+
+    private static HashSet<LayoutBox> CollectOverflowTextBoxes(
+        LayoutBox rootBox, bool blinkVisible, bool skipAnimatedContent,
+        bool skipFixedPositioned)
+    {
+        var deferred = new HashSet<LayoutBox>();
+        foreach (var box in rootBox.Descendants())
+        {
+            if (string.IsNullOrEmpty(box.TextRun) || box.Width <= 0f || box.Height <= 0f ||
+                box.Element?.Style is not { Position: PositionValue.Static } ||
+                !blinkVisible && InsideBlink(box.Element))
+                continue;
+
+            var textRect = box.ContentRect;
+            bool escapesVisibleOverflow = false;
+            var ownStyle = box.StyleOverride ?? box.Element?.Style;
+            bool clippedOrStacked = ownStyle != null &&
+                (ownStyle.Overflow != OverflowValue.Visible || ownStyle.Clip != null ||
+                 ownStyle.Visibility is VisibilityValue.Hidden or VisibilityValue.Collapse);
+            for (var ancestor = box.Parent; ancestor != null; ancestor = ancestor.Parent)
+            {
+                var style = ancestor.Element?.Style ?? ancestor.StyleOverride;
+                if (style != null &&
+                    (style.Overflow != OverflowValue.Visible ||
+                     style.Clip != null ||
+                     style.Visibility is VisibilityValue.Hidden or VisibilityValue.Collapse ||
+                     style.Position is PositionValue.Absolute or PositionValue.Fixed or PositionValue.Relative ||
+                     style.ZIndex != 0))
+                {
+                    clippedOrStacked = true;
+                    break;
+                }
+
+                if (ancestor.Element?.Style is { Overflow: OverflowValue.Visible } &&
+                    textRect.Bottom > ancestor.BorderRect.Bottom + 0.5f)
+                    escapesVisibleOverflow = true;
+            }
+
+            if (clippedOrStacked || !escapesVisibleOverflow ||
+                HasAnimatedAncestor(box) && skipAnimatedContent ||
+                skipFixedPositioned && HasFixedPositionedAncestor(box) ||
+                !PaintsOverLaterSibling(box, textRect))
+                continue;
+
+            deferred.Add(box);
+        }
+
+        return deferred;
+    }
+
+    private static bool PaintsOverLaterSibling(LayoutBox box, RectangleF textRect)
+    {
+        var branch = box;
+        for (var parent = box.Parent; parent != null; branch = parent, parent = parent.Parent)
+        {
+            var siblings = PaintOrder(parent).ToList();
+            int branchIndex = siblings.IndexOf(branch);
+            for (int i = branchIndex + 1; i < siblings.Count; i++)
+            {
+                var sibling = siblings[i];
+                var style = sibling.Element?.Style ?? sibling.StyleOverride;
+                if (style == null ||
+                    (style.BackgroundColor.A == 0 &&
+                     string.IsNullOrEmpty(style.BackgroundImage)) ||
+                    !Intersects(textRect, sibling.BorderRect))
+                    continue;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool Intersects(RectangleF first, RectangleF second) =>
+        first.Left < second.Right && first.Right > second.Left &&
+        first.Top < second.Bottom && first.Bottom > second.Top;
+
+    private static bool HasAnimatedAncestor(LayoutBox box)
+    {
+        for (var current = box.Element; current != null; current = current.Parent as DomElement)
+            if (IsAnimatedSubtree(current))
+                return true;
+        return false;
+    }
+
+    private static bool HasFixedPositionedAncestor(LayoutBox box)
+    {
+        for (var current = box; current != null; current = current.Parent)
+            if (IsFixedPrincipalBox(current))
+                return true;
+        return false;
+    }
+
+    private static HashSet<LayoutBox> CollectRootNegativeZIndexBoxes(LayoutBox rootBox)
+    {
+        var deferred = new HashSet<LayoutBox>();
+        foreach (var box in rootBox.Descendants())
+        {
+            var style = box.Element?.Style;
+            if (style == null || style.ZIndex >= 0 ||
+                style.Position is not (PositionValue.Absolute or PositionValue.Relative))
+                continue;
+
+            bool insideStackingContext = false;
+            for (var ancestor = box.Parent; ancestor != null; ancestor = ancestor.Parent)
+            {
+                var ancestorStyle = ancestor.Element?.Style;
+                if (ancestorStyle?.Position is PositionValue.Absolute or PositionValue.Relative &&
+                    ancestorStyle.ZIndex != 0)
+                {
+                    insideStackingContext = true;
+                    break;
+                }
+            }
+
+            if (!insideStackingContext)
+                deferred.Add(box);
+        }
+        return deferred;
     }
 
     private void PaintBox(SkiaRenderContext g, LayoutBox box, FontCache fonts,
@@ -850,6 +1026,9 @@ public class Renderer
                               bool skipFixedPositioned = false)
     {
         if (box == null) return;
+        if (!_paintingDeferredNegativeZIndexBoxes &&
+            _deferredNegativeZIndexBoxes?.Contains(box) == true)
+            return;
 
         if (box.Element?.Style?.Visibility is VisibilityValue.Hidden or VisibilityValue.Collapse)
             return;
@@ -912,20 +1091,19 @@ public class Renderer
                        ReferenceEquals(element.LayoutBox, box)
             ? element.Style?.Overflow ?? OverflowValue.Visible
             : OverflowValue.Visible;
-        bool hasHorizontalOverflow = overflow == OverflowValue.Scroll &&
-            box.Descendants().Any(child => child.BorderRect.Right > box.PaddingRect.Right + 0.5f);
+        var scrollMetrics = overflow is OverflowValue.Scroll or OverflowValue.Auto
+            ? box.GetOverflowScrollMetrics()
+            : default;
         int clipState = 0;
         if (overflow != OverflowValue.Visible)
         {
             clipState = g.Save();
             float clipWidth = box.Width + box.PaddingLeft + box.PaddingRight;
             float clipHeight = box.Height + box.PaddingTop + box.PaddingBottom;
-            if (overflow == OverflowValue.Scroll)
-            {
+            if (scrollMetrics.HasVerticalScrollbar)
                 clipWidth = Math.Max(0f, clipWidth - 14f);
-                if (hasHorizontalOverflow)
-                    clipHeight = Math.Max(0f, clipHeight - 14f);
-            }
+            if (scrollMetrics.HasHorizontalScrollbar)
+                clipHeight = Math.Max(0f, clipHeight - 14f);
             g.SetClip(new RectangleF(
                 box.X + box.BorderLeft,
                 box.Y + box.BorderTop,
@@ -933,13 +1111,14 @@ public class Renderer
                 SKClipOperation.Intersect);
         }
 
-        if (overflow == OverflowValue.Scroll)
+        if (overflow is OverflowValue.Scroll or OverflowValue.Auto)
             g.Canvas.Translate(-box.ScrollOffsetX, -box.ScrollOffsetY);
 
         // Overflow clipping and scrolling apply to the box's own content as
         // well as its descendants. Painting it before establishing the clip
         // let text on the scroll container escape onto the page.
-        PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
+        if (_deferredOverflowTextBoxes?.Contains(box) != true)
+            PaintContent(g, box, fonts, images, hoveredElement, focusedElement);
 
         foreach (var child in PaintOrder(box))
         {
@@ -960,62 +1139,58 @@ public class Renderer
         if (overflow != OverflowValue.Visible)
         {
             g.Restore(clipState);
-            if (overflow == OverflowValue.Scroll)
-                PaintOverflowScrollbars(g, box, hasHorizontalOverflow);
+            if (scrollMetrics.HasVerticalScrollbar || scrollMetrics.HasHorizontalScrollbar)
+                PaintOverflowScrollbars(g, box, scrollMetrics);
         }
     }
 
     private static void PaintOverflowScrollbars(
-        SkiaRenderContext g, LayoutBox box, bool hasHorizontalOverflow)
+        SkiaRenderContext g, LayoutBox box, OverflowScrollMetrics metrics)
     {
         const float size = 14f;
         var viewport = box.PaddingRect;
         if (viewport.Width <= size || viewport.Height <= size) return;
 
-        float contentRight = box.Descendants()
-            .Select(child => child.BorderRect.Right)
-            .DefaultIfEmpty(viewport.Right)
-            .Max();
-        float contentBottom = box.Descendants()
-            .Select(child => child.BorderRect.Bottom)
-            .DefaultIfEmpty(viewport.Bottom)
-            .Max();
-        float viewportHeight = viewport.Height - (hasHorizontalOverflow ? size : 0f);
-        var vertical = new RectangleF(viewport.Right - size, viewport.Top,
-            size, viewportHeight);
         using var track = CreateFillPaint(Color.FromArgb(0xD4, 0xD0, 0xC8));
         using var edge = CreateStrokePaint(Color.Gray, 1);
         using var thumb = CreateFillPaint(Color.FromArgb(0xC0, 0xC0, 0xC0));
         using var thumbEdge = CreateStrokePaint(Color.DarkGray, 1);
 
-        g.FillRectangle(track, vertical);
-        g.DrawRectangle(edge, vertical);
+        if (metrics.HasVerticalScrollbar)
+        {
+            var vertical = new RectangleF(viewport.Right - size, viewport.Top,
+                size, metrics.ViewportHeight);
+            float contentHeight = Math.Max(viewport.Height,
+                metrics.ContentBottom - viewport.Top);
+            float thumbHeight = Math.Max(8f,
+                vertical.Height * metrics.ViewportHeight / contentHeight);
+            float thumbY = vertical.Top + (vertical.Height - thumbHeight) *
+                (metrics.MaxScrollY <= 0f ? 0f : box.ScrollOffsetY / metrics.MaxScrollY);
+            var verticalThumb = new RectangleF(vertical.Left + 2, thumbY + 2,
+                Math.Max(1f, size - 4), Math.Max(1f, thumbHeight - 4));
+            g.FillRectangle(track, vertical);
+            g.DrawRectangle(edge, vertical);
+            g.FillRectangle(thumb, verticalThumb);
+            g.DrawRectangle(thumbEdge, verticalThumb);
+        }
 
-        float horizontalViewportWidth = viewport.Width - size;
-        float contentWidth = Math.Max(viewport.Width, contentRight - viewport.Left);
-        float contentHeight = Math.Max(viewport.Height, contentBottom - viewport.Top);
-        float thumbHeight = Math.Max(8f, vertical.Height * viewportHeight / contentHeight);
-        float thumbY = vertical.Top + (vertical.Height - thumbHeight) *
-            (contentHeight <= viewportHeight ? 0f :
-             box.ScrollOffsetY / (contentHeight - viewportHeight));
-        var verticalThumb = new RectangleF(vertical.Left + 2, thumbY + 2,
-            Math.Max(1f, size - 4), Math.Max(1f, thumbHeight - 4));
-        g.FillRectangle(thumb, verticalThumb);
-        g.DrawRectangle(thumbEdge, verticalThumb);
-
-        if (!hasHorizontalOverflow) return;
-        var horizontal = new RectangleF(viewport.Left, viewport.Bottom - size,
-            horizontalViewportWidth, size);
-        float thumbWidth = Math.Max(8f, horizontal.Width * horizontalViewportWidth / contentWidth);
-        float thumbX = horizontal.Left + (horizontal.Width - thumbWidth) *
-            (contentWidth <= horizontalViewportWidth ? 0f :
-             box.ScrollOffsetX / (contentWidth - horizontalViewportWidth));
-        var horizontalThumb = new RectangleF(thumbX + 2, horizontal.Top + 2,
-            Math.Max(1f, thumbWidth - 4), Math.Max(1f, size - 4));
-        g.FillRectangle(track, horizontal);
-        g.DrawRectangle(edge, horizontal);
-        g.FillRectangle(thumb, horizontalThumb);
-        g.DrawRectangle(thumbEdge, horizontalThumb);
+        if (metrics.HasHorizontalScrollbar)
+        {
+            var horizontal = new RectangleF(viewport.Left, viewport.Bottom - size,
+                metrics.ViewportWidth, size);
+            float contentWidth = Math.Max(viewport.Width,
+                metrics.ContentRight - viewport.Left);
+            float thumbWidth = Math.Max(8f,
+                horizontal.Width * metrics.ViewportWidth / contentWidth);
+            float thumbX = horizontal.Left + (horizontal.Width - thumbWidth) *
+                (metrics.MaxScrollX <= 0f ? 0f : box.ScrollOffsetX / metrics.MaxScrollX);
+            var horizontalThumb = new RectangleF(thumbX + 2, horizontal.Top + 2,
+                Math.Max(1f, thumbWidth - 4), Math.Max(1f, size - 4));
+            g.FillRectangle(track, horizontal);
+            g.DrawRectangle(edge, horizontal);
+            g.FillRectangle(thumb, horizontalThumb);
+            g.DrawRectangle(thumbEdge, horizontalThumb);
+        }
     }
 
     // ── Marquee ─────────────────────────────────────────────────────
@@ -1471,6 +1646,7 @@ public class Renderer
 
         bool isTableCell = elem.TagName is "td" or "th";
         Color localBackground = ResolveLocalBackground(elem, Color.White);
+        var borderRect = GetTableGridBorderRect(box);
 
         // Paint from the box's layout-resolved widths — they include HTML
         // border attributes the CSS style may know nothing about.
@@ -1478,39 +1654,104 @@ public class Renderer
         Color rightColor = BorderColorFor(BorderColorOrBlack(style.BorderRightColor), isTableCell, localBackground);
         Color bottomColor = BorderColorFor(BorderColorOrBlack(style.BorderBottomColor), isTableCell, localBackground);
         Color leftColor = BorderColorFor(BorderColorOrBlack(style.BorderLeftColor), isTableCell, localBackground);
-        PaintBorderSide(g, box.BorderRect, box.BorderTop, style.BorderTopStyle,
+
+        if (box.BorderTop > 0f &&
+            box.BorderTop.Equals(box.BorderRight) &&
+            box.BorderTop.Equals(box.BorderBottom) &&
+            box.BorderTop.Equals(box.BorderLeft) &&
+            style.BorderTopStyle == style.BorderRightStyle &&
+            style.BorderTopStyle == style.BorderBottomStyle &&
+            style.BorderTopStyle == style.BorderLeftStyle &&
+            topColor.Equals(rightColor) &&
+            topColor.Equals(bottomColor) &&
+            topColor.Equals(leftColor) &&
+            style.BorderTopStyle == BorderStyleValue.Dotted)
+        {
+            PaintPatternedBorder(g, borderRect, box.BorderTop, style.BorderTopStyle, topColor);
+            return;
+        }
+
+        if (box.BorderTop >= 3f &&
+            box.BorderTop.Equals(box.BorderRight) &&
+            box.BorderTop.Equals(box.BorderBottom) &&
+            box.BorderTop.Equals(box.BorderLeft) &&
+            style.BorderTopStyle == BorderStyleValue.Double &&
+            style.BorderTopStyle == style.BorderRightStyle &&
+            style.BorderTopStyle == style.BorderBottomStyle &&
+            style.BorderTopStyle == style.BorderLeftStyle &&
+            topColor.Equals(rightColor) &&
+            topColor.Equals(bottomColor) &&
+            topColor.Equals(leftColor))
+        {
+            PaintDoublePerimeter(g, borderRect, box.BorderTop, topColor);
+            return;
+        }
+
+        PaintBorderSide(g, borderRect, box.BorderTop, style.BorderTopStyle,
                         topColor, BorderSide.Top, localBackground,
-                        SameBorderEdge(box.BorderTop, style.BorderTopStyle, topColor,
-                                       box.BorderLeft, style.BorderLeftStyle, leftColor) ? 0 : box.BorderLeft,
-                        SameBorderEdge(box.BorderTop, style.BorderTopStyle, topColor,
-                                       box.BorderRight, style.BorderRightStyle, rightColor) ? 0 : box.BorderRight,
+                        BorderCornerInset(box.BorderTop, style.BorderTopStyle, topColor,
+                                          box.BorderLeft, style.BorderLeftStyle, leftColor),
+                        BorderCornerInset(box.BorderTop, style.BorderTopStyle, topColor,
+                                          box.BorderRight, style.BorderRightStyle, rightColor),
                         style.OwnBorderTopStyle);
-        PaintBorderSide(g, box.BorderRect, box.BorderRight, style.BorderRightStyle,
+        PaintBorderSide(g, borderRect, box.BorderRight, style.BorderRightStyle,
                         rightColor, BorderSide.Right, localBackground,
-                        SameBorderEdge(box.BorderRight, style.BorderRightStyle, rightColor,
-                                       box.BorderTop, style.BorderTopStyle, topColor) ? 0 : box.BorderTop,
-                        SameBorderEdge(box.BorderRight, style.BorderRightStyle, rightColor,
-                                       box.BorderBottom, style.BorderBottomStyle, bottomColor) ? 0 : box.BorderBottom,
+                        BorderCornerInset(box.BorderRight, style.BorderRightStyle, rightColor,
+                                          box.BorderTop, style.BorderTopStyle, topColor),
+                        BorderCornerInset(box.BorderRight, style.BorderRightStyle, rightColor,
+                                          box.BorderBottom, style.BorderBottomStyle, bottomColor),
                         style.OwnBorderRightStyle);
-        PaintBorderSide(g, box.BorderRect, box.BorderBottom, style.BorderBottomStyle,
+        PaintBorderSide(g, borderRect, box.BorderBottom, style.BorderBottomStyle,
                         bottomColor, BorderSide.Bottom, localBackground,
-                        SameBorderEdge(box.BorderBottom, style.BorderBottomStyle, bottomColor,
-                                       box.BorderLeft, style.BorderLeftStyle, leftColor) ? 0 : box.BorderLeft,
-                        SameBorderEdge(box.BorderBottom, style.BorderBottomStyle, bottomColor,
-                                       box.BorderRight, style.BorderRightStyle, rightColor) ? 0 : box.BorderRight,
+                        BorderCornerInset(box.BorderBottom, style.BorderBottomStyle, bottomColor,
+                                          box.BorderLeft, style.BorderLeftStyle, leftColor),
+                        BorderCornerInset(box.BorderBottom, style.BorderBottomStyle, bottomColor,
+                                          box.BorderRight, style.BorderRightStyle, rightColor),
                         style.OwnBorderBottomStyle);
-        PaintBorderSide(g, box.BorderRect, box.BorderLeft, style.BorderLeftStyle,
+        PaintBorderSide(g, borderRect, box.BorderLeft, style.BorderLeftStyle,
                         leftColor, BorderSide.Left, localBackground,
-                        SameBorderEdge(box.BorderLeft, style.BorderLeftStyle, leftColor,
-                                       box.BorderTop, style.BorderTopStyle, topColor) ? 0 : box.BorderTop,
-                        SameBorderEdge(box.BorderLeft, style.BorderLeftStyle, leftColor,
-                                       box.BorderBottom, style.BorderBottomStyle, bottomColor) ? 0 : box.BorderBottom,
+                        BorderCornerInset(box.BorderLeft, style.BorderLeftStyle, leftColor,
+                                          box.BorderTop, style.BorderTopStyle, topColor),
+                        BorderCornerInset(box.BorderLeft, style.BorderLeftStyle, leftColor,
+                                          box.BorderBottom, style.BorderBottomStyle, bottomColor),
                         style.OwnBorderLeftStyle);
     }
+
+    private static RectangleF GetTableGridBorderRect(LayoutBox box) =>
+        box.BoxType == BoxType.Table
+            ? new RectangleF(
+                box.BorderRect.X,
+                box.BorderRect.Y + box.TableGridTopInset,
+                box.BorderRect.Width,
+                Math.Max(0f, box.BorderRect.Height -
+                    box.TableGridTopInset - box.TableGridBottomInset))
+            : box.BorderRect;
 
     private static bool SameBorderEdge(float widthA, BorderStyleValue styleA, Color colorA,
         float widthB, BorderStyleValue styleB, Color colorB) =>
         widthA.Equals(widthB) && styleA == styleB && colorA.Equals(colorB);
+
+    private static void PaintPatternedBorder(
+        SkiaRenderContext g, RectangleF rect, float borderWidth,
+        BorderStyleValue style, Color color)
+    {
+        float width = Math.Max(1f, borderWidth);
+        if (style != BorderStyleValue.Dotted) return;
+        PaintDottedPerimeter(g,
+            rect.Left + width / 2f, rect.Top + width / 2f,
+            rect.Width - width, rect.Height - width, width, color);
+    }
+
+    private static float BorderCornerInset(float width, BorderStyleValue style, Color color,
+        float adjacentWidth, BorderStyleValue adjacentStyle, Color adjacentColor)
+    {
+        bool bevel = style is BorderStyleValue.Groove or BorderStyleValue.Ridge or
+            BorderStyleValue.Inset or BorderStyleValue.Outset or BorderStyleValue.Double ||
+            adjacentStyle is BorderStyleValue.Groove or BorderStyleValue.Ridge or
+            BorderStyleValue.Inset or BorderStyleValue.Outset or BorderStyleValue.Double;
+        return !bevel && SameBorderEdge(width, style, color,
+            adjacentWidth, adjacentStyle, adjacentColor) ? 0f : adjacentWidth;
+    }
 
     /// <summary>Table cell rules were grey (#808080), not text-black.
     /// Keep that default and adapt any authored border that is too close to
@@ -1547,7 +1788,7 @@ public class Renderer
         if (style.OutlineStyle == BorderStyleValue.None || style.OutlineWidth <= 0f)
             return;
 
-        var rect = box.BorderRect;
+        var rect = GetTableGridBorderRect(box);
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         const float OutlineOffset = 2f;
@@ -1706,7 +1947,7 @@ public class Renderer
 
     private static void PaintTableOuterBorder(SkiaRenderContext g, LayoutBox box)
     {
-        var rect = box.BorderRect;
+        var rect = GetTableGridBorderRect(box);
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         float w = Math.Max(1, box.BorderTop);
@@ -1738,7 +1979,7 @@ public class Renderer
     private static void PaintCollapsedTableOuterBorder(
         SkiaRenderContext g, LayoutBox box, ComputedStyle style)
     {
-        var rect = box.BorderRect;
+        var rect = GetTableGridBorderRect(box);
         var cells = box.Descendants()
             .Where(cell => cell.Element?.TagName is "td" or "th")
             .OrderBy(cell => cell.BorderRect.Top)
@@ -1746,7 +1987,7 @@ public class Renderer
             .ToList();
         if (cells.Count == 0)
         {
-            PaintCssOuterBorder(g, box, style);
+            PaintCssOuterBorder(g, box, style, rect);
             return;
         }
 
@@ -1867,9 +2108,9 @@ public class Renderer
         }
     }
 
-    private static void PaintCssOuterBorder(SkiaRenderContext g, LayoutBox box, ComputedStyle style)
+    private static void PaintCssOuterBorder(SkiaRenderContext g, LayoutBox box,
+        ComputedStyle style, RectangleF rect)
     {
-        var rect = box.BorderRect;
         PaintBorderSide(g, rect, box.BorderTop, style.BorderTopStyle,
             BorderColorOrBlack(style.BorderTopColor), BorderSide.Top, Color.White, 0f, 0f,
             style.OwnBorderTopStyle);
@@ -1986,7 +2227,8 @@ public class Renderer
         if (bStyle is BorderStyleValue.Groove or BorderStyleValue.Ridge
                    or BorderStyleValue.Inset or BorderStyleValue.Outset)
         {
-            Paint3DBorder(g, rect, bStyle, w, color, side, background);
+            Paint3DBorder(g, rect, bStyle, w, color, side, background,
+                nearCornerWidth, farCornerWidth);
             return;
         }
 
@@ -2045,8 +2287,8 @@ public class Renderer
             rect, w, side, nearCornerWidth, farCornerWidth));
         int state = g.Save();
         using var brush = CreateFillPaint(color);
-        float dashLength = Math.Max(3f, w * 3f);
-        float dashGap = Math.Max(2f, w * 2f);
+        float dashLength = Math.Max(3f, w * 2f);
+        float dashGap = Math.Max(2f, w);
         bool horizontal = side is BorderSide.Top or BorderSide.Bottom;
         float axisStart = horizontal ? rect.Left : rect.Top;
         float axisEnd = horizontal ? rect.Right : rect.Bottom;
@@ -2155,7 +2397,8 @@ public class Renderer
     }
 
     private static void Paint3DBorder(SkiaRenderContext g, RectangleF rect,
-        BorderStyleValue style, int w, Color baseColor, BorderSide side, Color background)
+        BorderStyleValue style, int w, Color baseColor, BorderSide side, Color background,
+        float nearCornerWidth, float farCornerWidth)
     {
         if (w < 1) return;
 
@@ -2166,72 +2409,97 @@ public class Renderer
 
         bool topLeft = side is BorderSide.Top or BorderSide.Left;
         bool raised = style is BorderStyleValue.Ridge or BorderStyleValue.Outset;
-
-        if (style is BorderStyleValue.Inset or BorderStyleValue.Outset)
+        using var clip = new Region(GetBorderPolygon(
+            rect, w, side, nearCornerWidth, farCornerWidth));
+        int state = g.Save();
+        try
         {
-            Color shade = (raised == topLeft) ? light : darkDark;
+            g.SetClip(clip, SKClipOperation.Intersect);
+
+            if (style is BorderStyleValue.Inset or BorderStyleValue.Outset)
+            {
+                Color shade = (raised == topLeft) ? light : darkDark;
+                if (NeedsStrongBevelOutline(background))
+                {
+                    int minChannel = Math.Min(baseColor.R, Math.Min(baseColor.G, baseColor.B));
+                    int maxChannel = Math.Max(baseColor.R, Math.Max(baseColor.G, baseColor.B));
+                    shade = maxChannel - minChannel > 24
+                        ? raised == topLeft ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f)
+                        : raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
+                }
+                using var brush = CreateFillPaint(shade);
+                switch (side)
+                {
+                    case BorderSide.Top: g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, w); break;
+                    case BorderSide.Bottom: g.FillRectangle(brush, rect.Left, rect.Bottom - w, rect.Width, w); break;
+                    case BorderSide.Left: g.FillRectangle(brush, rect.Left, rect.Top, w, rect.Height); break;
+                    case BorderSide.Right: g.FillRectangle(brush, rect.Right - w, rect.Top, w, rect.Height); break;
+                }
+                return;
+            }
+
+            // Groove and ridge are two-tone borders. Split each side along
+            // its width, while the clipped trapezoid joins the bands at corners.
+            bool outerLight = raised == topLeft;
+            Color outer = outerLight ? light : darkDark;
+            Color inner = outerLight ? dark : midLight;
             if (NeedsStrongBevelOutline(background))
             {
                 int minChannel = Math.Min(baseColor.R, Math.Min(baseColor.G, baseColor.B));
                 int maxChannel = Math.Max(baseColor.R, Math.Max(baseColor.G, baseColor.B));
-                shade = maxChannel - minChannel > 24
-                    ? raised == topLeft ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f)
-                    : raised == topLeft ? BevelHighlightColor(background) : BevelShadowColor(background);
+                if (maxChannel - minChannel > 24)
+                {
+                    outer = outerLight ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f);
+                    inner = outerLight ? Shade(baseColor, 0.45f) : Tint(baseColor, 0.30f);
+                }
+                else
+                {
+                    outer = outerLight ? BevelHighlightColor(background) : BevelShadowColor(background);
+                    inner = outerLight ? BevelShadowColor(background) : BevelHighlightColor(background);
+                }
             }
-            using var brush = CreateFillPaint(shade);
-            switch (side)
-            {
-                case BorderSide.Top: g.FillRectangle(brush, rect.Left, rect.Top, rect.Width, w); break;
-                case BorderSide.Bottom: g.FillRectangle(brush, rect.Left, rect.Bottom - w, rect.Width, w); break;
-                case BorderSide.Left: g.FillRectangle(brush, rect.Left, rect.Top, w, rect.Height); break;
-                case BorderSide.Right: g.FillRectangle(brush, rect.Right - w, rect.Top, w, rect.Height); break;
-            }
-            return;
-        }
 
-        // Groove and ridge are two-tone borders. The light/dark order flips
-        // on the bottom/right half so the border reads as carved or raised.
-        bool outerLight = raised == topLeft;
-        Color outer = outerLight ? light : darkDark;
-        Color inner = outerLight ? midLight : dark;
-        if (NeedsStrongBevelOutline(background))
-        {
-            int minChannel = Math.Min(baseColor.R, Math.Min(baseColor.G, baseColor.B));
-            int maxChannel = Math.Max(baseColor.R, Math.Max(baseColor.G, baseColor.B));
-            if (maxChannel - minChannel > 24)
+            int first = Math.Max(1, w / 2);
+            int second = Math.Max(1, w - first);
+            using var outerBrush = CreateFillPaint(outer, antialias: false);
+            using var innerBrush = CreateFillPaint(inner, antialias: false);
+
+            void FillBand(SKPaint brush, int startOffset, int endOffset)
             {
-                outer = outerLight ? Tint(baseColor, 0.55f) : Shade(baseColor, 0.45f);
-                inner = outerLight ? Tint(baseColor, 0.30f) : Shade(baseColor, 0.70f);
+                if (endOffset <= startOffset) return;
+                float bandStart = startOffset == 0 ? 0f : startOffset - 0.5f;
+                float bandEnd = endOffset == w ? w : endOffset + 0.5f;
+                float bandWidth = bandEnd - bandStart;
+                if (side is BorderSide.Top or BorderSide.Bottom)
+                {
+                    float y = side == BorderSide.Top
+                        ? rect.Top + bandStart
+                        : rect.Bottom - w + bandStart;
+                    g.FillRectangle(brush, rect.Left, y, rect.Width, bandWidth);
+                }
+                else
+                {
+                    float x = side == BorderSide.Left
+                        ? rect.Left + bandStart
+                        : rect.Right - w + bandStart;
+                    g.FillRectangle(brush, x, rect.Top, bandWidth, rect.Height);
+                }
+            }
+
+            if (topLeft)
+            {
+                FillBand(outerBrush, 0, first);
+                FillBand(innerBrush, first, w);
             }
             else
             {
-                outer = outerLight ? BevelHighlightColor(background) : BevelShadowColor(background);
-                inner = outerLight ? BevelShadowColor(background) : BevelHighlightColor(background);
+                FillBand(innerBrush, 0, second);
+                FillBand(outerBrush, second, w);
             }
         }
-        int first = Math.Max(1, w / 2);
-        int second = Math.Max(1, w - first);
-        using var outerBrush = CreateFillPaint(outer);
-        using var innerBrush = CreateFillPaint(inner);
-
-        switch (side)
+        finally
         {
-            case BorderSide.Top:
-                g.FillRectangle(outerBrush, rect.Left, rect.Top, rect.Width, first);
-                g.FillRectangle(innerBrush, rect.Left, rect.Top + first, rect.Width, second);
-                break;
-            case BorderSide.Bottom:
-                g.FillRectangle(innerBrush, rect.Left, rect.Bottom - w, rect.Width, second);
-                g.FillRectangle(outerBrush, rect.Left, rect.Bottom - first, rect.Width, first);
-                break;
-            case BorderSide.Left:
-                g.FillRectangle(outerBrush, rect.Left, rect.Top, first, rect.Height);
-                g.FillRectangle(innerBrush, rect.Left + first, rect.Top, second, rect.Height);
-                break;
-            case BorderSide.Right:
-                g.FillRectangle(innerBrush, rect.Right - w, rect.Top, second, rect.Height);
-                g.FillRectangle(outerBrush, rect.Right - first, rect.Top, first, rect.Height);
-                break;
+            g.Restore(state);
         }
     }
 
@@ -2257,6 +2525,55 @@ public class Renderer
                 DrawBorderScanline(g, brush, rect, side, offset, start, end);
             }
         }
+    }
+
+    private static void PaintDoublePerimeter(
+        SkiaRenderContext g, RectangleF rect, float borderWidth, Color color)
+    {
+        int width = Math.Max(1, (int)Math.Round(borderWidth));
+        if (width < 3)
+        {
+            PaintSimpleSide(g, rect, width, BorderStyleValue.Solid,
+                color, BorderSide.Top, 0f, 0f);
+            PaintSimpleSide(g, rect, width, BorderStyleValue.Solid,
+                color, BorderSide.Right, 0f, 0f);
+            PaintSimpleSide(g, rect, width, BorderStyleValue.Solid,
+                color, BorderSide.Bottom, 0f, 0f);
+            PaintSimpleSide(g, rect, width, BorderStyleValue.Solid,
+                color, BorderSide.Left, 0f, 0f);
+            return;
+        }
+
+        int lineWidth = Math.Max(1, width / 3);
+        int innerLineStart = width - lineWidth;
+        using var brush = CreateFillPaint(color, antialias: false);
+
+        // Build both rectangular rules from overlapping side fills instead
+        // of independently mitering four scanline sets. The overlap closes
+        // the single-pixel corner pinholes caused by fractional raster scale.
+        g.FillRectangle(brush, rect.Left, rect.Top,
+            rect.Width, lineWidth);
+        g.FillRectangle(brush, rect.Left, rect.Bottom - lineWidth,
+            rect.Width, lineWidth);
+        g.FillRectangle(brush, rect.Left, rect.Top + lineWidth,
+            lineWidth, Math.Max(0f, rect.Height - 2f * lineWidth));
+        g.FillRectangle(brush, rect.Right - lineWidth, rect.Top + lineWidth,
+            lineWidth, Math.Max(0f, rect.Height - 2f * lineWidth));
+
+        float innerTop = rect.Top + innerLineStart;
+        float innerBottom = rect.Bottom - width;
+        float innerLeft = rect.Left + innerLineStart;
+        float innerRight = rect.Right - width;
+        float innerHorizontalWidth = Math.Max(0f, rect.Width - 2f * innerLineStart);
+        float innerVerticalHeight = Math.Max(0f, rect.Height - 2f * innerLineStart);
+        g.FillRectangle(brush, innerLeft, innerTop,
+            innerHorizontalWidth, lineWidth);
+        g.FillRectangle(brush, innerLeft, innerBottom,
+            innerHorizontalWidth, lineWidth);
+        g.FillRectangle(brush, innerLeft, innerTop,
+            lineWidth, innerVerticalHeight);
+        g.FillRectangle(brush, innerRight, innerTop,
+            lineWidth, innerVerticalHeight);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2963,8 +3280,14 @@ public class Renderer
 
             default:    // text, password, and unknown → text field
                 string value = elem.GetAttr("value") ?? "";
-                if (type == "password") value = new string('*', value.Length);
-                PaintTextControl(g, box, fonts, style, value, isFocused, type == "password");
+                bool isPlaceholder = value.Length == 0 &&
+                    !string.IsNullOrEmpty(elem.GetAttr("placeholder"));
+                if (isPlaceholder)
+                    value = elem.GetAttr("placeholder")!;
+                else if (type == "password")
+                    value = new string('*', value.Length);
+                PaintTextControl(g, box, fonts, style, value, isFocused,
+                    type == "password", isPlaceholder);
                 return;
         }
     }
@@ -3273,7 +3596,7 @@ public class Renderer
 
     private void PaintTextControl(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                   ComputedStyle style, string text, bool isFocused,
-                                  bool isPassword)
+                                  bool isPassword, bool isPlaceholder)
     {
         var rect = box.BorderRect;   // chrome sits on the layout-reserved ring
         var face = box.ContentRect;
@@ -3305,7 +3628,7 @@ public class Renderer
         }
 
         var font = ResolveFont(fonts, style);
-        using var brush = CreateFillPaint(fgColor);
+        using var brush = CreateFillPaint(isPlaceholder ? Color.Gray : fgColor);
         SKTextAlign textAlign = style.OwnTextAlign
             ? (style.TextAlign == TextAlign.Center ? SKTextAlign.Center
               : style.TextAlign == TextAlign.Right ? SKTextAlign.Right
@@ -3317,7 +3640,7 @@ public class Renderer
         var textRect = new RectangleF(face.X + 3, face.Y,
                                       Math.Max(0, face.Width - 6), face.Height);
         float fieldScroll = 0f;
-        if (!isPassword && box.Element != null)
+        if (!isPassword && !isPlaceholder && box.Element != null)
             fieldScroll = Math.Max(0f, FieldScrollResolver?.Invoke(box.Element) ?? 0f);
 
         // Skia text edging is a mutable Skia text state. Password masks may
@@ -3332,7 +3655,7 @@ public class Renderer
             font.SkFont.Edging = isPassword ? SKFontEdging.Alias : SKFontEdging.Antialias;
 
             float lineY = textRect.Y + Math.Max(0f, (textRect.Height - font.GetHeight()) * 0.5f);
-            if (isPassword && box.Element != null)
+            if (isPassword && !isPlaceholder && box.Element != null)
             {
                 int length = text.Length;
                 float advance = PasswordMaskLayout.GetAdvance(font);

@@ -1426,7 +1426,6 @@ public partial class Form1 : Form
     {
         _globalScope = new JsScope();
         JsRuntime.PopulateGlobalScope(_globalScope);
-        DomBindings.RegisterEarlyGlobals(_globalScope, _canvas);   // parse-time alert() etc.
 
         // The certificate-error page's only button is a form whose
         // onsubmit calls window.acceptCertRisk() — with nothing bound
@@ -1452,6 +1451,8 @@ public partial class Form1 : Form
             BrowserRuntime.JavaScriptMaxExecutionMilliseconds,
             BrowserRuntime.JavaScriptMemoryLimitBytes,
             BrowserRuntime.JavaScriptMaxCallDepth);
+
+        DomBindings.RegisterEarlyGlobals(_globalScope, _canvas, _jsInterpreter);
 
         _jsInterpreter.ConsoleMessage += entry =>
             PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);
@@ -1985,7 +1986,6 @@ public partial class Form1 : Form
     {
         var frameScope = new JsScope();
         JsRuntime.PopulateGlobalScope(frameScope);
-        DomBindings.RegisterEarlyGlobals(frameScope, _canvas);
 
         var interpreter = new JsInterpreter(
             frameScope,
@@ -1995,6 +1995,8 @@ public partial class Form1 : Form
             BrowserRuntime.JavaScriptMaxExecutionMilliseconds,
             BrowserRuntime.JavaScriptMemoryLimitBytes,
             BrowserRuntime.JavaScriptMaxCallDepth);
+
+        DomBindings.RegisterEarlyGlobals(frameScope, _canvas, interpreter);
 
         interpreter.ConsoleMessage += entry =>
             PageInspector.PublishConsole(entry.Level, entry.Message, entry.Timestamp);

@@ -358,19 +358,21 @@ public class Retro99SuiteTests
     [Fact]
     public void Ie5BoxModelPersona()
     {
-        // IE5 persona (default): width includes padding and border.
-        var (doc, root) = Layout("css", "css2-boxmodel.html");
-        var box = doc.ElementDescendants().FirstOrDefault(e => e.GetAttr("id") == "ie5box");
-        var layoutBox = LayoutHarness.BoxOf(root, box!);
-        Check.That(layoutBox != null, "the box-model probe lays out");
-        Check.That(Math.Abs(layoutBox!.BorderRect.Width - 200f) < 1.5f,
-            "IE5 persona: authored width is the border-box width (200px)",
-            $"{layoutBox.BorderRect.Width:0.#}");
-
-        // Union persona: W3C content-box → 200 + 2*20 + 2*10 = 260.
-        BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+        var previousSettings = BrowserRuntime.Settings.Clone();
         try
         {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.InternetExplorer5 });
+            // IE5 persona: width includes padding and border.
+            var (doc, root) = Layout("css", "css2-boxmodel.html");
+            var box = doc.ElementDescendants().FirstOrDefault(e => e.GetAttr("id") == "ie5box");
+            var layoutBox = LayoutHarness.BoxOf(root, box!);
+            Check.That(layoutBox != null, "the box-model probe lays out");
+            Check.That(Math.Abs(layoutBox!.BorderRect.Width - 200f) < 1.5f,
+                "IE5 persona: authored width is the border-box width (200px)",
+                $"{layoutBox.BorderRect.Width:0.#}");
+
+            // Union persona: W3C content-box → 200 + 2*20 + 2*10 = 260.
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
             var (doc2, root2) = Layout("css", "css2-boxmodel.html");
             var box2 = doc2.ElementDescendants().FirstOrDefault(e => e.GetAttr("id") == "ie5box");
             var layoutBox2 = LayoutHarness.BoxOf(root2, box2!);
@@ -380,7 +382,7 @@ public class Retro99SuiteTests
         }
         finally
         {
-            BrowserRuntime.Apply(new UserSettings());
+            BrowserRuntime.Apply(previousSettings);
         }
         Check.Done();
     }
@@ -388,20 +390,30 @@ public class Retro99SuiteTests
     [Fact]
     public void ZIndexAndMinMax()
     {
-        var (doc, root) = Layout("css", "css2-boxmodel.html");
-        var minmax = doc.ElementDescendants().FirstOrDefault(e =>
-            (e.GetAttr("class") ?? "").Contains("minmax"));
-        var minmaxBox = LayoutHarness.BoxOf(root, minmax!);
-        Check.That(minmaxBox != null && minmaxBox!.BorderRect.Width >= 118f,
-            "min-width clamps the box open", $"{minmaxBox?.BorderRect.Width:0.#}");
-        Check.That(minmaxBox!.BorderRect.Width <= 262f,
-            "max-width caps the box", $"{minmaxBox.BorderRect.Width:0.#}");
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+            var (doc, root) = Layout("css", "css2-boxmodel.html");
+            var minmax = doc.ElementDescendants().FirstOrDefault(e =>
+                (e.GetAttr("class") ?? "").Contains("minmax"));
+            var minmaxBox = LayoutHarness.BoxOf(root, minmax!);
+            Check.That(minmaxBox != null && minmaxBox!.BorderRect.Width >= 118f,
+                "min-width clamps the box open", $"{minmaxBox?.BorderRect.Width:0.#}");
+            Check.That(minmaxBox!.BorderRect.Width <= 272f,
+                "max-width caps content width before padding and borders are added in the union",
+                $"{minmaxBox.BorderRect.Width:0.#}");
 
-        // z-index stack order: z5 paints above z2 at the same level
-        var z2 = doc.ElementDescendants().First(e => (e.GetAttr("class") ?? "").Contains("z2"));
-        var z5 = doc.ElementDescendants().First(e => (e.GetAttr("class") ?? "").Contains("z5"));
-        Check.That((z5.Style?.ZIndex ?? 0) > (z2.Style?.ZIndex ?? 0),
-            "z-index values resolve on positioned elements");
+            // z-index stack order: z5 paints above z2 at the same level
+            var z2 = doc.ElementDescendants().First(e => (e.GetAttr("class") ?? "").Contains("z2"));
+            var z5 = doc.ElementDescendants().First(e => (e.GetAttr("class") ?? "").Contains("z5"));
+            Check.That((z5.Style?.ZIndex ?? 0) > (z2.Style?.ZIndex ?? 0),
+                "z-index values resolve on positioned elements");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
         Check.Done();
     }
 
@@ -888,16 +900,25 @@ public class Retro99SuiteTests
     [Fact]
     public void PersonaSurfaceDefaults()
     {
-        Check.That(BrowserRuntime.IsInternetExplorer5, "fresh settings default to the IE5 persona");
-        Check.That(BrowserRuntime.SupportsDocumentAll && !BrowserRuntime.SupportsDocumentLayers,
-            "IE5 persona exposes all, not layers");
-        Check.That(BrowserRuntime.SupportsGetElementById, "IE5 persona exposes getElementById");
-        Check.That(BrowserRuntime.Http11Enabled, "1999 personas speak HTTP/1.1");
-        Check.That(BrowserRuntime.UsesIe5BoxModel, "IE5 persona applies the IE5 box model");
-        Check.That(UserSettings.DefaultIe5UserAgent == "Mozilla/4.0 (compatible; MSIE 5.0; Windows 98)",
-            "the IE5 UA string is the period capture");
-        Check.That(UserSettings.DefaultNetscape47UserAgent == "Mozilla/4.7 [en] (Win98; I)",
-            "the NS4.7 UA string is the period capture");
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings());
+            Check.That(BrowserRuntime.IsRetro96, "fresh settings default to the Retro96 compatibility union");
+            Check.That(BrowserRuntime.SupportsDocumentAll && BrowserRuntime.SupportsDocumentLayers,
+                "Retro96 union exposes both legacy DOM surfaces");
+            Check.That(BrowserRuntime.SupportsGetElementById, "Retro96 union exposes getElementById");
+            Check.That(BrowserRuntime.Http11Enabled, "1999 personas speak HTTP/1.1");
+            Check.That(!BrowserRuntime.UsesIe5BoxModel, "Retro96 union uses the standard CSS box model");
+            Check.That(UserSettings.DefaultIe5UserAgent == "Mozilla/4.0 (compatible; MSIE 5.0; Windows 98)",
+                "the IE5 UA string is the period capture");
+            Check.That(UserSettings.DefaultNetscape47UserAgent == "Mozilla/4.7 [en] (Win98; I)",
+                "the NS4.7 UA string is the period capture");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
         Check.Done();
     }
 }

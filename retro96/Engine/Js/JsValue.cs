@@ -16,7 +16,7 @@ public enum JsType
 }
 
 /// <summary>
-/// A JavaScript 1.1/1.2 value.  Conversions follow the era's rules:
+/// A JavaScript 1999 value.  Conversions follow the era's rules:
 /// numbers stringify with the classic integer/exponent split, strings
 /// parse as octal when they look octal (decimal fallback for 8/9), and
 /// abstract (loose) equality implements the full conversion table.
@@ -81,22 +81,9 @@ public class JsValue
         JsType.Boolean   => _boolValue ? 1.0 : 0.0,
         JsType.Number    => _numberValue,
         JsType.String    => StringToNumber(_stringValue!),
-        JsType.Object or JsType.Function => ObjectToNumber(),
+        JsType.Object or JsType.Function => ToPrimitive().ToNumber(),
         _ => double.NaN
     };
-
-    /// <summary>
-    /// Number conversion for objects: an own numeric "value" property wins
-    /// (valueOf semantics — Date, Number wrappers); anything else parses
-    /// its string form ("[object Object]" → NaN).
-    /// </summary>
-    private double ObjectToNumber()
-    {
-        var o = GetObjectOrFunction();
-        if (o.Properties.TryGetValue("value", out var v) && v.Type == JsType.Number)
-            return v.GetNumber();
-        return StringToNumber(o.ToJsString());
-    }
 
     public string ToJsString() => Type switch
     {
@@ -105,7 +92,7 @@ public class JsValue
         JsType.Boolean   => _boolValue ? "true" : "false",
         JsType.Number    => NumberToString(_numberValue),
         JsType.String    => _stringValue!,
-        JsType.Object or JsType.Function => ToPrimitive().ToJsString(),
+        JsType.Object or JsType.Function => ToPrimitive(preferString: true).ToJsString(),
         _ => "undefined"
     };
 
@@ -125,14 +112,22 @@ public class JsValue
     /// the STRING form, so "" + date is the formatted date while date - 1
     /// (numeric context) uses ToNumber's valueOf path.
     /// </summary>
-    public JsValue ToPrimitive() => Type switch
+    public JsValue ToPrimitive() => ToPrimitive(preferString: false);
+
+    private JsValue ToPrimitive(bool preferString)
     {
-        JsType.Object or JsType.Function when JsObject.Stringifier != null
-            => JsValue.From(JsObject.Stringifier(GetObjectOrFunction())),
-        JsType.Object   => JsValue.From("[object Object]"),
-        JsType.Function => JsValue.From("function() { ... }"),
-        _ => this
-    };
+        if (Type is not (JsType.Object or JsType.Function))
+            return this;
+
+        var obj = GetObjectOrFunction();
+        if (obj.TryConvertToPrimitive(preferString || obj.Class == "Date", out var primitive))
+            return primitive;
+        if (JsObject.Stringifier != null)
+            return JsValue.From(JsObject.Stringifier(obj));
+        return JsValue.From(obj.Class.Length > 0
+            ? $"[object {obj.Class}]"
+            : "function() { ... }");
+    }
 
     // ── Equality ───────────────────────────────────────────────────────────
 
@@ -325,12 +320,28 @@ public class JsObject
 
     public Dictionary<string, JsValue> Properties { get; } = new(StringComparer.Ordinal);
     public JsObject? Prototype { get; set; }
+    internal Func<JsObject, bool, JsValue>? PrimitiveConverter { get; set; }
 
     /// <summary>
     /// Hook the interpreter installs so arrays join and dates stringify
     /// correctly wherever a JsValue must become a string ("" + [1,2]).
     /// </summary>
     public static Func<JsObject, string>? Stringifier { get; set; }
+
+    internal bool TryConvertToPrimitive(bool preferString, out JsValue primitive)
+    {
+        for (JsObject? current = this; current != null; current = current.Prototype)
+        {
+            if (current.PrimitiveConverter is { } converter)
+            {
+                primitive = converter(this, preferString);
+                return true;
+            }
+        }
+
+        primitive = JsValue.Undefined;
+        return false;
+    }
 
     /// <summary>
     /// String coercion for object values.  Objects use the interpreter's
@@ -359,8 +370,46 @@ public class JsObject
 
     public virtual void Set(string name, JsValue value)
     {
+        if (Class == "Array")
+        {
+            if (name == "length")
+            {
+                double newLength = value.ToNumber();
+                if (double.IsNaN(newLength) || double.IsInfinity(newLength) ||
+                    newLength < 0 || newLength > uint.MaxValue ||
+                    newLength != Math.Truncate(newLength))
+                    throw new JsRangeErrorException("Invalid array length");
+
+                uint length = (uint)newLength;
+                if (Properties.TryGetValue("length", out var currentLength) &&
+                    currentLength.Type == JsType.Number &&
+                    length < currentLength.GetNumber())
+                {
+                    foreach (string key in Properties.Keys.ToArray())
+                        if (IsArrayIndex(key) && uint.Parse(key, CultureInfo.InvariantCulture) >= length)
+                            Properties.Remove(key);
+                }
+                Properties[name] = JsValue.From((double)length);
+                return;
+            }
+
+            if (IsArrayIndex(name))
+            {
+                uint index = uint.Parse(name, CultureInfo.InvariantCulture);
+                if (index < uint.MaxValue &&
+                    (!Properties.TryGetValue("length", out var currentLength) ||
+                     currentLength.Type != JsType.Number ||
+                     index >= currentLength.GetNumber()))
+                    Properties["length"] = JsValue.From((double)index + 1);
+            }
+        }
         Properties[name] = value;
     }
+
+    private static bool IsArrayIndex(string name) =>
+        uint.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out uint index) &&
+        index < uint.MaxValue &&
+        index.ToString(CultureInfo.InvariantCulture) == name;
 
     public bool Has(string name)
     {
@@ -413,6 +462,7 @@ public class JsFunction : JsObject
         Name = name;
         UseFunctionObjectAsThis = useFunctionObjectAsThis;
         Class = "Function";
+        Set("length", JsValue.From(Params.Count));
         if (name != null) Set("name", JsValue.From(name));
     }
 
@@ -425,6 +475,7 @@ public class JsFunction : JsObject
         Native = null;
         Name = name ?? body.Id?.Name;
         Class = "Function";
+        Set("length", JsValue.From(Params.Count));
         Set("name", JsValue.From(Name ?? ""));
         var instancePrototype = new JsObject
         {

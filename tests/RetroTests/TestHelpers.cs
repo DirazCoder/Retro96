@@ -73,12 +73,14 @@ public sealed class PageHarness
     public DomDocument Document = null!;
     public List<string> ScriptErrors = new();
 
-    public DomDocument LoadHtml(string html, string url = "file:///C:/web/page.htm")
+    public DomDocument LoadHtml(string html, string url = "file:///C:/web/page.htm",
+                                int executionLimitMs = 5000)
     {
         var parsed = ParsedUrl.Parse(url);
         JsRuntime.PopulateGlobalScope(Scope);
 
-        Interpreter = new JsInterpreter(Scope, null, _ => { }, _ => { });
+        Interpreter = new JsInterpreter(Scope, null, _ => { }, _ => { },
+            timeLimitMs: executionLimitMs);
         Interpreter.RegisterRuntimeBuiltins();
         State = new DocumentBindingsState { Interpreter = Interpreter, Canvas = Canvas };
         Interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, State);

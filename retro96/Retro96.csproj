@@ -75,6 +75,10 @@
   <!-- SkiaSharp is the engine's rendering, 
        text-measurement and image-decoding stack. -->
   <ItemGroup>
+    <Compile Remove="Retro96.Rendering\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- The WinForms SDK injects a GLOBAL `using System.Drawing;` which 
          would make every engine type (Color/Font/Bitmap/Graphics…) in 
          Retro96.Drawing ambiguous inside this project. Drop the global 
@@ -101,5 +105,4 @@
   <ItemGroup>
     <EmbeddedResource Include="assets\**\*" />
   </ItemGroup>
-
 </Project>

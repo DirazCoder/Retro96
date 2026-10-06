@@ -23,7 +23,8 @@ public static class JsRuntime
 
     public static void PopulateGlobalScope(JsScope globalScope)
     {
-        var functionProto = new JsObject { Class = "Function" };
+        globalScope.Define("undefined", JsValue.Undefined);
+        var functionProto = new JsFunction((_, _) => JsValue.Undefined, globalScope);
         JsInterpreter.FunctionPrototype = functionProto;
         var objectProto = RegisterObject(globalScope);
         functionProto.Prototype = objectProto;
@@ -56,6 +57,9 @@ public static class JsRuntime
     private static double Arg(JsValue[] a, int i) => i < a.Length ? a[i].ToNumber() : double.NaN;
     private static string ArgStr(JsValue[] a, int i, string def = "") =>
         i < a.Length ? a[i].ToJsString() : def;
+
+    private static Regex CreateJsRegex(string source, RegexOptions options) =>
+        new(source, options, TimeSpan.FromSeconds(1));
 
     private static int LengthOf(JsValue self) =>
         self.Type is JsType.Object or JsType.Function &&
@@ -93,7 +97,19 @@ public static class JsRuntime
         var objProto = new JsObject { Class = "Object" };
 
         objProto.Set("toString", Fn(scope, "toString", (self, args) =>
-            JsValue.From("[object Object]")));
+        {
+            string tag = self.Type switch
+            {
+                JsType.String => "String",
+                JsType.Number => "Number",
+                JsType.Boolean => "Boolean",
+                JsType.Function => "Function",
+                JsType.Object => self.GetObject().Class is { Length: > 0 } className
+                    ? className : "Object",
+                _ => "Object"
+            };
+            return JsValue.From($"[object {tag}]");
+        }));
 
         objProto.Set("toLocaleString", Fn(scope, "toLocaleString", (self, args) =>
             JsValue.From(self.ToJsString())));
@@ -150,6 +166,7 @@ public static class JsRuntime
             return JsValue.FromObject(o);
         }, scope, "Object");
         objectCtor.Set("prototype", JsValue.FromObject(objProto));
+        objProto.Set("constructor", JsValue.FromFunction(objectCtor));
         scope.Define("Object", JsValue.FromFunction(objectCtor));
 
         return objProto;
@@ -174,7 +191,7 @@ public static class JsRuntime
                 functionBody, parameterNames, scope, "anonymous"));
         }, scope, "Function");
         constructor.Prototype = functionProto;
-        constructor.Set("prototype", JsValue.FromObject(functionProto));
+        constructor.Set("prototype", JsValue.FromFunction((JsFunction)functionProto));
         functionProto.Set("constructor", JsValue.FromFunction(constructor));
         scope.Define("Function", JsValue.FromFunction(constructor));
     }
@@ -389,7 +406,7 @@ public static class JsRuntime
             {
                 double n = args[0].ToNumber();
                 if (double.IsNaN(n) || double.IsInfinity(n) || n < 0 || n != Math.Truncate(n) || n > int.MaxValue)
-                    throw new JsInterpreterException("Invalid array length");
+                    throw new JsRangeErrorException("Invalid array length");
                 length = (int)n;
             }
             else
@@ -528,7 +545,7 @@ public static class JsRuntime
                 // RegExp separator — ToJsString on a RegExp object is
                 // "[object Object]", so this needs the real source
                 var (source, flags) = RegexParts(args[0]);
-                parts = new Regex(source, RegexOptionsFor(flags)).Split(str);
+                parts = CreateJsRegex(source, RegexOptionsFor(flags)).Split(str);
             }
             else
             {
@@ -564,11 +581,11 @@ public static class JsRuntime
             if (!flags.Contains('g'))
             {
                 // Non-global: single-match array or null
-                var m = new Regex(source, options).Match(str);
+                var m = CreateJsRegex(source, options).Match(str);
                 return m.Success ? MatchArray(scope, m, str) : JsValue.Null;
             }
 
-            var matches = new Regex(source, options).Matches(str);
+            var matches = CreateJsRegex(source, options).Matches(str);
             if (matches.Count == 0) return JsValue.Null;
             var result = NewArray(scope);
             int n = 0;
@@ -588,7 +605,7 @@ public static class JsRuntime
                 args[0].GetObjectOrFunction().Class == "RegExp")
             {
                 var (source, flags) = RegexParts(args[0]);
-                var regex = new Regex(source, RegexOptionsFor(flags));
+                var regex = CreateJsRegex(source, RegexOptionsFor(flags));
                 // $1..$9 group references — the era's usage
                 return JsValue.From(flags.Contains('g')
                     ? regex.Replace(str, replacement)
@@ -607,13 +624,26 @@ public static class JsRuntime
             if (args.Length == 0) return JsValue.From(-1);
             var str = self.ToJsString();
             var (source, flags) = RegexParts(args[0]);
-            var m = new Regex(source, RegexOptionsFor(flags)).Match(str);
+            var m = CreateJsRegex(source, RegexOptionsFor(flags)).Match(str);
             return JsValue.From(m.Success ? m.Index : -1);
         }));
 
         strProto.Set("toString", Fn(scope, "toString", (self, args) =>
-            JsValue.From(self.ToJsString())));
-        strProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => self));
+            self.Type is JsType.Object or JsType.Function &&
+            self.GetObjectOrFunction().Class == "String"
+                ? self.GetObjectOrFunction().Get("value")
+                : self));
+        strProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
+            self.Type is JsType.Object or JsType.Function &&
+            self.GetObjectOrFunction().Class == "String"
+                ? self.GetObjectOrFunction().Get("value")
+                : self));
+
+        strProto.Set("localeCompare", Fn(scope, "localeCompare", (self, args) =>
+            JsValue.From(args.Length == 0
+                ? 0
+                : string.Compare(self.ToJsString(), args[0].ToJsString(),
+                    CultureInfo.CurrentCulture, CompareOptions.None))));
 
         // ── Era HTML wrapper methods — extremely common on 1996 pages:
         //    document.write("Welcome".big().blink()) etc.
@@ -738,13 +768,17 @@ public static class JsRuntime
             int radix = args.Length > 0 && !double.IsNaN(args[0].ToNumber())
                 ? (int)args[0].ToNumber() : 10;
             if (radix < 2 || radix > 36)
-                throw new JsInterpreterException("radix out of range");
+                throw new JsRangeErrorException("radix out of range");
             if (radix == 10)
                 return JsValue.From(JsValue.NumberToString(num));
             return JsValue.From(ConvertToBase(num, radix));
         }));
 
-        numProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => self));
+        numProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
+            self.Type is JsType.Object or JsType.Function &&
+            self.GetObjectOrFunction().Class == "Number"
+                ? self.GetObjectOrFunction().Get("value")
+                : self));
 
         // ── ES3 / JScript 5.0 number formatting (checklist §12) ──
         // toFixed — fixed-point with era round-half-away-from-zero on the
@@ -764,7 +798,7 @@ public static class JsRuntime
                 double d = args[0].ToNumber();
                 if (double.IsNaN(d)) return JsValue.From("NaN");
                 if (d < 0 || d > 100)
-                    throw new JsInterpreterException("toFixed() digits argument must be between 0 and 100");
+                    throw new JsRangeErrorException("toFixed() digits argument must be between 0 and 100");
                 digits = (int)d;
             }
             // ES3: |x| ≥ 10^21 returns the plain (exponential) ToString form.
@@ -787,7 +821,7 @@ public static class JsRuntime
                 double d = args[0].ToNumber();
                 if (double.IsNaN(d)) return JsValue.From("NaN");
                 if (d < 0 || d > 100)
-                    throw new JsInterpreterException("toExponential() fraction digits argument must be between 0 and 100");
+                    throw new JsRangeErrorException("toExponential() fraction digits argument must be between 0 and 100");
                 digits = (int)d;
             }
             else
@@ -824,7 +858,7 @@ public static class JsRuntime
             double pd = args[0].ToNumber();
             if (double.IsNaN(pd)) return JsValue.From("NaN");
             if (pd < 1 || pd > 100)
-                throw new JsInterpreterException("toPrecision() argument must be between 1 and 100");
+                throw new JsRangeErrorException("toPrecision() argument must be between 1 and 100");
             int precision = (int)pd;
 
             if (num == 0.0)
@@ -998,7 +1032,11 @@ public static class JsRuntime
 
         boolProto.Set("toString", Fn(scope, "toString", (self, args) =>
             JsValue.From(self.ToBoolean() ? "true" : "false")));
-        boolProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => self));
+        boolProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
+            self.Type is JsType.Object or JsType.Function &&
+            self.GetObjectOrFunction().Class == "Boolean"
+                ? self.GetObjectOrFunction().Get("value")
+                : self));
 
         var boolCtor = new JsFunction((self, args) =>
         {
@@ -1162,6 +1200,8 @@ public static class JsRuntime
         dateProto.Set("getMinutes",  Fn(scope, "getMinutes",  (s, a) => JsValue.From(LocalOf(s).Minute)));
         dateProto.Set("getSeconds",  Fn(scope, "getSeconds",  (s, a) => JsValue.From(LocalOf(s).Second)));
         dateProto.Set("getMilliseconds", Fn(scope, "getMilliseconds", (s, a) => JsValue.From(LocalOf(s).Millisecond)));
+        dateProto.Set("getTimezoneOffset", Fn(scope, "getTimezoneOffset", (s, a) =>
+            JsValue.From(-TimeZoneInfo.Local.GetUtcOffset(LocalOf(s)).TotalMinutes)));
 
         // getYear — the era's method: year minus 1900
         dateProto.Set("getYear", Fn(scope, "getYear", (s, a) =>
@@ -1241,13 +1281,15 @@ public static class JsRuntime
             return JsValue.From(LocalOf(s).ToString(CultureInfo.CurrentCulture));
         }));
 
-        dateProto.Set("toGMTString", Fn(scope, "toGMTString", (s, a) =>
+        var toUtcString = Fn(scope, "toUTCString", (s, a) =>
         {
             double ms = MsOf(s);
             if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
             return JsValue.From(Epoch.AddMilliseconds(ms).ToString(
                 "ddd, dd MMM yyyy HH:mm:ss 'GMT'", CultureInfo.InvariantCulture));
-        }));
+        });
+        dateProto.Set("toUTCString", toUtcString);
+        dateProto.Set("toGMTString", toUtcString);
 
         var dateCtor = new JsFunction((self, args) =>
         {
@@ -1283,6 +1325,7 @@ public static class JsRuntime
                 int hour = args.Length > 3 ? (int)args[3].ToNumber() : 0;
                 int minute = args.Length > 4 ? (int)args[4].ToNumber() : 0;
                 int second = args.Length > 5 ? (int)args[5].ToNumber() : 0;
+                int millisecond = args.Length > 6 ? (int)args[6].ToNumber() : 0;
                 try
                 {
                     // ECMAScript normalizes month/day overflow (e.g. month 12
@@ -1293,7 +1336,8 @@ public static class JsRuntime
                         .AddDays(day - 1)
                         .AddHours(hour)
                         .AddMinutes(minute)
-                        .AddSeconds(second);
+                        .AddSeconds(second)
+                        .AddMilliseconds(millisecond);
                     ms = (d.ToUniversalTime() - Epoch).TotalMilliseconds;
                 }
                 catch { ms = double.NaN; }
@@ -1330,6 +1374,39 @@ public static class JsRuntime
                 : JsValue.From(double.NaN);
         }, scope, "parse")));
 
+        dateCtor.Set("UTC", JsValue.FromFunction(new JsFunction((self, args) =>
+        {
+            if (args.Length == 0)
+                return JsValue.From(double.NaN);
+
+            double yearValue = args[0].ToNumber();
+            if (double.IsNaN(yearValue) || double.IsInfinity(yearValue))
+                return JsValue.From(double.NaN);
+            int year = (int)yearValue;
+            if (year is >= 0 and <= 99) year += 1900;
+            int month = args.Length > 1 ? ToIntSafe(args[1]) : 0;
+            int day = args.Length > 2 ? ToIntSafe(args[2]) : 1;
+            int hour = args.Length > 3 ? ToIntSafe(args[3]) : 0;
+            int minute = args.Length > 4 ? ToIntSafe(args[4]) : 0;
+            int second = args.Length > 5 ? ToIntSafe(args[5]) : 0;
+            int millisecond = args.Length > 6 ? ToIntSafe(args[6]) : 0;
+            try
+            {
+                var utc = new DateTime(year, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                    .AddMonths(month)
+                    .AddDays(day - 1)
+                    .AddHours(hour)
+                    .AddMinutes(minute)
+                    .AddSeconds(second)
+                    .AddMilliseconds(millisecond);
+                return JsValue.From((utc - Epoch).TotalMilliseconds);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return JsValue.From(double.NaN);
+            }
+        }, scope, "UTC")));
+
         scope.Define("Date", JsValue.FromFunction(dateCtor));
     }
 
@@ -1362,7 +1439,7 @@ public static class JsRuntime
             string input = args[0].ToJsString();
             if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.From(false); }
 
-            var m = new Regex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
+            var m = CreateJsRegex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (m.Success)
             {
                 if (flags.Contains('g'))
@@ -1382,7 +1459,7 @@ public static class JsRuntime
             string input = args[0].ToJsString();
             if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.Null; }
 
-            var m = new Regex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
+            var m = CreateJsRegex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (!m.Success)
             {
                 o.Set("lastIndex", JsValue.From(0));
@@ -1731,10 +1808,10 @@ public static class JsRuntime
             JsValue.From(EncodeUri(args.Length > 0 ? args[0].ToJsString() : "", component: true))));
 
         scope.Define("decodeURI", Fn(scope, "decodeURI", (self, args) =>
-            JsValue.From(Uri.UnescapeDataString(args.Length > 0 ? args[0].ToJsString() : ""))));
+            JsValue.From(DecodeUri(args.Length > 0 ? args[0].ToJsString() : ""))));
 
         scope.Define("decodeURIComponent", Fn(scope, "decodeURIComponent", (self, args) =>
-            JsValue.From(Uri.UnescapeDataString(args.Length > 0 ? args[0].ToJsString() : ""))));
+            JsValue.From(DecodeUri(args.Length > 0 ? args[0].ToJsString() : ""))));
 
         // NaN / Infinity globals (NN3 allowed them bare)
         scope.Define("NaN", JsValue.From(double.NaN));
@@ -1757,6 +1834,26 @@ public static class JsRuntime
                 result.Append('%').Append(b.ToString("X2", CultureInfo.InvariantCulture));
         }
         return result.ToString();
+    }
+
+    private static string DecodeUri(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] != '%') continue;
+            if (!TryHex(value, i + 1, 2, out _))
+                throw new JsUriErrorException("Malformed URI sequence");
+            i += 2;
+        }
+
+        try
+        {
+            return Uri.UnescapeDataString(value);
+        }
+        catch (UriFormatException ex)
+        {
+            throw new JsUriErrorException(ex.Message);
+        }
     }
 
     private static bool TryHex(string s, int start, int count, out int value)

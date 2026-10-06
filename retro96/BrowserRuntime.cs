@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using Retro96.Engine.Dom;
 
 namespace Retro96;
 
@@ -62,9 +63,17 @@ public static class BrowserRuntime
     /// document.ids instead, so the property is undefined there.</summary>
     public static bool SupportsGetElementById => !IsNetscape3 && !IsNetscape47;
 
-    /// <summary>IE5 quirks-mode box model: width/height include padding and
-    /// border (checklist §9). Only the strict IE5 persona applies it.</summary>
+    /// <summary>Whether the selected persona implements the IE5 quirks box model.</summary>
     public static bool UsesIe5BoxModel => IsInternetExplorer5;
+
+    /// <summary>
+    /// Whether this document uses IE5's quirks box model. IE5 switches back
+    /// to the CSS content-box model for standards-mode documents.
+    /// </summary>
+    public static bool UsesIe5BoxModelFor(DomDocument? document) =>
+        UsesIe5BoxModel &&
+        document != null &&
+        !string.Equals(document.QuirksMode, "strict", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Wire protocol: 1999 personas speak HTTP/1.1 (RFC 2616), the
     /// 1996 historical personas stay on HTTP/1.0.</summary>

@@ -32,6 +32,34 @@ public sealed class DocumentBindingsState
     /// <summary>Browser shell hooks — set by BrowserCanvas.</summary>
     public BrowserCanvas? Canvas;
 
+    private JsInterpreter? _reflowInterpreter;
+    private bool _reflowPending;
+
+    public void RequestReflow()
+    {
+        if (Interpreter is { IsExecuting: true } interpreter)
+        {
+            if (!ReferenceEquals(_reflowInterpreter, interpreter))
+            {
+                if (_reflowInterpreter != null)
+                    _reflowInterpreter.ScriptExecutionCompleted -= FlushPendingReflow;
+                _reflowInterpreter = interpreter;
+                interpreter.ScriptExecutionCompleted += FlushPendingReflow;
+            }
+            _reflowPending = true;
+            return;
+        }
+
+        Canvas?.ReflowDocument();
+    }
+
+    private void FlushPendingReflow()
+    {
+        if (!_reflowPending) return;
+        _reflowPending = false;
+        Canvas?.ReflowDocument();
+    }
+
     public DomDocument? Document;
 
     /// <summary>The window object for THIS page.  RegisterAll runs before
@@ -225,9 +253,11 @@ public static class DomBindings
     /// JsRuntime.PopulateGlobalScope; RegisterAll later replaces everything
     /// with the complete bindings.
     /// </summary>
-    public static void RegisterEarlyGlobals(JsScope globalScope, BrowserCanvas canvas)
+    public static void RegisterEarlyGlobals(JsScope globalScope, BrowserCanvas canvas,
+                                            JsInterpreter interpreter)
     {
-        RegisterWindow(globalScope, null, null, canvas, null);
+        var state = new DocumentBindingsState { Interpreter = interpreter };
+        RegisterWindow(globalScope, null, null, canvas, state);
         if (globalScope.Get("window").GetObjectOrFunction() is { } w)
             globalScope.GlobalFallback = w;
     }
@@ -291,6 +321,7 @@ public static class DomBindings
         w.Set("alert", Fn(scope, "alert", (self, args) =>
         {
             string msg = args.Length > 0 ? args[0].ToJsString() : "";
+            using var timeoutPause = state?.Interpreter?.PauseTimeoutBudget();
             canvas.ShowAlert(msg);
             return JsValue.Undefined;
         }));
@@ -298,6 +329,7 @@ public static class DomBindings
         w.Set("confirm", Fn(scope, "confirm", (self, args) =>
         {
             string msg = args.Length > 0 ? args[0].ToJsString() : "";
+            using var timeoutPause = state?.Interpreter?.PauseTimeoutBudget();
             return JsValue.From(canvas.ShowConfirm(msg));
         }));
 
@@ -305,6 +337,7 @@ public static class DomBindings
         {
             string msg = args.Length > 0 ? args[0].ToJsString() : "Enter value:";
             string def = args.Length > 1 ? args[1].ToJsString() : "";
+            using var timeoutPause = state?.Interpreter?.PauseTimeoutBudget();
             string? input = canvas.ShowPrompt(msg, def);
             return input == null ? JsValue.Null : JsValue.From(input);
         }));
@@ -1006,7 +1039,7 @@ public static class DomBindings
         // valid. Reflow resolves the replacement styles and rebuilds all box
         // geometry before repainting; a plain repaint leaves stale pixels and
         // stale boxes from the previous document.
-        state.Canvas?.ReflowDocument();
+        state.RequestReflow();
     }
 
     private static JsObject NewArray(JsScope scope)
@@ -1853,6 +1886,12 @@ public static class DomBindings
             "type", "color", "face"
         };
 
+        private void RequestReflow()
+        {
+            if (_state != null) _state.RequestReflow();
+            else _canvas?.ReflowDocument();
+        }
+
         /// <summary>
         /// .style — a live InlineStyleObject bound to this element's STYLE
         /// attribute is created lazily by Get(name) and cached in
@@ -2070,7 +2109,7 @@ public static class DomBindings
                         return JsValue.Undefined;
                 }
 
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return JsValue.Undefined;
             }, _scope, "insertAdjacentHTML"));
 
@@ -2102,7 +2141,7 @@ public static class DomBindings
                         return JsValue.Undefined;
                 }
 
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return JsValue.Undefined;
             }, _scope, "insertAdjacentText"));
 
@@ -2170,10 +2209,11 @@ public static class DomBindings
 
             var style = _element.Style;
             if (style == null) return (0, 0, 0, 0);
-            double w = (style.Width ?? 0) + (BrowserRuntime.UsesIe5BoxModel ? 0 :
+            bool ie5BoxModel = BrowserRuntime.UsesIe5BoxModelFor(_element.OwnerDocument());
+            double w = (style.Width ?? 0) + (ie5BoxModel ? 0 :
                        style.PaddingLeft + style.PaddingRight +
                        style.BorderLeftWidth + style.BorderRightWidth);
-            double h = (style.Height ?? 0) + (BrowserRuntime.UsesIe5BoxModel ? 0 :
+            double h = (style.Height ?? 0) + (ie5BoxModel ? 0 :
                        style.PaddingTop + style.PaddingBottom +
                        style.BorderTopWidth + style.BorderBottomWidth);
             return (style.Left ?? 0, style.Top ?? 0, w, h);
@@ -2188,9 +2228,10 @@ public static class DomBindings
             }
             var style = _element.Style;
             if (style == null) return (0, 0);
-            double width = (style.Width ?? 0) + (BrowserRuntime.UsesIe5BoxModel
+            bool ie5BoxModel = BrowserRuntime.UsesIe5BoxModelFor(_element.OwnerDocument());
+            double width = (style.Width ?? 0) + (ie5BoxModel
                 ? 0 : style.PaddingLeft + style.PaddingRight);
-            double height = (style.Height ?? 0) + (BrowserRuntime.UsesIe5BoxModel
+            double height = (style.Height ?? 0) + (ie5BoxModel
                 ? 0 : style.PaddingTop + style.PaddingBottom);
             return (width, height);
         }
@@ -2301,7 +2342,7 @@ public static class DomBindings
                         return JsValue.Null;
                     _element.InsertBefore(newNode, oldNode);
                     _element.RemoveChild(oldNode);
-                    _canvas?.ReflowDocument();
+                    RequestReflow();
                     return JsValue.FromObject(WrapNode(oldNode));   // DOM1: returns the replaced node
                 }, _scope, "replaceChild"));
             if (name == "cloneNode")
@@ -2498,7 +2539,7 @@ public static class DomBindings
             if (name == "style" && !Properties.ContainsKey("style"))
             {
                 Properties["style"] = JsValue.FromObject(
-                    new InlineStyleObject(_element, _canvas, _scope));
+                    new InlineStyleObject(_element, _canvas, _scope, _state));
             }
 
             // getElementsByTagName — later DOM API; hide it in IE3 mode.
@@ -2700,7 +2741,7 @@ public static class DomBindings
                         body.AppendChild(row);
                     }
 
-                    _canvas?.ReflowDocument();
+                    RequestReflow();
                     return WrapChildValue(row);
                 }, _scope, "insertRow"));
 
@@ -2716,7 +2757,7 @@ public static class DomBindings
                     if (child == null) return JsValue.Null;
 
                     _element.AppendChild(child);
-                    _canvas?.ReflowDocument();
+                    RequestReflow();
                     return child is DomElement childElement
                         ? WrapChildValue(childElement)
                         : JsValue.FromObject(WrapNode(child));
@@ -2734,7 +2775,7 @@ public static class DomBindings
                         reference = UnwrapNodeArg(args[1]);
 
                     _element.InsertBefore(child, reference);
-                    _canvas?.ReflowDocument();
+                    RequestReflow();
                     return child is DomElement childElement
                         ? WrapChildValue(childElement)
                         : JsValue.FromObject(WrapNode(child));
@@ -2749,7 +2790,7 @@ public static class DomBindings
                         return JsValue.Null;
 
                     _element.RemoveChild(child);
-                    _canvas?.ReflowDocument();
+                    RequestReflow();
                     return child is DomElement childElement
                         ? WrapChildValue(childElement)
                         : JsValue.FromObject(WrapNode(child));
@@ -2804,7 +2845,7 @@ public static class DomBindings
                 var source = body != null ? body.Children : fragment.Children;
                 foreach (var child in source.ToList())
                     _element.AppendChild(child);
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return;
             }
 
@@ -2819,7 +2860,7 @@ public static class DomBindings
                 foreach (var oldChild in _element.Children.ToList())
                     _element.RemoveChild(oldChild);
                 _element.AppendChild(new DomText { Data = value.ToJsString() });
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return;
             }
 
@@ -2837,7 +2878,7 @@ public static class DomBindings
                         _element.RemoveChild(oldChild);
                     _element.AppendChild(new DomText { Data = text });
                 }
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return;
             }
 
@@ -2857,7 +2898,7 @@ public static class DomBindings
                 foreach (var node in nodes)
                     parent.InsertBefore(node, _element);
                 parent.RemoveChild(_element);
-                _canvas?.ReflowDocument();
+                RequestReflow();
                 return;
             }
 
@@ -3003,11 +3044,14 @@ public static class DomBindings
     {
         private readonly DomElement _element;
         private readonly BrowserCanvas? _canvas;
+        private readonly DocumentBindingsState? _state;
 
-        public InlineStyleObject(DomElement element, BrowserCanvas? canvas, JsScope scope)
+        public InlineStyleObject(DomElement element, BrowserCanvas? canvas, JsScope scope,
+                                 DocumentBindingsState? state)
         {
             _element = element;
             _canvas = canvas;
+            _state = state;
             Class = "CSSStyleDeclaration";
         }
 
@@ -3149,7 +3193,11 @@ public static class DomBindings
         private void Reflow()
         {
             if (_canvas == null) return;
-            try { _canvas.ReflowDocument(); }
+            try
+            {
+                if (_state != null) _state.RequestReflow();
+                else _canvas.ReflowDocument();
+            }
             catch { /* best-effort reflow */ }
         }
     }
@@ -3590,7 +3638,7 @@ public static class DomBindings
             mutate(decls);
             _element.SetAttr("style",
                 string.Join("; ", decls.Select(kv => $"{kv.Key}: {kv.Value}")));
-            try { _state.Canvas?.ReflowDocument(); }
+            try { _state.RequestReflow(); }
             catch { /* best-effort reflow */ }
         }
 

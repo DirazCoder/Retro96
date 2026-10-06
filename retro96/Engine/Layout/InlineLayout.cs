@@ -663,10 +663,11 @@ public static class InlineLayout
         // ── Fragment + measure, collapsing adjacent spaces across run
         //    boundaries. Line-leading spaces are dropped at wrap time.
         var items = new List<MeasuredItem>(source.Count);
+        var firstLetterApplied = new HashSet<DomElement>();
         bool lastWasSpace = true;   // stream start: no leading space
         foreach (var box in source)
         {
-            foreach (var prepared in ApplyFirstLetter(box))
+            foreach (var prepared in ApplyFirstLetter(box, firstLetterApplied))
             {
                 if (prepared.IsFloated)
                 {
@@ -739,8 +740,10 @@ public static class InlineLayout
             items.Reverse();
         }
 
-        // Inline non-replaced elements contribute horizontal margins at
-        // their outer edges, not once per word fragment.
+        // Inline non-replaced elements contribute horizontal box decorations
+        // at their outer edges, not once per word fragment. Vertical
+        // padding/borders surround each line fragment without changing the
+        // line box height.
         for (int i = 0; i < items.Count; i++)
         {
             var item = items[i];
@@ -751,14 +754,41 @@ public static class InlineLayout
 
             bool firstFragment = i == 0 || items[i - 1].Box.Element != element;
             bool lastFragment = i == items.Count - 1 || items[i + 1].Box.Element != element;
+            float paddingTop = ResolveInlinePadding(
+                style.PaddingTop, style.PaddingTopPercent, containerWidth);
+            float paddingBottom = ResolveInlinePadding(
+                style.PaddingBottom, style.PaddingBottomPercent, containerWidth);
+            float paddingLeft = firstFragment
+                ? ResolveInlinePadding(style.PaddingLeft, style.PaddingLeftPercent, containerWidth)
+                : 0f;
+            float paddingRight = lastFragment
+                ? ResolveInlinePadding(style.PaddingRight, style.PaddingRightPercent, containerWidth)
+                : 0f;
+            float borderTop = Math.Max(0f, style.BorderTopWidth);
+            float borderBottom = Math.Max(0f, style.BorderBottomWidth);
+            float borderLeft = firstFragment ? Math.Max(0f, style.BorderLeftWidth) : 0f;
+            float borderRight = lastFragment ? Math.Max(0f, style.BorderRightWidth) : 0f;
+            item.Box.PaddingTop = paddingTop;
+            item.Box.PaddingBottom = paddingBottom;
+            item.Box.PaddingLeft = paddingLeft;
+            item.Box.PaddingRight = paddingRight;
+            item.Box.BorderTop = borderTop;
+            item.Box.BorderBottom = borderBottom;
+            item.Box.BorderLeft = borderLeft;
+            item.Box.BorderRight = borderRight;
+
             float marginLeft = firstFragment
                 ? style.MarginLeft + (style.MarginLeftPercent ?? 0f) * containerWidth / 100f
                 : item.MarginL;
             float marginRight = lastFragment
                 ? style.MarginRight + (style.MarginRightPercent ?? 0f) * containerWidth / 100f
                 : item.MarginR;
-            if (firstFragment || lastFragment)
-                items[i] = item with { MarginL = marginLeft, MarginR = marginRight };
+            items[i] = item with
+            {
+                W = item.W + paddingLeft + paddingRight + borderLeft + borderRight,
+                MarginL = marginLeft,
+                MarginR = marginRight
+            };
         }
 
         float currentY = startY;
@@ -1230,23 +1260,25 @@ public static class InlineLayout
             box.X = x + it.MarginL;
             if (!it.Atomic)
             {
-                box.Width = it.W;
+                box.Width = Math.Max(0f, it.W -
+                    box.PaddingLeft - box.PaddingRight - box.BorderLeft - box.BorderRight);
                 box.Height = it.H;
             }
 
+            float contentY;
             switch (it.VA)
             {
                 case VAlignMode.Top:
-                    box.Y = y + minLeadingTop - it.LeadingTop;
+                    contentY = y + minLeadingTop - it.LeadingTop;
                     break;
                 case VAlignMode.Middle:
-                    box.Y = y + (unshiftedLineH - it.ContentHeight) / 2f - it.LeadingTop;
+                    contentY = y + (unshiftedLineH - it.ContentHeight) / 2f - it.LeadingTop;
                     break;
                 case VAlignMode.Bottom:
-                    box.Y = y + unshiftedLineH - minLeadingTop - it.ContentHeight - it.LeadingTop;
+                    contentY = y + unshiftedLineH - minLeadingTop - it.ContentHeight - it.LeadingTop;
                     break;
                 default:
-                    box.Y = y + maxAscent - it.Asc - GetBaselineShift(it, lineH);
+                    contentY = y + maxAscent - it.Asc - GetBaselineShift(it, lineH);
                     break;
             }
 
@@ -1256,7 +1288,8 @@ public static class InlineLayout
             // next to a Courier word) then land a pixel apart even though
             // the baseline math is exact.
             if (!it.Atomic)
-                box.Y = MathF.Round(box.Y);
+                contentY = MathF.Round(contentY);
+            box.Y = contentY - box.BorderTop - box.PaddingTop;
 
             x += it.MarginL + it.W + it.MarginR;
             // Word-spacing only BETWEEN visible items — a zero-footprint
@@ -1289,6 +1322,9 @@ public static class InlineLayout
         style.TextIndentPercent.HasValue
             ? containingWidth * style.TextIndentPercent.Value / 100f
             : style.TextIndent;
+
+    private static float ResolveInlinePadding(float value, float? percent, float containingWidth) =>
+        Math.Max(0f, percent.HasValue ? containingWidth * percent.Value / 100f : value);
 
     private static float InterItemLetterSpacing(LayoutBox previous, LayoutBox current)
     {
@@ -1469,12 +1505,18 @@ public static class InlineLayout
         return new string(chars);
     }
 
-    private static IEnumerable<LayoutBox> ApplyFirstLetter(LayoutBox box)
+    private static IEnumerable<LayoutBox> ApplyFirstLetter(
+        LayoutBox box, HashSet<DomElement> appliedElements)
     {
-        var style = box.Element?.Style?.FirstLetterStyle;
+        var element = box.Element;
+        var elementStyle = element?.Style;
+        var style = elementStyle?.FirstLetterStyle;
         string text = box.TextRun ?? "";
-        if (style == null || text.Length == 0 || box.Parent == null ||
-            box.StyleOverride != null)
+        bool isGeneratedBefore = elementStyle?.GeneratedBefore is { } beforeStyle &&
+            ReferenceEquals(box.StyleOverride, beforeStyle);
+        if (style == null || element == null || text.Length == 0 ||
+            box.Parent == null || appliedElements.Contains(element) ||
+            box.StyleOverride != null && !isGeneratedBefore)
         {
             yield return box;
             yield break;
@@ -1488,6 +1530,7 @@ public static class InlineLayout
             yield break;
         }
 
+        appliedElements.Add(element);
         var firstBox = new LayoutBox(box.Element, BoxType.Inline)
         {
             TextRun = text[first].ToString(),
@@ -1500,7 +1543,8 @@ public static class InlineLayout
         var restBox = new LayoutBox(box.Element, BoxType.Inline)
         {
             TextRun = rest,
-            Parent = box.Parent
+            Parent = box.Parent,
+            StyleOverride = box.StyleOverride
         };
         int index = box.Parent.Children.IndexOf(box);
         box.Parent.Children.RemoveAt(index);

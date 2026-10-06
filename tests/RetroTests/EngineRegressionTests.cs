@@ -173,6 +173,50 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void FirstLetterStylesGeneratedBeforeContentOnceAndAfterKeepsBaseSize()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            ".sample{width:300px;font-size:16px}" +
+            ".sample::before{content:'>> ';color:green;font-weight:bold}" +
+            ".sample::first-letter{font-size:300%;color:blue;float:left;margin-right:10px;line-height:1}" +
+            ".sample::after{content:' <<';color:purple;font-weight:bold}" +
+            "</style></head><body><div id='sample' class='sample'>" +
+            "The first letter should be styled; later text should remain normal.</div></body></html>");
+        var sample = doc.ElementDescendants().First(element => element.GetAttr("id") == "sample");
+        var generatedBefore = sample.Style!.GeneratedBefore!;
+        var generatedAfter = sample.Style.GeneratedAfter!;
+        var firstLetter = root.Descendants().First(box =>
+            box.Element == sample && box.TextRun == ">" &&
+            box.StyleOverride == sample.Style.FirstLetterStyle);
+        var remainingBefore = root.Descendants().First(box =>
+            box.Element == sample && box.TextRun == ">" &&
+            box.StyleOverride == generatedBefore);
+        var firstBodyWord = root.Descendants().First(box =>
+            box.Element == sample && box.TextRun == "The");
+        var afterText = root.Descendants().First(box =>
+            box.Element == sample && box.TextRun == "<<" &&
+            box.StyleOverride == generatedAfter);
+
+        Check.That(firstLetter.IsFloated && firstLetter.Width > firstBodyWord.Width &&
+                   firstLetter.StyleOverride?.Color == Color.Blue,
+            "the generated first character receives the large blue first-letter style",
+            $"float={firstLetter.IsFloated}, size={firstLetter.Width:0.#}, " +
+            $"normal word width={firstBodyWord.Width:0.#}, color={firstLetter.StyleOverride?.Color}");
+        Check.That(remainingBefore.StyleOverride?.Color == Color.Green &&
+                   firstBodyWord.StyleOverride == null,
+            "remaining generated-before content stays green and the real first word stays normal",
+            $"before color={remainingBefore.StyleOverride?.Color}, " +
+            $"body override={firstBodyWord.StyleOverride?.FontSize}");
+        Check.That(afterText.StyleOverride?.FontSize == sample.Style.FontSize &&
+                   afterText.StyleOverride?.FontWeight == FontWeightValue.Bold &&
+                   afterText.StyleOverride?.Color == Color.FromArgb(0x80, 0x00, 0x80),
+            "generated-after text remains bold purple at the element's normal font size",
+            $"after size={afterText.StyleOverride?.FontSize}, base size={sample.Style.FontSize}");
+        Check.Done();
+    }
+
+    [Fact]
     public void FirstLineStyleAppliesToParagraphsInsideTableCells()
     {
         var (doc, root) = LayoutHarness.Parse(
@@ -249,6 +293,43 @@ public class EngineRegressionTests
         Check.That(textPixels > 20,
             "inline-block child text is actually painted",
             $"dark content pixels={textPixels}, color={inlineBlockText?.Element?.Style?.Color}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void InlineBackgroundIncludesPaddingAndPaddingAffectsFollowingContent()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}.green{display:inline;" +
+            "background:#ccffcc;padding:15px}</style></head><body>" +
+            "<span id='green' class='green'>Inline 1</span>" +
+            "<span id='next'>Next</span></body></html>");
+        var green = doc.ElementDescendants().First(element => element.GetAttr("id") == "green");
+        var greenFragments = root.Descendants()
+            .Where(box => ReferenceEquals(box.Element, green) && !string.IsNullOrEmpty(box.TextRun))
+            .ToList();
+        var firstWord = greenFragments.First(box => box.TextRun == "Inline");
+        var lastWord = greenFragments.Last(box => box.TextRun == "1");
+        var nextWord = LayoutHarness.TextBoxContaining(root, "Next")!;
+
+        Check.That(firstWord.PaddingLeft == 15f && lastWord.PaddingRight == 15f &&
+                   greenFragments.All(box => box.PaddingTop == 15f && box.PaddingBottom == 15f),
+            "inline padding is applied to the outer and vertical fragment edges",
+            $"first={firstWord.PaddingLeft}, last={lastWord.PaddingRight}, " +
+            $"vertical={greenFragments.First().PaddingTop}/{greenFragments.First().PaddingBottom}");
+        Check.That(nextWord.X >= lastWord.BorderRect.Right,
+            "inline horizontal padding advances the following inline content",
+            $"last inline right={lastWord.BorderRect.Right:0.#}, next x={nextWord.X:0.#}");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        int sampleX = Math.Max(0, (int)MathF.Floor(firstWord.X + 2f));
+        int sampleY = Math.Max(0, (int)MathF.Floor(firstWord.ContentRect.Y + firstWord.Height / 2f));
+        var paddingPixel = bitmap.GetPixel(sampleX, sampleY);
+        Check.That(paddingPixel.G > 240 && paddingPixel.R > 180 && paddingPixel.B > 180,
+            "the inline background paints through its leading padding",
+            $"pixel={paddingPixel} at ({sampleX},{sampleY})");
         Check.Done();
     }
 
@@ -576,6 +657,213 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void TableRowBackgroundShowsThroughTransparentCells()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0} table{border-collapse:separate;border-spacing:0} " +
+            "td{padding:8px;border:1px solid black}</style></head><body>" +
+            "<table><tr id='total' style='background:#ffffcc'>" +
+            "<td>Label</td><td id='total-cell'>Total</td></tr></table></body></html>");
+        var row = doc.ElementDescendants().First(element => element.GetAttr("id") == "total");
+        var cellElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "total-cell");
+        var rowBox = LayoutHarness.BoxOf(root, row)!;
+        var cellBox = LayoutHarness.BoxOf(root, cellElement)!;
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        int sampleX = (int)(cellBox.BorderRect.Left + cellBox.BorderLeft + 2f);
+        int sampleY = (int)(cellBox.BorderRect.Top + cellBox.BorderTop + 2f);
+        var pixel = bitmap.GetPixel(sampleX, sampleY);
+        Check.That(rowBox.Height > 0f && rowBox.Width > 0f,
+            "table row has its laid-out grid dimensions",
+            $"row={rowBox.Width:0.#}x{rowBox.Height:0.#}");
+        Check.That(pixel.R == 255 && pixel.G == 255 && pixel.B == 204,
+            "row background paints beneath transparent cells",
+            $"pixel={pixel}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void NegativeZIndexPositionedBoxPaintsBehindNormalContentBackground()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            "body{margin:0}.surface{width:200px;height:120px;background:#fff}" +
+            ".positioning{position:relative;height:100px}" +
+            "#negative{position:absolute;z-index:-1;top:0;left:0;width:80px;height:80px;background:#00f}" +
+            "#positive{position:absolute;z-index:1;top:10px;left:10px;width:20px;height:20px;background:#f00}" +
+            "</style></head><body><div class='surface'><div class='positioning'>" +
+            "<div id='negative'></div><div id='positive'></div>" +
+            "</div></div></body></html>");
+        var negative = doc.ElementDescendants().First(element => element.GetAttr("id") == "negative");
+        var positive = doc.ElementDescendants().First(element => element.GetAttr("id") == "positive");
+        var negativeBox = LayoutHarness.BoxOf(root, negative)!;
+        var positiveBox = LayoutHarness.BoxOf(root, positive)!;
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        var negativeOnlyPixel = bitmap.GetPixel((int)(negativeBox.X + 60f),
+            (int)(negativeBox.Y + 60f));
+        var positivePixel = bitmap.GetPixel((int)(positiveBox.X + 10f),
+            (int)(positiveBox.Y + 10f));
+        Check.That(negativeOnlyPixel.R == 255 && negativeOnlyPixel.G == 255 &&
+                   negativeOnlyPixel.B == 255,
+            "negative stacking level is covered by later normal-flow background",
+            $"pixel={negativeOnlyPixel}");
+        Check.That(positivePixel.R == 255 && positivePixel.G == 0 && positivePixel.B == 0,
+            "positive stacking level remains above normal-flow background",
+            $"pixel={positivePixel}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void AbsoluteOffsetsUseContainingBlockPaddingEdge()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}" +
+            "#container{position:relative;width:180px;height:120px;padding:25px;border:3px solid black}" +
+            "#child{position:absolute;top:0;left:0;width:30px;height:20px}</style></head>" +
+            "<body><div id='container'><div id='child'></div></div></body></html>");
+        var container = doc.ElementDescendants().First(element => element.GetAttr("id") == "container");
+        var child = doc.ElementDescendants().First(element => element.GetAttr("id") == "child");
+        var containerBox = LayoutHarness.BoxOf(root, container)!;
+        var childBox = LayoutHarness.BoxOf(root, child)!;
+
+        Check.That(Math.Abs(childBox.X - (containerBox.X + containerBox.BorderLeft)) < 0.5f,
+            "absolute left:0 starts at the containing block's padding edge",
+            $"child x={childBox.X:0.#}, padding edge={containerBox.X + containerBox.BorderLeft:0.#}");
+        Check.That(Math.Abs(childBox.Y - (containerBox.Y + containerBox.BorderTop)) < 0.5f,
+            "absolute top:0 starts at the containing block's padding edge",
+            $"child y={childBox.Y:0.#}, padding edge={containerBox.Y + containerBox.BorderTop:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void RelativePositionedBoxPaintsAboveLaterNormalFlowSibling()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#host{position:relative;width:240px}" +
+            "#moving{position:relative;top:30px;left:50px;width:100px;height:60px;background:#ccffcc}" +
+            "#following{width:200px;height:60px;background:#f0f0f0}</style></head><body>" +
+            "<div id='host'><div id='moving'></div><div id='following'></div></div>" +
+            "</body></html>");
+        var moving = doc.ElementDescendants().First(element => element.GetAttr("id") == "moving");
+        var movingBox = LayoutHarness.BoxOf(root, moving)!;
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        var overlapPixel = bitmap.GetPixel((int)(movingBox.X + 10f),
+            (int)(movingBox.Y + movingBox.Height - 10f));
+        Check.That(overlapPixel.R == 204 && overlapPixel.G == 255 &&
+                   overlapPixel.B == 204,
+            "relatively positioned box paints above later normal-flow sibling",
+            $"pixel={overlapPixel}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void VisibleOverflowTextPaintsOverLaterSiblingBackgroundButHiddenOverflowDoesNot()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0;font-size:16px;line-height:20px}" +
+            ".box{width:180px;height:20px;padding:8px;border:2px solid black;line-height:20px}" +
+            ".result{height:40px;background:#ffff00}" +
+            "#visible{overflow:visible}#hidden{overflow:hidden}" +
+            "</style></head><body><div id='visible' class='box'>FIRST<br>SECOND<br>OVERFLOW</div>" +
+            "<div id='visible-result' class='result'></div>" +
+            "<div id='hidden' class='box'>FIRST<br>SECOND<br>HIDDEN</div>" +
+            "<div id='hidden-result' class='result'></div></body></html>");
+        var visibleText = LayoutHarness.TextBoxContaining(root, "OVERFLOW")!;
+        var hiddenText = LayoutHarness.TextBoxContaining(root, "HIDDEN")!;
+        var visibleResult = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(element => element.GetAttr("id") == "visible-result"))!;
+        var hiddenResult = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(element => element.GetAttr("id") == "hidden-result"))!;
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        int CountInkInOverlap(LayoutBox text, LayoutBox result)
+        {
+            var overlapLeft = Math.Max(0, (int)MathF.Floor(Math.Max(text.ContentRect.Left,
+                result.BorderRect.Left)));
+            var overlapTop = Math.Max(0, (int)MathF.Floor(Math.Max(text.ContentRect.Top,
+                result.BorderRect.Top)));
+            var overlapRight = Math.Min(bitmap.Width, (int)MathF.Ceiling(Math.Min(
+                text.ContentRect.Right, result.BorderRect.Right)));
+            var overlapBottom = Math.Min(bitmap.Height, (int)MathF.Ceiling(Math.Min(
+                text.ContentRect.Bottom, result.BorderRect.Bottom)));
+            int count = 0;
+            for (int y = overlapTop; y < overlapBottom; y++)
+                for (int x = overlapLeft; x < overlapRight; x++)
+                {
+                    var pixel = bitmap.GetPixel(x, y);
+                    if (pixel.R < 180 && pixel.G < 180 && pixel.B < 180)
+                        count++;
+                }
+            return count;
+        }
+
+        Check.That(CountInkInOverlap(visibleText, visibleResult) > 0,
+            "visible overflow text paints above a following sibling background",
+            $"ink pixels={CountInkInOverlap(visibleText, visibleResult)}");
+        Check.That(CountInkInOverlap(hiddenText, hiddenResult) == 0,
+            "hidden overflow remains clipped before the following sibling background",
+            $"ink pixels={CountInkInOverlap(hiddenText, hiddenResult)}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void OverflowAutoShowsScrollbarsOnlyWhenContentOverflows()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}" +
+            ".box{width:120px;height:60px;padding:0;overflow:auto;background:#fff}" +
+            "#large{width:200px;height:120px;background:#fff}" +
+            "#small{width:80px;height:40px;background:#fff}</style></head><body>" +
+            "<div id='auto' class='box'><div id='large'></div></div>" +
+            "<div id='fit' class='box'><div id='small'></div></div>" +
+            "</body></html>");
+        var auto = doc.ElementDescendants().First(element => element.GetAttr("id") == "auto");
+        var fit = doc.ElementDescendants().First(element => element.GetAttr("id") == "fit");
+        var autoBox = LayoutHarness.BoxOf(root, auto)!;
+        var fitBox = LayoutHarness.BoxOf(root, fit)!;
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        var autoMetrics = autoBox.GetOverflowScrollMetrics();
+        var fitMetrics = fitBox.GetOverflowScrollMetrics();
+        var verticalTrack = bitmap.GetPixel((int)(autoBox.PaddingRect.Right - 7f),
+            (int)(autoBox.PaddingRect.Top + 40f));
+        var horizontalTrack = bitmap.GetPixel((int)(autoBox.PaddingRect.Left + 90f),
+            (int)(autoBox.PaddingRect.Bottom - 7f));
+        var fitScrollbarArea = bitmap.GetPixel((int)(fitBox.PaddingRect.Right - 7f),
+            (int)(fitBox.PaddingRect.Top + 10f));
+
+        Check.That(autoMetrics.HasVerticalScrollbar && autoMetrics.HasHorizontalScrollbar,
+            "overflow:auto requests bars for content overflowing both axes",
+            $"vertical={autoMetrics.HasVerticalScrollbar}, horizontal={autoMetrics.HasHorizontalScrollbar}");
+        Check.That(verticalTrack == Color.FromArgb(0xD4, 0xD0, 0xC8) &&
+                   horizontalTrack == Color.FromArgb(0xD4, 0xD0, 0xC8),
+            "overflow:auto paints vertical and horizontal scrollbar tracks",
+            $"vertical={verticalTrack}, horizontal={horizontalTrack}");
+        Check.That(!fitMetrics.HasVerticalScrollbar && !fitMetrics.HasHorizontalScrollbar &&
+                   fitScrollbarArea == Color.White,
+            "overflow:auto leaves scrollbars absent when content fits",
+            $"vertical={fitMetrics.HasVerticalScrollbar}, horizontal={fitMetrics.HasHorizontalScrollbar}, pixel={fitScrollbarArea}");
+        Check.Done();
+    }
+
+    [Fact]
     public void Css2NestedCountersQuotesColorsMarkersAndDisplayTablesResolve()
     {
         const string html = """
@@ -771,12 +1059,17 @@ public class EngineRegressionTests
     {
         var (doc, root) = LayoutHarness.Parse(
             "<html><head><style>body{margin:0}.fixed{" +
-            "position:fixed;bottom:0;left:0;right:0;height:30px;background:#00ff00}" +
+            "position:fixed;bottom:0;left:0;right:0;height:30px;background:#00ff00;" +
+            "outline:3px solid red}" +
             ".long{height:1600px}</style></head><body>" +
             "<div id='fixed' class='fixed'>Pinned status bar</div>" +
             "<div class='long'></div></body></html>");
         var fixedBox = LayoutHarness.BoxOf(root,
             doc.ElementDescendants().First(element => element.GetAttr("id") == "fixed"))!;
+        var fixedBoxes = Renderer.CollectTopLevelFixedBoxes(root);
+        Check.That(fixedBoxes.Count == 1 && ReferenceEquals(fixedBoxes[0], fixedBox),
+            "fixed overlay collection excludes non-fixed page content",
+            $"collected {fixedBoxes.Count} top-level fixed boxes");
         Check.That(Math.Abs(fixedBox.BorderRect.Bottom - 600f) < 0.5f && root.Height > 1200f,
             "fixed bottom is computed from the viewport, not the expanded document",
             $"bar bottom={fixedBox.BorderRect.Bottom:0.#}, document height={root.Height:0.#}");
@@ -808,11 +1101,19 @@ public class EngineRegressionTests
             try
             {
                 target.ClipRect(SkiaSharp.SKRect.Create(0, 0, 800, 600));
-                target.Translate(0, -scrollY);
-                target.DrawPicture(pagePicture);
+                int pageState = target.Save();
+                try
+                {
+                    target.Translate(0, -scrollY);
+                    target.DrawPicture(pagePicture);
+                }
+                finally
+                {
+                    target.RestoreToCount(pageState);
+                }
                 renderer.RenderFixedToCanvas(target, root, doc,
-                    LayoutHarness.Fonts, images, 800, 600, 0, scrollY,
-                    null, true);
+                    LayoutHarness.Fonts, images, 800, 600, 0, 0,
+                    null, true, fixedBoxes: fixedBoxes);
             }
             finally
             {
@@ -822,7 +1123,7 @@ public class EngineRegressionTests
         }
 
         PaintAtScroll(topCanvas, 0);
-        PaintAtScroll(scrolledCanvas, 200);
+        PaintAtScroll(scrolledCanvas, 200.5f);
         var topPixel = topBitmap.GetPixel(10, 580);
         var scrolledPixel = scrolledBitmap.GetPixel(10, 580);
         Check.That(topPixel.Green > 180 && scrolledPixel.Green > 180 &&
@@ -836,8 +1137,17 @@ public class EngineRegressionTests
                 if (topBitmap.GetPixel(x, y) != scrolledBitmap.GetPixel(x, y))
                     changedPixels++;
         Check.That(changedPixels == 0,
-            "fixed bar text and background stay aligned at the viewport bottom",
+            "fixed bar text, background, and outline stay aligned at fractional scroll offsets",
             $"changed pixels in the bar region={changedPixels}");
+        PaintAtScroll(scrolledCanvas, 731.25f);
+        int outlineChangedPixels = 0;
+        for (int y = 550; y < 600; y++)
+            for (int x = 0; x < 800; x++)
+                if (topBitmap.GetPixel(x, y) != scrolledBitmap.GetPixel(x, y))
+                    outlineChangedPixels++;
+        Check.That(outlineChangedPixels == 0,
+            "fixed outline pixels are invariant across rapid scroll offsets",
+            $"changed pixels in the fixed region={outlineChangedPixels}");
         Check.Done();
     }
 
@@ -960,56 +1270,211 @@ public class EngineRegressionTests
     [Fact]
     public void DottedOutlineAndAuthoredTextInputBorderPaintTheirStyles()
     {
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.InternetExplorer5 });
+            var (doc, root) = LayoutHarness.Parse(
+                "<html><head><style>" +
+                "input[type='text']{background-color:#eef8ff;border:1px solid #0066cc}" +
+                ".dotted{width:120px;height:40px;outline:3px dotted #000}" +
+                ".dashed{width:60px;height:40px;border:5px dashed #005588}" +
+                "</style></head><body>" +
+                "<input id='field' type='text' value='test'>" +
+                "<div id='outline' class='dotted'></div>" +
+                "<div id='dashed' class='dashed'></div>" +
+                "</body></html>");
+            using var images = new ImageCache { CookieStore = new CookieStore() };
+            using var loader = new ResourceLoader(new CookieStore());
+            using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+            var fieldElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "field");
+            var field = LayoutHarness.BoxOf(root, fieldElement)!;
+            var fieldEdge = bitmap.GetPixel(
+                (int)(field.BorderRect.Left + field.BorderRect.Width / 2f),
+                (int)(field.BorderRect.Top + 0.5f));
+            Check.That(fieldElement.Style?.BorderTopStyle == BorderStyleValue.Solid &&
+                       fieldElement.Style.BorderTopWidth == 1f &&
+                       fieldEdge.B > 150 && fieldEdge.R < 80,
+                "authored input border replaces the native grey inset edge",
+                fieldEdge.ToString());
+
+            var outlineElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "outline");
+            var outline = LayoutHarness.BoxOf(root, outlineElement)!.BorderRect;
+            int maxDark = 0, maxLight = 0;
+            for (int y = (int)outline.Top - 8; y < (int)outline.Top + 2; y++)
+            {
+                int dark = 0, light = 0;
+                for (int x = (int)outline.Left - 8; x < (int)outline.Right + 8; x++)
+                {
+                    var pixel = bitmap.GetPixel(x, y);
+                    if (pixel.R < 80 && pixel.G < 80 && pixel.B < 80) dark++;
+                    if (pixel.R > 200 && pixel.G > 200 && pixel.B > 200) light++;
+                }
+                maxDark = Math.Max(maxDark, dark);
+                maxLight = Math.Max(maxLight, light);
+            }
+            Check.That(maxDark > 2 && maxLight > 2,
+                "outline-style:dotted paints visible dots separated by gaps",
+                $"dark pixels={maxDark}, light pixels={maxLight}");
+
+            var dashedElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "dashed");
+            var dashed = LayoutHarness.BoxOf(root, dashedElement)!.BorderRect;
+            var bottomCorner = bitmap.GetPixel((int)dashed.Left + 1, (int)dashed.Bottom - 2);
+            Check.That(bottomCorner.B > 80 && bottomCorner.R < 80,
+                "matching dashed sides meet without a diagonal corner cut",
+                bottomCorner.ToString());
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void GrooveRidgeAndDoubleBordersPaintDistinctBandsAndCorners()
+    {
         var (doc, root) = LayoutHarness.Parse(
-            "<html><head><style>" +
-            "input[type='text']{background-color:#eef8ff;border:1px solid #0066cc}" +
-            ".dotted{width:120px;height:40px;outline:3px dotted #000}" +
-            ".dashed{width:60px;height:40px;border:5px dashed #005588}" +
-            "</style></head><body>" +
-            "<input id='field' type='text' value='test'>" +
-            "<div id='outline' class='dotted'></div>" +
-            "<div id='dashed' class='dashed'></div>" +
-            "</body></html>");
+            "<html><head><style>body{margin:0;background:#fff}" +
+            ".box{width:100px;height:40px;margin:12px;border-color:#808080}" +
+            "#groove{border:8px groove #808080}#ridge{border:8px ridge #808080}" +
+            "#double{border:9px double #000}</style></head><body>" +
+            "<div id='groove' class='box'></div><div id='ridge' class='box'></div>" +
+            "<div id='double' class='box'></div></body></html>");
+        LayoutBox BorderBox(string id)
+        {
+            var element = doc.ElementDescendants().First(item => item.GetAttr("id") == id);
+            return LayoutHarness.BoxOf(root, element)!;
+        }
+
+        var groove = BorderBox("groove");
+        var ridge = BorderBox("ridge");
+        var doubleBorder = BorderBox("double");
         using var images = new ImageCache { CookieStore = new CookieStore() };
         using var loader = new ResourceLoader(new CookieStore());
         using var bitmap = LayoutHarness.Render(doc, root, images, loader);
 
-        var fieldElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "field");
-        var field = LayoutHarness.BoxOf(root, fieldElement)!;
-        var fieldEdge = bitmap.GetPixel(
-            (int)(field.BorderRect.Left + field.BorderRect.Width / 2f),
-            (int)(field.BorderRect.Top + 0.5f));
-        Check.That(fieldElement.Style?.BorderTopStyle == BorderStyleValue.Solid &&
-                   fieldElement.Style.BorderTopWidth == 1f &&
-                   fieldEdge.B > 150 && fieldEdge.R < 80,
-            "authored input border replaces the native grey inset edge",
-            fieldEdge.ToString());
-
-        var outlineElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "outline");
-        var outline = LayoutHarness.BoxOf(root, outlineElement)!.BorderRect;
-        int maxDark = 0, maxLight = 0;
-        for (int y = (int)outline.Top - 8; y < (int)outline.Top + 2; y++)
+        int TopBorderLuminance(LayoutBox box, int inset)
         {
-            int dark = 0, light = 0;
-            for (int x = (int)outline.Left - 8; x < (int)outline.Right + 8; x++)
-            {
-                var pixel = bitmap.GetPixel(x, y);
-                if (pixel.R < 80 && pixel.G < 80 && pixel.B < 80) dark++;
-                if (pixel.R > 200 && pixel.G > 200 && pixel.B > 200) light++;
-            }
-            maxDark = Math.Max(maxDark, dark);
-            maxLight = Math.Max(maxLight, light);
+            int x = (int)(box.BorderRect.Left + box.BorderLeft + box.Width / 2f);
+            int y = (int)(box.BorderRect.Top + inset);
+            var pixel = bitmap.GetPixel(x, y);
+            return pixel.R + pixel.G + pixel.B;
         }
-        Check.That(maxDark > 2 && maxLight > 2,
-            "outline-style:dotted paints visible dots separated by gaps",
-            $"dark pixels={maxDark}, light pixels={maxLight}");
 
-        var dashedElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "dashed");
-        var dashed = LayoutHarness.BoxOf(root, dashedElement)!.BorderRect;
-        var bottomCorner = bitmap.GetPixel((int)dashed.Left + 1, (int)dashed.Bottom - 2);
-        Check.That(bottomCorner.B > 80 && bottomCorner.R < 80,
-            "matching dashed sides meet without a diagonal corner cut",
-            bottomCorner.ToString());
+        Check.That(TopBorderLuminance(groove, 1) < TopBorderLuminance(groove, 6),
+            "groove top border transitions from its dark outer band to a light inner band",
+            $"outer={TopBorderLuminance(groove, 1)}, inner={TopBorderLuminance(groove, 6)}");
+        Check.That(TopBorderLuminance(ridge, 1) > TopBorderLuminance(ridge, 6),
+            "ridge top border transitions from its light outer band to a dark inner band",
+            $"outer={TopBorderLuminance(ridge, 1)}, inner={TopBorderLuminance(ridge, 6)}");
+
+        int doubleX = (int)(doubleBorder.BorderRect.Left + doubleBorder.BorderLeft +
+            doubleBorder.Width / 2f);
+        int doubleY = (int)doubleBorder.BorderRect.Top;
+        var outerLine = bitmap.GetPixel(doubleX, doubleY + 1);
+        var gap = bitmap.GetPixel(doubleX, doubleY + 4);
+        var innerLine = bitmap.GetPixel(doubleX, doubleY + 8);
+        Check.That(outerLine.R < 40 && outerLine.G < 40 && outerLine.B < 40 &&
+                   gap.R > 240 && gap.G > 240 && gap.B > 240 &&
+                   innerLine.R < 40 && innerLine.G < 40 && innerLine.B < 40,
+            "double border keeps two dark rules separated by a clear center gap",
+            $"outer={outerLine}, gap={gap}, inner={innerLine}");
+
+        var scaledRenderer = new Renderer(LayoutHarness.Fonts, images, loader);
+        const float zoom = 1.5f;
+        using var scaledBitmap = new SkiaSharp.SKBitmap(
+            new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                SkiaSharp.SKAlphaType.Premul));
+        using var scaledCanvas = new SkiaSharp.SKCanvas(scaledBitmap);
+        scaledRenderer.RenderToCanvas(scaledCanvas, root, doc, LayoutHarness.Fonts, images,
+            800, 600, 0, 0, null, true, renderScale: zoom);
+
+        bool CornerHasNoBackground(LayoutBox box, int cssBorderWidth)
+        {
+            int extent = (int)MathF.Ceiling(cssBorderWidth * zoom);
+            int left = (int)MathF.Round(box.BorderRect.Left * zoom);
+            int top = (int)MathF.Round(box.BorderRect.Top * zoom);
+            int right = (int)MathF.Round(box.BorderRect.Right * zoom);
+            int bottom = (int)MathF.Round(box.BorderRect.Bottom * zoom);
+            var corners = new[]
+            {
+                (X: left, Y: top),
+                (X: right - extent, Y: top),
+                (X: left, Y: bottom - extent),
+                (X: right - extent, Y: bottom - extent)
+            };
+            foreach (var corner in corners)
+                for (int y = corner.Y; y < corner.Y + extent; y++)
+                    for (int x = corner.X; x < corner.X + extent; x++)
+                    {
+                        var pixel = scaledBitmap.GetPixel(x, y);
+                        if (pixel.Red > 245 && pixel.Green > 245 && pixel.Blue > 245)
+                            return false;
+                    }
+            return true;
+        }
+
+        Check.That(CornerHasNoBackground(groove, 8),
+            "groove corner joins contain no background-colored pixel at 150% zoom");
+        Check.That(CornerHasNoBackground(ridge, 8),
+            "ridge corner joins contain no background-colored pixel at 150% zoom");
+
+        bool BevelHasNoHorizontalHairline(LayoutBox box, int borderWidth)
+        {
+            int x = (int)MathF.Round(
+                (box.BorderRect.Left + box.BorderLeft + box.Width / 2f) * zoom);
+            int top = (int)MathF.Round(box.BorderRect.Top * zoom);
+            int extent = (int)MathF.Ceiling(borderWidth * zoom);
+            for (int y = top; y < top + extent; y++)
+            {
+                var pixel = scaledBitmap.GetPixel(x, y);
+                if (pixel.Red > 245 && pixel.Green > 245 && pixel.Blue > 245)
+                    return false;
+            }
+            return true;
+        }
+
+        Check.That(BevelHasNoHorizontalHairline(groove, 8),
+            "groove's adjacent color bands have no white scanline at 150% zoom");
+        Check.That(BevelHasNoHorizontalHairline(ridge, 8),
+            "ridge's adjacent color bands have no white scanline at 150% zoom");
+
+        bool DoubleRuleReachesEveryCorner(int cssInset)
+        {
+            int extent = 5;
+            int inset = (int)MathF.Round(cssInset * zoom);
+            int left = (int)MathF.Round(doubleBorder.BorderRect.Left * zoom);
+            int top = (int)MathF.Round(doubleBorder.BorderRect.Top * zoom);
+            int right = (int)MathF.Round(doubleBorder.BorderRect.Right * zoom);
+            int bottom = (int)MathF.Round(doubleBorder.BorderRect.Bottom * zoom);
+            var corners = new[]
+            {
+                (X: left + inset, Y: top + inset),
+                (X: right - extent - inset, Y: top + inset),
+                (X: left + inset, Y: bottom - extent - inset),
+                (X: right - extent - inset, Y: bottom - extent - inset)
+            };
+            foreach (var corner in corners)
+            {
+                bool foundDark = false;
+                for (int y = corner.Y; y < corner.Y + extent; y++)
+                    for (int x = corner.X; x < corner.X + extent; x++)
+                    {
+                        var pixel = scaledBitmap.GetPixel(x, y);
+                        if (pixel.Red < 40 && pixel.Green < 40 && pixel.Blue < 40)
+                            foundDark = true;
+                    }
+                if (!foundDark) return false;
+            }
+            return true;
+        }
+
+        Check.That(DoubleRuleReachesEveryCorner(0),
+            "double outer rule reaches all four corners at 150% zoom");
+        Check.That(DoubleRuleReachesEveryCorner(6),
+            "double inner rule reaches all four corners at 150% zoom");
         Check.Done();
     }
 
@@ -1078,6 +1543,8 @@ public class EngineRegressionTests
         var borderDotsElement = doc.ElementDescendants()
             .First(element => element.GetAttr("id") == "border-dots");
         var borderDotsRect = LayoutHarness.BoxOf(root, borderDotsElement)!.BorderRect;
+        var dottedCorner = bitmap.GetPixel(
+            (int)borderDotsRect.Left + 1, (int)borderDotsRect.Top + 1);
         int borderDotsY = (int)MathF.Round(borderDotsRect.Top + 3f);
         var dotWidths = new List<int>();
         int currentDotWidth = 0;
@@ -1109,6 +1576,9 @@ public class EngineRegressionTests
                    dotWidths.Max() - dotWidths.Min() <= 1,
             "dotted border keeps dot size consistent along its straight side",
             $"dot widths=[{string.Join(",", dotWidths)}]");
+        Check.That(dottedCorner.R > 140 && dottedCorner.G > 140 && dottedCorner.B > 140,
+            "dotted border rounds its corner instead of clipping a square dot into it",
+            dottedCorner.ToString());
 
         var dashElement = doc.ElementDescendants().First(element => element.GetAttr("id") == "dashes");
         var dashRect = LayoutHarness.BoxOf(root, dashElement)!.BorderRect;
@@ -1129,8 +1599,9 @@ public class EngineRegressionTests
         }
         if (run > 0) runLengths.Add(run);
         Check.That(runLengths.Count >= 2 &&
-                   runLengths.Max() - runLengths.Min() <= 1,
-            "vertical dashed borders keep full, uniform dashes instead of a clipped final dash",
+                   runLengths.Max() - runLengths.Min() <= 1 &&
+                   runLengths.Max() <= 11,
+            "vertical dashed borders keep short, uniform dashes instead of oversized clipped runs",
             $"runs=[{string.Join(",", runLengths)}]");
         Check.Done();
     }
@@ -1346,6 +1817,29 @@ public class EngineRegressionTests
             Check.That(CountInk(boostedBitmap) > CountInk(overlayBitmap),
                 "control overlay text omits the extra legacy embolden applied by ordinary rectangle draws",
                 $"boosted={CountInk(boostedBitmap)}, overlay={CountInk(overlayBitmap)}");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void LegacyStrokeBoostDoesNotEmboldenMonospaceFonts()
+    {
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+            using var fonts = new FontCache();
+            var monospace = fonts.Resolve(["Courier New", "monospace"], 16f, 400, false);
+            var proportional = fonts.Resolve(["Arial", "sans-serif"], 16f, 400, false);
+
+            Check.That(!monospace.LegacyStrokeBoost,
+                "legacy rasterization preserves regular Courier weight");
+            Check.That(proportional.LegacyStrokeBoost,
+                "legacy stroke boost remains enabled for small proportional text");
         }
         finally
         {
@@ -1878,6 +2372,18 @@ public class EngineRegressionTests
             Check.That(Math.Abs(img.BorderRect.Width - 100f) < 0.5f,
                 "IE5 img quirk: margin+border+width+border — padding never participates",
                 $"borderBox={img.BorderRect.Width:0.#}");
+
+            var (strictDoc, strictRoot) = LayoutHarness.Parse(
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" " +
+                "\"http://www.w3.org/TR/html4/strict.dtd\">" +
+                "<html><body><div id='strict' " +
+                "style='width:200px;padding:10px;border:5px solid black'>x</div></body></html>");
+            var strictBox = LayoutHarness.BoxOf(strictRoot,
+                strictDoc.ElementDescendants().First(e => e.GetAttr("id") == "strict"))!;
+            Check.That(strictDoc.QuirksMode == "strict" &&
+                       Math.Abs(strictBox.BorderRect.Width - 230f) < 0.5f,
+                "IE5 standards mode uses the CSS content-box model",
+                $"mode={strictDoc.QuirksMode}, borderBox={strictBox.BorderRect.Width:0.#}");
 
             // The W3C content-box model in the union persona.
             BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
@@ -2439,6 +2945,10 @@ public class EngineRegressionTests
             doc.ElementDescendants().First(e => e.GetAttr("id") == "capTop"))!;
         var capBot = LayoutHarness.BoxOf(root,
             doc.ElementDescendants().First(e => e.GetAttr("id") == "capBot"))!;
+        var topTable = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "top"))!;
+        var bottomTable = LayoutHarness.BoxOf(root,
+            doc.ElementDescendants().First(e => e.GetAttr("id") == "bot"))!;
         var tdTop = LayoutHarness.BoxOf(root,
             doc.ElementDescendants().First(e => e.GetAttr("id") == "top")
                 .ElementDescendants().First(e => e.TagName == "td"))!;
@@ -2451,6 +2961,24 @@ public class EngineRegressionTests
         Check.That(capBot.Y >= tdBot.BorderRect.Bottom - 1f,
             "caption-side:bottom places the caption below the grid",
             $"capY={capBot.Y:0.#} gridBottom={tdBot.BorderRect.Bottom:0.#}");
+        var topGrid = new Retro96.Drawing.RectangleF(
+            topTable.BorderRect.X,
+            topTable.BorderRect.Y + topTable.TableGridTopInset,
+            topTable.BorderRect.Width,
+            Math.Max(0f, topTable.BorderRect.Height -
+                topTable.TableGridTopInset - topTable.TableGridBottomInset));
+        var bottomGrid = new Retro96.Drawing.RectangleF(
+            bottomTable.BorderRect.X,
+            bottomTable.BorderRect.Y + bottomTable.TableGridTopInset,
+            bottomTable.BorderRect.Width,
+            Math.Max(0f, bottomTable.BorderRect.Height -
+                bottomTable.TableGridTopInset - bottomTable.TableGridBottomInset));
+        Check.That(topGrid.Top >= capTop.BorderRect.Bottom - 0.5f,
+            "the table border starts below a top caption",
+            $"grid={topGrid}, caption={capTop.BorderRect}");
+        Check.That(bottomGrid.Bottom <= capBot.BorderRect.Top + 0.5f,
+            "the table border ends above a bottom caption",
+            $"grid={bottomGrid}, caption={capBot.BorderRect}");
         Check.Done();
     }
 
@@ -2488,28 +3016,72 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void CssTableCellBordersAreIncludedInIntrinsicColumnWidths()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            ".show{border-collapse:separate;empty-cells:show}" +
+            ".show td{border:2px solid #000;padding:10px}" +
+            ".hide{border-collapse:separate;empty-cells:hide}" +
+            ".hide td{border:2px solid #000;padding:10px}" +
+            "</style></head><body>" +
+            "<table class='show'><tr><td>Cell 1</td><td></td><td>Cell 3</td></tr>" +
+            "<tr><td></td><td>Cell 5</td><td></td></tr></table>" +
+            "<table class='hide'><tr><td>Cell 1</td><td></td><td>Cell 3</td></tr>" +
+            "<tr><td></td><td>Cell 5</td><td></td></tr></table>" +
+            "</body></html>");
+
+        foreach (var table in doc.ElementDescendants()
+                     .Where(element => element.GetAttr("class") is "show" or "hide"))
+        {
+            foreach (var text in new[] { "Cell 1", "Cell 3", "Cell 5" })
+            {
+                var cell = table.ElementDescendants().First(element =>
+                    element.TagName == "td" && element.InnerText?.Trim() == text);
+                var cellBox = LayoutHarness.BoxOf(root, cell)!;
+                var textBoxes = cellBox.Descendants()
+                    .Where(box => box.TextRun != null &&
+                        !LayoutEngine.IsAsciiWhitespaceOnly(box.TextRun))
+                    .ToList();
+                Check.That(textBoxes.Count > 0 &&
+                           textBoxes.Select(box => MathF.Round(box.Y, 1)).Distinct().Count() == 1,
+                    $"{table.GetAttr("class")} cell '{text}' fits on one line",
+                    string.Join(", ", textBoxes.Select(box => $"{box.TextRun}@{box.Y:0.0}")));
+            }
+        }
+        Check.Done();
+    }
+
+    [Fact]
     public void OffsetWidthReadsTheRealLayoutBox()
     {
-        var page = new PageHarness();
-        page.LoadHtml(
-            "<html><body><div id='d' style='width:220px; padding:10px; border:5px solid black'>box</div></body></html>");
-        Retro96.Engine.Css.StyleResolver.Resolve(page.Document, 800);
-        LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings { EngineMode = RetroEngineMode.Retro96 });
+            var page = new PageHarness();
+            page.LoadHtml(
+                "<html><body><div id='d' style='width:220px; padding:10px; border:5px solid black'>box</div></body></html>");
+            Retro96.Engine.Css.StyleResolver.Resolve(page.Document, 800);
+            LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
 
-        // Default persona = IE5 quirks: the authored width IS the border box,
-        // so the REAL box-backed offsetWidth is 220 (the pre-layout style
-        // fallback in DomBindings keeps its own 250 arithmetic — it never
-        // consults layout).
-        Check.That(page.EvalString("document.getElementById('d').offsetWidth") == "220",
-            "offsetWidth reads the real layout box (IE5 quirks: authored width = border box)",
-            page.EvalString("document.getElementById('d').offsetWidth"));
-        Check.That(page.EvalString("document.getElementById('d').clientWidth") == "210",
-            "clientWidth = border box − borders (quirks content + padding)",
-            page.EvalString("document.getElementById('d').clientWidth"));
-        Check.That(page.EvalString("document.getElementById('d').offsetHeight") != "0" &&
-                  page.EvalString("document.getElementById('d').offsetHeight") != "",
-            "offsetHeight is a real measured height once a box exists",
-            page.EvalString("document.getElementById('d').offsetHeight"));
+            // The Retro96 union keeps the CSS content-box model: 220px content
+            // plus 20px padding and 10px border gives a 250px border box.
+            Check.That(page.EvalString("document.getElementById('d').offsetWidth") == "250",
+                "offsetWidth reads the real layout box (CSS content width plus padding and border)",
+                page.EvalString("document.getElementById('d').offsetWidth"));
+            Check.That(page.EvalString("document.getElementById('d').clientWidth") == "240",
+                "clientWidth = CSS content width plus padding",
+                page.EvalString("document.getElementById('d').clientWidth"));
+            Check.That(page.EvalString("document.getElementById('d').offsetHeight") != "0" &&
+                      page.EvalString("document.getElementById('d').offsetHeight") != "",
+                "offsetHeight is a real measured height once a box exists",
+                page.EvalString("document.getElementById('d').offsetHeight"));
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
         Check.Done();
     }
 

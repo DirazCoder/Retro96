@@ -10,6 +10,280 @@ namespace RetroTests;
 public class JsEngineTests
 {
     [Fact]
+    public void RunLocalEcma3CorpusForDiagnostics()
+    {
+        const string suiteRoot = @"C:\Users\diraz\Downloads\ecma_3";
+        const string resultPath =
+            @"C:\Users\diraz\.copilot\session-state\527d2379-dd34-4d59-9b06-da3c30b3fa2d\files\ecma3-results.txt";
+        const string testHarness = """
+            var __ecma3 = { checks: 0, failures: [] };
+            var testcases = [];
+            var tc = 0;
+            var SECTION = '';
+            var summary = '';
+            var status = '';
+            var expect;
+            var actual;
+            function reportCompare(expected, actual, description) {
+                __ecma3.checks++;
+                if (expected != actual && !(expected != expected && actual != actual)) {
+                    __ecma3.failures[__ecma3.failures.length] =
+                        (description || '') + " expected '" + expected + "', got '" + actual + "'";
+                    return false;
+                }
+                return true;
+            }
+            function TestCase(name, description, expected, actual) {
+                this.name = name;
+                this.description = description;
+                this.expect = expected;
+                this.actual = actual;
+                this.passed = expected == actual ||
+                    (expected != expected && actual != actual);
+                testcases[tc++] = this;
+            }
+            function AddTestCase(description, expected, actual) {
+                new TestCase(SECTION || '', description, expected, actual);
+            }
+            function test() {
+                for (var i = 0; i < testcases.length; i++) {
+                    reportCompare(testcases[i].expect, testcases[i].actual,
+                        testcases[i].description);
+                }
+            }
+            function addThis() { reportCompare(expect, actual, status || summary); }
+            function inSection(section) { return 'Section ' + section + ' - '; }
+            function print() {}
+            function printStatus() {}
+            function printBugNumber() {}
+            function enterFunc() {}
+            function exitFunc() {}
+            function gc() {}
+            function options() { return ''; }
+            function jit() { return false; }
+            function quit() {}
+            function startTest() {}
+            function writeHeaderToLog() {}
+            """;
+
+        Assert.True(Directory.Exists(suiteRoot), $"ECMA-3 corpus not found: {suiteRoot}");
+        var testFiles = Directory.EnumerateFiles(suiteRoot, "*.js", SearchOption.AllDirectories)
+            .Where(path => Path.GetFileName(path) is not ("shell.js" or "browser.js") &&
+                !IsMozillaSpecificCorpusFile(suiteRoot, path))
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        int skipped = Directory.EnumerateFiles(suiteRoot, "*.js", SearchOption.AllDirectories)
+            .Count(path => Path.GetFileName(path) is not ("shell.js" or "browser.js")) -
+            testFiles.Length;
+        var results = new List<string>();
+        int passed = 0, failed = 0, errors = 0, noReport = 0;
+        Directory.CreateDirectory(Path.GetDirectoryName(resultPath)!);
+
+        void SaveProgress()
+        {
+            File.WriteAllLines(resultPath,
+                new[]
+                {
+                    $"Files={testFiles.Length}; SkippedMozillaSpecific={skipped}; Completed={passed + failed + errors + noReport}; Passed={passed}; Failed={failed}; Errors={errors}; NoReport={noReport}",
+                    ""
+                }.Concat(results));
+        }
+
+        File.WriteAllText(resultPath,
+            $"Running {testFiles.Length} ECMA-3 test files directly.{Environment.NewLine}");
+
+        foreach (string testPath in testFiles)
+        {
+            string relativePath = Path.GetRelativePath(suiteRoot, testPath);
+            bool expectsError = Path.GetFileName(testPath).EndsWith("-n.js", StringComparison.Ordinal);
+            var scope = new JsScope();
+            JsRuntime.PopulateGlobalScope(scope);
+            var interpreter = new JsInterpreter(scope, null, _ => { }, _ => { },
+                timeLimitMs: 1000);
+            interpreter.RegisterRuntimeBuiltins();
+            var scriptErrors = new List<string>();
+            interpreter.ConsoleMessage += entry =>
+            {
+                if (entry.Level == "error")
+                    scriptErrors.Add(entry.Message);
+            };
+            Exception? scriptError = null;
+            try
+            {
+                interpreter.ExecuteString(testHarness);
+                string shellPath = Path.Combine(Path.GetDirectoryName(testPath)!, "shell.js");
+                if (File.Exists(shellPath))
+                    interpreter.ExecuteString(File.ReadAllText(shellPath));
+                int errorsBeforeTest = scriptErrors.Count;
+                interpreter.ExecuteString(File.ReadAllText(testPath));
+                if (scriptErrors.Count == errorsBeforeTest &&
+                    interpreter.ExecuteString("__ecma3.checks === 0 && testcases.length > 0")
+                        .ToBoolean())
+                    interpreter.ExecuteString("test()");
+            }
+            catch (Exception ex)
+            {
+                scriptError = ex;
+            }
+
+            if (scriptError != null || scriptErrors.Count > 0)
+            {
+                if (expectsError)
+                    passed++;
+                else
+                {
+                    errors++;
+                    results.Add($"ERROR\t{relativePath}\t{scriptError?.Message ?? scriptErrors[^1]}");
+                }
+                SaveProgress();
+                continue;
+            }
+
+            if (expectsError)
+            {
+                failed++;
+                results.Add($"FAIL\t{relativePath}\texpected an exception, but the script completed");
+                SaveProgress();
+                continue;
+            }
+
+            int checks = int.Parse(interpreter.ExecuteString("__ecma3.checks").ToJsString(),
+                System.Globalization.CultureInfo.InvariantCulture);
+            int assertionFailures = int.Parse(interpreter.ExecuteString(
+                "__ecma3.failures.length").ToJsString(),
+                System.Globalization.CultureInfo.InvariantCulture);
+            if (assertionFailures > 0)
+            {
+                failed++;
+                results.Add($"FAIL\t{relativePath}\t{interpreter.ExecuteString("__ecma3.failures.join(' | ')").ToJsString()}");
+            }
+            else if (checks == 0)
+            {
+                noReport++;
+                results.Add($"NO REPORT\t{relativePath}\tno assertions reported");
+            }
+            else
+                passed++;
+
+            SaveProgress();
+        }
+        Assert.True(failed == 0 && errors == 0 && noReport == 0,
+            $"ECMA-3 corpus: files={testFiles.Length}, skipped Mozilla-specific={skipped}, passed={passed}, failed={failed}, errors={errors}, no-report={noReport}. Details: {resultPath}");
+    }
+
+    private static bool IsMozillaSpecificCorpusFile(string root, string path)
+    {
+        string relativePath = Path.GetRelativePath(root, path).Replace('\\', '/');
+        return relativePath.StartsWith("extensions/", StringComparison.OrdinalIgnoreCase) ||
+               relativePath.Equals("Unicode/uc-005.js", StringComparison.OrdinalIgnoreCase) ||
+               relativePath.Equals("Function/regress-58274.js", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SuppliedEs3RuntimeFailuresAreCovered()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body></body></html>");
+
+        void CheckExpression(string name, string expression)
+        {
+            var actual = page.Eval(expression);
+            Check.That(actual.ToBoolean(), name, actual.ToJsString());
+        }
+
+        CheckExpression("labeled continue targets the outer loop",
+            "var count=0; outer: for(var i=0;i<3;i++){for(var j=0;j<3;j++){" +
+            "if(j===1) continue outer; count++;}} count===3");
+        CheckExpression("var arguments after return parses and preserves arguments object",
+            "(function(){function F3(){return arguments; var arguments=555;}" +
+            "return typeof F3()==='object';})()");
+        CheckExpression("formal parameter named arguments shadows the arguments object",
+            "(function(arguments){return arguments;})(55)===55");
+        CheckExpression("ToPrimitive calls object valueOf methods in operand order",
+            "(function(){var order='';var a={valueOf:function(){order+='a';return 3;}};" +
+            "var b={valueOf:function(){order+='b';return 6;}};" +
+            "return (a&b)===2&&order==='ab';})()");
+        CheckExpression("compound assignment evaluates its left reference first",
+            "(function(){var order='';var o={x:1};" +
+            "function key(){order+='l';return 'x';}" +
+            "function right(){order+='r';return 2;}o[key()]+=right();" +
+            "return order==='lr'&&o.x===3;})()");
+        CheckExpression("function length reports declared parameters",
+            "function f(a,b,c){} f.length===3");
+        CheckExpression("plain objects inherit Object constructor",
+            "({}).constructor===Object");
+        CheckExpression("array index assignment extends length",
+            "var a=[]; a[10]='x'; a.length===11");
+        CheckExpression("String wrapper valueOf returns primitive",
+            "var s=new String('test'); typeof s==='object' && s.valueOf()==='test'");
+        CheckExpression("String wrapper ToPrimitive avoids recursive toString",
+            "var s=new String('test'); String(s)==='test' && s+'! '==='test! '");
+        CheckExpression("Number wrapper valueOf returns primitive",
+            "var n=new Number(12); n.valueOf()===12 && n-2===10");
+        CheckExpression("Boolean wrapper valueOf returns primitive",
+            "var b=new Boolean(false); b.valueOf()===false && b==false");
+        CheckExpression("String.localeCompare is available",
+            "'a'.localeCompare('b')<0");
+        CheckExpression("Date.UTC returns epoch milliseconds",
+            "Date.UTC(2020,0,1)===1577836800000");
+        CheckExpression("Date constructor preserves milliseconds",
+            "new Date(2020,0,1,0,0,0,500).getMilliseconds()===500");
+        CheckExpression("Date.toUTCString is available",
+            "typeof new Date(0).toUTCString()==='string'");
+        CheckExpression("Date.getTimezoneOffset is available",
+            "typeof new Date().getTimezoneOffset()==='number'");
+        CheckExpression("RegExp literal exposes multiline flag",
+            "/test/m.multiline===true");
+        CheckExpression("unresolved identifiers throw ReferenceError",
+            "(function(){try{missingEs3Binding;}catch(e){return e instanceof ReferenceError;}})()");
+        CheckExpression("typeof remains safe for unresolved identifiers",
+            "typeof missingEs3Binding==='undefined'");
+        CheckExpression("invalid array length throws RangeError",
+            "(function(){try{new Array(-1);}catch(e){return e instanceof RangeError;}})()");
+        CheckExpression("malformed URI throws URIError",
+            "(function(){try{decodeURIComponent('%');}catch(e){return e instanceof URIError;}})()");
+        CheckExpression("Function.prototype has function type",
+            "typeof Function.prototype==='function'");
+        CheckExpression("Object.prototype.toString identifies arrays",
+            "Object.prototype.toString.call([])==='[object Array]'");
+        CheckExpression("Object.prototype.toString identifies strings",
+            "Object.prototype.toString.call('')==='[object String]'");
+        CheckExpression("Math.log(0) is negative infinity",
+            "Math.log(0)===-Infinity");
+        CheckExpression("parseInt parses negative values",
+            "parseInt('-42')===-42");
+        CheckExpression("parseInt recognizes hex prefixes",
+            "parseInt('0x10')===16");
+        CheckExpression("parseFloat parses exponents",
+            "parseFloat('1e3')===1000");
+        Check.Done();
+    }
+
+    [Fact]
+    public void DomMutationReflowsAreCoalescedUntilHandlerCompletes()
+    {
+        var canvas = new Retro96.BrowserCanvas();
+        var page = new PageHarness { Canvas = canvas };
+        page.LoadHtml(
+            "<html><body><button id='run'>run</button>" +
+            "<div id='target'></div></body></html>");
+        page.Eval(
+            "var target = document.getElementById('target');" +
+            "document.getElementById('run').onclick = function() {" +
+            "for (var i = 0; i < 100; i++) target.innerHTML = '<span>' + i + '</span>';};");
+        canvas.Log.Reflows = 0;
+
+        page.FireEvent(page.Document.AllTags("button")[0], "onclick");
+
+        Check.That(canvas.Log.Reflows == 1,
+            "100 DOM mutations cause one layout rebuild after the handler",
+            canvas.Log.Reflows.ToString());
+        Check.That(page.Document.AllTags("div")[0].InnerText == "99",
+            "the final DOM mutation is still applied");
+        Check.Done();
+    }
+
+    [Fact]
     public void FutureReservedWordsCanBeUsedAsFunctionNames()
     {
         var page = new PageHarness();
@@ -487,6 +761,36 @@ public class JsEngineTests
         Check.Done();
     }
 
+    [Fact]
+    public void BlockingDialogsDoNotConsumeEventHandlerExecutionBudget()
+    {
+        var page = new PageHarness { Canvas = new SlowAlertCanvas() };
+        page.LoadHtml(
+            "<html><body>" +
+            "<button id='inline' onclick=\"alert('wait'); window.inlineDone = true;\">inline</button>" +
+            "<button id='dom0'>dom0</button>" +
+            "</body></html>",
+            executionLimitMs: 50);
+
+        var buttons = page.Document.AllTags("button");
+        page.FireEvent(buttons[0], "onclick");
+        Check.That(page.EvalString("window.inlineDone") == "true",
+            "time waiting for alert does not time out an inline event handler");
+
+        page.Eval("document.getElementById('dom0').onclick = function() {" +
+                  "alert('wait'); window.dom0Done = true;};");
+        page.FireEvent(buttons[1], "onclick");
+        Check.That(page.EvalString("window.dom0Done") == "true",
+            "time waiting for alert does not time out a DOM-0 event handler");
+        Check.Done();
+    }
+
+    private sealed class SlowAlertCanvas : BrowserCanvas
+    {
+        public override void ShowAlert(string message) =>
+            Thread.Sleep(120);
+    }
+
     // ── error handling ───────────────────────────────────────────────
 
     [Fact]
@@ -525,6 +829,27 @@ public class JsEngineTests
         Check.That(entries.Any(e => e.Level == "error" && e.Message.Contains("Syntax error")),
             "syntax errors are published as console errors",
             string.Join(" | ", entries.Select(e => $"{e.Level}:{e.Message}")));
+        Check.Done();
+    }
+
+    [Fact]
+    public void EvalSyntaxErrorsAreCatchableWithoutConsoleNoise()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body></body></html>");
+        var entries = new List<JsInterpreter.ConsoleEntry>();
+        page.Interpreter.ConsoleMessage += entry => entries.Add(entry);
+
+        string result = page.EvalString(
+            "(function() { try { eval('this is not valid javascript {{{'); } " +
+            "catch (e) { return e.name + ':' + (e instanceof SyntaxError); } })()");
+
+        Check.That(result == "SyntaxError:true",
+            "invalid source passed to eval throws a catchable SyntaxError",
+            result);
+        Check.That(entries.Count == 0,
+            "a caught eval SyntaxError is not reported as an uncaught page error",
+            string.Join(" | ", entries.Select(e => e.Message)));
         Check.Done();
     }
 
@@ -1162,28 +1487,37 @@ public class JsEngineTests
         Check.Done();
     }
 
-    // ── Personas: IE5 default / NS4.7 / Retro96 union ─────────────────
+    // ── Personas: Retro96 union default / IE5 / NS4.7 ─────────────────
 
     [Fact]
-    public void DefaultPersonaIsIe5()
+    public void DefaultPersonaIsRetro96Union()
     {
-        // Engine default (no BrowserRuntime.Apply): IE5, March 1999.
-        var page = new PageHarness();
-        page.LoadHtml("<html><body></body></html>");
-        Check.That(page.EvalString("navigator.userAgent") == "Mozilla/4.0 (compatible; MSIE 5.0; Windows 98)",
-            "navigator.userAgent is the IE5 Win98 string in the default persona",
-            page.EvalString("navigator.userAgent"));
-        Check.That(page.EvalString("navigator.appName") == "Microsoft Internet Explorer",
-            "navigator.appName is Microsoft Internet Explorer");
-        Check.That(page.EvalString("navigator.javaEnabled()") == "true",
-            "navigator.javaEnabled() returns true (applets enabled)");
-        Check.That(page.EvalString("typeof document.all") != "undefined",
-            "document.all exists in the IE5 persona");
-        Check.That(page.EvalString("typeof document.layers") == "undefined",
-            "document.layers is undefined in the IE5 persona",
-            page.EvalString("typeof document.layers"));
-        Check.That(page.EvalString("typeof document.getElementById") == "function",
-            "getElementById exists in the IE5 persona");
+        var previousSettings = BrowserRuntime.Settings.Clone();
+        try
+        {
+            BrowserRuntime.Apply(new UserSettings());
+            // Engine default: Retro96 compatibility union.
+            var page = new PageHarness();
+            page.LoadHtml("<html><body></body></html>");
+            Check.That(page.EvalString("navigator.userAgent") == UserSettings.DefaultRetro96UserAgent,
+                "navigator.userAgent uses the default Retro96 union value",
+                page.EvalString("navigator.userAgent"));
+            Check.That(page.EvalString("navigator.appName") == "Microsoft Internet Explorer",
+                "navigator.appName retains its legacy-compatible value");
+            Check.That(page.EvalString("navigator.javaEnabled()") == "true",
+                "navigator.javaEnabled() returns true (applets enabled)");
+            Check.That(page.EvalString("typeof document.all") != "undefined",
+                "document.all exists in the Retro96 union");
+            Check.That(page.EvalString("typeof document.layers") != "undefined",
+                "document.layers exists in the Retro96 union",
+                page.EvalString("typeof document.layers"));
+            Check.That(page.EvalString("typeof document.getElementById") == "function",
+                "getElementById exists in the Retro96 union");
+        }
+        finally
+        {
+            BrowserRuntime.Apply(previousSettings);
+        }
         Check.Done();
     }
 

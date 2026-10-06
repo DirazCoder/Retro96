@@ -17,7 +17,7 @@ public class JsParserException : Exception
 }
 
 /// <summary>
-/// JavaScript 1.1/1.2 recursive-descent parser.
+/// JavaScript 1999 recursive-descent parser.
 ///
 /// Semicolon handling follows the real automatic-semicolon-insertion
 /// rules: a missing ';' is legal before a token that follows a line

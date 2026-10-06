@@ -21,6 +21,16 @@ public enum BoxType
     TableCaption
 }
 
+public readonly record struct OverflowScrollMetrics(
+    bool HasVerticalScrollbar,
+    bool HasHorizontalScrollbar,
+    float ViewportWidth,
+    float ViewportHeight,
+    float ContentRight,
+    float ContentBottom,
+    float MaxScrollX,
+    float MaxScrollY);
+
 /// <summary>
 /// A box in the layout tree.
 ///
@@ -47,6 +57,8 @@ public class LayoutBox
     public float ViewportWidth, ViewportHeight;
     public ComputedStyle? StyleOverride { get; set; }
     public bool ShrinkToFitCell { get; set; }
+    public float TableGridTopInset { get; set; }
+    public float TableGridBottomInset { get; set; }
 
     // Spacing (px)
     public float MarginTop, MarginRight, MarginBottom, MarginLeft;
@@ -80,6 +92,67 @@ public class LayoutBox
         X - MarginLeft, Y - MarginTop,
         Width + PaddingLeft + PaddingRight + BorderLeft + BorderRight + MarginLeft + MarginRight,
         Height + PaddingTop + PaddingBottom + BorderTop + BorderBottom + MarginTop + MarginBottom);
+
+    public OverflowScrollMetrics GetOverflowScrollMetrics()
+    {
+        const float scrollbarSize = 14f;
+        const float epsilon = 0.5f;
+        var viewport = PaddingRect;
+        float contentRight = Descendants()
+            .Select(child => child.BorderRect.Right)
+            .DefaultIfEmpty(viewport.Right)
+            .Max();
+        float contentBottom = Descendants()
+            .Select(child => child.BorderRect.Bottom)
+            .DefaultIfEmpty(viewport.Bottom)
+            .Max();
+
+        bool hasVerticalScrollbar = false;
+        bool hasHorizontalScrollbar = false;
+        var overflow = Element?.Style?.Overflow ?? OverflowValue.Visible;
+        if (overflow == OverflowValue.Scroll)
+        {
+            hasVerticalScrollbar = true;
+            hasHorizontalScrollbar = contentRight > viewport.Right + epsilon;
+        }
+        else if (overflow == OverflowValue.Auto)
+        {
+            foreach (var state in new[]
+                     {
+                         (Vertical: false, Horizontal: false),
+                         (Vertical: true, Horizontal: false),
+                         (Vertical: false, Horizontal: true),
+                         (Vertical: true, Horizontal: true)
+                     })
+            {
+                bool needsVertical = contentBottom >
+                    viewport.Bottom - (state.Horizontal ? scrollbarSize : 0f) + epsilon;
+                bool needsHorizontal = contentRight >
+                    viewport.Right - (state.Vertical ? scrollbarSize : 0f) + epsilon;
+                if (needsVertical == state.Vertical &&
+                    needsHorizontal == state.Horizontal)
+                {
+                    hasVerticalScrollbar = state.Vertical;
+                    hasHorizontalScrollbar = state.Horizontal;
+                    break;
+                }
+            }
+        }
+
+        float viewportWidth = Math.Max(0f,
+            viewport.Width - (hasVerticalScrollbar ? scrollbarSize : 0f));
+        float viewportHeight = Math.Max(0f,
+            viewport.Height - (hasHorizontalScrollbar ? scrollbarSize : 0f));
+        float maxScrollX = Math.Max(0f,
+            contentRight - viewport.Left - viewportWidth);
+        float maxScrollY = Math.Max(0f,
+            contentBottom - viewport.Top - viewportHeight);
+
+        return new OverflowScrollMetrics(
+            hasVerticalScrollbar, hasHorizontalScrollbar,
+            viewportWidth, viewportHeight, contentRight, contentBottom,
+            maxScrollX, maxScrollY);
+    }
 
     public float ScrollableRight
     {
