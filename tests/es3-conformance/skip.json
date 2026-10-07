@@ -135,6 +135,7 @@
  "js1_5/Exceptions/regress-257751.js": "[skip:mozilla-extension] error lineNumber/fileName properties are SpiderMonkey extensions",
  "js1_5/Exceptions/regress-315147.js": "[skip:mozilla-flags] uses Mozilla-only shell/version features",
  "js1_5/Exceptions/regress-332472.js": "[skip:impl-defined-message] asserts SpiderMonkey's exact SyntaxError message text for RegExp; §15.11.2 leaves messages implementation-defined",
+ "js1_5/Expressions/regress-96526-delelem.js": "[skip:mozilla-extension] asserts Array.prototype.toSource output spacing — toSource is a Mozilla extension, not ES3",
  "js1_5/Function/regress-222029-001.js": "[skip:mozilla-extension] Function.prototype.caller is a Mozilla extension, not ES3",
  "js1_5/Function/regress-222029-002.js": "[skip:mozilla-extension] Function.prototype.caller is a Mozilla extension, not ES3",
  "js1_5/Function/regress-338001.js": "[skip:sm-arena-stress] SpiderMonkey allocator stress (33 MB identifiers); not ES3 semantics",
