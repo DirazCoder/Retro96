@@ -305,7 +305,22 @@ public class JsLexer
                     case 'b': sb.Append('\b'); _pos++; _column++; break;
                     case 'f': sb.Append('\f'); _pos++; _column++; break;
                     case 'v': sb.Append('\v'); _pos++; _column++; break;   // §7.8.4 \v — vertical tab
-                    case '0': sb.Append('\0'); _pos++; _column++; break;
+                    case '0':
+                        {
+                            // §7.8.4 (era rule): \0 is NUL, and up to two
+                            // more octal digits extend it ('\011' is TAB).
+                            // _pos sits ON the '0'; extra digits follow it.
+                            int val = 0, digits = 0;
+                            while (digits < 2 && _pos + 1 + digits < _source.Length &&
+                                   _source[_pos + 1 + digits] is >= '0' and <= '7')
+                            {
+                                val = val * 8 + (_source[_pos + 1 + digits] - '0');
+                                digits++;
+                            }
+                            sb.Append((char)val);
+                            _pos += 1 + digits; _column += 1 + digits;
+                            break;
+                        }
                     case '\\': sb.Append('\\'); _pos++; _column++; break;
                     case '\'': sb.Append('\''); _pos++; _column++; break;
                     case '"': sb.Append('"'); _pos++; _column++; break;

@@ -38,6 +38,15 @@ public class JsParser
     private readonly IReadOnlyList<JsToken> _tokens;
     private int _position;
 
+    /// <summary>Expression-nesting guard: pathological inputs like 10,000
+    /// nested parentheses used to overflow the real .NET stack before any
+    /// ES3 error could fire. The limit mirrors the era engines' parse-depth
+    /// limits — beyond it, a SyntaxError is thrown (§16). Any exception from
+    /// eval() is acceptable per the conformance corpus (regress-192414).</summary>
+    private int _exprDepth;
+    private int _stmtDepth;
+    private const int MaxExpressionDepth = 512;
+
     public static ProgramNode Parse(string source, bool allowTopLevelReturn = false)
     {
         var lexer = new JsLexer(source ?? throw new ArgumentNullException(nameof(source)));
@@ -341,6 +350,23 @@ public class JsParser
     }
 
     private Stmt ParseStatement()
+    {
+        // 100,000 nested do-while blocks used to overflow the real stack
+        if (++_stmtDepth > MaxStatementDepth)
+        {
+            var t = Peek();
+            throw new JsParserException("Statement nesting too deep", t.Line, t.Column);
+        }
+        try
+        {
+            return ParseStatementCore();
+        }
+        finally { _stmtDepth--; }
+    }
+
+    private const int MaxStatementDepth = 512;
+
+    private Stmt ParseStatementCore()
     {
         if (IsAtEnd()) return new EmptyStatement();
 
@@ -697,14 +723,23 @@ public class JsParser
     /// <summary>Comma expression.  allowIn=false while parsing a for-init.</summary>
     private Expr ParseExpression(bool allowIn = true)
     {
-        var expr = ParseAssignment(allowIn);
-        while (CheckPunct(","))
+        if (++_exprDepth > MaxExpressionDepth)
         {
-            Advance();
-            var right = ParseAssignment(allowIn);
-            expr = new BinaryExpr(",", expr, right);
+            var t = Peek();
+            throw new JsParserException("Expression nesting too deep", t.Line, t.Column);
         }
-        return expr;
+        try
+        {
+            var expr = ParseAssignment(allowIn);
+            while (CheckPunct(","))
+            {
+                Advance();
+                var right = ParseAssignment(allowIn);
+                expr = new BinaryExpr(",", expr, right);
+            }
+            return expr;
+        }
+        finally { _exprDepth--; }
     }
 
     private static readonly string[] _assignOps =
@@ -876,6 +911,22 @@ public class JsParser
     }
 
     private Expr ParseUnary()
+    {
+        // pathological chains ('+ + + ... + x' 10,000 deep) used to overflow
+        // the real stack before any ES3 error could fire
+        if (++_exprDepth > MaxExpressionDepth)
+        {
+            var t = Peek();
+            throw new JsParserException("Expression nesting too deep", t.Line, t.Column);
+        }
+        try
+        {
+            return ParseUnaryCore();
+        }
+        finally { _exprDepth--; }
+    }
+
+    private Expr ParseUnaryCore()
     {
         if (CheckPunct("!"))  { Advance(); return new UnaryExpr("!",  ParseUnary()); }
         if (CheckPunct("~"))  { Advance(); return new UnaryExpr("~",  ParseUnary()); }

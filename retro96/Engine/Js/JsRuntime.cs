@@ -98,8 +98,232 @@ public static class JsRuntime
     private static string ArgStr(JsValue[] a, int i, string def = "") =>
         i < a.Length ? a[i].ToJsString() : def;
 
-    private static Regex CreateJsRegex(string source, RegexOptions options) =>
-        new(TranslateToNet(source), options, TimeSpan.FromSeconds(1));
+    private static Regex CreateJsRegex(string source, RegexOptions options)
+    {
+        try
+        {
+            return new Regex(TranslateToNet(source, multiline: options.HasFlag(RegexOptions.Multiline)),
+                options, TimeSpan.FromSeconds(1));
+        }
+        catch (System.Text.RegularExpressions.RegexParseException ex)
+        {
+            // A pattern .NET cannot compile is a SyntaxError in JS terms
+            // (§15.10.1) — surfacing the raw parse exception used to kill
+            // the host worker (regress-85721, unicode-001)
+            throw new JsSyntaxErrorException(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Translates an ES3 RegExp pattern to the .NET dialect. ES3 stores the
+    /// pattern with '/' escaped and an empty pattern as "(?:)"; beyond that
+    /// the two engines differ in syntax AND semantics:
+    ///   • octal escapes \0..\377 in and out of classes (.NET rejects them)
+    ///   • \d \s \w are ASCII-only in JS, Unicode-wide in .NET
+    ///   • a backreference to a group that has not (yet) captured matches
+    ///     the empty string in JS; .NET fails the whole branch
+    ///   • [] and [^] are legal empty / anti-empty JS classes
+    ///   • non-multiline $ must NOT match before a trailing \n (.NET's does)
+    ///   • absurd counted quantifiers {2147483648+} overflow .NET's parser
+    /// </summary>
+    private static bool HasHex(string s, int start, int count)
+    {
+        if (start + count > s.Length) return false;
+        for (int i = 0; i < count; i++)
+            if (!Uri.IsHexDigit(s[start + i])) return false;
+        return true;
+    }
+
+    private static string TranslateToNet(string source, bool multiline)
+    {
+        if (source.Length == 0) return source;
+
+        // count capturing groups: unescaped '(' not followed by '?'
+        int groups = 0;
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (source[i] == '\\' && i + 1 < source.Length) { i++; continue; }
+            if (source[i] == '(' && !(i + 1 < source.Length && source[i + 1] == '?')) groups++;
+        }
+
+        const string digitSet = "0-9";
+        const string spaceSet = " \\t\\n\\r\\f\\v\\u00a0\\u2028\\u2029\\ufeff";
+        const string wordSet = "A-Za-z0-9_";
+
+        var sb = new System.Text.StringBuilder(source.Length + 16);
+        bool inClass = false;
+        for (int i = 0; i < source.Length; i++)
+        {
+            char c = source[i];
+
+            if (c == '\\' && i + 1 < source.Length)
+            {
+                char n = source[i + 1];
+
+                // IdentityEscape \/ — a stored '/' re-becomes literal
+                if (n == '/') { sb.Append('/'); i++; continue; }
+
+                // \cX is a control escape only when X is a letter; \c
+                // followed by anything else is a literal 'c' (.NET reads
+                // \c[ as ESC, 0x1B — regress-334158)
+                if (n == 'c' && !(i + 2 < source.Length && char.IsLetter(source[i + 2])))
+                { sb.Append('c'); i++; continue; }
+
+                // \uXXXX / \xXX need their hex digits; otherwise the era
+                // engines read them as literal 'u'/'x' (unicode-001:
+                // /\u001g/ matches "u001g")
+                if (n == 'u' && !HasHex(source, i + 2, 4)) { sb.Append('u'); i++; continue; }
+                if (n == 'x' && !HasHex(source, i + 2, 2)) { sb.Append('x'); i++; continue; }
+
+                // --- class shorthand escapes (JS = ASCII, .NET = Unicode) ---
+                if (!inClass)
+                {
+                    switch (n)
+                    {
+                        case 'd': sb.Append("[0-9]"); i++; continue;
+                        case 'D': sb.Append("[^0-9]"); i++; continue;
+                        case 's': sb.Append('[').Append(spaceSet).Append(']'); i++; continue;
+                        case 'S': sb.Append("[^").Append(spaceSet).Append(']'); i++; continue;
+                        case 'w': sb.Append('[').Append(wordSet).Append(']'); i++; continue;
+                        case 'W': sb.Append("[^").Append(wordSet).Append(']'); i++; continue;
+                    }
+                }
+                else
+                {
+                    // inside a class, positive shorthands expand to members
+                    switch (n)
+                    {
+                        case 'd': sb.Append(digitSet); i++; continue;
+                        case 's': sb.Append(spaceSet); i++; continue;
+                        case 'w': sb.Append(wordSet); i++; continue;
+                        // \D \S \W inside classes stay as-is (rare; .NET-wide)
+                    }
+                }
+
+                // --- numeric escapes: backreference or legacy octal ---
+                if (n is >= '0' and <= '9')
+                {
+                    // read the full decimal run (at most 3 digits)
+                    int j = i + 1, runLen = 0;
+                    long run = 0;
+                    while (j < source.Length && runLen < 3 && char.IsDigit(source[j]))
+                    {
+                        run = run * 10 + (source[j] - '0');
+                        runLen++;
+                        j++;
+                    }
+
+                    bool backref = false;
+                    long refNum = 0, refLen = 0;
+                    if (n != '0' && !inClass)   // in a class \N is octal, never a backref
+                    {
+                        // JS: \N is a backreference when group N exists —
+                        // prefer the longest run that names an existing group
+                        if (run <= groups && run >= 1) { backref = true; refNum = run; refLen = runLen; }
+                        else if (runLen >= 2 && n - '0' <= groups)
+                        { backref = true; refNum = n - '0'; refLen = 1; }
+                    }
+
+                    if (backref)
+                    {
+                        // JS: a backreference to a group that has not yet
+                        // captured matches empty; .NET fails the branch —
+                        // rewrite as a conditional with an empty else-part
+                        sb.Append("(?(").Append(refNum).Append(")\\")
+                          .Append(refNum).Append("|)");
+                        i += (int)refLen;
+                        continue;
+                    }
+
+                    // legacy octal: up to three octal digits, value ≤ 255
+                    if (n is >= '0' and <= '7')
+                    {
+                        int val = 0, digits = 0;
+                        j = i + 1;
+                        while (j < source.Length && digits < 3 &&
+                               source[j] is >= '0' and <= '7' &&
+                               val * 8 + (source[j] - '0') <= 255)
+                        {
+                            val = val * 8 + (source[j] - '0');
+                            digits++;
+                            j++;
+                        }
+                        if (digits > 0)
+                        {
+                            sb.Append("\\x").Append(val.ToString("X2",
+                                System.Globalization.CultureInfo.InvariantCulture));
+                            i += digits;
+                            continue;
+                        }
+                    }
+                }
+
+                sb.Append(c).Append(n);
+                i++;
+                continue;
+            }
+
+            if (!inClass)
+            {
+                if (c == '[')
+                {
+                    // empty JS classes: [] matches nothing, [^] matches everything
+                    if (i + 1 < source.Length && source[i + 1] == ']')
+                    { sb.Append("[^\\d\\D]"); i++; continue; }
+                    if (i + 2 < source.Length && source[i + 1] == '^' && source[i + 2] == ']')
+                    { sb.Append("[\\d\\D]"); i += 2; continue; }
+                    inClass = true;
+                    sb.Append(c);
+                    continue;
+                }
+                if (c == '$')
+                {
+                    // JS $ = absolute end unless multiline; .NET's $ also
+                    // matches before a single trailing \n
+                    sb.Append(multiline ? "$" : "\\z");
+                    continue;
+                }
+                if (c == '{')
+                {
+                    // clamp absurd counted quantifiers to a large-but-legal
+                    // bound — observably identical on any realistic input
+                    int close = source.IndexOf('}', i);
+                    if (close > i)
+                    {
+                        string body = source[(i + 1)..close];
+                        string[] parts = body.Split(',');
+                        bool allDigits = parts.Length is 1 or 2;
+                        foreach (var p in parts) allDigits &= p.Length > 0 && p.All(char.IsDigit);
+                        if (allDigits)
+                        {
+                            const long Clamp = 100000;
+                            long n0 = long.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture);
+                            long n1 = parts.Length == 2
+                                ? long.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture)
+                                : n0;
+                            bool n1Open = parts.Length == 2 && parts[1].Length == 0;
+                            n0 = Math.Min(n0, Clamp);
+                            n1 = n1Open ? n0 : Math.Min(n1, Clamp);
+                            sb.Append('{').Append(n0);
+                            if (parts.Length == 2) sb.Append(n1Open ? "," : $",{n1}");
+                            sb.Append('}');
+                            i = close;
+                            continue;
+                        }
+                    }
+                    sb.Append(c);
+                    continue;
+                }
+            }
+            else if (c == ']')
+            {
+                inClass = false;
+            }
+
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
 
     /// <summary>
     /// ES3 stores the pattern with '/' escaped ("\\/") and an empty pattern
@@ -118,7 +342,14 @@ public static class JsRuntime
     /// </summary>
     public static void ApplyRegExpShape(JsObject o, string pattern, string flags)
     {
-        string stored = pattern.Length == 0 ? "(?:)" : pattern.Replace("/", "\\/");
+        // normalise: the incoming pattern may already carry \/ escapes (regex
+        // literals keep them raw) — strip those first so a re-escape never
+        // doubles up (<\\/sql:url> used to become <\\\\/sql:url>).
+        // §15.10.7.1 + the suite's bug-225550 note: the empty pattern is
+        // stored as "" and only toString() renders it as "(?:)".
+        if (pattern == "(?:)") pattern = "";
+        pattern = pattern.Replace("\\/", "/");
+        string stored = pattern.Length == 0 ? "" : pattern.Replace("/", "\\/");
         // §15.10.6.4: flags print in canonical g,i,m order regardless of how
         // the RegExp was constructed (/test2/ig .toString() is "/test2/gi")
         string canon =
@@ -130,6 +361,10 @@ public static class JsRuntime
         o.Attrs?.Remove("ignoreCase"); o.Attrs?.Remove("multiline"); o.Attrs?.Remove("lastIndex");
         o.Set("source", JsValue.From(stored));
         o.Set("flags", JsValue.From(flags));
+        // §15.10.4.1: the pattern is compiled WHEN the RegExp is created —
+        // invalid syntax (a**, /+a/, (?, {2,1}) ...) is a SyntaxError at
+        // construction time, not at first use
+        CreateJsRegex(stored, RegexOptionsFor(flags));
         o.Set("global", JsValue.From(flags.Contains('g')));
         o.Set("ignoreCase", JsValue.From(flags.Contains('i')));
         o.Set("multiline", JsValue.From(flags.Contains('m')));
@@ -143,10 +378,57 @@ public static class JsRuntime
         o.Attrs["lastIndex"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
     }
 
-    private static int LengthOf(JsValue self) =>
-        self.Type is JsType.Object or JsType.Function &&
-        self.GetObjectOrFunction().Get("length") is { Type: JsType.Number } l
-            ? (int)l.GetNumber() : 0;
+    private static long LengthOf(JsValue self)
+    {
+        if (self.Type is JsType.Object or JsType.Function &&
+            self.GetObjectOrFunction().Get("length") is { Type: JsType.Number } l)
+        {
+            double d = l.GetNumber();
+            if (double.IsNaN(d) || d < 0) return 0;
+            if (d >= 4294967295.0) return 4294967295L;   // §15.4.5.1: max uint32-1
+            return (long)d;
+        }
+        return 0;
+    }
+
+    /// <summary>§15.4.4.x receivers pass through ToObject: array builtins
+    /// stay callable on primitives via .call() — [].splice.call(0) returns
+    /// an empty array instead of a host crash (regress-451483).</summary>
+    private static JsObject BoxReceiver(JsValue self)
+    {
+        if (self.Type is JsType.Object or JsType.Function) return self.GetObjectOrFunction();
+        var o = new JsObject
+        {
+            Class = self.Type switch
+            {
+                JsType.String => "String",
+                JsType.Number => "Number",
+                JsType.Boolean => "Boolean",
+                _ => "Object"
+            }
+        };
+        if (self.Type is not (JsType.Undefined or JsType.Null)) o.Set("value", self);
+        return o;
+    }
+
+    /// <summary>Own array-index keys (canonical digit strings) of an
+    /// object, sorted ascending — array algorithms enumerate EXISTING
+    /// elements so billion-length holey arrays never materialize.</summary>
+    private static List<long> OwnIndexKeys(JsObject arr, long len)
+    {
+        var indices = new List<long>();
+        foreach (var k in arr.Properties.Keys)
+        {
+            if (k.Length == 0 || k[0] < '0' || k[0] > '9') continue;
+            // canonical array index: digits only, no leading zero
+            if (k.Length > 1 && k[0] == '0') continue;
+            if (!long.TryParse(k, out long idx) || idx < 0) continue;
+            if (idx >= len) continue;
+            indices.Add(idx);
+        }
+        indices.Sort();
+        return indices;
+    }
 
     /// <summary>
     /// Clamps a JS number to a safe int before casting — out-of-range
@@ -283,9 +565,31 @@ public static class JsRuntime
             string parameters = string.Join(",", args.Take(parameterCount)
                 .Select(argument => argument.ToJsString()));
             string body = args.Length > 0 ? args[^1].ToJsString() : "";
-            var program = JsParser.Parse($"function anonymous({parameters}){{{body}}}");
-            var declaration = program.Body.OfType<FunctionDeclaration>().FirstOrDefault()
-                ?? throw new JsInterpreterException("Invalid Function constructor body");
+            // §15.3.2.1: parse failures surface as a catchable JS
+            // SyntaxError — new Function('123', '') used to leak the raw
+            // C# parser exception and kill the host (regress-118849)
+            FunctionDeclaration declaration;
+            try
+            {
+                // Pre-validate: the body must parse standalone — an
+                // unbalanced '}' is a SyntaxError (new Function('} {')),
+                // and top-level return is legal inside the body
+                JsParser.Parse(body, allowTopLevelReturn: true);
+                var program = JsParser.Parse($"function anonymous({parameters}){{{body}}}");
+                declaration = program.Body.OfType<FunctionDeclaration>().FirstOrDefault()
+                    ?? throw new JsParserException("Invalid Function constructor body", 0, 0);
+            }
+            catch (JsParserException ex)
+            {
+                var syntaxErrorConstructor = scope.Get("SyntaxError");
+                JsObject? proto = syntaxErrorConstructor.Type == JsType.Function &&
+                    syntaxErrorConstructor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } pv
+                        ? pv.GetObject() : null;
+                var error = new JsObject { Class = "Error", Prototype = proto };
+                error.Set("name", JsValue.From("SyntaxError"));
+                error.Set("message", JsValue.From(ex.RawMessage));
+                throw new JsThrownException(JsValue.FromObject(error));
+            }
             var functionBody = new FunctionExpr(
                 declaration.Id, declaration.Params, declaration.Body);
             var parameterNames = declaration.Params.Select(parameter => parameter.Name).ToArray();
@@ -310,18 +614,32 @@ public static class JsRuntime
 
         arrProto.Set("push", Fn(scope, "push", 1, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
+            // §15.4.4.7 via §15.4.5.1: every item is STORED (indices past
+            // 2^32-2 become plain properties), length advances to the last
+            // LEGAL value, and the overflow surfaces as a RangeError from
+            // the final length Put — the stored items stay visible
+            // (regress-465980 observes the partial mutation)
+            long newLen = length;
+            bool overflow = false;
             foreach (var item in args)
-                arr.Set((length++).ToString(), item);
-            arr.Set("length", JsValue.From(length));
-            return JsValue.From(length);
+            {
+                arr.Set(length.ToString(System.Globalization.CultureInfo.InvariantCulture), item);
+                if (length <= 4294967294L) newLen = length + 1;
+                else overflow = true;
+                length++;
+            }
+            arr.Set("length", JsValue.From(newLen));
+            if (overflow)
+                throw new JsRangeErrorException("array length overflow");
+            return JsValue.From(newLen);
         }));
 
         arrProto.Set("pop", Fn(scope, "pop", (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             if (length == 0) return JsValue.Undefined;
             length--;
             var last = arr.Get(length.ToString());
@@ -332,47 +650,84 @@ public static class JsRuntime
 
         arrProto.Set("shift", Fn(scope, "shift", (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             if (length == 0) return JsValue.Undefined;
             var first = arr.Get("0");
-            for (int i = 1; i < length; i++)
-                arr.Set((i - 1).ToString(), arr.Get(i.ToString()));
-            arr.Properties.Remove((length - 1).ToString());
+            // §15.4.4.9: slot j ends up holding old slot j+1; holes stay
+            // holes — only EXISTING elements are touched so billion-length
+            // holey arrays shift without materializing
+            var existing = OwnIndexKeys(arr, length);
+            var final = new HashSet<long>();
+            foreach (var idx in existing) if (idx >= 1) final.Add(idx - 1);
+            var finalSorted = new List<long>(final);
+            finalSorted.Sort();
+            foreach (var idx in finalSorted)
+                arr.Set(idx.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    arr.Get((idx + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            foreach (var idx in existing)
+                if (!final.Contains(idx))
+                    arr.Properties.Remove(idx.ToString(System.Globalization.CultureInfo.InvariantCulture));
             arr.Set("length", JsValue.From(length - 1));
             return first;
         }));
 
         arrProto.Set("unshift", Fn(scope, "unshift", 1, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
-            for (int i = length - 1; i >= 0; i--)
-                arr.Set((i + args.Length).ToString(), arr.Get(i.ToString()));
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
+            // §15.4.4.13: EXISTING elements move up by argCount (descending
+            // so a move never clobbers an unprocessed source); the inserts
+            // land, and the FINAL length Put is what throws — elements
+            // already written stay visible (regress-465980)
+            var moveUp = OwnIndexKeys(arr, length);
+            for (int m = moveUp.Count - 1; m >= 0; m--)
+            {
+                long idx = moveUp[m];
+                arr.Set((idx + args.Length).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    arr.Get(idx.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                arr.Properties.Remove(idx.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
             for (int i = 0; i < args.Length; i++)
-                arr.Set(i.ToString(), args[i]);
-            arr.Set("length", JsValue.From(length + args.Length));
-            return JsValue.From(length + args.Length);
+                arr.Set(((long)i).ToString(System.Globalization.CultureInfo.InvariantCulture), args[i]);
+            long newLength = length + args.Length;
+            if (newLength > 4294967295L)
+                throw new JsRangeErrorException("array length overflow");   // §15.4.4.13 step 9
+            arr.Set("length", JsValue.From(newLength));
+            return JsValue.From(newLength);
         }));
 
         arrProto.Set("reverse", Fn(scope, "reverse", (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
-            for (int i = 0; i < length / 2; i++)
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
+            // §15.4.4.8 on the EXISTING slots: swap symmetric pairs, move
+            // lone survivors, leave paired holes empty — sparse arrays
+            // reverse in O(elements), not O(length)
+            var keys = OwnIndexKeys(arr, length);
+            var keySet = new HashSet<long>();
+            foreach (var k in keys) keySet.Add(k);
+            foreach (var idx in keys)
             {
-                string a = i.ToString(), b = (length - 1 - i).ToString();
-                var left = arr.Get(a);
-                arr.Set(a, arr.Get(b));
-                arr.Set(b, left);
+                long partner = length - 1 - idx;
+                if (partner <= idx) continue;   // middle or already-paired
+                bool left = keySet.Contains(idx);
+                bool right = keySet.Contains(partner);
+                if (!left && !right) continue;
+                string a = idx.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                string b = partner.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                var lv = left ? arr.Get(a) : JsValue.Undefined;
+                var rv = right ? arr.Get(b) : JsValue.Undefined;
+                if (right) arr.Set(a, rv); else arr.Properties.Remove(a);
+                if (left) arr.Set(b, lv); else arr.Properties.Remove(b);
             }
             return self;
         }));
 
         arrProto.Set("join", Fn(scope, "join", 1, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             string sep = args.Length > 0 ? args[0].ToJsString() : ",";
             var sb = new StringBuilder();
             for (int i = 0; i < length; i++)
@@ -392,10 +747,10 @@ public static class JsRuntime
 
         arrProto.Set("slice", Fn(scope, "slice", 2, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
-            int start = args.Length > 0 ? ToIntSafe(args[0]) : 0;
-            int end   = args.Length > 1 ? ToIntSafe(args[1]) : length;
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
+            long start = args.Length > 0 ? ToIntSafe(args[0]) : 0;
+            long end   = args.Length > 1 ? ToIntSafe(args[1]) : length;
 
             if (start < 0) start = Math.Max(length + start, 0);
             if (end < 0)   end   = Math.Max(length + end, 0);
@@ -403,8 +758,8 @@ public static class JsRuntime
             end   = Math.Min(end, length);
 
             var newArr = NewArray(scope);
-            int n = 0;
-            for (int i = start; i < end; i++)
+            long n = 0;
+            for (long i = start; i < end; i++)
                 newArr.Set((n++).ToString(), arr.Get(i.ToString()));
             newArr.Set("length", JsValue.From(n));
             return JsValue.FromObject(newArr);
@@ -412,27 +767,45 @@ public static class JsRuntime
 
         arrProto.Set("concat", Fn(scope, "concat", 1, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             var newArr = NewArray(scope);
-            int n = 0;
+            long n = 0;
 
-            for (int i = 0; i < length; i++)
-                newArr.Set((n++).ToString(), arr.Get(i.ToString()));
+            // §15.4.4.4: concatenate, preserving holes — only EXISTING
+            // elements are copied, so huge holey arrays stay sparse; the
+            // logical length grows by each source's length.
+            double total = length;
+            foreach (var arg in args)
+                if (arg.Type is (JsType.Object or JsType.Function) &&
+                    arg.GetObjectOrFunction().Class == "Array")
+                    total += LengthOf(arg);
+                else
+                    total += 1;
+            if (total > 4294967295.0)
+                throw new JsRangeErrorException("array length overflow");   // §15.4.4.4
 
+            foreach (var idx in OwnIndexKeys(arr, length))
+                newArr.Set(idx.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    arr.Get(idx.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+
+            n = length;
             foreach (var arg in args)
             {
                 if (arg.Type is (JsType.Object or JsType.Function) &&
                     arg.GetObjectOrFunction().Class == "Array")
                 {
                     var argArr = arg.GetObjectOrFunction();
-                    int argLen = LengthOf(arg);
-                    for (int i = 0; i < argLen; i++)
-                        newArr.Set((n++).ToString(), argArr.Get(i.ToString()));
+                    long argLen = LengthOf(arg);
+                    foreach (var idx in OwnIndexKeys(argArr, argLen))
+                        newArr.Set((n + idx).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            argArr.Get(idx.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                    n += argLen;
                 }
                 else
                 {
-                    newArr.Set((n++).ToString(), arg);
+                    newArr.Set(n.ToString(System.Globalization.CultureInfo.InvariantCulture), arg);
+                    n++;
                 }
             }
 
@@ -442,35 +815,35 @@ public static class JsRuntime
 
         arrProto.Set("splice", Fn(scope, "splice", 2, (self, args) =>
         {
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             if (args.Length == 0)
                 return JsValue.FromObject(NewArray(scope));
 
-            int start = ToIntSafe(args[0]);
+            long start = ToIntSafe(args[0]);
             if (start < 0) start = Math.Max(length + start, 0);
             start = Math.Min(start, length);
 
-            int deleteCount = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
+            long deleteCount = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
                 ? ToIntSafe(args[1]) : length - start;
             deleteCount = Math.Clamp(deleteCount, 0, length - start);
 
             var removed = NewArray(scope);
-            int rn = 0;
-            for (int i = 0; i < deleteCount; i++)
+            long rn = 0;
+            for (long i = 0; i < deleteCount; i++)
                 removed.Set((rn++).ToString(), arr.Get((start + i).ToString()));
             removed.Set("length", JsValue.From(rn));
 
-            int insertCount = args.Length > 2 ? args.Length - 2 : 0;
+            long insertCount = args.Length > 2 ? args.Length - 2 : 0;
 
-            for (int i = start + deleteCount; i < length; i++)
+            for (long i = start + deleteCount; i < length; i++)
                 arr.Set((i - deleteCount + insertCount).ToString(), arr.Get(i.ToString()));
 
-            for (int i = 0; i < insertCount; i++)
+            for (long i = 0; i < insertCount; i++)
                 arr.Set((start + i).ToString(), args[2 + i]);
 
-            int newLength = length - deleteCount + insertCount;
-            for (int i = newLength; i < length; i++)
+            long newLength = length - deleteCount + insertCount;
+            for (long i = newLength; i < length; i++)
                 arr.Properties.Remove(i.ToString());
             arr.Set("length", JsValue.From(newLength));
 
@@ -480,12 +853,12 @@ public static class JsRuntime
         arrProto.Set("indexOf", Fn(scope, "indexOf", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(-1);
-            var arr = self.GetObjectOrFunction();
-            int length = LengthOf(self);
+            var arr = BoxReceiver(self);
+            long length = LengthOf(self);
             int from = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
                 ? Math.Max(ToIntSafe(args[1]), 0) : 0;
 
-            for (int i = from; i < length; i++)
+            for (long i = from; i < length; i++)
                 if (arr.Get(i.ToString()).AbstractEquals(args[0]))
                     return JsValue.From(i);
             return JsValue.From(-1);
@@ -877,11 +1250,16 @@ public static class JsRuntime
         return (v.ToJsString(), "");
     }
 
+    /// <summary>§15.10.6.2 step 8: ToInteger(lastIndex); i &lt; 0 or
+    /// i &gt; length ⇒ lastIndex resets to 0 and the match fails. The
+    /// sentinel -1 carries "negative" through to the callers.</summary>
     private static int NormalizeLastIndex(JsValue value)
     {
         if (value.Type != JsType.Number) return 0;
         double n = value.GetNumber();
-        if (double.IsNaN(n) || n <= 0) return 0;
+        if (double.IsNaN(n)) return 0;
+        if (n < 0) return -1;
+        if (n == 0) return 0;
         if (double.IsInfinity(n) || n > int.MaxValue) return int.MaxValue;
         return (int)Math.Truncate(n);
     }
@@ -917,9 +1295,23 @@ public static class JsRuntime
     {
         var numProto = new JsObject { Class = "Number", Prototype = objectProto };
 
+        // §15.7.4: Number.prototype methods are NOT generic — they read the
+        // receiver's [[Number Value]] directly, so overwriting valueOf on a
+        // wrapper cannot redirect them (and recursing through ToNumber used
+        // to stack-overflow when valueOf returned the wrapper itself).
+        static double NumberValueOf(JsValue self)
+        {
+            if (self.Type == JsType.Number) return self.GetNumber();
+            if (self.Type is JsType.Object or JsType.Function &&
+                self.GetObjectOrFunction().Class == "Number")
+                return self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } n
+                    ? n.GetNumber() : 0.0;   // Number.prototype itself: +0
+            throw new JsTypeErrorException("Number.prototype method called on a non-Number object");
+        }
+
         numProto.Set("toString", Fn(scope, "toString", (self, args) =>
         {
-            double num = self.ToNumber();
+            double num = NumberValueOf(self);
             int radix = args.Length > 0 && !double.IsNaN(args[0].ToNumber())
                 ? (int)args[0].ToNumber() : 10;
             if (radix < 2 || radix > 36)
@@ -944,7 +1336,7 @@ public static class JsRuntime
         // ECMAScript implementations exhibit).
         numProto.Set("toFixed", Fn(scope, "toFixed", 1, (self, args) =>
         {
-            double num = self.ToNumber();
+            double num = NumberValueOf(self);
             if (double.IsNaN(num)) return JsValue.From("NaN");
             if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
             if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
@@ -966,7 +1358,7 @@ public static class JsRuntime
 
         numProto.Set("toExponential", Fn(scope, "toExponential", 1, (self, args) =>
         {
-            double num = self.ToNumber();
+            double num = NumberValueOf(self);
             if (double.IsNaN(num)) return JsValue.From("NaN");
             if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
             if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
@@ -1004,7 +1396,7 @@ public static class JsRuntime
 
         numProto.Set("toPrecision", Fn(scope, "toPrecision", 1, (self, args) =>
         {
-            double num = self.ToNumber();
+            double num = NumberValueOf(self);
             if (double.IsNaN(num)) return JsValue.From("NaN");
             if (double.IsPositiveInfinity(num)) return JsValue.From("Infinity");
             if (double.IsNegativeInfinity(num)) return JsValue.From("-Infinity");
@@ -1910,9 +2302,11 @@ public static class JsRuntime
             RequireRegExp(self, "RegExp.prototype.test");
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
-            int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
+            // §15.10.6.2: only a GLOBAL regexp consults lastIndex
+            int lastIndex = flags.Contains('g') ? NormalizeLastIndex(o.Get("lastIndex")) : 0;
             string input = args[0].ToJsString();
-            if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.From(false); }
+            if (lastIndex < 0 || lastIndex > input.Length)
+            { o.Set("lastIndex", JsValue.From(0)); return JsValue.From(false); }
 
             var m = CreateJsRegex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (m.Success)
@@ -1931,9 +2325,11 @@ public static class JsRuntime
             RequireRegExp(self, "RegExp.prototype.exec");
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
-            int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
+            // §15.10.6.2: only a GLOBAL regexp consults lastIndex
+            int lastIndex = flags.Contains('g') ? NormalizeLastIndex(o.Get("lastIndex")) : 0;
             string input = args[0].ToJsString();
-            if (lastIndex > input.Length) { o.Set("lastIndex", JsValue.From(0)); return JsValue.Null; }
+            if (lastIndex < 0 || lastIndex > input.Length)
+            { o.Set("lastIndex", JsValue.From(0)); return JsValue.Null; }
 
             var m = CreateJsRegex(source, RegexOptionsFor(flags)).Match(input, lastIndex);
             if (!m.Success)
@@ -1953,7 +2349,9 @@ public static class JsRuntime
             // §15.10.6.4: TypeError on anything without RegExp shape
             RequireRegExp(self, "RegExp.prototype.toString");
             var o = self.GetObjectOrFunction();
-            return JsValue.From($"/{o.Get("source").ToJsString()}/{o.Get("flags").ToJsString()}");
+            string src = o.Get("source").ToJsString();
+            if (src.Length == 0) src = "(?:)";   // §15.10.6.4 empty-pattern form
+            return JsValue.From($"/{src}/{o.Get("flags").ToJsString()}");
         }));
 
         /// §15.10.6 builtins demand a real RegExp receiver

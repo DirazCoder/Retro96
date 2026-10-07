@@ -2270,9 +2270,19 @@ public class JsInterpreter
         JsValue l = ToPrimitiveV(left, preferString: lDate);
         JsValue r = ToPrimitiveV(right, preferString: rDate);
 
-        // String + anything → string; the era's document.write glue
+        // String + anything → string; the era's document.write glue.
+        // Strings past 2^30 throw RangeError — runaway doubling loops
+        // ('s += s' x 100000) used to kill the host with a hard OOM
         if (l.Type == JsType.String || r.Type == JsType.String)
-            return JsValue.From(l.ToJsString() + r.ToJsString());
+        {
+            string ls = l.ToJsString(), rs = r.ToJsString();
+            // 2^26 chars (128 MB of UTF-16) is far past any era script's
+            // needs and stays under the host OOM point, so the throw is
+            // always a catchable RangeError (regress-3649-n)
+            if ((long)ls.Length + rs.Length > (1L << 26))
+                throw new JsRangeErrorException("string length overflow");
+            return JsValue.From(ls + rs);
+        }
         return JsValue.From(l.ToNumber() + r.ToNumber());
     }
 
@@ -2707,31 +2717,57 @@ public class JsInterpreter
         if (self.Type is not (JsType.Object or JsType.Function))
             return self;
         var arr = self.GetObjectOrFunction();
-        int len = arr.Get("length") is { Type: JsType.Number } l ? (int)l.GetNumber() : 0;
-        if (len <= 1) return self;
+        double lenD = arr.Get("length") is { Type: JsType.Number } l ? l.GetNumber() : 0;
+        if (double.IsNaN(lenD) || lenD <= 1) return self;
+        long len = lenD >= 4294967295.0 ? 4294967295L : (long)lenD;
 
-        var elements = new List<JsValue>(len);
-        for (int i = 0; i < len; i++)
-            elements.Add(arr.Get(i.ToString()));
+        // §15.4.4.11: only elements that EXIST are sorted — holes stay
+        // holes, undefined values go to the end, and a billion-length
+        // holey array never materializes (Sort used to OOM on Array(1<<30))
+        var slots = new List<long>();
+        foreach (var k in arr.Properties.Keys)
+        {
+            if (k.Length == 0 || k[0] < '0' || k[0] > '9') continue;
+            if (k.Length > 1 && k[0] == '0') continue;   // non-canonical index
+            if (!long.TryParse(k, out long idx) || idx < 0 || idx >= len) continue;
+            slots.Add(idx);
+        }
+        if (slots.Count <= 1) return self;
+        slots.Sort();
+
+        var defined = new List<JsValue>(slots.Count);
+        int undefs = 0;
+        foreach (var idx in slots)
+        {
+            var v = arr.Get(idx.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (v.Type == JsType.Undefined) undefs++;
+            else defined.Add(v);
+        }
 
         JsFunction? compareFn =
             args.Length > 0 && args[0].Type == JsType.Function ? args[0].GetFunction() : null;
 
         // Insertion sort — stable, and safe with the interpreter's callbacks
-        for (int i = 1; i < elements.Count; i++)
+        for (int i = 1; i < defined.Count; i++)
         {
-            var x = elements[i];
+            var x = defined[i];
             int j = i - 1;
-            while (j >= 0 && CompareSort(elements[j], x, compareFn) > 0)
+            while (j >= 0 && CompareSort(defined[j], x, compareFn) > 0)
             {
-                elements[j + 1] = elements[j];
+                defined[j + 1] = defined[j];
                 j--;
             }
-            elements[j + 1] = x;
+            defined[j + 1] = x;
         }
 
-        for (int i = 0; i < len; i++)
-            arr.Set(i.ToString(), elements[i]);
+        // write back: sorted defined values first, then the undefined tail
+        int di = 0;
+        for (int s = 0; s < slots.Count; s++)
+        {
+            long slot = slots[s];
+            var v = s < slots.Count - undefs ? defined[di++] : JsValue.Undefined;
+            arr.Set(slot.ToString(System.Globalization.CultureInfo.InvariantCulture), v);
+        }
         return self;
     }
 
