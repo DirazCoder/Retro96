@@ -19,6 +19,7 @@
  "ecma/LexicalConventions/7.4.3-4-n.js": "[skip:mozilla-flags] uses Mozilla-only shell/version features",
  "ecma/LexicalConventions/7.4.3-7-n.js": "[skip:mozilla-flags] uses Mozilla-only shell/version features",
  "ecma/LexicalConventions/7.4.3-9-n.js": "[skip:mozilla-flags] uses Mozilla-only shell/version features",
+ "ecma/Statements/12.6.3-2.js": "[skip:pre-es3-semantics] asserts pre-ES3 Netscape behaviour (constructor delegating to its own prototype object); ES3 §12.6.4 enumerates only the object’s prototype chain, so the loop is empty",
  "ecma/extensions/10.1.6.js": "[skip:__proto__] __proto__ is a Mozilla extension, not ES3",
  "ecma/extensions/11.6.1-1.js": "[skip:__proto__] __proto__ is a Mozilla extension, not ES3",
  "ecma/extensions/11.6.1-2.js": "[skip:__proto__] __proto__ is a Mozilla extension, not ES3",

@@ -87,6 +87,10 @@ public class JsScope
     /// route assignment to their object instead of a local slot.</summary>
     protected virtual void Put(string name, JsValue value) => PutLocal(name, value);
 
+    /// <summary>Internal raw write used by eval hoisting (§10.2.2): no
+    /// DontDelete bookkeeping, later declarations overwrite.</summary>
+    internal void PutBinding(string name, JsValue value) => Put(name, value);
+
     private void PutLocal(string name, JsValue value)
     {
         if (!_spilled)
@@ -245,16 +249,22 @@ public class JsScope
 
     /// <summary>Declare a var WITHOUT DontDelete — §10.2.2/§10.1.2: bindings
     /// created by EVAL code are ordinary properties of the variable object,
-    /// so `eval("var x = 1"); delete x` is true.</summary>
+    /// so `eval("var x = 1"); delete x` is true. Like DeclareInVariableEnv
+    /// this never clobbers an existing binding (eval's `var t` after a
+    /// hoisted `function t` must not reset it — §10.1.3 "left unchanged").
+    /// </summary>
     public void DefineInVariableEnvEval(string name, JsValue value)
     {
         var scope = this;
         while (scope != null && !scope.IsVariableEnvironment)
             scope = scope.Parent;
         scope = scope ?? this;
-        scope.Put(name, value);
-        if (scope.Parent == null)
-            scope.GlobalFallback?.Set(name, value);
+        if (!scope.HasOwn(name))
+        {
+            scope.PutBinding(name, value);
+            if (scope.Parent == null)
+                scope.GlobalFallback?.Set(name, value);
+        }
     }
 
     /// <summary>Bind a hoisted name in eval mode: no DontDelete (§10.2.2),

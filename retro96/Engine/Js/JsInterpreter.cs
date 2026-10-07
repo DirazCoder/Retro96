@@ -475,6 +475,23 @@ public class JsInterpreter
     /// code carry no DontDelete (delete of an eval'd var is true).</summary>
     private int _evalDepth;
 
+    /// <summary>Function declarations NESTED inside blocks/if/loops — the
+    /// era "function statement" semantics rebind them when their block
+    /// executes (if (1) function f(){...} — fe-001), while DIRECT body
+    /// declarations bind once at instantiation (§10.1.3) and their later
+    /// statement execution must not clobber prototype mutations.</summary>
+    private static readonly HashSet<FunctionDeclaration> _nestedFnDeclarations = new();
+
+    private static void MarkNestedDeclaration(Stmt stmt)
+    {
+        switch (stmt)
+        {
+            case FunctionDeclaration f: _nestedFnDeclarations.Add(f); break;
+            case LabeledStatement ls: MarkNestedDeclaration(ls.Body); break;
+            case WithStatement ws: MarkNestedDeclaration(ws.Body); break;
+        }
+    }
+
     /// <summary>§10.1.8 mapped-arguments bookkeeping — argument index ↔
     /// parameter name, keyed by the arguments object and by the function
     /// scope so both write directions find the pairing cheaply.</summary>
@@ -1331,7 +1348,7 @@ public class JsInterpreter
         {
             if (s is JsWithScope) { inWithEnv = true; break; }
         }
-        if (inWithEnv)
+        if (inWithEnv || _nestedFnDeclarations.Contains(fnDecl))
         {
             var paramNames = new string[fnDecl.Params.Count];
             for (int i = 0; i < paramNames.Length; i++)
@@ -2713,29 +2730,29 @@ public class JsInterpreter
                 foreach (var d in varDecl.Declarations) plan.Items.Add(d.Id.Name);
                 break;
             case BlockStatement block:
-                foreach (var s in block.Body) CollectHoistOne(s, plan); break;
+                foreach (var s in block.Body) { MarkNestedDeclaration(s); CollectHoistOne(s, plan); } break;
             case IfStatement i:
-                CollectHoistOne(i.Consequent, plan);
-                if (i.Alternate != null) CollectHoistOne(i.Alternate, plan);
+                MarkNestedDeclaration(i.Consequent); CollectHoistOne(i.Consequent, plan);
+                if (i.Alternate != null) { MarkNestedDeclaration(i.Alternate); CollectHoistOne(i.Alternate, plan); }
                 break;
-            case WhileStatement w: CollectHoistOne(w.Body, plan); break;
-            case DoWhileStatement dw: CollectHoistOne(dw.Body, plan); break;
+            case WhileStatement w: MarkNestedDeclaration(w.Body); CollectHoistOne(w.Body, plan); break;
+            case DoWhileStatement dw: MarkNestedDeclaration(dw.Body); CollectHoistOne(dw.Body, plan); break;
             case ForStatement f:
                 if (f.Init is VarDeclaration vd) CollectHoistOne(vd, plan);
-                CollectHoistOne(f.Body, plan);
+                MarkNestedDeclaration(f.Body); CollectHoistOne(f.Body, plan);
                 break;
-            case ForInStatement fi: CollectHoistOne(fi.Body, plan); break;
+            case ForInStatement fi: MarkNestedDeclaration(fi.Body); CollectHoistOne(fi.Body, plan); break;
             case SwitchStatement sw:
                 foreach (var c in sw.Cases)
-                    foreach (var s in c.Consequent) CollectHoistOne(s, plan);
+                    foreach (var s in c.Consequent) { MarkNestedDeclaration(s); CollectHoistOne(s, plan); }
                 break;
             case TryStatement t:
-                CollectHoistOne(t.Block, plan);
-                if (t.Handler != null) CollectHoistOne(t.Handler.Body, plan);
-                if (t.Finalizer != null) CollectHoistOne(t.Finalizer, plan);
+                MarkNestedDeclaration(t.Block); CollectHoistOne(t.Block, plan);
+                if (t.Handler != null) { MarkNestedDeclaration(t.Handler.Body); CollectHoistOne(t.Handler.Body, plan); }
+                if (t.Finalizer != null) { MarkNestedDeclaration(t.Finalizer); CollectHoistOne(t.Finalizer, plan); }
                 break;
-            case LabeledStatement ls: CollectHoistOne(ls.Body, plan); break;
-            case WithStatement ws: CollectHoistOne(ws.Body, plan); break;
+            case LabeledStatement ls: MarkNestedDeclaration(ls.Body); CollectHoistOne(ls.Body, plan); break;
+            case WithStatement ws: MarkNestedDeclaration(ws.Body); CollectHoistOne(ws.Body, plan); break;
         }
     }
 
@@ -2775,9 +2792,16 @@ public class JsInterpreter
                     paramNames[i] = fn.Params[i].Name;
                 var func = new JsFunction(
                     new FunctionExpr(fn.Id, fn.Params, fn.Body, fn.SourceText), paramNames, targetScope);
-                // §10.2.2: eval-code function declarations are deletable
-                if (_evalDepth > 0) targetScope.DefineEvalHoisted(fn.Id.Name, JsValue.FromFunction(func));
-                else targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
+                if (_evalDepth > 0)
+                {
+                    // §10.1.3: a LATER declaration overwrites (function t(){}
+                    // function t(){}); eval bindings stay deletable (§10.2.2)
+                    targetScope.PutBinding(fn.Id.Name, JsValue.FromFunction(func));
+                    if (targetScope.Parent == null)
+                        targetScope.GlobalFallback?.Set(fn.Id.Name, JsValue.FromFunction(func));
+                }
+                else
+                    targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
                 break;
 
             case VarDeclaration varDecl:
@@ -2791,37 +2815,37 @@ public class JsInterpreter
                 break;
 
             case BlockStatement block:
-                foreach (var s in block.Body) HoistOne(s, targetScope);
+                foreach (var s in block.Body) { MarkNestedDeclaration(s); HoistOne(s, targetScope); }
                 break;
 
             case IfStatement i:
-                HoistOne(i.Consequent, targetScope);
-                if (i.Alternate != null) HoistOne(i.Alternate, targetScope);
+                MarkNestedDeclaration(i.Consequent); HoistOne(i.Consequent, targetScope);
+                if (i.Alternate != null) { MarkNestedDeclaration(i.Alternate); HoistOne(i.Alternate, targetScope); }
                 break;
 
-            case WhileStatement w: HoistOne(w.Body, targetScope); break;
-            case DoWhileStatement dw: HoistOne(dw.Body, targetScope); break;
+            case WhileStatement w: MarkNestedDeclaration(w.Body); HoistOne(w.Body, targetScope); break;
+            case DoWhileStatement dw: MarkNestedDeclaration(dw.Body); HoistOne(dw.Body, targetScope); break;
 
             case ForStatement f:
                 if (f.Init is VarDeclaration vd) HoistOne(vd, targetScope);
-                HoistOne(f.Body, targetScope);
+                MarkNestedDeclaration(f.Body); HoistOne(f.Body, targetScope);
                 break;
 
-            case ForInStatement fi: HoistOne(fi.Body, targetScope); break;
+            case ForInStatement fi: MarkNestedDeclaration(fi.Body); HoistOne(fi.Body, targetScope); break;
 
             case SwitchStatement sw:
                 foreach (var c in sw.Cases)
-                    foreach (var s in c.Consequent) HoistOne(s, targetScope);
+                    foreach (var s in c.Consequent) { MarkNestedDeclaration(s); HoistOne(s, targetScope); }
                 break;
 
             case TryStatement t:
-                HoistOne(t.Block, targetScope);
-                if (t.Handler != null) HoistOne(t.Handler.Body, targetScope);
-                if (t.Finalizer != null) HoistOne(t.Finalizer, targetScope);
+                MarkNestedDeclaration(t.Block); HoistOne(t.Block, targetScope);
+                if (t.Handler != null) { MarkNestedDeclaration(t.Handler.Body); HoistOne(t.Handler.Body, targetScope); }
+                if (t.Finalizer != null) { MarkNestedDeclaration(t.Finalizer); HoistOne(t.Finalizer, targetScope); }
                 break;
 
-            case LabeledStatement ls: HoistOne(ls.Body, targetScope); break;
-            case WithStatement ws: HoistOne(ws.Body, targetScope); break;
+            case LabeledStatement ls: MarkNestedDeclaration(ls.Body); HoistOne(ls.Body, targetScope); break;
+            case WithStatement ws: MarkNestedDeclaration(ws.Body); HoistOne(ws.Body, targetScope); break;
         }
     }
 
@@ -2916,7 +2940,10 @@ public class JsInterpreter
             {
                 if (self.Type != JsType.Function)
                     throw new JsInterpreterException("Function.prototype.call on non-function");
-                var thisArg = args.Length > 0 ? args[0] : GlobalThis();
+                // §15.3.4.4: no thisArg ⇒ undefined (script functions then get
+                // the global via §10.2.3 inside CallFunction; native methods
+                // see the raw undefined and can throw per their spec)
+                var thisArg = args.Length > 0 ? args[0] : JsValue.Undefined;
                 var rest = args.Length > 1 ? args[1..] : Array.Empty<JsValue>();
                 return CallFunction(self.GetFunction(), thisArg, rest);
             }, "call", length: 1));
@@ -2925,7 +2952,9 @@ public class JsInterpreter
             {
                 if (self.Type != JsType.Function)
                     throw new JsInterpreterException("Function.prototype.apply on non-function");
-                var thisArg = args.Length > 0 ? args[0] : GlobalThis();
+                // §15.3.4.3: no thisArg ⇒ undefined (CallFunction applies
+                // the §10.2.3 global conversion for script functions only)
+                var thisArg = args.Length > 0 ? args[0] : JsValue.Undefined;
                 var callArgs = new List<JsValue>();
                 // §15.3.4.3: argArray null/undefined ⇒ no arguments; an
                 // object/Array ⇒ spread; anything else ⇒ TypeError

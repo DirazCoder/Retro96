@@ -162,6 +162,7 @@ public static class JsRuntime
 
         var sb = new System.Text.StringBuilder(source.Length + 16);
         bool inClass = false;
+        bool lastExpansion = false;   // last in-class emission was a shorthand expansion
         for (int i = 0; i < source.Length; i++)
         {
             char c = source[i];
@@ -203,9 +204,9 @@ public static class JsRuntime
                     // inside a class, positive shorthands expand to members
                     switch (n)
                     {
-                        case 'd': sb.Append(digitSet); i++; continue;
-                        case 's': sb.Append(spaceSet); i++; continue;
-                        case 'w': sb.Append(wordSet); i++; continue;
+                        case 'd': sb.Append(digitSet); lastExpansion = true; i++; continue;
+                        case 's': sb.Append(spaceSet); lastExpansion = true; i++; continue;
+                        case 'w': sb.Append(wordSet); lastExpansion = true; i++; continue;
                         // \D \S \W inside classes stay as-is (rare; .NET-wide)
                     }
                 }
@@ -289,8 +290,17 @@ public static class JsRuntime
                 if (c == '$')
                 {
                     // JS $ = absolute end unless multiline; .NET's $ also
-                    // matches before a single trailing \n
-                    sb.Append(multiline ? "$" : "\\z");
+                    // matches before a single trailing \n. In multiline, ES3
+                    // anchors accept EVERY line terminator (\n \r LS PS) —
+                    // .NET's Multiline only knows \n (regress-78156)
+                    sb.Append(multiline ? "(?=\\z|[\\r\\n\\u2028\\u2029])" : "\\z");
+                    continue;
+                }
+                if (c == '^')
+                {
+                    // ES3 ^ = start or after ANY line terminator; .NET's
+                    // Multiline ^ only matches after \n
+                    sb.Append(multiline ? "(?<=\\A|[\\r\\n\\u2028\\u2029])" : "^");
                     continue;
                 }
                 if (c == '{')
@@ -329,7 +339,22 @@ public static class JsRuntime
             {
                 inClass = false;
             }
+            else if (inClass && c == '-')
+            {
+                // [\s-:] / [a-\w]: JS treats a dash adjacent to a class
+                // shorthand as a LITERAL — the expansion would otherwise
+                // form a (possibly reverse-order) .NET range (regress-375715)
+                bool nextIsShorthand = i + 2 < source.Length &&
+                                       source[i + 1] == '\\' &&
+                                       source[i + 2] is 'd' or 's' or 'w';
+                if (lastExpansion || nextIsShorthand)
+                {
+                    sb.Append("\\-");
+                    continue;
+                }
+            }
 
+            lastExpansion = false;
             sb.Append(c);
         }
         return sb.ToString();
@@ -1221,12 +1246,11 @@ public static class JsRuntime
 
         strProto.Set("match", Fn(scope, "match", 1, (self, args) =>
         {
-            // §15.5.4.10: match requires a String value or String wrapper —
-            // a foreign receiver (apply with no thisArg) is a TypeError
-            if (self.Type is not (JsType.String) &&
-                !(self.Type is (JsType.Object or JsType.Function) &&
-                  self.GetObjectOrFunction().Class == "String"))
-                throw new JsTypeErrorException("String.prototype.match is not generic");
+            // §15.5.4.10 per the ECMA_2 match-004 header: match is
+            // intentionally GENERIC (any coercible receiver); only a
+            // null/undefined this throws (regress-295052's bare apply())
+            if (self.Type is JsType.Null or JsType.Undefined)
+                throw new JsTypeErrorException("String.prototype.match called on null or undefined");
             if (args.Length == 0) return JsValue.Null;
             var str = self.ToJsString();
             var (source, flags) = RegexParts(args[0]);
@@ -1435,7 +1459,10 @@ public static class JsRuntime
         var result = NewArray(scope);
         int n = 0;
         foreach (Group g in m.Groups)
-            result.Set((n++).ToString(), JsValue.From(g.Value));
+            // a non-participating capture is undefined, not ""
+            // (regress-123437: /(a)?a/ on 'a' → ["a", undefined])
+            result.Set((n++).ToString(),
+                g.Success ? JsValue.From(g.Value) : JsValue.Undefined);
         result.Set("length", JsValue.From(n));
         result.Set("index", JsValue.From(m.Index));
         result.Set("input", JsValue.From(input));
@@ -2651,6 +2678,12 @@ public static class JsRuntime
             if (args.Length > 0 && args[0].Type is (JsType.Object or JsType.Function) &&
                 args[0].GetObjectOrFunction().Class == "RegExp" && flagsUndefined)
                 return args[0];
+
+            // §15.10.4.1 step 4: a RegExp pattern WITH a flags argument is
+            // a TypeError (15.10.4.1-5-n)
+            if (args.Length > 1 && args[0].Type is (JsType.Object or JsType.Function) &&
+                args[0].GetObjectOrFunction().Class == "RegExp")
+                throw new JsTypeErrorException("Cannot supply flags when constructing one RegExp from another");
 
             string pattern;
             string flags = flagsUndefined ? "" : args[1].ToJsString();
