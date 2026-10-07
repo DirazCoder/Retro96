@@ -3040,59 +3040,18 @@ public class JsInterpreter
                 var replaceFn = fnReplace ? args[1].GetFunction() : null;
                 string replacement = fnReplace ? "" : args[1].ToJsString();
 
-                string GetSubstitution(System.Text.RegularExpressions.Match m, string s)
+                string GetSubstitution(JsRegexMatch m, string s)
                 {
                     if (fnReplace)
                     {
                         var callArgs = new List<JsValue> { JsValue.From(m.Value) };
-                        for (int g = 1; g < m.Groups.Count; g++)
+                        for (int g = 1; g < m.Groups.Length; g++)
                             callArgs.Add(m.Groups[g].Success ? JsValue.From(m.Groups[g].Value) : JsValue.Undefined);
                         callArgs.Add(JsValue.From(m.Index));
                         callArgs.Add(JsValue.From(s));
                         return CallFunction(replaceFn!, GlobalThis(), callArgs.ToArray()).ToJsString();
                     }
-                    var sb = new System.Text.StringBuilder();
-                    int captures = m.Groups.Count - 1;
-                    for (int i = 0; i < replacement.Length; i++)
-                    {
-                        char c = replacement[i];
-                        if (c != '$' || i + 1 >= replacement.Length) { sb.Append(c); continue; }
-                        char n1 = replacement[i + 1];
-                        switch (n1)
-                        {
-                            case '$': sb.Append('$'); i++; break;
-                            case '&': sb.Append(m.Value); i++; break;
-                            case '`': sb.Append(s[..m.Index]); i++; break;
-                            case '\'': sb.Append(s[(m.Index + m.Length)..]); i++; break;
-                            default:
-                                if (char.IsDigit(n1))
-                                {
-                                    // two-digit group first; falls back to one
-                                    // digit when that group does not exist
-                                    if (i + 2 < replacement.Length && char.IsDigit(replacement[i + 2]))
-                                    {
-                                        int nn = (n1 - '0') * 10 + (replacement[i + 2] - '0');
-                                        if (nn >= 1 && nn <= captures)
-                                        {
-                                            sb.Append(m.Groups[nn].Success ? m.Groups[nn].Value : "");
-                                            i += 2;
-                                            continue;
-                                        }
-                                    }
-                                    int one = n1 - '0';
-                                    if (one >= 1 && one <= captures)
-                                    {
-                                        sb.Append(m.Groups[one].Success ? m.Groups[one].Value : "");
-                                        i++;
-                                        continue;
-                                    }
-                                    sb.Append('$');   // unknown group: literal $
-                                }
-                                else sb.Append('$');
-                                break;
-                        }
-                    }
-                    return sb.ToString();
+                    return JsRegex.Substitute(replacement, s, m);
                 }
 
                 if (isRegex)

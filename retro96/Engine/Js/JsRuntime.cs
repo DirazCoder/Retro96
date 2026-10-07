@@ -108,7 +108,14 @@ public static class JsRuntime
     private static string ArgStr(JsValue[] a, int i, string def = "") =>
         i < a.Length ? a[i].ToJsString() : def;
 
-    internal static Regex CreateJsRegex(string source, RegexOptions options)
+    /// <summary>Compiles an ES3 pattern on whichever backend fits it:
+    /// patterns needing ES3 §15.10.2.5 loop semantics (empty-iteration
+    /// rejection / per-iteration capture reset) go to the native matcher,
+    /// everything else to the .NET translation layer.</summary>
+    internal static JsRegex CreateJsRegex(string source, RegexOptions options) =>
+        new(source, options);
+
+    internal static Regex CreateNetRegex(string source, RegexOptions options)
     {
         try
         {
@@ -1207,7 +1214,7 @@ public static class JsRuntime
                     }
                     elements.Add(JsValue.From(str[p..m.Index]));
                     if (elements.Count >= limit) break;
-                    for (int g = 1; g < m.Groups.Count; g++)
+                    for (int g = 1; g < m.Groups.Length; g++)
                     {
                         // a non-participating capture contributes undefined
                         elements.Add(m.Groups[g].Success
@@ -1282,7 +1289,7 @@ public static class JsRuntime
             if (matches.Count == 0) return JsValue.Null;
             var result = NewArray(scope);
             int n = 0;
-            foreach (Match m in matches)
+            foreach (var m in matches)
                 result.Set((n++).ToString(), JsValue.From(m.Value));
             result.Set("length", JsValue.From(n));
             return JsValue.FromObject(result);
@@ -1301,7 +1308,7 @@ public static class JsRuntime
                 var regex = CreateJsRegex(source, RegexOptionsFor(flags));
                 // $1..$9 group references — the era's usage
                 return JsValue.From(flags.Contains('g')
-                    ? regex.Replace(str, replacement)
+                    ? regex.Replace(str, replacement, -1)
                     : regex.Replace(str, replacement, 1));
             }
 
@@ -1470,11 +1477,11 @@ public static class JsRuntime
         return options;
     }
 
-    private static JsValue MatchArray(JsScope scope, Match m, string input)
+    private static JsValue MatchArray(JsScope scope, JsRegexMatch m, string input)
     {
         var result = NewArray(scope);
         int n = 0;
-        foreach (Group g in m.Groups)
+        foreach (var g in m.Groups)
             // a non-participating capture is undefined, not ""
             // (regress-123437: /(a)?a/ on 'a' → ["a", undefined])
             result.Set((n++).ToString(),

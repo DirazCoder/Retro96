@@ -89,6 +89,8 @@
     <Compile Include="../../retro96/Engine/Js/JsScope.cs" />
     <Compile Include="../../retro96/Engine/Js/JsInterpreter.cs" />
     <Compile Include="../../retro96/Engine/Js/JsRuntime.cs" />
+    <Compile Include="../../retro96/Engine/Js/JsRegex.cs" />
+    <Compile Include="../../retro96/Engine/Js/Es3NativeRegex.cs" />
     <Compile Include="../../retro96/Engine/Js/DomBindings.cs" />
     <Compile Include="../../retro96/Engine/Js/JsDialogGeometry.cs" />
     <Compile Include="../../retro96/Engine/NavigationHistory.cs" />
