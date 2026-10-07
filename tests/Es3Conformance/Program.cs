@@ -53,7 +53,10 @@ public static class Program
     private static readonly string[] Suites = { "ecma", "ecma_2", "ecma_3", "js1_1", "js1_2", "js1_3", "js1_4", "js1_5" };
 
     private const int WallClockWatchdogMs = 120_000;   // generous: engine budgets 5s per file
-    private const int SlowLaneLimitMs = 60_000;
+    // Heavy-but-legitimate suite files (e.g. ecma/Date getters that sweep
+    // year 0 through harness helper loops) exceed the primary budget on an
+    // interpreter; the slow lane retries those once at a longer budget
+    private const int SlowLaneLimitMs = 180_000;
     private const int MaxDetailLines = 40;
 
     public static int Main(string[] args)
@@ -203,7 +206,7 @@ public static class Program
         private readonly Action<string>? _echo;   // live output mirror (--single)
 
         /// <summary>Per-file engine budget. The default sweep uses 10s; the
-        /// slow lane retries script-timeouts once at a minute before calling
+        /// slow lane retries script-timeouts once at a longer budget before calling
         /// them timeouts for good (heavy but correct tests must not die to a
         /// wall-clock budget — infinite loops still hit this ceiling).</summary>
         public int TimeLimitMs { get; set; } = 10_000;

@@ -33,7 +33,7 @@ public static class JsRuntime
         var stringProto = RegisterString(globalScope, objectProto);
         var numberProto = RegisterNumber(globalScope, objectProto);
         var boolProto   = RegisterBoolean(globalScope, objectProto);
-        RegisterMath(globalScope);
+        RegisterMath(globalScope, objectProto);
         RegisterDate(globalScope, objectProto);
         RegisterRegExp(globalScope, objectProto);
         RegisterError(globalScope, objectProto);
@@ -449,6 +449,9 @@ public static class JsRuntime
         var arr = new JsObject { Class = "Array" };
         arr.Prototype = JsInterpreter.ArrayPrototype;
         arr.Set("length", JsValue.From(0));
+        // §15.4.5.1: array length is { DontEnum, DontDelete } (writable)
+        arr.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+        arr.Attrs["length"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
         return arr;
     }
 
@@ -631,6 +634,11 @@ public static class JsRuntime
         // Array.prototype chains to Object.prototype — arrays inherit
         // hasOwnProperty/valueOf like everything else
         var arrProto = new JsObject { Class = "Array", Prototype = objectProto };
+        // §15.4.4: the Array prototype object is itself an Array whose
+        // length is 0 and is not deletable/enumerable (§15.4.5.1)
+        arrProto.Set("length", JsValue.From(0));
+        arrProto.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+        arrProto.Attrs["length"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
 
         arrProto.Set("push", Fn(scope, "push", 1, (self, args) =>
         {
@@ -730,7 +738,13 @@ public static class JsRuntime
             foreach (var idx in keys)
             {
                 long partner = length - 1 - idx;
-                if (partner <= idx) continue;   // middle or already-paired
+                if (partner == idx) continue;   // lone middle element
+                // Each pair is handled exactly once — either from the lower
+                // existing index, or, when the partner is a hole this loop
+                // never visits, from the higher one (an A[8]<->A[0] swap was
+                // previously skipped because index 0 was a hole, leaving the
+                // high-index value unmoved)
+                if (partner < idx && keySet.Contains(partner)) continue;
                 bool left = keySet.Contains(idx);
                 bool right = keySet.Contains(partner);
                 if (!left && !right) continue;
@@ -748,7 +762,10 @@ public static class JsRuntime
         {
             var arr = BoxReceiver(self);
             long length = LengthOf(self);
-            string sep = args.Length > 0 ? args[0].ToJsString() : ",";
+            // §15.4.4.3: an undefined separator joins with the comma; a
+            // null separator joins with the string "null"
+            string sep = args.Length > 0 && args[0].Type != JsType.Undefined
+                ? args[0].ToJsString() : ",";
             var sb = new StringBuilder();
             for (int i = 0; i < length; i++)
             {
@@ -1329,7 +1346,7 @@ public static class JsRuntime
             throw new JsTypeErrorException("Number.prototype method called on a non-Number object");
         }
 
-        numProto.Set("toString", Fn(scope, "toString", (self, args) =>
+        numProto.Set("toString", Fn(scope, "toString", 1, (self, args) =>
         {
             double num = NumberValueOf(self);
             int radix = args.Length > 0 && !double.IsNaN(args[0].ToNumber())
@@ -1342,12 +1359,19 @@ public static class JsRuntime
         }));
 
         numProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
-            self.Type is JsType.Object or JsType.Function &&
-            self.GetObjectOrFunction().Class == "Number"
+        {
+            // §15.7.4.3: valueOf is NOT generic — a Number primitive or a
+            // Number object receiver only, TypeError otherwise
+            if (self.Type == JsType.Number) return self;
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                self.GetObjectOrFunction().Class == "Number")
+            {
                 // Number.prototype's own [[Value]] is +0 (§15.7.4)
-                ? self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } n
-                    ? n : JsValue.From(0)
-                : self));
+                return self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } n
+                    ? n : JsValue.From(0);
+            }
+            throw new JsTypeErrorException("Number.prototype.valueOf called on an object that is not a Number");
+        }));
 
         // ── ES3 / JScript 5.0 number formatting (checklist §12) ──
         // toFixed — fixed-point with era round-half-away-from-zero on the
@@ -1657,11 +1681,12 @@ public static class JsRuntime
     // Math
     // ─────────────────────────────────────────────────────────────────────
 
-    private static void RegisterMath(JsScope scope)
+    private static void RegisterMath(JsScope scope, JsObject objectProto)
     {
         // §15.8: Math's [[Class]] is "Math" (Object.prototype.toString
-        // reports "[object Math]")
-        var math = new JsObject { Class = "Math" };
+        // reports "[object Math]"); it chains to Object.prototype so
+        // `Math instanceof Object` holds and Math.toString() resolves
+        var math = new JsObject { Class = "Math", Prototype = objectProto };
 
         math.Set("E",       JsValue.From(Math.E));
         math.Set("PI",      JsValue.From(Math.PI));
@@ -1678,8 +1703,13 @@ public static class JsRuntime
         math.Set("round", Fn(scope, "round", 1, (s, a) =>
         {
             double v = Arg(a, 0);
-            // JS rounds .5 up (toward +Infinity), unlike .NET's banker's rounding
-            return JsValue.From(Math.Floor(v + 0.5));
+            // §15.8.2.15: ±0 pass through unchanged (round(-0) === -0), and
+            // values in (-0.5, 0) round to -0, not +0; JS rounds .5 up toward
+            // +Infinity, unlike .NET's banker's rounding
+            if (double.IsNaN(v) || double.IsInfinity(v) || v == 0) return JsValue.From(v);
+            double r = Math.Floor(v + 0.5);
+            if (r == 0 && v < 0) return JsValue.From(-0.0);
+            return JsValue.From(r);
         }));
         math.Set("min",   Fn(scope, "min", 2,   (s, a) =>
         {
@@ -1709,7 +1739,28 @@ public static class JsRuntime
             }
             return JsValue.From(max);
         }));
-        math.Set("pow",   Fn(scope, "pow", 2,   (s, a) => JsValue.From(Math.Pow(Arg(a, 0), Arg(a, 1)))));
+        math.Set("pow", Fn(scope, "pow", 2, (s, a) =>
+        {
+            // §15.8.2.13 (ES3): NaN exponent dominates, |base| == 1 with an
+            // infinite exponent is NaN, and ±0 exponents yield 1 — .NET's
+            // Math.Pow alone implements the ES5+ answers instead
+            double x = Arg(a, 0), y = Arg(a, 1);
+            if (double.IsNaN(y)) return JsValue.From(double.NaN);
+            if (y == 0) return JsValue.From(1);
+            if (double.IsNaN(x)) return JsValue.From(double.NaN);
+            if (double.IsPositiveInfinity(y) || double.IsNegativeInfinity(y))
+            {
+                if (x == 1 || x == -1) return JsValue.From(double.NaN);
+                if (double.IsPositiveInfinity(x) || double.IsNegativeInfinity(x))
+                    return JsValue.From(double.IsPositiveInfinity(y)
+                        ? double.PositiveInfinity : 0.0);
+                double ax = Math.Abs(x);
+                return JsValue.From(double.IsPositiveInfinity(y)
+                    ? (ax > 1 ? double.PositiveInfinity : 0.0)
+                    : (ax > 1 ? 0.0 : double.PositiveInfinity));
+            }
+            return JsValue.From(Math.Pow(x, y));
+        }));
         math.Set("sqrt",  Fn(scope, "sqrt", 1,  (s, a) => JsValue.From(Math.Sqrt(Arg(a, 0)))));
         math.Set("log",   Fn(scope, "log", 1,   (s, a) => JsValue.From(Math.Log(Arg(a, 0)))));
         math.Set("exp",   Fn(scope, "exp", 1,   (s, a) => JsValue.From(Math.Exp(Arg(a, 0)))));
@@ -1959,7 +2010,10 @@ public static class JsRuntime
         string core = $"{TwoDigits(h)}:{TwoDigits(mi)}:{TwoDigits(s)}";
         if (utcStyle)
             return $"{day}, {TwoDigits(d)} {mon} {DateYearString(y)} {core} GMT";
-        return $"{day} {mon} {TwoDigits(d)} {core} {DateYearString(y)}";
+        // SpiderMonkey/Mozilla layout (bug 118266): the date part leads,
+        // then the time — toDateString() is a strict prefix of toString()
+        // and toTimeString() is the remainder after one space
+        return $"{day} {mon} {TwoDigits(d)} {DateYearString(y)} {core}";
     }
     private static string DateDatePart(double localMs) =>
         $"{DateDayNames[(int)WeekDay(localMs)]} {DateMonthNames[(int)MonthFromTime(localMs)]} " +
@@ -2137,8 +2191,16 @@ public static class JsRuntime
         dateProto.Set("toString", Fn(scope, "toString", (s, a) =>
         {
             double ms = MsOf(s);
-            return JsValue.From(double.IsNaN(ms) ? "Invalid Date"
-                : DateToStringStyle(LocalTime(ms), utcStyle: false));
+            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
+            // Mozilla layout: toDateString() + " " + toTimeString()
+            double local = LocalTime(ms);
+            double off = local - ms;
+            string sign = off < 0 ? "-" : "+";
+            double abs = Math.Abs(off);
+            return JsValue.From(
+                $"{DateToStringStyle(local, utcStyle: false)} GMT{sign}" +
+                $"{TwoDigits(Math.Floor(abs / MsPerHour))}" +
+                $"{TwoDigits(PosMod(Math.Floor(abs / MsPerMinute), 60))}");
         }));
         dateProto.Set("toDateString", Fn(scope, "toDateString", (s, a) =>
         {
@@ -2164,9 +2226,38 @@ public static class JsRuntime
         {
             double ms = MsOf(s);
             if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            try { return JsValue.From(Epoch.AddMilliseconds(
-                    Math.Clamp(LocalTime(ms), -62_135_596_800_000.0, 253_402_300_799_999.0))
+            double local = LocalTime(ms);
+            // .NET's calendar only covers 0001–9999; outside that, format
+            // manually with a signed full year (the suite checks the year
+            // survives toLocaleString — e.g. -271821 for the time origin)
+            if (local < -62_135_596_800_000.0 || local > 253_402_300_799_999.0)
+                return JsValue.From($"{DateDatePart(local)} " +
+                    $"{TwoDigits(HourFromTime(local))}:{TwoDigits(MinFromTime(local))}:{TwoDigits(SecFromTime(local))}");
+            try { return JsValue.From(Epoch.AddMilliseconds(local)
                 .ToString(CultureInfo.CurrentCulture)); }
+            catch { return JsValue.From("Invalid Date"); }
+        }));
+        dateProto.Set("toLocaleDateString", Fn(scope, "toLocaleDateString", (s, a) =>
+        {
+            double ms = MsOf(s);
+            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
+            double local = LocalTime(ms);
+            if (local < -62_135_596_800_000.0 || local > 253_402_300_799_999.0)
+                return JsValue.From(DateDatePart(local));
+            try { return JsValue.From(Epoch.AddMilliseconds(local)
+                .ToString("d", CultureInfo.CurrentCulture)); }
+            catch { return JsValue.From("Invalid Date"); }
+        }));
+        dateProto.Set("toLocaleTimeString", Fn(scope, "toLocaleTimeString", (s, a) =>
+        {
+            double ms = MsOf(s);
+            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
+            double local = LocalTime(ms);
+            if (local < -62_135_596_800_000.0 || local > 253_402_300_799_999.0)
+                return JsValue.From(
+                    $"{TwoDigits(HourFromTime(local))}:{TwoDigits(MinFromTime(local))}:{TwoDigits(SecFromTime(local))}");
+            try { return JsValue.From(Epoch.AddMilliseconds(local)
+                .ToString("T", CultureInfo.CurrentCulture)); }
             catch { return JsValue.From("Invalid Date"); }
         }));
         var toUtcString = Fn(scope, "toUTCString", (s, a) =>
@@ -2290,6 +2381,14 @@ public static class JsRuntime
     private static bool TryParseEraDate(string s, out DateTime date)
     {
         date = default;
+        // strip the timezone decorations Date.prototype.toString appends
+        // ("GMT+0000", "UTC", parenthesised zone names) so the time part of
+        // a toString() string round-trips through Date.parse
+        int gmt = s.IndexOf(" GMT", StringComparison.OrdinalIgnoreCase);
+        if (gmt >= 0) s = s[..gmt];
+        int paren = s.IndexOf("(");
+        if (paren >= 0) s = s[..paren].TrimEnd();
+        s = s.Trim();
         // "13:30 AM" / "13:30 PM" are invalid 12-hour clock readings —
         // .NET's lenient TryParse swallows the meridian, so pre-check them
         // (the suite requires these to produce an Invalid Date).
@@ -2298,7 +2397,11 @@ public static class JsRuntime
         if (meridian.Success && int.Parse(meridian.Groups[1].Value) > 12)
             return false;
 
-        // Navigator's toString format first
+        // Navigator's toString formats first — the Mozilla layout (date part
+        // leading) and the pre-2002 era layout (year trailing)
+        if (DateTime.TryParseExact(s, "ddd MMM dd yyyy HH:mm:ss",
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
+            return true;
         if (DateTime.TryParseExact(s, "ddd MMM dd HH:mm:ss yyyy",
                 CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
             return true;
@@ -2622,8 +2725,8 @@ public static class JsRuntime
             string s = args[0].ToJsString().Trim();
             if (s.Length == 0) return JsValue.From(double.NaN);
 
-            // ±Infinity
-            string body = s.StartsWith('+') ? s[1..] : s;
+            // ±Infinity — §15.1.2.3 admits a leading sign before Infinity
+            string body = s.StartsWith('+') || s.StartsWith('-') ? s[1..] : s;
             if (body.StartsWith("Infinity", StringComparison.Ordinal))
                 return JsValue.From(s.StartsWith('-')
                     ? double.NegativeInfinity : double.PositiveInfinity);
@@ -2674,7 +2777,8 @@ public static class JsRuntime
         // also understands %uXXXX
         scope.Define("escape", Fn(scope, "escape", 1, (self, args) =>
         {
-            var s = args.Length > 0 ? args[0].ToJsString() : "";
+            // §15.1.2.4: a missing argument is ToPrimitive(undefined) → "undefined"
+            var s = (args.Length > 0 ? args[0] : JsValue.Undefined).ToJsString();
             var sb = new StringBuilder(s.Length + 16);
             foreach (char c in s)
             {
@@ -2691,7 +2795,8 @@ public static class JsRuntime
 
         scope.Define("unescape", Fn(scope, "unescape", 1, (self, args) =>
         {
-            var s = args.Length > 0 ? args[0].ToJsString() : "";
+            // §15.1.2.5: a missing argument is ToPrimitive(undefined) → "undefined"
+            var s = (args.Length > 0 ? args[0] : JsValue.Undefined).ToJsString();
             var sb = new StringBuilder(s.Length);
             for (int i = 0; i < s.Length; i++)
             {

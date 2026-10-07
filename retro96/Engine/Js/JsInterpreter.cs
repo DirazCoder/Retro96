@@ -1993,12 +1993,17 @@ public class JsInterpreter
     private JsValue ExecuteArray(ArrayExpr arrayExpr)
     {
         var arr = new JsObject { Class = "Array", Prototype = ArrayPrototype };
+        // §15.4.5.1: array length is { DontEnum, DontDelete } (writable)
+        arr.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+        arr.Attrs["length"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
         int index = 0;
         foreach (var elem in arrayExpr.Elements)
         {
-            // Holes and uninitialised slots read back as undefined
-            arr.Set(index.ToString(),
-                elem != null ? ExecuteExpression(elem) : JsValue.Undefined);
+            // §11.1.4: elisions leave NO property behind — a hole is not an
+            // own enumerable property (for-in must skip it) but still counts
+            // toward the length
+            if (elem != null)
+                arr.Set(index.ToString(), ExecuteExpression(elem));
             index++;
         }
         arr.Set("length", JsValue.From(index));
@@ -2703,7 +2708,7 @@ public class JsInterpreter
                 if (args.Length == 0) return JsValue.Undefined;
                 if (args[0].Type != JsType.String) return args[0];
                 return EvalString(args[0].GetString(), _currentScope);
-            }, "eval", global: true);
+            }, "eval", global: true, length: 1);
             _globalEvalFunction = evalValue.GetFunction();
         }
 
@@ -2730,12 +2735,19 @@ public class JsInterpreter
                     throw new JsInterpreterException("Function.prototype.apply on non-function");
                 var thisArg = args.Length > 0 ? args[0] : GlobalThis();
                 var callArgs = new List<JsValue>();
-                if (args.Length > 1 && args[1].Type == JsType.Object)
+                // §15.3.4.3: argArray null/undefined ⇒ no arguments; an
+                // object/Array ⇒ spread; anything else ⇒ TypeError
+                if (args.Length > 1)
                 {
-                    var arr = args[1].GetObjectOrFunction();
-                    int len = arr.Get("length") is { Type: JsType.Number } l ? (int)l.GetNumber() : 0;
-                    for (int i = 0; i < len; i++)
-                        callArgs.Add(arr.Get(i.ToString()));
+                    if (args[1].Type is JsType.Object or JsType.Function)
+                    {
+                        var arr = args[1].GetObjectOrFunction();
+                        int len = arr.Get("length") is { Type: JsType.Number } l ? (int)l.GetNumber() : 0;
+                        for (int i = 0; i < len; i++)
+                            callArgs.Add(arr.Get(i.ToString()));
+                    }
+                    else if (args[1].Type is not (JsType.Null or JsType.Undefined))
+                        throw new JsTypeErrorException("Function.prototype.apply: second argument must be an array or arguments object");
                 }
                 return CallFunction(self.GetFunction(), thisArg, callArgs.ToArray());
             }, "apply", length: 2));
@@ -2895,6 +2907,12 @@ public class JsInterpreter
         var mapped = mode is "map" or "filter"
             ? new JsObject { Class = "Array", Prototype = ArrayPrototype }
             : null;
+        if (mapped != null)
+        {
+            // §15.4.5.1 length attributes for result arrays too
+            mapped.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+            mapped.Attrs["length"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+        }
 
         for (int i = 0; i < len; i++)
         {
