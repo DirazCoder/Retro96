@@ -48,3 +48,6 @@ desktop.ini
 
 # kilo / AI tool artifacts
 .kilo/
+
+# es3 conformance generated output
+tests/Es3Conformance/results/
