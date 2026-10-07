@@ -478,6 +478,8 @@ public static class JsRuntime
             return JsValue.FromObject(newArr);
         }, scope, "Array", length: 1);
         arrayCtor.Set("prototype", JsValue.FromObject(arrProto));
+        // §15.4.3.1: Array.prototype.constructor is the Array constructor.
+        arrProto.Set("constructor", JsValue.FromFunction(arrayCtor));
         scope.Define("Array", JsValue.FromFunction(arrayCtor));
 
         return arrProto;
@@ -1002,6 +1004,8 @@ public static class JsRuntime
         numberCtor.Set("NaN", JsValue.From(double.NaN));
         numberCtor.Set("POSITIVE_INFINITY", JsValue.From(double.PositiveInfinity));
         numberCtor.Set("NEGATIVE_INFINITY", JsValue.From(double.NegativeInfinity));
+        // §15.7.3.1: Number.prototype.constructor is the Number constructor.
+        numProto.Set("constructor", JsValue.FromFunction(numberCtor));
         scope.Define("Number", JsValue.FromFunction(numberCtor));
 
         return numProto;
