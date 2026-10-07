@@ -38,6 +38,11 @@ public class JsScope
     /// introduce only lexical object environments in between.</summary>
     public bool IsVariableEnvironment { get; set; } = true;
 
+    /// <summary>Set when this scope's function has an arguments object
+    /// whose index properties are mapped to the parameters (§10.1.8) —
+    /// lets assignment paths sync cheaply without a table probe.</summary>
+    public bool HasArgumentsBinding;
+
     private string[] _names = System.Array.Empty<string>();
     private JsValue[] _values = System.Array.Empty<JsValue>();
     private int _count;
@@ -186,6 +191,37 @@ public class JsScope
         }
     }
 
+    /// <summary>
+    /// Capture where an assignment to <paramref name="name"/> lands by
+    /// resolving the reference NOW (§11.13.1: the left-hand Reference is
+    /// evaluated before the right-hand expression). The returned writer
+    /// stores through the exact scope/with-object chosen at resolution
+    /// time, so a binding that appears later — e.g. a with-object property
+    /// created by the RHS itself (`with(o) x = o.x = 2` must set the OUTER
+    /// x, not o.x) — cannot redirect the store.
+    /// </summary>
+    public System.Action<JsValue> ResolveAssignmentSink(string name)
+    {
+        var scope = this;
+        while (scope != null)
+        {
+            if (scope.HasOwn(name))
+            {
+                var target = scope;
+                return target.Parent == null
+                    ? v => { target.Put(name, v); target.GlobalFallback?.Set(name, v); }
+                    : v => target.Put(name, v);
+            }
+            if (scope.Parent == null)
+            {
+                var root = scope;
+                return v => { root.Put(name, v); root.GlobalFallback?.Set(name, v); };
+            }
+            scope = scope.Parent;
+        }
+        return v => Set(name, v);
+    }
+
     /// <summary>Define a variable in THIS scope (var declarations, params).
     /// Virtual: var/function declarations inside a with body bind in the
     /// enclosing variable environment (§10.2.2/§12.10), never the object.</summary>
@@ -205,6 +241,36 @@ public class JsScope
         while (scope != null && !scope.IsVariableEnvironment)
             scope = scope.Parent;
         (scope ?? this).Define(name, value);
+    }
+
+    /// <summary>Declare a var WITHOUT DontDelete — §10.2.2/§10.1.2: bindings
+    /// created by EVAL code are ordinary properties of the variable object,
+    /// so `eval("var x = 1"); delete x` is true.</summary>
+    public void DefineInVariableEnvEval(string name, JsValue value)
+    {
+        var scope = this;
+        while (scope != null && !scope.IsVariableEnvironment)
+            scope = scope.Parent;
+        scope = scope ?? this;
+        scope.Put(name, value);
+        if (scope.Parent == null)
+            scope.GlobalFallback?.Set(name, value);
+    }
+
+    /// <summary>Bind a hoisted name in eval mode: no DontDelete (§10.2.2),
+    /// routed into the enclosing VARIABLE environment past with scopes.</summary>
+    public void DefineEvalHoisted(string name, JsValue value)
+    {
+        var scope = this;
+        while (scope != null && !scope.IsVariableEnvironment)
+            scope = scope.Parent;
+        scope = scope ?? this;
+        if (!scope.HasOwn(name))
+        {
+            scope.Put(name, value);
+            if (scope.Parent == null)
+                scope.GlobalFallback?.Set(name, value);
+        }
     }
 
     /// <summary>Declare a var WITHOUT clobbering an existing binding —

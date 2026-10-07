@@ -471,6 +471,38 @@ public class JsInterpreter
         }
     }
 
+    /// <summary>Depth of DIRECT eval — §10.2.2: bindings created by eval
+    /// code carry no DontDelete (delete of an eval'd var is true).</summary>
+    private int _evalDepth;
+
+    /// <summary>§10.1.8 mapped-arguments bookkeeping — argument index ↔
+    /// parameter name, keyed by the arguments object and by the function
+    /// scope so both write directions find the pairing cheaply.</summary>
+    private sealed class ArgumentsBinding
+    {
+        public JsScope Scope = null!;
+        public JsObject ArgsObj = null!;
+        public readonly Dictionary<string, string> IndexToParam = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, string> ParamToIndex = new(StringComparer.Ordinal);
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsObject, ArgumentsBinding> _argumentsBindingsByObj = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsScope, ArgumentsBinding> _argumentsBindingsByScope = new();
+
+    /// <summary>Propagate a parameter write to the mapped arguments slot
+    /// (§10.1.8: arguments[i] and the parameter share their value).</summary>
+    private static void SyncArgumentsFromParam(JsScope from, string name, JsValue value)
+    {
+        for (var scope = from; scope != null; scope = scope.Parent)
+        {
+            if (!scope.HasArgumentsBinding) continue;
+            if (_argumentsBindingsByScope.TryGetValue(scope, out var b) &&
+                b.ParamToIndex.TryGetValue(name, out var idx) &&
+                b.ArgsObj.HasOwn(idx))   // delete breaks the mapping (§10.1.8)
+                b.ArgsObj.Set(idx, value);
+        }
+    }
+
     /// <summary>Eval a string in an explicit scope (eval()).</summary>
     public JsValue EvalString(string source, JsScope scope)
     {
@@ -490,12 +522,14 @@ public class JsInterpreter
         }
         var old = _currentScope;
         _currentScope = scope;
+        _evalDepth++;
         try
         {
             return Execute(program);
         }
         finally
         {
+            _evalDepth--;
             _currentScope = old;
         }
     }
@@ -1258,7 +1292,11 @@ public class JsInterpreter
         foreach (var d in varDecl.Declarations)
         {
             // §12.2: the DECLARATION binds in the variable environment...
-            _currentScope.DeclareInVariableEnv(d.Id.Name);
+            // §10.2.2: bindings from EVAL code carry no DontDelete
+            if (_evalDepth > 0)
+                _currentScope.DefineInVariableEnvEval(d.Id.Name, JsValue.Undefined);
+            else
+                _currentScope.DeclareInVariableEnv(d.Id.Name);
             if (d.Init != null)
             {
                 // ...but the initialiser is an ASSIGNMENT — §12.10: a
@@ -1266,6 +1304,7 @@ public class JsInterpreter
                 // (with(x){var f=2} writes x.f when x has an f — 185485)
                 JsValue value = ExecuteExpression(d.Init);
                 _currentScope.Set(d.Id.Name, value);
+                SyncArgumentsFromParam(_currentScope, d.Id.Name, value);
                 DebugVariableWrite(d.Id.Name, value);
             }
         }
@@ -1409,8 +1448,11 @@ public class JsInterpreter
         if (objVal.Type is JsType.Null or JsType.Undefined)
             return JsValue.Undefined;
 
+        // §12.6.4 step 4: ToObject — for-in over a primitive enumerates the
+        // wrapper's inherited properties (Number.prototype.foo shows up for
+        // `for (j in 7)`)
         if (objVal.Type is not (JsType.Object or JsType.Function))
-            return JsValue.Undefined;
+            objVal = JsValue.FromObject(BoxPrimitive(objVal));
 
         var obj = objVal.GetObjectOrFunction();
 
@@ -1471,6 +1513,21 @@ public class JsInterpreter
                 _currentScope.Set(ident.Name, JsValue.From(key));
             else if (forInStmt.Left is Identifier ident2)
                 _currentScope.Set(ident2.Name, JsValue.From(key));
+            // §12.6.4 step 6: any LeftHandSideExpression target — the
+            // member expression re-evaluates EVERY iteration (its object
+            // and computed parts are live: `for (a[i++] in o)` indexes on)
+            else if (forInStmt.Left is MemberExpr member)
+            {
+                JsValue target = ExecuteExpression(member.Object);
+                string propName = GetMemberPropertyName(member);
+                SetProperty(target, propName, JsValue.From(key));
+            }
+            else if (forInStmt.Left is ExpressionStatement mes && mes.Expression is MemberExpr member2)
+            {
+                JsValue target = ExecuteExpression(member2.Object);
+                string propName = GetMemberPropertyName(member2);
+                SetProperty(target, propName, JsValue.From(key));
+            }
 
             try
             {
@@ -1620,16 +1677,63 @@ public class JsInterpreter
         }
     }
 
+    /// <summary>ToObject (§9.9) for with-statements and for-in over
+    /// primitives: a fresh wrapper object with the right [[Class]] and
+    /// prototype so inherited members resolve (§12.10 step 3, §12.6.4).
+    /// String wrappers carry the read-only length (§15.5.5.1).</summary>
+    private JsObject BoxPrimitive(JsValue v)
+    {
+        switch (v.Type)
+        {
+            case JsType.String:
+            {
+                var so = new JsObject { Class = "String", Prototype = JsInterpreter.StringPrototype };
+                so.Set("value", v);
+                so.Set("length", JsValue.From(v.GetString().Length));
+                so.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                so.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+                so.Attrs["length"] = JsObject.PropAttr.Builtin;
+                return so;
+            }
+            case JsType.Number:
+            {
+                var no = new JsObject { Class = "Number", Prototype = JsInterpreter.NumberPrototype };
+                no.Set("value", v);
+                no.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                no.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+                return no;
+            }
+            case JsType.Boolean:
+            {
+                var bo = new JsObject { Class = "Boolean", Prototype = JsInterpreter.BooleanPrototype };
+                bo.Set("value", v);
+                bo.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                bo.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+                return bo;
+            }
+            default:
+                throw new JsTypeErrorException("cannot box value for object environment");
+        }
+    }
+
     private JsValue ExecuteWith(WithStatement with)
     {
         JsValue objVal = ExecuteExpression(with.Object);
-        if (objVal.Type is not (JsType.Object or JsType.Function))
-            return ExecuteStatement(with.Body);
+        if (objVal.Type is JsType.Null or JsType.Undefined)
+            throw new JsTypeErrorException(
+                $"'{DescribeJsValue(objVal)}' has no properties");
 
+        // §12.10 step 3: ToObject of a primitive gives the with body a
+        // wrapper (with(7) exposes Number.prototype members — valueOf()
+        // inside the body returns the primitive number)
+        if (objVal.Type is not (JsType.Object or JsType.Function))
+            objVal = JsValue.FromObject(BoxPrimitive(objVal));
+
+        var withObj = objVal.GetObjectOrFunction();
         // §12.10/§10.2.3: object environment — lookups walk the object's
         // property chain (DontEnum builtins like Date.prototype methods are
         // visible), writes land on the object, var binds in the outer scope.
-        var withScope = new JsWithScope(_currentScope, objVal.GetObjectOrFunction());
+        var withScope = new JsWithScope(_currentScope, withObj);
 
         var old = _currentScope;
         _currentScope = withScope;
@@ -1704,9 +1808,11 @@ public class JsInterpreter
         {
             if (a.Operator != "=" && !_currentScope.Has(ident.Name))
                 throw new JsReferenceErrorException($"{ident.Name} is not defined");   // §11.13.2
-            JsValue oldValue = a.Operator == "="
-                ? JsValue.Undefined
-                : _currentScope.Get(ident.Name);
+            // §11.13.1: the LHS Reference is resolved BEFORE the RHS runs —
+            // a with-object property created by the RHS must not capture
+            // the store (with(o) x = o.x = 2 sets the outer x)
+            var sink = _currentScope.ResolveAssignmentSink(ident.Name);
+            JsValue oldValue = a.Operator == "=" ? JsValue.Undefined : _currentScope.Get(ident.Name);
             JsValue rightVal = ExecuteExpression(a.Right);
             JsValue newValue = a.Operator == "="
                 ? rightVal
@@ -1725,7 +1831,8 @@ public class JsInterpreter
                 return newValue;
             }
 
-            _currentScope.Set(ident.Name, newValue);
+            sink(newValue);
+            SyncArgumentsFromParam(_currentScope, ident.Name, newValue);
             DebugVariableWrite(ident.Name, newValue);
             return newValue;
         }
@@ -1808,10 +1915,10 @@ public class JsInterpreter
             "!=" => JsValue.From(!left.AbstractEquals(right)),
             "===" => JsValue.From(left.StrictEquals(right)),
             "!==" => JsValue.From(!left.StrictEquals(right)),
-            "<" => JsValue.From(LessThan3(left, right) == Cmp3.True),
-            ">" => JsValue.From(LessThan3(right, left) == Cmp3.True),
-            "<=" => JsValue.From(LessThan3(right, left) == Cmp3.False),
-            ">=" => JsValue.From(LessThan3(left, right) == Cmp3.False),
+            "<"  => JsValue.From(RelationalCmp(left, right, swap: false) == Cmp3.True),
+            ">"  => JsValue.From(RelationalCmp(left, right, swap: true) == Cmp3.True),
+            "<=" => JsValue.From(RelationalCmp(left, right, swap: true) == Cmp3.False),
+            ">=" => JsValue.From(RelationalCmp(left, right, swap: false) == Cmp3.False),
             _ => throw new JsInterpreterException($"Unknown binary operator: {b.Operator}")
         };
     }
@@ -1854,6 +1961,7 @@ public class JsInterpreter
             JsValue oldVal = _currentScope.Get(ident.Name);
             JsValue newVal = JsValue.From(oldVal.ToNumber() + delta);
             _currentScope.Set(ident.Name, newVal);
+            SyncArgumentsFromParam(_currentScope, ident.Name, newVal);
             // §11.3.1/§11.3.2: the postfix result is the ToNumber'ed old value
             return up.Prefix ? newVal : JsValue.From(oldVal.ToNumber());
         }
@@ -2067,11 +2175,28 @@ public class JsInterpreter
         {
             JsValue objVal = ExecuteExpression(member.Object);
             if (objVal.Type is not (JsType.Object or JsType.Function))
-                return JsValue.From(false);
+            {
+                // §11.4.1 step 3b: delete on a primitive's member targets the
+                // ToObject wrapper — a missing property deletes as true
+                return JsValue.From(objVal.Type is not (JsType.Null or JsType.Undefined)
+                    && true);
+            }
+            var target = objVal.GetObjectOrFunction();
+            string name = GetMemberPropertyName(member);
+            // §11.4.1 step 3b: deleting a property the object does not have
+            // returns true, not false
+            if (!target.Has(name)) return JsValue.From(true);
+            // §10.1.8: deleting arguments[i] severs the parameter mapping
+            if (target.Class == "Arguments" &&
+                _argumentsBindingsByObj.TryGetValue(target, out var ab) &&
+                ab.IndexToParam.TryGetValue(name, out var paramName))
+            {
+                ab.IndexToParam.Remove(name);
+                ab.ParamToIndex.Remove(paramName);
+            }
             // Route through the VIRTUAL Delete so host objects can
             // intercept removal exactly like Get/Set.
-            return JsValue.From(objVal.GetObjectOrFunction().Delete(
-                GetMemberPropertyName(member)));
+            return JsValue.From(target.Delete(name));
         }
 
         // §11.4.1 step 1: the operand is still EVALUATED (delete ++o.a
@@ -2168,6 +2293,28 @@ public class JsInterpreter
             argsObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
             argsObj.Attrs["length"] = JsObject.PropAttr.DontEnum;
             argsObj.Attrs["callee"] = JsObject.PropAttr.DontEnum;
+            // §10.1.8 mapped arguments: arguments[i] SHARES the value of
+            // parameter Params[i] (the LAST occurrence when names repeat —
+            // f7(x,x,x,x){ x = 999 } makes arguments[3] === 999)
+            var binding = new ArgumentsBinding { Scope = funcScope, ArgsObj = argsObj };
+            bool anyMapping = false;
+            for (int i = 0; i < func.Params.Count && i < args.Length; i++)
+            {
+                // last occurrence of a repeated name owns the mapping
+                int last = i;
+                for (int j = func.Params.Count - 1; j > i; j--)
+                    if (func.Params[j] == func.Params[i]) { last = j; break; }
+                if (last != i) continue;
+                binding.IndexToParam[i.ToString()] = func.Params[i];
+                binding.ParamToIndex[func.Params[i]] = i.ToString();
+                anyMapping = true;
+            }
+            if (anyMapping)
+            {
+                funcScope.HasArgumentsBinding = true;
+                _argumentsBindingsByObj.Add(argsObj, binding);
+                _argumentsBindingsByScope.Add(funcScope, binding);
+            }
             funcScope.Define("arguments", JsValue.FromObject(argsObj));
             for (int i = 0; i < func.Params.Count; i++)
                 funcScope.Define(func.Params[i],
@@ -2286,6 +2433,15 @@ public class JsInterpreter
              Retro96.DebugLog.JsTraceEnabled))
             Retro96.DebugLog.JsWrite($"PROP_SET name='{name}' target={DescribeJsValue(target)} value={DescribeJsValue(value)}");
 
+        // §10.1.8: writing arguments[i] writes the mapped parameter too
+        if (target.Type is (JsType.Object or JsType.Function) &&
+            target.GetObjectOrFunction().Class == "Arguments" &&
+            _argumentsBindingsByObj.TryGetValue(target.GetObjectOrFunction(), out var ab) &&
+            ab.IndexToParam.TryGetValue(name, out var paramName))
+        {
+            ab.Scope.Set(paramName, value);
+        }
+
         // Writes to primitives are silently dropped, JS-style
         if (target.Type is JsType.Object or JsType.Function)
             target.GetObjectOrFunction().Set(name, value);
@@ -2380,22 +2536,25 @@ public class JsInterpreter
     /// <summary>
     /// §11.8.5 Abstract Relational Comparison with its three-valued result:
     /// True / False / Undefined (either operand NaN after ToPrimitive).
-    /// The comparison operators map Undefined per their own sections
-    /// (&lt; and &gt; → false, &lt;= and &gt;= → false as well).
+    /// §11.8.2/§11.8.4 swap the comparison ARGUMENTS, but the ToPrimitive
+    /// conversions still run in SOURCE order (left operand first) — the
+    /// order real engines implement and ES5 later made explicit.
     /// </summary>
     private enum Cmp3 { True, False, Undefined }
 
-    private Cmp3 LessThan3(JsValue a, JsValue b)
+    private Cmp3 RelationalCmp(JsValue left, JsValue right, bool swap)
     {
-        // §11.8.5: ToPrimitive with hint Number (valueOf first — a Date
-        // compares numerically here, unlike +)
-        var pa = ToPrimitiveV(a, preferString: false);
-        var pb = ToPrimitiveV(b, preferString: false);
-        if (pa.Type == JsType.String && pb.Type == JsType.String)
-            return string.CompareOrdinal(pa.GetString(), pb.GetString()) < 0
+        // §11.8.5: ToPrimitive with hint Number, left-then-right in source
+        // order (valueOf first — a Date compares numerically here, unlike +)
+        var pl = ToPrimitiveV(left, preferString: false);
+        var pr = ToPrimitiveV(right, preferString: false);
+        var px = swap ? pr : pl;
+        var py = swap ? pl : pr;
+        if (px.Type == JsType.String && py.Type == JsType.String)
+            return string.CompareOrdinal(px.GetString(), py.GetString()) < 0
                 ? Cmp3.True : Cmp3.False;
-        double an = pa.ToNumber();
-        double bn = pb.ToNumber();
+        double an = px.ToNumber();
+        double bn = py.ToNumber();
         if (double.IsNaN(an) || double.IsNaN(bn)) return Cmp3.Undefined;
         return an < bn ? Cmp3.True : Cmp3.False;
     }
@@ -2573,7 +2732,11 @@ public class JsInterpreter
             else
             {
                 var name = (string)item;
-                if (!targetScope.Has(name))
+                // §12.2/§10.1.3: var hoisting pre-binds the name in THIS
+                // variable environment — HasOwn, not chain Has: a local
+                // `var x` must shadow an outer x from function entry
+                // ("var a = x; var x = 23" sees the hoisted local undefined)
+                if (!targetScope.HasOwn(name))
                     targetScope.Define(name, JsValue.Undefined);
             }
         }
@@ -2589,13 +2752,19 @@ public class JsInterpreter
                     paramNames[i] = fn.Params[i].Name;
                 var func = new JsFunction(
                     new FunctionExpr(fn.Id, fn.Params, fn.Body, fn.SourceText), paramNames, targetScope);
-                targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
+                // §10.2.2: eval-code function declarations are deletable
+                if (_evalDepth > 0) targetScope.DefineEvalHoisted(fn.Id.Name, JsValue.FromFunction(func));
+                else targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
                 break;
 
             case VarDeclaration varDecl:
                 foreach (var d in varDecl.Declarations)
-                    if (!targetScope.Has(d.Id.Name))
+                {
+                    if (_evalDepth > 0)
+                        targetScope.DefineEvalHoisted(d.Id.Name, JsValue.Undefined);
+                    else if (!targetScope.HasOwn(d.Id.Name))
                         targetScope.Define(d.Id.Name, JsValue.Undefined);
+                }
                 break;
 
             case BlockStatement block:
@@ -2795,6 +2964,28 @@ public class JsInterpreter
 
             ArrayPrototype.Set("filter", Native((self, args) =>
                 FilterArray(self, args), "filter"));
+
+            // §15.4.4.32/§15.4.5.1-era: Array.prototype.toLocaleString joins
+            // the elements' OWN toLocaleString() results with a locale
+            // separator; null/undefined contribute nothing
+            ArrayPrototype.Set("toLocaleString", Native((self, args) =>
+            {
+                if (self.Type is not (JsType.Object or JsType.Function))
+                    throw new JsTypeErrorException("Array.prototype.toLocaleString is not generic");
+                var arr = self.GetObjectOrFunction();
+                long len = arr.Get("length") is { Type: JsType.Number } l ? (long)l.GetNumber() : 0;
+                var parts = new List<string>();
+                for (int i = 0; i < len; i++)
+                {
+                    var v = arr.Get(i.ToString());
+                    if (v.Type is JsType.Null or JsType.Undefined) continue;
+                    var m = GetProperty(v, "toLocaleString");
+                    if (m.Type != JsType.Function)
+                        throw new JsTypeErrorException("array element toLocaleString is not a function");
+                    parts.Add(CallFunction(m.GetFunction(), v, Array.Empty<JsValue>()).ToJsString());
+                }
+                return JsValue.From(string.Join(", ", parts));
+            }, "toLocaleString", length: 0));
         }
 
         // These were added after the §15 freeze pass in JsRuntime, so give

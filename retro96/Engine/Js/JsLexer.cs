@@ -431,6 +431,10 @@ public class JsLexer
                     bi = bi * 16 + HexValue(c);
                 val = (double)bi;   // BigInteger→double is round-to-nearest-even
             }
+            // §7.8.3 note: the character after a NumericLiteral must not
+            // be IdentifierStart or a digit — "0x41in" is a SyntaxError
+            if (_pos < _source.Length && IsIdentifierStart(_source[_pos]))
+                throw new JsLexerException("identifier starts immediately after numeric literal");
             return new JsNumberToken(val, 0, 0, 0, false);
         }
 
@@ -487,6 +491,12 @@ public class JsLexer
         }
 
         string text = _source[start.._pos];
+
+        // §7.8.3 note: the character after a NumericLiteral must not be an
+        // IdentifierStart or a digit — "3in", "3e", "3.toString" are
+        // SyntaxErrors (identifiers may not abut numeric literals)
+        if (_pos < _source.Length && IsIdentifierStart(_source[_pos]))
+            throw new JsLexerException("identifier starts immediately after numeric literal");
 
         // Octal (0NN, no 8/9, not followed by dot/exp — those make it decimal)
         if (looksOctal && !sawDot && !sawExp && text.Length > 1)
@@ -709,6 +719,11 @@ public class JsLexer
     }
 
     private static bool IsDigit(char c) => c is >= '0' and <= '9';
+
+    /// <summary>§7.6 IdentifierStart: a letter, underscore or dollar (the
+    /// ASCII rule; non-ASCII letters count via char.IsLetter).</summary>
+    private static bool IsIdentifierStart(char c) =>
+        char.IsLetter(c) || c is '_' or '$';
     private static bool IsHexDigit(char c) =>
         c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
     private static int HexValue(char c) => c switch

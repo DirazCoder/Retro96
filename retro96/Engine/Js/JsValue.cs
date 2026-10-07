@@ -344,6 +344,10 @@ public class JsValue
         if (t == "Infinity" || t == "+Infinity") return double.PositiveInfinity;
         if (t == "-Infinity") return double.NegativeInfinity;
 
+        // §9.3.1: the ENTIRE trimmed string must be a StrDecimalLiteral —
+        // trailing junk ("1234\0") is NaN, not a parsed prefix
+        if (!IsStrDecimalLiteral(t)) return double.NaN;
+
         // §9.3.1: leading-zero digit runs are DECIMAL here (Math.abs('077')
         // is 77 — octal parsing belongs to parseInt and to the lexer's
         // integer-literal grammar, not ToNumber).
@@ -351,6 +355,28 @@ public class JsValue
             return num;
 
         return double.NaN;
+    }
+
+    /// <summary>§9.3.1 StrDecimalLiteral shape: optional sign, digits with
+    /// optional fraction and exponent (".5" allowed, bare "." not).
+    /// Whitespace was already trimmed.</summary>
+    private static bool IsStrDecimalLiteral(string t)
+    {
+        int i = 0;
+        if (i < t.Length && (t[i] == '+' || t[i] == '-')) i++;
+        int digits = 0;
+        while (i < t.Length && t[i] >= '0' && t[i] <= '9') { i++; digits++; }
+        if (i < t.Length && t[i] == '.') { i++; while (i < t.Length && t[i] >= '0' && t[i] <= '9') { i++; digits++; } }
+        if (digits == 0) return false;
+        if (i < t.Length && (t[i] == 'e' || t[i] == 'E'))
+        {
+            i++;
+            if (i < t.Length && (t[i] == '+' || t[i] == '-')) i++;
+            int expDigits = 0;
+            while (i < t.Length && t[i] >= '0' && t[i] <= '9') { i++; expDigits++; }
+            if (expDigits == 0) return false;
+        }
+        return i == t.Length;
     }
 
     private static bool AllDigits(string s)
@@ -595,6 +621,10 @@ public class JsFunction : JsObject
             Prototype = JsInterpreter.ObjectPrototype
         };
         instancePrototype.Set("constructor", JsValue.FromFunction(this));
+        // §13.1.2/§15.2.3.1: constructor on the auto-created prototype is
+        // DontEnum — for-in over instances must not see it
+        instancePrototype.Attrs ??= new System.Collections.Generic.Dictionary<string, PropAttr>();
+        instancePrototype.Attrs["constructor"] = PropAttr.DontEnum | PropAttr.DontDelete;
         Set("prototype", JsValue.FromObject(instancePrototype));
         MarkInstancePropsDontEnum();
     }
