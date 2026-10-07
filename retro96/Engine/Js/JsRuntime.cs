@@ -95,10 +95,20 @@ public static class JsRuntime
 
     private static bool IsNegZero(double d) =>
         d == 0.0 && System.BitConverter.DoubleToInt64Bits(d) < 0;
+
+    /// <summary>§9.5-style ToUint32 for array method lengths: NaN/±∞ → 0,
+    /// otherwise floor(|x|) mod 2^32.</summary>
+    private static long ToUint32Len(double d)
+    {
+        if (double.IsNaN(d) || double.IsInfinity(d)) return 0;
+        double m = Math.Floor(Math.Abs(d));
+        m %= 4294967296.0;
+        return (long)m;
+    }
     private static string ArgStr(JsValue[] a, int i, string def = "") =>
         i < a.Length ? a[i].ToJsString() : def;
 
-    private static Regex CreateJsRegex(string source, RegexOptions options)
+    internal static Regex CreateJsRegex(string source, RegexOptions options)
     {
         try
         {
@@ -444,6 +454,18 @@ public static class JsRuntime
         return (int)d;
     }
 
+    /// <summary>[[Class]] name used by Object.prototype.toString (§8.6.2).</summary>
+    internal static string ClassTagOf(JsValue v) => v.Type switch
+    {
+        JsType.String => "String",
+        JsType.Number => "Number",
+        JsType.Boolean => "Boolean",
+        JsType.Function => "Function",
+        JsType.Object => v.GetObject().Class is { Length: > 0 } className
+            ? className : "Object",
+        _ => "Object"
+    };
+
     private static JsObject NewArray(JsScope scope)
     {
         var arr = new JsObject { Class = "Array" };
@@ -643,12 +665,17 @@ public static class JsRuntime
         arrProto.Set("push", Fn(scope, "push", 1, (self, args) =>
         {
             var arr = BoxReceiver(self);
-            long length = LengthOf(self);
+            // §15.4.4.7 steps 4-5: n = ToUint32(this.length) — on plain
+            // objects a length of 2^37 wraps to 0 (regress-488989)
+            long length = ToUint32Len(LengthOf(self));
+            bool isArray = self.Type is (JsType.Object or JsType.Function) &&
+                           arr.Class == "Array";
             // §15.4.4.7 via §15.4.5.1: every item is STORED (indices past
             // 2^32-2 become plain properties), length advances to the last
             // LEGAL value, and the overflow surfaces as a RangeError from
             // the final length Put — the stored items stay visible
-            // (regress-465980 observes the partial mutation)
+            // (regress-465980 observes the partial mutation); a PLAIN
+            // object's length is an ordinary property, so no throw there
             long newLen = length;
             bool overflow = false;
             foreach (var item in args)
@@ -659,7 +686,7 @@ public static class JsRuntime
                 length++;
             }
             arr.Set("length", JsValue.From(newLen));
-            if (overflow)
+            if (overflow && isArray)
                 throw new JsRangeErrorException("array length overflow");
             return JsValue.From(newLen);
         }));
@@ -778,9 +805,13 @@ public static class JsRuntime
         }));
 
         arrProto.Set("toString", Fn(scope, "toString", (self, args) =>
-            self.Type is JsType.Object or JsType.Function
+            self.Type is (JsType.Object or JsType.Function) &&
+            self.GetObjectOrFunction().Class == "Array"
                 ? arrProto.Get("join").GetFunction().Native!(self, Array.Empty<JsValue>())
-                : self));
+                // non-Array receivers report their [[Class]] (regress-387501:
+                // Array.prototype.toString.call(new String('foo')) is
+                // "[object String]"; toLocaleString stays generic and joins)
+                : JsValue.From($"[object {ClassTagOf(self)}]")));
 
         arrProto.Set("slice", Fn(scope, "slice", 2, (self, args) =>
         {
@@ -865,23 +896,46 @@ public static class JsRuntime
                 ? ToIntSafe(args[1]) : length - start;
             deleteCount = Math.Clamp(deleteCount, 0, length - start);
 
+            long insertCount = args.Length > 2 ? args.Length - 2 : 0;
+            long newLength = length - deleteCount + insertCount;
+
+            // §15.4.4.12: the final length Put of a real array is a RangeError
+            // past 2^32-1 — evaluated BEFORE the (sparse) element moves so a
+            // 4-billion-length array cannot OOM the splice (regress-322135-03)
+            bool isArray = self.Type is (JsType.Object or JsType.Function) &&
+                           arr.Class == "Array";
+            if (isArray && newLength > 4294967295L)
+                throw new JsRangeErrorException("array length overflow");
+
+            // Sparse plan (§15.4.12): only EXISTING elements move; holes
+            // never materialize regardless of the array's length
+            var tail = new List<(long idx, JsValue v)>();
+            var deleted = new List<JsValue>();
+            foreach (var k in OwnIndexKeys(arr, length))
+            {
+                if (k < start) continue;
+                var v = arr.Get(k.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                if (k < start + deleteCount) deleted.Add(v);
+                else tail.Add((k, v));
+            }
+            // clear everything from the cut point on, then re-place
+            foreach (var k in OwnIndexKeys(arr, length))
+            {
+                if (k < start) continue;
+                arr.Properties.Remove(k.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
             var removed = NewArray(scope);
             long rn = 0;
-            for (long i = 0; i < deleteCount; i++)
-                removed.Set((rn++).ToString(), arr.Get((start + i).ToString()));
+            foreach (var v in deleted)
+                removed.Set((rn++).ToString(), v);
             removed.Set("length", JsValue.From(rn));
 
-            long insertCount = args.Length > 2 ? args.Length - 2 : 0;
-
-            for (long i = start + deleteCount; i < length; i++)
-                arr.Set((i - deleteCount + insertCount).ToString(), arr.Get(i.ToString()));
-
-            for (long i = 0; i < insertCount; i++)
-                arr.Set((start + i).ToString(), args[2 + i]);
-
-            long newLength = length - deleteCount + insertCount;
-            for (long i = newLength; i < length; i++)
-                arr.Properties.Remove(i.ToString());
+            for (int i = 0; i < insertCount; i++)
+                arr.Set((start + i).ToString(System.Globalization.CultureInfo.InvariantCulture), args[2 + i]);
+            foreach (var (idx, v) in tail)
+                arr.Set((idx - deleteCount + insertCount)
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture), v);
             arr.Set("length", JsValue.From(newLength));
 
             return JsValue.FromObject(removed);
@@ -1054,10 +1108,25 @@ public static class JsRuntime
             var str = self.ToJsString();
             var result = NewArray(scope);
 
-            int limit = args.Length > 1 && args[1].Type == JsType.Number &&
-                        !double.IsNaN(args[1].ToNumber())
-                ? (int)args[1].ToNumber() : int.MaxValue;
-            if (limit < 1)
+            // §15.5.4.14 steps 4-5: undefined limit = 2^32-1 (unlimited);
+            // otherwise ToUint32 (NaN/strings → 0, so split(str, "boo") is
+            // [] — NOT an unlimited split)
+            bool noLimit = args.Length < 2 || args[1].Type == JsType.Undefined;
+            double limitNum = noLimit ? double.NaN : args[1].ToNumber();
+            int limit;
+            if (noLimit)
+                limit = int.MaxValue - 1;
+            else
+            {
+                // §9.8 ToUint32: NaN/±∞ → 0; negatives WRAP modulo 2^32
+                // (-4294967295 → 1, -1 → 4294967295 i.e. unlimited)
+                double t = double.IsNaN(limitNum) || double.IsInfinity(limitNum)
+                    ? 0 : Math.Floor(limitNum);
+                double m = t % 4294967296.0;
+                if (m < 0) m += 4294967296.0;
+                limit = m >= int.MaxValue ? int.MaxValue - 1 : (int)m;
+            }
+            if (limit <= 0)
             {
                 result.Set("length", JsValue.From(0));
                 return JsValue.FromObject(result);
@@ -1072,36 +1141,73 @@ public static class JsRuntime
                 return JsValue.FromObject(result);
             }
 
-            if (args.Length == 0)
+            var elements = new List<JsValue>();
+            bool isRegex = args[0].Type is (JsType.Object or JsType.Function) &&
+                           args[0].GetObjectOrFunction().Class == "RegExp";
+            if (isRegex)
             {
-                result.Set("0", JsValue.From(str));
-                result.Set("length", JsValue.From(1));
-                return JsValue.FromObject(result);
-            }
-
-            string[] parts;
-            if (args[0].Type is (JsType.Object or JsType.Function) &&
-                args[0].GetObjectOrFunction().Class == "RegExp")
-            {
-                // RegExp separator — ToJsString on a RegExp object is
-                // "[object Object]", so this needs the real source
+                // §15.5.4.14 SplitMatch: the separator's captures are spliced
+                // between the pieces; an empty match exactly where the last
+                // split ended (e == p) advances without splitting; the g flag
+                // and lastIndex are ignored
                 var (source, flags) = RegexParts(args[0]);
-                parts = CreateJsRegex(source, RegexOptionsFor(flags)).Split(str);
+                var re = CreateJsRegex(source, RegexOptionsFor(flags));
+                int p = 0, q = 0;
+                while (q != str.Length && elements.Count < limit)
+                {
+                    var m = re.Match(str, q);
+                    if (!m.Success) break;
+                    int e = m.Index + m.Length;
+                    if (e == p)
+                    {
+                        // empty match at the split point — no piece; step past
+                        q = m.Index + 1;
+                        continue;
+                    }
+                    elements.Add(JsValue.From(str[p..m.Index]));
+                    if (elements.Count >= limit) break;
+                    for (int g = 1; g < m.Groups.Count; g++)
+                    {
+                        // a non-participating capture contributes undefined
+                        elements.Add(m.Groups[g].Success
+                            ? JsValue.From(m.Groups[g].Value) : JsValue.Undefined);
+                        if (elements.Count >= limit) break;
+                    }
+                    p = e;
+                    q = e;
+                }
+                if (elements.Count < limit)
+                    elements.Add(JsValue.From(str[p..]));
             }
             else
             {
                 string separator = args[0].ToJsString();
-                parts = separator.Length == 0
-                    ? str.Select(c => c.ToString()).ToArray()
-                    : str.Split(new[] { separator }, StringSplitOptions.None);
+                int start = 0;
+                if (separator.Length == 0)
+                {
+                    foreach (var c in str)
+                    {
+                        if (elements.Count >= limit) break;
+                        elements.Add(JsValue.From(c.ToString()));
+                    }
+                }
+                else
+                {
+                    int idx;
+                    while (elements.Count < limit &&
+                           (idx = str.IndexOf(separator, start, StringComparison.Ordinal)) >= 0)
+                    {
+                        elements.Add(JsValue.From(str[start..idx]));
+                        start = idx + separator.Length;
+                    }
+                    if (elements.Count < limit)
+                        elements.Add(JsValue.From(str[start..]));
+                }
             }
 
             int n = 0;
-            foreach (var part in parts)
-            {
-                if (n >= limit) break;
-                result.Set((n++).ToString(), JsValue.From(part));
-            }
+            foreach (var part in elements)
+                result.Set((n++).ToString(), part);
             result.Set("length", JsValue.From(n));
             return JsValue.FromObject(result);
         }));
@@ -1115,6 +1221,12 @@ public static class JsRuntime
 
         strProto.Set("match", Fn(scope, "match", 1, (self, args) =>
         {
+            // §15.5.4.10: match requires a String value or String wrapper —
+            // a foreign receiver (apply with no thisArg) is a TypeError
+            if (self.Type is not (JsType.String) &&
+                !(self.Type is (JsType.Object or JsType.Function) &&
+                  self.GetObjectOrFunction().Class == "String"))
+                throw new JsTypeErrorException("String.prototype.match is not generic");
             if (args.Length == 0) return JsValue.Null;
             var str = self.ToJsString();
             var (source, flags) = RegexParts(args[0]);
@@ -1260,6 +1372,12 @@ public static class JsRuntime
                 strObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
                 strObj.Attrs["length"] = JsObject.PropAttr.Builtin;   // §15.5.5.1: length is { ReadOnly, DontEnum, DontDelete }
                 strObj.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+                // §15.5.5.2: the wrapper's index properties expose the
+                // characters (generic array-ish methods like
+                // Array.prototype.toString rely on them)
+                for (int ci = 0; ci < text.Length && ci < 4096; ci++)
+                    strObj.Set(ci.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        JsValue.From(text[ci].ToString()));
                 return self;
             }
             return JsValue.From(text);
@@ -1277,7 +1395,7 @@ public static class JsRuntime
         return strProto;
     }
 
-    private static (string Source, string Flags) RegexParts(JsValue v)
+    internal static (string Source, string Flags) RegexParts(JsValue v)
     {
         if (v.Type is (JsType.Object or JsType.Function))
         {
@@ -1304,7 +1422,7 @@ public static class JsRuntime
     private static int AdvanceLastIndex(int index, int length, int inputLength) =>
         Math.Min(inputLength, length == 0 ? index + 1 : index + length);
 
-    private static RegexOptions RegexOptionsFor(string flags)
+    internal static RegexOptions RegexOptionsFor(string flags)
     {
         var options = RegexOptions.None;
         if (flags.Contains('i')) options |= RegexOptions.IgnoreCase;

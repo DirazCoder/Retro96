@@ -1320,17 +1320,30 @@ public class JsInterpreter
     /// </summary>
     private JsValue ExecuteFunctionDeclaration(FunctionDeclaration fnDecl)
     {
-        var paramNames = new string[fnDecl.Params.Count];
-        for (int i = 0; i < paramNames.Length; i++)
-            paramNames[i] = fnDecl.Params[i].Name;
-        var func = new JsFunction(
-            new FunctionExpr(fnDecl.Id, fnDecl.Params, fnDecl.Body, fnDecl.SourceText),
-            paramNames, _currentScope);
-        // §10.2.2: function declarations from EVAL code are deletable
-        if (_evalDepth > 0)
-            _currentScope.DefineInVariableEnvEval(fnDecl.Id.Name, JsValue.FromFunction(func));
-        else
-            _currentScope.DefineInVariableEnv(fnDecl.Id.Name, JsValue.FromFunction(func));
+        // §10.1.3: the binding was already made at variable instantiation
+        // (the hoist). Re-creating the function here is ONLY for the era
+        // with-scope closure semantics (bug 184107: a function declared
+        // inside with(obj) closes over the with environment) — a plain
+        // re-execution must not clobber a prototype already swapped in
+        // (`Ctor.prototype = X;` before the hoisted declaration statement)
+        bool inWithEnv = false;
+        for (var s = _currentScope; s != null && !s.IsVariableEnvironment; s = s.Parent)
+        {
+            if (s is JsWithScope) { inWithEnv = true; break; }
+        }
+        if (inWithEnv)
+        {
+            var paramNames = new string[fnDecl.Params.Count];
+            for (int i = 0; i < paramNames.Length; i++)
+                paramNames[i] = fnDecl.Params[i].Name;
+            var func = new JsFunction(
+                new FunctionExpr(fnDecl.Id, fnDecl.Params, fnDecl.Body, fnDecl.SourceText),
+                paramNames, _currentScope);
+            if (_evalDepth > 0)
+                _currentScope.DefineInVariableEnvEval(fnDecl.Id.Name, JsValue.FromFunction(func));
+            else
+                _currentScope.DefineInVariableEnv(fnDecl.Id.Name, JsValue.FromFunction(func));
+        }
         return JsValue.Undefined;
     }
 
@@ -2960,6 +2973,140 @@ public class JsInterpreter
             return JsValue.Undefined;
         }, "clearInterval", global: true);
 
+        // §15.5.4.11 String.prototype.replace with the full ES3
+        // GetSubstitution ($$ $& $` $' $n $nn) and FUNCTION replacements —
+        // must live interpreter-side so callbacks reach CallFunction
+        if (!BrowserRuntime.IsInternetExplorer3 && StringPrototype != null)
+        {
+            StringPrototype.Set("replace", Native((self, args) =>
+            {
+                if (args.Length < 2) return self;
+                var str = self.ToJsString();
+                bool isRegex = args[0].Type is (JsType.Object or JsType.Function) &&
+                               args[0].GetObjectOrFunction().Class == "RegExp";
+                bool fnReplace = args[1].Type == JsType.Function;
+                var replaceFn = fnReplace ? args[1].GetFunction() : null;
+                string replacement = fnReplace ? "" : args[1].ToJsString();
+
+                string GetSubstitution(System.Text.RegularExpressions.Match m, string s)
+                {
+                    if (fnReplace)
+                    {
+                        var callArgs = new List<JsValue> { JsValue.From(m.Value) };
+                        for (int g = 1; g < m.Groups.Count; g++)
+                            callArgs.Add(m.Groups[g].Success ? JsValue.From(m.Groups[g].Value) : JsValue.Undefined);
+                        callArgs.Add(JsValue.From(m.Index));
+                        callArgs.Add(JsValue.From(s));
+                        return CallFunction(replaceFn!, GlobalThis(), callArgs.ToArray()).ToJsString();
+                    }
+                    var sb = new System.Text.StringBuilder();
+                    int captures = m.Groups.Count - 1;
+                    for (int i = 0; i < replacement.Length; i++)
+                    {
+                        char c = replacement[i];
+                        if (c != '$' || i + 1 >= replacement.Length) { sb.Append(c); continue; }
+                        char n1 = replacement[i + 1];
+                        switch (n1)
+                        {
+                            case '$': sb.Append('$'); i++; break;
+                            case '&': sb.Append(m.Value); i++; break;
+                            case '`': sb.Append(s[..m.Index]); i++; break;
+                            case '\'': sb.Append(s[(m.Index + m.Length)..]); i++; break;
+                            default:
+                                if (char.IsDigit(n1))
+                                {
+                                    // two-digit group first; falls back to one
+                                    // digit when that group does not exist
+                                    if (i + 2 < replacement.Length && char.IsDigit(replacement[i + 2]))
+                                    {
+                                        int nn = (n1 - '0') * 10 + (replacement[i + 2] - '0');
+                                        if (nn >= 1 && nn <= captures)
+                                        {
+                                            sb.Append(m.Groups[nn].Success ? m.Groups[nn].Value : "");
+                                            i += 2;
+                                            continue;
+                                        }
+                                    }
+                                    int one = n1 - '0';
+                                    if (one >= 1 && one <= captures)
+                                    {
+                                        sb.Append(m.Groups[one].Success ? m.Groups[one].Value : "");
+                                        i++;
+                                        continue;
+                                    }
+                                    sb.Append('$');   // unknown group: literal $
+                                }
+                                else sb.Append('$');
+                                break;
+                        }
+                    }
+                    return sb.ToString();
+                }
+
+                if (isRegex)
+                {
+                    var (source, flags) = JsRuntime.RegexParts(args[0]);
+                    var regex = JsRuntime.CreateJsRegex(source, JsRuntime.RegexOptionsFor(flags));
+                    bool global = flags.Contains('g');
+                    var sb = new System.Text.StringBuilder();
+                    int last = 0, count = 0;
+                    for (var m = regex.Match(str); m.Success; m = m.NextMatch())
+                    {
+                        sb.Append(str[last..m.Index]).Append(GetSubstitution(m, str));
+                        last = m.Index + m.Length;
+                        // empty matches must advance or NextMatch loops forever
+                        if (m.Length == 0 && m.Index == last - 1) { }
+                        count++;
+                        if (!global) break;
+                        if (m.Length == 0 && last < str.Length)
+                        {
+                            // skip one char to make progress; keep the char
+                            sb.Append(str[last]);
+                            last++;
+                        }
+                        if (count > str.Length + 1) break;
+                    }
+                    sb.Append(str[last..]);
+                    return JsValue.From(sb.ToString());
+                }
+
+                var searchStr = args[0].ToJsString();
+                int index = str.IndexOf(searchStr, StringComparison.Ordinal);
+                if (index < 0) return self;
+                // string searchValue also passes through GetSubstitution with
+                // zero captures (§15.5.4.11) — $$ $& $` $' only; $n stays
+                // literal when there are no groups
+                string sub;
+                if (fnReplace)
+                {
+                    sub = CallFunction(replaceFn!, GlobalThis(), new[]
+                    {
+                        JsValue.From(searchStr), JsValue.From(index), JsValue.From(str)
+                    }).ToJsString();
+                }
+                else
+                {
+                    var sb2 = new System.Text.StringBuilder();
+                    for (int i = 0; i < replacement.Length; i++)
+                    {
+                        char c = replacement[i];
+                        if (c != '$' || i + 1 >= replacement.Length) { sb2.Append(c); continue; }
+                        switch (replacement[i + 1])
+                        {
+                            case '$': sb2.Append('$'); i++; break;
+                            case '&': sb2.Append(searchStr); i++; break;
+                            case '`': sb2.Append(str[..index]); i++; break;
+                            case '\'': sb2.Append(str[(index + searchStr.Length)..]); i++; break;
+                            default: sb2.Append('$'); break;
+                        }
+                    }
+                    sub = sb2.ToString();
+                }
+                return JsValue.From(
+                    str[..index] + sub + str[(index + searchStr.Length)..]);
+            }, "replace", length: 2));
+        }
+
         // Array callback helpers are later ECMAScript additions.
         if (!BrowserRuntime.IsInternetExplorer3 && ArrayPrototype != null)
         {
@@ -2994,7 +3141,7 @@ public class JsInterpreter
                         throw new JsTypeErrorException("array element toLocaleString is not a function");
                     parts.Add(CallFunction(m.GetFunction(), v, Array.Empty<JsValue>()).ToJsString());
                 }
-                return JsValue.From(string.Join(", ", parts));
+                return JsValue.From(string.Join(",", parts));
             }, "toLocaleString", length: 0));
         }
 
@@ -3066,13 +3213,19 @@ public class JsInterpreter
             defined[j + 1] = x;
         }
 
-        // write back: sorted defined values first, then the undefined tail
-        int di = 0;
-        for (int s = 0; s < slots.Count; s++)
+        // write back (§15.4.4.11 + regress-311515): the sorted defined
+        // values COMPACT to the lowest indices, explicit undefined values
+        // land at the very end (len-u…len-1), and every other previously
+        // filled slot becomes a hole
+        for (int i = 0; i < defined.Count; i++)
+            arr.Set(i.ToString(System.Globalization.CultureInfo.InvariantCulture), defined[i]);
+        for (int i = 0; i < undefs; i++)
+            arr.Set((len - undefs + i).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                JsValue.Undefined);
+        foreach (var slot in slots)
         {
-            long slot = slots[s];
-            var v = s < slots.Count - undefs ? defined[di++] : JsValue.Undefined;
-            arr.Set(slot.ToString(System.Globalization.CultureInfo.InvariantCulture), v);
+            if (slot < defined.Count || slot >= len - undefs) continue;
+            arr.Properties.Remove(slot.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
         return self;
     }

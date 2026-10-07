@@ -199,7 +199,7 @@ public class JsLexer
                 continue;
             }
 
-            if (c is ' ' or '\t' or '\f' or '\v' or '\u00A0' or '\uFEFF')
+            if (c is ' ' or '\t' or '\f' or '\v' or '\u00A0' or '\uFEFF' or '\uFFFE' or '\uFFFF')
             {
                 _pos++;
                 _column++;
@@ -626,6 +626,7 @@ public class JsLexer
 
         var patternSb = new StringBuilder();
         bool inClass = false;
+        bool closed = false;
         while (_pos < _source.Length)
         {
             char c = _source[_pos];
@@ -636,6 +637,7 @@ public class JsLexer
             {
                 _pos++;
                 _column++;
+                closed = true;
                 break;
             }
 
@@ -662,6 +664,13 @@ public class JsLexer
             _pos++;
             _column++;
         }
+
+        // regress-173067: running off the end inside a character class must
+        // be a SyntaxError, not a silently truncated pattern
+        if (!closed)
+            throw new JsLexerException(inClass
+                ? "unterminated character class"
+                : "Unterminated regex literal");
 
         var flagsSb = new StringBuilder();
         while (_pos < _source.Length && char.IsLetter(_source[_pos]))
