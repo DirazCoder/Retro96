@@ -52,6 +52,11 @@ public static class JsRuntime
                               Func<JsValue, JsValue[], JsValue> impl) =>
         JsValue.FromFunction(new JsFunction(impl, scope, name));
 
+    /// <summary>Builtin with an explicit Function.length (ECMA-262 §15).</summary>
+    private static JsValue Fn(JsScope scope, string name, int length,
+                              Func<JsValue, JsValue[], JsValue> impl) =>
+        JsValue.FromFunction(new JsFunction(impl, scope, name, length: length));
+
     private static double Num(JsValue v) => v.ToNumber();
     private static string Str(JsValue v) => v.ToJsString();
     private static double Arg(JsValue[] a, int i) => i < a.Length ? a[i].ToNumber() : double.NaN;
@@ -1123,67 +1128,201 @@ public static class JsRuntime
 
     private static double MsOf(JsValue self)
     {
+        // §15.9.5: the Date.prototype functions require a receiver whose
+        // [[Class]] is "Date"; Date.prototype itself qualifies (value NaN).
         if (self.Type is (JsType.Object or JsType.Function) &&
-            self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } v)
-            return v.GetNumber();
-        return double.NaN;
+            self.GetObjectOrFunction().Class == "Date")
+        {
+            return self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } v
+                ? v.GetNumber()
+                : double.NaN;
+        }
+        throw new JsTypeErrorException("Date.prototype method called on a non-Date object");
     }
 
-    private static DateTime LocalOf(JsValue self)
-        => Epoch.AddMilliseconds(MsOf(self)).ToLocalTime();
+    // ── ECMA-262 §15.9.1 date-time arithmetic (pure double, overflow-safe) ──
+    // The old implementation stored dates as .NET DateTime, which cannot
+    // represent the full ES3 time range ±8.64e15 ms (§15.9.1.1) nor NaN,
+    // so pre-1970/late dates and (new Date(NaN)).getX() crashed the engine.
+    // Everything below works on the raw millisecond time value instead.
 
-    private static DateTime UtcOf(JsValue self)
-        => Epoch.AddMilliseconds(MsOf(self));
+    private const double MsPerSecond = 1000.0;
+    private const double MsPerMinute = 60_000.0;
+    private const double MsPerHour   = 3_600_000.0;
+    private const double MsPerDay    = 86_400_000.0;
+    private const double TimeClipLimit = 8_640_000_000_000_000.0; // §15.9.1.1
 
-    /// <summary>
-    /// Shared implementation of the ES3 Date setters: reads the current local
-    /// time, replaces the components whose argument index was supplied (the
-    /// others keep their current values), writes the new epoch-ms back onto
-    /// the Date object and returns the new time value. ECMAScript's
-    /// month/day/hour overflow is preserved by building from DateTime(1,1)
-    /// and adding the raw component deltas.
-    /// </summary>
-    private static double SetDateParts(JsValue self, JsValue[] args,
-        int year = -1, int month = -1, int day = -1,
-        int hour = -1, int minute = -1, int second = -1, int milli = -1)
+    private static readonly double[] DaysBeforeMonth =
+        { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    private static readonly double[] DaysBeforeMonthLeap =
+        { 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335 };
+
+    private static readonly string[] DateDayNames =
+        { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    private static readonly string[] DateMonthNames =
+        { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    /// <summary>JS-style remainder: result always in [0, n) for n &gt; 0.</summary>
+    private static double PosMod(double v, double n)
     {
-        double ms = MsOf(self);
-        if (double.IsNaN(ms)) return double.NaN;
+        double r = v % n;
+        return r < 0 ? r + n : r;
+    }
 
-        var current = Epoch.AddMilliseconds(ms).ToLocalTime();
+    /// <summary>ECMA-262 §9.4 ToInteger: NaN → 0, truncate toward zero.</summary>
+    private static double ToIntegerD(double x)
+    {
+        if (double.IsNaN(x)) return 0;
+        if (double.IsInfinity(x)) return x;
+        return Math.Truncate(x);
+    }
 
-        int ArgAt(int index) =>
-            index >= 0 && index < args.Length ? (int)args[index].ToNumber() : int.MinValue;
+    // §15.9.1.2 Day Number and Time within Day
+    private static double Day(double t) => Math.Floor(t / MsPerDay);
+    private static double TimeWithinDay(double t) => PosMod(t, MsPerDay);
 
-        int yv = ArgAt(year);
-        int y = yv != int.MinValue ? yv : current.Year;
-        if (yv != int.MinValue && y >= 0 && y <= 99) y += 1900;   // era two-digit rule
-        int mo = ArgAt(month); if (mo == int.MinValue) mo = current.Month - 1;
-        int d  = ArgAt(day);   if (d  == int.MinValue) d  = current.Day;
-        int h  = ArgAt(hour);  if (h  == int.MinValue) h  = current.Hour;
-        int mi = ArgAt(minute); if (mi == int.MinValue) mi = current.Minute;
-        int se = ArgAt(second); if (se == int.MinValue) se = current.Second;
-        int ml = ArgAt(milli); if (ml == int.MinValue) ml = current.Millisecond;
+    // §15.9.1.3 Year Number
+    private static double DaysInYear(double y)
+        => (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 366 : 365;
+    private static double DayFromYear(double y)
+        => 365 * (y - 1970)
+         + Math.Floor((y - 1969) / 4.0)
+         - Math.Floor((y - 1901) / 100.0)
+         + Math.Floor((y - 1601) / 400.0);
+    private static double TimeFromYear(double y) => MsPerDay * DayFromYear(y);
+    private static double YearFromTime(double t)
+    {
+        if (double.IsNaN(t) || double.IsInfinity(t)) return double.NaN;
+        double d = Day(t);
+        double y = Math.Floor(d / 365.2425) + 1970;   // seed estimate, then adjust
+        while (DayFromYear(y) > d) y -= 1;
+        while (DayFromYear(y + 1) <= d) y += 1;
+        return y;
+    }
 
-        double newMs;
+    // §15.9.1.4 Month Number / §15.9.1.5 Date Number
+    private static double DayWithinYear(double t)
+        => Day(t) - DayFromYear(YearFromTime(t));
+    private static double MonthFromTime(double t)
+    {
+        if (double.IsNaN(t)) return double.NaN;
+        double d = DayWithinYear(t);
+        var table = DaysInYear(YearFromTime(t)) == 366 ? DaysBeforeMonthLeap : DaysBeforeMonth;
+        for (int m = 11; m >= 0; m--)
+            if (d >= table[m]) return m;
+        return 0;
+    }
+    private static double DateFromTime(double t)
+    {
+        if (double.IsNaN(t)) return double.NaN;
+        var table = DaysInYear(YearFromTime(t)) == 366 ? DaysBeforeMonthLeap : DaysBeforeMonth;
+        return DayWithinYear(t) - table[(int)MonthFromTime(t)] + 1;
+    }
+
+    // §15.9.1.6 Week Day / time-of-day fields
+    private static double WeekDay(double t) =>
+        double.IsNaN(t) ? double.NaN : PosMod(Day(t) + 4, 7);   // 1970-01-01 was a Thursday
+    private static double HourFromTime(double t) =>
+        double.IsNaN(t) ? double.NaN : PosMod(Math.Floor(t / MsPerHour), 24);
+    private static double MinFromTime(double t) =>
+        double.IsNaN(t) ? double.NaN : PosMod(Math.Floor(t / MsPerMinute), 60);
+    private static double SecFromTime(double t) =>
+        double.IsNaN(t) ? double.NaN : PosMod(Math.Floor(t / MsPerSecond), 60);
+    private static double MsFromTime(double t) =>
+        double.IsNaN(t) ? double.NaN : PosMod(t, MsPerSecond);
+
+    // §15.9.1.7/§15.9.1.8 local ↔ UTC conversion through the host zone.
+    // DaylightSavingTA is folded into the zone lookup (offset at instant);
+    // for wall-clock → UTC the probe is treated as a local wall time.
+    private static double UtcOffsetAt(double t, bool treatAsLocalWall)
+    {
+        if (double.IsNaN(t) || double.IsInfinity(t)) return 0;
+        double clamped = Math.Clamp(t, -62_135_596_800_000.0, 253_402_300_799_999.0);
         try
         {
-            var rebuilt = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Local)
-                .AddYears(y - 1)
-                .AddMonths(mo)
-                .AddDays(d - 1)
-                .AddHours(h)
-                .AddMinutes(mi)
-                .AddSeconds(se)
-                .AddMilliseconds(ml);
-            newMs = (rebuilt.ToUniversalTime() - Epoch).TotalMilliseconds;
+            var probe = Epoch.AddMilliseconds(clamped);
+            var wall = treatAsLocalWall
+                ? DateTime.SpecifyKind(probe, DateTimeKind.Unspecified)
+                : probe;
+            return TimeZoneInfo.Local.GetUtcOffset(wall).TotalMilliseconds;
         }
-        catch { return double.NaN; }
-
-        if (self.Type is (JsType.Object or JsType.Function))
-            self.GetObjectOrFunction().Set("value", JsValue.From(newMs));
-        return newMs;
+        catch { return 0; }
     }
+    private static double LocalTime(double t) => t + UtcOffsetAt(t, treatAsLocalWall: false);
+    private static double UtcFromLocal(double t) => t - UtcOffsetAt(t, treatAsLocalWall: true);
+
+    // §15.9.1.9 MakeTime
+    private static double MakeTime(double hour, double min, double sec, double ms)
+    {
+        if (double.IsNaN(hour) || double.IsNaN(min) || double.IsNaN(sec) || double.IsNaN(ms))
+            return double.NaN;
+        double h = ToIntegerD(hour), m = ToIntegerD(min),
+               s = ToIntegerD(sec), milli = ToIntegerD(ms);
+        if (double.IsNaN(h + m + s + milli)) return double.NaN;  // ∞ + (−∞) guard
+        return ((h * 60 + m) * 60 + s) * 1000 + milli;
+    }
+    // §15.9.1.10 MakeDay
+    private static double MakeDay(double year, double month, double date)
+    {
+        if (double.IsNaN(year) || double.IsNaN(month) || double.IsNaN(date))
+            return double.NaN;
+        double y = ToIntegerD(year), m = ToIntegerD(month), d = ToIntegerD(date);
+        if (double.IsNaN(y + m + d)) return double.NaN;
+        double ym = y + Math.Floor(m / 12);
+        double mn = PosMod(m, 12);
+        var table = DaysInYear(ym) == 366 ? DaysBeforeMonthLeap : DaysBeforeMonth;
+        return DayFromYear(ym) + table[(int)mn] + (d - 1);
+    }
+    // §15.9.1.11 MakeDate / §15.9.1.12 TimeClip
+    private static double MakeDate(double day, double time) => day * MsPerDay + time;
+    private static double TimeClip(double t)
+    {
+        if (double.IsNaN(t) || Math.Abs(t) > TimeClipLimit) return double.NaN;
+        // The era engines store integral milliseconds — the suite expects
+        // e.g. setTime(…441.6572) → …441, so clip to ToInteger as well.
+        return ToIntegerD(t);
+    }
+
+    /// <summary>Writes a (already TimeClip'd) time value and returns it.</summary>
+    private static JsValue StoreTime(JsValue self, double u)
+    {
+        if (self.Type is (JsType.Object or JsType.Function) &&
+            self.GetObjectOrFunction().Class == "Date")
+        {
+            self.GetObjectOrFunction().Set("value", JsValue.From(u));
+            return JsValue.From(u);
+        }
+        throw new JsTypeErrorException("Date.prototype method called on a non-Date object");
+    }
+
+    // Era display format for the Date string family (NN4 personality):
+    // "Mon Sep 17 14:23:11 1996", day zero-padded — kept byte-identical,
+    // but computed from the raw components so extreme years can't overflow.
+    private static string DateYearString(double y)
+    {
+        if (y >= 0 && y <= 9999)
+            return ((long)y).ToString("0000", CultureInfo.InvariantCulture);
+        if (y > 9999) return "+" + (long)y;
+        return "-" + ((long)(-y)).ToString("0000", CultureInfo.InvariantCulture);
+    }
+    private static string TwoDigits(double v)
+        => ((long)v).ToString("00", CultureInfo.InvariantCulture);
+    private static string DateToStringStyle(double localMs, bool utcStyle)
+    {
+        double y = YearFromTime(localMs), mo = MonthFromTime(localMs),
+               d = DateFromTime(localMs), h = HourFromTime(localMs),
+               mi = MinFromTime(localMs), s = SecFromTime(localMs);
+        string day = DateDayNames[(int)WeekDay(localMs)];
+        string mon = DateMonthNames[(int)mo];
+        string core = $"{TwoDigits(h)}:{TwoDigits(mi)}:{TwoDigits(s)}";
+        if (utcStyle)
+            return $"{day}, {TwoDigits(d)} {mon} {DateYearString(y)} {core} GMT";
+        return $"{day} {mon} {TwoDigits(d)} {core} {DateYearString(y)}";
+    }
+    private static string DateDatePart(double localMs) =>
+        $"{DateDayNames[(int)WeekDay(localMs)]} {DateMonthNames[(int)MonthFromTime(localMs)]} " +
+        $"{TwoDigits(DateFromTime(localMs))} {DateYearString(YearFromTime(localMs))}";
 
     private static void RegisterDate(JsScope scope, JsObject objectProto)
     {
@@ -1192,101 +1331,187 @@ public static class JsRuntime
         dateProto.Set("getTime", Fn(scope, "getTime", (self, args) => JsValue.From(MsOf(self))));
         dateProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => JsValue.From(MsOf(self))));
 
-        dateProto.Set("getFullYear", Fn(scope, "getFullYear", (s, a) => JsValue.From(LocalOf(s).Year)));
-        dateProto.Set("getMonth",    Fn(scope, "getMonth",    (s, a) => JsValue.From(LocalOf(s).Month - 1)));
-        dateProto.Set("getDate",     Fn(scope, "getDate",     (s, a) => JsValue.From(LocalOf(s).Day)));
-        dateProto.Set("getDay",      Fn(scope, "getDay",      (s, a) => JsValue.From((int)LocalOf(s).DayOfWeek)));
-        dateProto.Set("getHours",   Fn(scope, "getHours",    (s, a) => JsValue.From(LocalOf(s).Hour)));
-        dateProto.Set("getMinutes",  Fn(scope, "getMinutes",  (s, a) => JsValue.From(LocalOf(s).Minute)));
-        dateProto.Set("getSeconds",  Fn(scope, "getSeconds",  (s, a) => JsValue.From(LocalOf(s).Second)));
-        dateProto.Set("getMilliseconds", Fn(scope, "getMilliseconds", (s, a) => JsValue.From(LocalOf(s).Millisecond)));
+        // ── local getters (§15.9.5): NaN time value ⇒ NaN for every field ──
+        dateProto.Set("getFullYear",     Fn(scope, "getFullYear",     (s, a) => JsValue.From(YearFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getMonth",        Fn(scope, "getMonth",        (s, a) => JsValue.From(MonthFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getDate",         Fn(scope, "getDate",         (s, a) => JsValue.From(DateFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getDay",          Fn(scope, "getDay",          (s, a) => JsValue.From(WeekDay(LocalTime(MsOf(s))))));
+        dateProto.Set("getHours",        Fn(scope, "getHours",        (s, a) => JsValue.From(HourFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getMinutes",      Fn(scope, "getMinutes",      (s, a) => JsValue.From(MinFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getSeconds",      Fn(scope, "getSeconds",      (s, a) => JsValue.From(SecFromTime(LocalTime(MsOf(s))))));
+        dateProto.Set("getMilliseconds", Fn(scope, "getMilliseconds", (s, a) => JsValue.From(MsFromTime(LocalTime(MsOf(s))))));
         dateProto.Set("getTimezoneOffset", Fn(scope, "getTimezoneOffset", (s, a) =>
-            JsValue.From(-TimeZoneInfo.Local.GetUtcOffset(LocalOf(s)).TotalMinutes)));
+            JsValue.From((MsOf(s) - LocalTime(MsOf(s))) / MsPerMinute)));
 
-        // getYear — the era's method: year minus 1900
+        // getYear — the era's method: year minus 1900 (Annex B.2.5 behaviour)
         dateProto.Set("getYear", Fn(scope, "getYear", (s, a) =>
-            JsValue.From(LocalOf(s).Year - 1900)));
+            JsValue.From(YearFromTime(LocalTime(MsOf(s))) - 1900)));
 
-        // ── UTC getters (JScript 5 / JavaScript 1.3, ES3) ──
-        dateProto.Set("getUTCFullYear",   Fn(scope, "getUTCFullYear",   (s, a) => JsValue.From(UtcOf(s).Year)));
-        dateProto.Set("getUTCMonth",      Fn(scope, "getUTCMonth",      (s, a) => JsValue.From(UtcOf(s).Month - 1)));
-        dateProto.Set("getUTCDate",       Fn(scope, "getUTCDate",       (s, a) => JsValue.From(UtcOf(s).Day)));
-        dateProto.Set("getUTCDay",        Fn(scope, "getUTCDay",        (s, a) => JsValue.From((int)UtcOf(s).DayOfWeek)));
-        dateProto.Set("getUTCHours",      Fn(scope, "getUTCHours",      (s, a) => JsValue.From(UtcOf(s).Hour)));
-        dateProto.Set("getUTCMinutes",    Fn(scope, "getUTCMinutes",    (s, a) => JsValue.From(UtcOf(s).Minute)));
-        dateProto.Set("getUTCSeconds",    Fn(scope, "getUTCSeconds",    (s, a) => JsValue.From(UtcOf(s).Second)));
-        dateProto.Set("getUTCMilliseconds", Fn(scope, "getUTCMilliseconds", (s, a) => JsValue.From(UtcOf(s).Millisecond)));
+        // ── UTC getters ──
+        dateProto.Set("getUTCFullYear",     Fn(scope, "getUTCFullYear",     (s, a) => JsValue.From(YearFromTime(MsOf(s)))));
+        dateProto.Set("getUTCMonth",        Fn(scope, "getUTCMonth",        (s, a) => JsValue.From(MonthFromTime(MsOf(s)))));
+        dateProto.Set("getUTCDate",         Fn(scope, "getUTCDate",         (s, a) => JsValue.From(DateFromTime(MsOf(s)))));
+        dateProto.Set("getUTCDay",          Fn(scope, "getUTCDay",          (s, a) => JsValue.From(WeekDay(MsOf(s)))));
+        dateProto.Set("getUTCHours",        Fn(scope, "getUTCHours",        (s, a) => JsValue.From(HourFromTime(MsOf(s)))));
+        dateProto.Set("getUTCMinutes",      Fn(scope, "getUTCMinutes",      (s, a) => JsValue.From(MinFromTime(MsOf(s)))));
+        dateProto.Set("getUTCSeconds",      Fn(scope, "getUTCSeconds",      (s, a) => JsValue.From(SecFromTime(MsOf(s)))));
+        dateProto.Set("getUTCMilliseconds", Fn(scope, "getUTCMilliseconds", (s, a) => JsValue.From(MsFromTime(MsOf(s)))));
 
-        // ── Local setters (ES3 / JScript 5 — Y2K remediation surface) ──
-        dateProto.Set("setFullYear", Fn(scope, "setFullYear", (self, args) =>
-            JsValue.From(SetDateParts(self, args,
-                year: 0, month: 1, day: 2))));
-        dateProto.Set("setMonth", Fn(scope, "setMonth", (self, args) =>
-            JsValue.From(SetDateParts(self, args, month: 0, day: 1))));
-        dateProto.Set("setDate", Fn(scope, "setDate", (self, args) =>
-            JsValue.From(SetDateParts(self, args, day: 0))));
-        dateProto.Set("setHours", Fn(scope, "setHours", (self, args) =>
-            JsValue.From(SetDateParts(self, args, hour: 0, minute: 1, second: 2, milli: 3))));
-        dateProto.Set("setMinutes", Fn(scope, "setMinutes", (self, args) =>
-            JsValue.From(SetDateParts(self, args, minute: 0, second: 1, milli: 2))));
-        dateProto.Set("setSeconds", Fn(scope, "setSeconds", (self, args) =>
-            JsValue.From(SetDateParts(self, args, second: 0, milli: 1))));
-        dateProto.Set("setMilliseconds", Fn(scope, "setMilliseconds", (self, args) =>
-            JsValue.From(SetDateParts(self, args, milli: 0))));
+        // ── setters (§15.9.5): build via MakeTime/MakeDay, TimeClip, store.
+        // Function.length mirrors the §15.9.5 signatures (setSeconds(sec, ms) → 2 …).
+        dateProto.Set("setTime", Fn(scope, "setTime", 1, (self, args) =>
+            StoreTime(self, TimeClip(Arg(args, 0)))));
 
+        dateProto.Set("setMilliseconds", Fn(scope, "setMilliseconds", 1, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double time = MakeTime(HourFromTime(t), MinFromTime(t), SecFromTime(t), Arg(args, 0));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(Day(t), time))));
+        }));
+        dateProto.Set("setSeconds", Fn(scope, "setSeconds", 2, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double time = MakeTime(HourFromTime(t), MinFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(Day(t), time))));
+        }));
+        dateProto.Set("setMinutes", Fn(scope, "setMinutes", 3, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double time = MakeTime(HourFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : SecFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(Day(t), time))));
+        }));
+        dateProto.Set("setHours", Fn(scope, "setHours", 4, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double time = MakeTime(Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MinFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : SecFromTime(t),
+                args.Length > 3 ? args[3].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(Day(t), time))));
+        }));
+        dateProto.Set("setDate", Fn(scope, "setDate", 1, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double day = MakeDay(YearFromTime(t), MonthFromTime(t), Arg(args, 0));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(day, TimeWithinDay(t)))));
+        }));
+        dateProto.Set("setMonth", Fn(scope, "setMonth", 2, (self, args) =>
+        {
+            double t = LocalTime(MsOf(self));
+            double day = MakeDay(YearFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : DateFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(day, TimeWithinDay(t)))));
+        }));
+        // setFullYear treats a NaN date as +0 before reading the month/date
+        // defaults (the two-digit rule deliberately does NOT apply here).
+        dateProto.Set("setFullYear", Fn(scope, "setFullYear", 3, (self, args) =>
+        {
+            double tv = MsOf(self);
+            double t = double.IsNaN(tv) ? LocalTime(0) : LocalTime(tv);
+            double day = MakeDay(Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MonthFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : DateFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(day, TimeWithinDay(t)))));
+        }));
+
+        // ── UTC setters (§15.9.5): same arithmetic in UTC space ──
+        dateProto.Set("setUTCMilliseconds", Fn(scope, "setUTCMilliseconds", 1, (self, args) =>
+        {
+            double t = MsOf(self);
+            double time = MakeTime(HourFromTime(t), MinFromTime(t), SecFromTime(t), Arg(args, 0));
+            return StoreTime(self, TimeClip(MakeDate(Day(t), time)));
+        }));
+        dateProto.Set("setUTCSeconds", Fn(scope, "setUTCSeconds", 2, (self, args) =>
+        {
+            double t = MsOf(self);
+            double time = MakeTime(HourFromTime(t), MinFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(MakeDate(Day(t), time)));
+        }));
+        dateProto.Set("setUTCMinutes", Fn(scope, "setUTCMinutes", 3, (self, args) =>
+        {
+            double t = MsOf(self);
+            double time = MakeTime(HourFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : SecFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(MakeDate(Day(t), time)));
+        }));
+        dateProto.Set("setUTCHours", Fn(scope, "setUTCHours", 4, (self, args) =>
+        {
+            double t = MsOf(self);
+            double time = MakeTime(Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MinFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : SecFromTime(t),
+                args.Length > 3 ? args[3].ToNumber() : MsFromTime(t));
+            return StoreTime(self, TimeClip(MakeDate(Day(t), time)));
+        }));
+        dateProto.Set("setUTCDate", Fn(scope, "setUTCDate", 1, (self, args) =>
+        {
+            double t = MsOf(self);
+            double day = MakeDay(YearFromTime(t), MonthFromTime(t), Arg(args, 0));
+            return StoreTime(self, TimeClip(MakeDate(day, TimeWithinDay(t))));
+        }));
+        dateProto.Set("setUTCMonth", Fn(scope, "setUTCMonth", 2, (self, args) =>
+        {
+            double t = MsOf(self);
+            double day = MakeDay(YearFromTime(t), Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : DateFromTime(t));
+            return StoreTime(self, TimeClip(MakeDate(day, TimeWithinDay(t))));
+        }));
+        dateProto.Set("setUTCFullYear", Fn(scope, "setUTCFullYear", 3, (self, args) =>
+        {
+            double t = MsOf(self);
+            if (double.IsNaN(t)) t = 0;
+            double day = MakeDay(Arg(args, 0),
+                args.Length > 1 ? args[1].ToNumber() : MonthFromTime(t),
+                args.Length > 2 ? args[2].ToNumber() : DateFromTime(t));
+            return StoreTime(self, TimeClip(MakeDate(day, TimeWithinDay(t))));
+        }));
+
+        // ── string family (implementation-defined format; era NN4 layout) ──
+        dateProto.Set("toString", Fn(scope, "toString", (s, a) =>
+        {
+            double ms = MsOf(s);
+            return JsValue.From(double.IsNaN(ms) ? "Invalid Date"
+                : DateToStringStyle(LocalTime(ms), utcStyle: false));
+        }));
         dateProto.Set("toDateString", Fn(scope, "toDateString", (s, a) =>
         {
             double ms = MsOf(s);
-            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            // ECMAScript-ish "Fri Mar 05 1999"
-            return JsValue.From(LocalOf(s).ToString(
-                "ddd MMM dd yyyy", CultureInfo.InvariantCulture));
+            return JsValue.From(double.IsNaN(ms) ? "Invalid Date"
+                : DateDatePart(LocalTime(ms)));
         }));
-
         dateProto.Set("toTimeString", Fn(scope, "toTimeString", (s, a) =>
         {
             double ms = MsOf(s);
             if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            var local = LocalOf(s);
-            var offset = TimeZoneInfo.Local.GetUtcOffset(local);
-            string sign = offset < TimeSpan.Zero ? "-" : "+";
-            var abs = offset < TimeSpan.Zero ? -offset : offset;
-            string off = $"{sign}{abs.Hours:00}{abs.Minutes:00}";
-            return JsValue.From(local.ToString(
-                "HH:mm:ss", CultureInfo.InvariantCulture) + " GMT" + off);
+            double local = LocalTime(ms);
+            double off = local - ms;   // LocalTZA + DST in ms
+            string sign = off < 0 ? "-" : "+";
+            double abs = Math.Abs(off);
+            return JsValue.From(
+                $"{TwoDigits(HourFromTime(local))}:{TwoDigits(MinFromTime(local))}:" +
+                $"{TwoDigits(SecFromTime(local))} GMT{sign}" +
+                $"{TwoDigits(Math.Floor(abs / MsPerHour))}" +
+                $"{TwoDigits(PosMod(Math.Floor(abs / MsPerMinute), 60))}");
         }));
-
-
-        dateProto.Set("setTime", Fn(scope, "setTime", (self, args) =>
-        {
-            double ms = Arg(args, 0);
-            if (self.Type is (JsType.Object or JsType.Function))
-                self.GetObjectOrFunction().Set("value", JsValue.From(ms));
-            return JsValue.From(ms);
-        }));
-
-        dateProto.Set("toString", Fn(scope, "toString", (s, a) =>
-        {
-            double ms = MsOf(s);
-            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            // Navigator format: "Mon Sep 17 14:23:11 1996"
-            return JsValue.From(LocalOf(s).ToString(
-                "ddd MMM dd HH:mm:ss yyyy", CultureInfo.InvariantCulture));
-        }));
-
         dateProto.Set("toLocaleString", Fn(scope, "toLocaleString", (s, a) =>
         {
             double ms = MsOf(s);
             if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            return JsValue.From(LocalOf(s).ToString(CultureInfo.CurrentCulture));
+            try { return JsValue.From(Epoch.AddMilliseconds(
+                    Math.Clamp(LocalTime(ms), -62_135_596_800_000.0, 253_402_300_799_999.0))
+                .ToString(CultureInfo.CurrentCulture)); }
+            catch { return JsValue.From("Invalid Date"); }
         }));
-
         var toUtcString = Fn(scope, "toUTCString", (s, a) =>
         {
             double ms = MsOf(s);
-            if (double.IsNaN(ms)) return JsValue.From("Invalid Date");
-            return JsValue.From(Epoch.AddMilliseconds(ms).ToString(
-                "ddd, dd MMM yyyy HH:mm:ss 'GMT'", CultureInfo.InvariantCulture));
+            return JsValue.From(double.IsNaN(ms) ? "Invalid Date"
+                : DateToStringStyle(ms, utcStyle: true));
         });
         dateProto.Set("toUTCString", toUtcString);
         dateProto.Set("toGMTString", toUtcString);
@@ -1296,51 +1521,51 @@ public static class JsRuntime
             double ms;
             if (args.Length == 0)
             {
-                ms = (DateTime.UtcNow - Epoch).TotalMilliseconds;
+                // The era clocks report integral milliseconds; the suite's
+                // TIME_NOW-based expectations assume new Date() is integral.
+                ms = Math.Truncate((DateTime.UtcNow - Epoch).TotalMilliseconds);
             }
             else if (args.Length == 1)
             {
                 if (args[0].Type == JsType.Number)
                 {
-                    ms = args[0].GetNumber();
+                    // §15.9.3.2: numeric argument — raw ms, clipped to the
+                    // ES3 time range (Infinity/out-of-range becomes NaN).
+                    ms = TimeClip(args[0].GetNumber());
                 }
-                else
+                else if (args[0].Type == JsType.String)
                 {
                     // Era date-string parsing: "Mon Sep 17 14:23:11 1996" and
                     // "9/17/96" styles — try common formats, fall back to
                     // DateTime.TryParse, then NaN (Invalid Date)
                     var s = args[0].ToJsString().Trim();
                     ms = TryParseEraDate(s, out var d)
-                        ? (d.ToUniversalTime() - Epoch).TotalMilliseconds
+                        ? TimeClip((d.ToUniversalTime() - Epoch).TotalMilliseconds)
                         : double.NaN;
+                }
+                else
+                {
+                    // §15.9.3.2: any other type — ToNumber first (so
+                    // new Date(true) → 1 ms).
+                    ms = TimeClip(args[0].ToNumber());
                 }
             }
             else
             {
-                int year = (int)Arg(args, 0);
+                // §15.9.3.1: components are local time; month/day/hour overflow
+                // is normalized by MakeTime/MakeDay (§15.9.1).
+                double year = args[0].ToNumber();
                 // Two-digit years are 19xx — era scripts wrote new Date(96, 8, 17)
-                if (year >= 0 && year <= 99) year += 1900;
-                int month = args.Length > 1 ? (int)args[1].ToNumber() : 0;
-                int day = args.Length > 2 ? (int)args[2].ToNumber() : 1;
-                int hour = args.Length > 3 ? (int)args[3].ToNumber() : 0;
-                int minute = args.Length > 4 ? (int)args[4].ToNumber() : 0;
-                int second = args.Length > 5 ? (int)args[5].ToNumber() : 0;
-                int millisecond = args.Length > 6 ? (int)args[6].ToNumber() : 0;
-                try
-                {
-                    // ECMAScript normalizes month/day overflow (e.g. month 12
-                    // becomes January of the following year) rather than
-                    // treating it as an invalid Date.
-                    var d = new DateTime(year, 1, 1, 0, 0, 0, DateTimeKind.Local)
-                        .AddMonths(month)
-                        .AddDays(day - 1)
-                        .AddHours(hour)
-                        .AddMinutes(minute)
-                        .AddSeconds(second)
-                        .AddMilliseconds(millisecond);
-                    ms = (d.ToUniversalTime() - Epoch).TotalMilliseconds;
-                }
-                catch { ms = double.NaN; }
+                if (year is >= 0 and <= 99) year += 1900;
+                double month = args[1].ToNumber();
+                double day   = args.Length > 2 ? args[2].ToNumber() : 1;
+                double hour  = args.Length > 3 ? args[3].ToNumber() : 0;
+                double minute = args.Length > 4 ? args[4].ToNumber() : 0;
+                double second = args.Length > 5 ? args[5].ToNumber() : 0;
+                double milli  = args.Length > 6 ? args[6].ToNumber() : 0;
+                ms = TimeClip(UtcFromLocal(MakeDate(
+                    MakeDay(year, month, day),
+                    MakeTime(hour, minute, second, milli))));
             }
 
             // Genuine `new Date(...)` only mutates self. A plain Date() call
@@ -1357,13 +1582,15 @@ public static class JsRuntime
                 return self;
             }
 
-            var now = (DateTime.UtcNow - Epoch).TotalMilliseconds;
+            var now = Math.Truncate((DateTime.UtcNow - Epoch).TotalMilliseconds);
             return JsValue.From(
                 Epoch.AddMilliseconds(now).ToLocalTime().ToString(
                     "ddd MMM dd HH:mm:ss yyyy", CultureInfo.InvariantCulture));
-        }, scope, "Date");
+        }, scope, "Date", length: 7);
 
         dateCtor.Set("prototype", JsValue.FromObject(dateProto));
+        // §15.9.5.1: Date.prototype.constructor is the Date constructor.
+        dateProto.Set("constructor", JsValue.FromFunction(dateCtor));
 
         // Date.parse(string) → ms
         dateCtor.Set("parse", JsValue.FromFunction(new JsFunction((self, args) =>
@@ -1376,42 +1603,38 @@ public static class JsRuntime
 
         dateCtor.Set("UTC", JsValue.FromFunction(new JsFunction((self, args) =>
         {
+            // §15.9.4.3: components are UTC; the two-digit rule applies to
+            // the year only. NaN components make the result NaN.
             if (args.Length == 0)
                 return JsValue.From(double.NaN);
 
-            double yearValue = args[0].ToNumber();
-            if (double.IsNaN(yearValue) || double.IsInfinity(yearValue))
-                return JsValue.From(double.NaN);
-            int year = (int)yearValue;
+            double year = args[0].ToNumber();
             if (year is >= 0 and <= 99) year += 1900;
-            int month = args.Length > 1 ? ToIntSafe(args[1]) : 0;
-            int day = args.Length > 2 ? ToIntSafe(args[2]) : 1;
-            int hour = args.Length > 3 ? ToIntSafe(args[3]) : 0;
-            int minute = args.Length > 4 ? ToIntSafe(args[4]) : 0;
-            int second = args.Length > 5 ? ToIntSafe(args[5]) : 0;
-            int millisecond = args.Length > 6 ? ToIntSafe(args[6]) : 0;
-            try
-            {
-                var utc = new DateTime(year, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                    .AddMonths(month)
-                    .AddDays(day - 1)
-                    .AddHours(hour)
-                    .AddMinutes(minute)
-                    .AddSeconds(second)
-                    .AddMilliseconds(millisecond);
-                return JsValue.From((utc - Epoch).TotalMilliseconds);
-            }
-            catch (ArgumentOutOfRangeException)
-            {
-                return JsValue.From(double.NaN);
-            }
-        }, scope, "UTC")));
+            double month = args.Length > 1 ? args[1].ToNumber() : 0;
+            double day   = args.Length > 2 ? args[2].ToNumber() : 1;
+            double hour  = args.Length > 3 ? args[3].ToNumber() : 0;
+            double minute = args.Length > 4 ? args[4].ToNumber() : 0;
+            double second = args.Length > 5 ? args[5].ToNumber() : 0;
+            double milli  = args.Length > 6 ? args[6].ToNumber() : 0;
+            return JsValue.From(TimeClip(MakeDate(
+                MakeDay(year, month, day),
+                MakeTime(hour, minute, second, milli))));
+        }, scope, "UTC", length: 7)));
 
         scope.Define("Date", JsValue.FromFunction(dateCtor));
     }
 
     private static bool TryParseEraDate(string s, out DateTime date)
     {
+        date = default;
+        // "13:30 AM" / "13:30 PM" are invalid 12-hour clock readings —
+        // .NET's lenient TryParse swallows the meridian, so pre-check them
+        // (the suite requires these to produce an Invalid Date).
+        var meridian = System.Text.RegularExpressions.Regex.Match(
+            s, "(?<!\\d)([0-9]{1,2})\\s*[:.]\\s*[0-9]{2}\\s*([AaPp])\\.?\\s*[Mm]");
+        if (meridian.Success && int.Parse(meridian.Groups[1].Value) > 12)
+            return false;
+
         // Navigator's toString format first
         if (DateTime.TryParseExact(s, "ddd MMM dd HH:mm:ss yyyy",
                 CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
