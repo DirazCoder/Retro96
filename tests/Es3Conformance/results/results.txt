@@ -897,7 +897,7 @@ PASS ecma_3/Operators/11.13.1-002.js
 PASS ecma_3/Operators/11.4.1-001.js
 PASS ecma_3/Operators/11.4.1-002.js
 PASS ecma_3/Operators/order-01.js
-SKIP ecma_3/RegExp/15.10.2-1.js :: [known-gap:regexp-empty-repeat] section 7 needs ES3 §15.10.2.5 empty-iteration semantics beyond the .NET-backed engine
+PASS ecma_3/RegExp/15.10.2-1.js
 PASS ecma_3/RegExp/15.10.2.12.js
 PASS ecma_3/RegExp/15.10.3.1-1.js
 PASS ecma_3/RegExp/15.10.3.1-2.js
@@ -911,7 +911,7 @@ PASS ecma_3/RegExp/15.10.6.2-1.js
 PASS ecma_3/RegExp/15.10.6.2-2.js
 PASS ecma_3/RegExp/octal-001.js
 PASS ecma_3/RegExp/octal-002.js
-SKIP ecma_3/RegExp/perlstress-001.js :: [known-gap:regexp-empty-repeat] section needs ES3 §15.10.2.5 empty-iteration semantics beyond the .NET-backed engine
+PASS ecma_3/RegExp/perlstress-001.js
 PASS ecma_3/RegExp/perlstress-002.js
 PASS ecma_3/RegExp/regress-100199.js
 PASS ecma_3/RegExp/regress-105972.js
@@ -926,7 +926,7 @@ PASS ecma_3/RegExp/regress-188206.js
 PASS ecma_3/RegExp/regress-191479.js
 PASS ecma_3/RegExp/regress-202564.js
 SKIP ecma_3/RegExp/regress-209067.js :: [skip:mozilla-decomp] uses Mozilla's function decompilation expectations
-SKIP ecma_3/RegExp/regress-209919.js :: [known-gap:regexp-empty-repeat] needs ES3 §15.10.2.5 empty-iteration rule (a repeated atom may not match empty once its minimum is met) which the .NET-backed translation layer does not express
+PASS ecma_3/RegExp/regress-209919.js
 PASS ecma_3/RegExp/regress-216591.js
 PASS ecma_3/RegExp/regress-220367-001.js
 PASS ecma_3/RegExp/regress-223273.js

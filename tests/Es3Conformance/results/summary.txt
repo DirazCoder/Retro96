@@ -1,17 +1,17 @@
 ﻿Retro96 ES3 conformance — Mozilla legacy suite sweep
-date: 2026-10-07 22:49:11   elapsed: 02:43
+date: 2026-10-07 23:41:46   elapsed: 03:04
 
 total: 1856
-  PASS    1500
+  PASS    1503
   FAIL    0
   TIMEOUT 0
   CRASH   0
-  SKIP    356
+  SKIP    353
 
 per suite:
   ecma     PASS=569 SKIP=51
   ecma_2   PASS=158 SKIP=14
-  ecma_3   PASS=204 SKIP=25
+  ecma_3   PASS=207 SKIP=22
   js1_1    PASS=2
   js1_2    PASS=55 SKIP=31
   js1_3    PASS=22 SKIP=5

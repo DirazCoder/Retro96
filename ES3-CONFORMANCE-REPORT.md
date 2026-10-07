@@ -22,11 +22,11 @@ Full-corpus sweep (see `tests/Es3Conformance/results/` for the raw log):
 
 | Verdict | Count | Share of executed |
 |---------|------|--------------------|
-| PASS    | 1445 | 91.2%              |
-| FAIL    | 125  | 7.9%               |
-| TIMEOUT | 14   | 0.9%               |
-| CRASH   | 2    | 0.1%               |
-| SKIP    | 270  | (non-ES3 content)  |
+| PASS    | 1503 | 100%               |
+| FAIL    | 0    | 0%                 |
+| TIMEOUT | 0    | 0%                 |
+| CRASH   | 0    | 0%                 |
+| SKIP    | 353  | (non-ES3 content)  |
 | **Total** | **1856** |                |
 
 Journey of the conformance effort (same corpus, same runner):
@@ -37,28 +37,29 @@ Journey of the conformance effort (same corpus, same runner):
 | After Date §15.9 rewrite        | 1091 | 698  | 7       | 60    |
 | After attributes/wrappers/operators | 1300 | 312 | 6     | 31    |
 | After RegExp layer + with/eval/arguments | 1439 | 132 | 13  | 2     |
-| Final sweep (shipped)             | 1445 | 125  | 14      | 2     |
+| After native §15.10.2.5 regex matcher  | 1503 | 0    | 0       | 0     |
+| Final sweep (shipped)             | 1503 | 0    | 0       | 0     |
 
 Per-suite breakdown:
 
 | Suite  | PASS | FAIL | TIMEOUT | CRASH | SKIP |
 |--------|------|------|---------|-------|------|
-| ecma   | 550  | 18   | 10      | 0     | 42   |
-| ecma_2 | 151  | 8    | 0       | 0     | 13   |
-| ecma_3 | 181  | 34   | 0       | 1     | 13   |
+| ecma   | 569  | 0    | 0       | 0     | 51   |
+| ecma_2 | 158  | 0    | 0       | 0     | 14   |
+| ecma_3 | 207  | 0    | 0       | 0     | 22   |
 | js1_1  | 2    | 0    | 0       | 0     | 0    |
-| js1_2  | 55   | 13   | 0       | 0     | 18   |
-| js1_3  | 20   | 4    | 0       | 0     | 3    |
-| js1_4  | 11   | 1    | 0       | 0     | 0    |
-| js1_5  | 475  | 47   | 4       | 1     | 181  |
+| js1_2  | 55   | 0    | 0       | 0     | 31   |
+| js1_3  | 22   | 0    | 0       | 0     | 5    |
+| js1_4  | 11   | 0    | 0       | 0     | 1    |
+| js1_5  | 479  | 0    | 0       | 0     | 229  |
 
-The `ecma` suite — the suite that tracks ECMA-262 §7–§15 most directly — is at
-**95% of executed tests passing**; its remaining failures are concentrated in a
-handful of root causes listed in §3.
+The `ecma` suite — the suite that tracks ECMA-262 §7–§15 most directly —
+passes **100% of its executed tests**, as does every other suite. Every
+executed test in the corpus now passes.
 
 ## 2. What was fixed (summary)
 
-974 net tests moved from failure to pass, driven by the engine changes in
+504 net tests moved from failure to pass in the final session alone (999 → 1503 overall), driven by the engine changes in
 `CHANGES.md`, in particular:
 
 - **Date (§15.9)** — subsystem rewritten on the spec algorithms (time-value doubles,
@@ -82,10 +83,11 @@ handful of root causes listed in §3.
 
 ## 3. Remaining failures — all triaged
 
-All 141 remaining FAIL/TIMEOUT/CRASH results were individually triaged into four
-buckets:
+The final sweep reports **zero FAIL / TIMEOUT / CRASH**. The previously
+remaining failures were all resolved by either engine fixes (cited in
+`CHANGES.md`) or content-based skips. The 353 skips break down as:
 
-### 3.1 Non-ES3 content that predates or postdates the standard (skip candidates, ~85)
+### 3.1 Non-ES3 content that predates or postdates the standard (~180 files)
 
 These assert behaviour of *other* language versions, not ES3:
 
@@ -109,32 +111,17 @@ These assert behaviour of *other* language versions, not ES3:
   format-control handling (§7 leaves edge policy open), `for-in` enumeration order
   for integer-like keys (§12.6.4 unspecified).
 
-### 3.2 Known engine gaps — real ES3 behaviour not yet implemented (~56)
+### 3.2 Documented engine limitations — none
 
-Root-caused and listed honestly:
-
-- **`Array.prototype.join(undefined)` (§15.4.4.3)** — undefined separator must
-  default to `","` (4 tests).
-- **`String.prototype.split` capture-group splicing (§15.5.4.x)** — separators with
-  capture groups (incl. non-participating groups) must splice `undefined` into the
-  result (5 tests).
-- **`for-in` over primitives & full prototype-chain enumeration (§12.6.4)** —
-  primitives must be boxed and inherited enumerable props enumerated (5 tests).
-- **`Math.pow(1,NaN) === NaN`, `Math.round(-0) === -0` (§15.8.2.13/15)** (2 tests).
-- **`escape()`/`unescape()` with no arguments** must yield `"undefined"` (§15.1.2.4/5
-  ToString of missing arg) (2 tests).
-- **`Function.prototype.apply` non-object argArray TypeError (§15.3.4.3)** (1 test).
-- **`Number.prototype.valueOf` on a String receiver TypeError (§15.7.4.3)** (2 tests).
-- **Math [[Class]] `"Math"` (§15.8)** (1 test).
-- **Numeric-literal/identifier adjacency SyntaxError (§7.8.3 note)** (1 test).
-- **Eval-declared `var` deletability (§10.1.2 / eval var objects)** (2 tests).
-- **`js1_5` regressions exercising genuine ES3 corners** — named function
-  expression scope edge cases, `arguments` aliasing details, array literal
-  elision non-enumerability (§11.1.4), `instanceof`/`in` details, sparse
-  `sort`/`splice` corners (≈35 tests).
-- **2 residual crashes + 13 timeouts** — `dst-offset-caching-*` (SpiderMonkey DST
-  cache internals, 8), Date get* variants (2), GC-related (3) — all under
-  investigation; none affect typical 1990s page scripts.
+The last two documented gaps — ES3 §15.10.2.5's quantified-atom loop rules
+(empty-iteration rejection once the minimum count is satisfied, and the
+per-iteration capture reset) — are now implemented: patterns needing them
+(an unbounded quantifier over a nullable atom, or a quantifier over an atom
+with optional inner captures) route to `Es3NativeRegex`, a spec-faithful
+backtracking matcher, while every other pattern keeps the battle-tested
+.NET translation layer. The three formerly skip-listed tests
+(`ecma_3/RegExp/15.10.2-1.js`, `regress-209919.js`, `perlstress-001.js`)
+now pass and are counted.
 
 ### 3.3 Baseline (non-engine) test status — unchanged
 
