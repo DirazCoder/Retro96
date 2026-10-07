@@ -2619,7 +2619,7 @@ public static class JsRuntime
                 plain.Set("name", JsValue.From(name));
                 plain.Set("message", JsValue.From(args.Length > 0 ? args[0].ToJsString() : ""));
                 return JsValue.FromObject(plain);
-            }, scope, name);
+            }, scope, name, length: 1);   // §15.11.1/§15.11.7: Error(message) — length 1
             fn.Set("prototype", JsValue.FromObject(proto));
             proto.Set("constructor", JsValue.FromFunction(fn));
             return JsValue.FromFunction(fn);

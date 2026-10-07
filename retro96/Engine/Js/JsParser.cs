@@ -1025,9 +1025,12 @@ public class JsParser
     /// new a.b.C(x, y) — parse the constructor as a member chain (dots
     /// only, no calls), then the argument list.  `new Date` without
     /// parentheses is also legal.  The callee may itself be another new
-    /// expression (`new new Foo()` used to be a parse error).
+    /// expression (`new new Foo()`). When the new expression is itself a
+    /// CALLEE (memberTailOnly), a trailing (...) belongs to the ENCLOSING
+    /// new as its argument list — `new new T(a,b).v(c)` constructs
+    /// (new T(a,b)).v with argument c (§11.2 MemberExpression grammar).
     /// </summary>
-    private Expr ParseNew()
+    private Expr ParseNew(bool memberTailOnly = false)
     {
         ExpectKeyword("new");
 
@@ -1050,15 +1053,39 @@ public class JsParser
         var newExpr = new NewExpr(callee, args);
 
         // The result is a value: calls and member access chain onto it
-        return ParseCallMemberTail(newExpr);
+        return memberTailOnly ? ParseMemberTail(newExpr) : ParseCallMemberTail(newExpr);
+    }
+
+    /// <summary>Member access only (no calls) — used inside new-callees.</summary>
+    private Expr ParseMemberTail(Expr expr)
+    {
+        while (true)
+        {
+            if (CheckPunct("."))
+            {
+                Advance();
+                var id = ExpectIdentifierName("identifier after '.'");
+                expr = new MemberExpr(expr, id, Computed: false);
+            }
+            else if (CheckPunct("["))
+            {
+                Advance();
+                var property = ParseExpression();
+                ExpectPunct("]");
+                expr = new MemberExpr(expr, property, Computed: true);
+            }
+            else break;
+        }
+        return expr;
     }
 
     /// <summary>Callee of a new-expression: a member chain, or ANOTHER
-    /// new expression (new new Foo()).</summary>
+    /// new expression (new new Foo()) — the inner one keeps only member
+    /// tails so the enclosing new's argument list is not stolen.</summary>
     private Expr ParseNewCallee()
     {
         if (CheckKeyword("new"))
-            return ParseNew();
+            return ParseNew(memberTailOnly: true);
 
         Expr callee = ParsePrimary();
         while (true)

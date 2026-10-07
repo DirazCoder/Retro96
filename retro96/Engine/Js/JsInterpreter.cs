@@ -1326,7 +1326,11 @@ public class JsInterpreter
         var func = new JsFunction(
             new FunctionExpr(fnDecl.Id, fnDecl.Params, fnDecl.Body, fnDecl.SourceText),
             paramNames, _currentScope);
-        _currentScope.DefineInVariableEnv(fnDecl.Id.Name, JsValue.FromFunction(func));
+        // §10.2.2: function declarations from EVAL code are deletable
+        if (_evalDepth > 0)
+            _currentScope.DefineInVariableEnvEval(fnDecl.Id.Name, JsValue.FromFunction(func));
+        else
+            _currentScope.DefineInVariableEnv(fnDecl.Id.Name, JsValue.FromFunction(func));
         return JsValue.Undefined;
     }
 
@@ -2325,6 +2329,12 @@ public class JsInterpreter
                 ? GlobalThis() : thisValue);
 
             var body = func.Body ?? throw new JsInterpreterException("Function body is missing");
+            // §13 (named function expression): the function's OWN name is
+            // bound inside its scope to the function object — `var x =
+            // function g(){ return g; }` — for declarations the same binding
+            // resolves identically through the closure, so bind always
+            if (body.Id != null)
+                funcScope.Define(body.Id.Name, JsValue.FromFunction(func));
             ApplyHoistPlan(GetHoistPlan(body), funcScope);
 
             var old = _currentScope;
