@@ -7,12 +7,16 @@ public class JsParserException : Exception
 {
     public int Line { get; }
     public int Column { get; }
+    /// <summary>The bare message without the "Line N, Column M" prefix —
+    /// this is what JS-visible SyntaxErrors carry (era message fidelity).</summary>
+    public string RawMessage { get; }
 
     public JsParserException(string message, int line, int column)
         : base($"Line {line}, Column {column}: {message}")
     {
         Line = line;
         Column = column;
+        RawMessage = message;
     }
 }
 
@@ -34,11 +38,22 @@ public class JsParser
     private readonly IReadOnlyList<JsToken> _tokens;
     private int _position;
 
-    public static ProgramNode Parse(string source)
+    public static ProgramNode Parse(string source, bool allowTopLevelReturn = false)
     {
         var lexer = new JsLexer(source ?? throw new ArgumentNullException(nameof(source)));
-        var parser = new JsParser(lexer.Tokenize());
-        return parser.ParseProgram();
+        IReadOnlyList<JsToken> tokens;
+        try
+        {
+            tokens = lexer.Tokenize();
+        }
+        catch (JsLexerException ex)
+        {
+            // lexer failures are SyntaxErrors like parser failures — callers
+            // only expect JsParserException from Parse
+            throw new JsParserException(ex.Message, 0, 0);
+        }
+        var parser = new JsParser(tokens);
+        return parser.ParseProgram(allowTopLevelReturn);
     }
 
     public JsParser(IReadOnlyList<JsToken> tokens)
@@ -132,7 +147,7 @@ public class JsParser
     // Program / statements
     // ─────────────────────────────────────────────────────────────────────
 
-    public ProgramNode ParseProgram()
+    public ProgramNode ParseProgram(bool allowTopLevelReturn = false)
     {
         var body = new List<Stmt>();
         while (!IsAtEnd())
@@ -140,7 +155,177 @@ public class JsParser
             var stmt = ParseStatement();
             if (stmt != null) body.Add(stmt);
         }
-        return new ProgramNode(body);
+        var program = new ProgramNode(body);
+        ValidateEarlyErrors(program, allowTopLevelReturn);
+        return program;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Early errors (§12.6/§12.7/§12.8/§12.9/§12.12): continue must target an
+    // enclosing iteration (with a matching label when labelled), break must
+    // target an enclosing iteration or labelled statement, and return must
+    // be inside a function body. These are compile-time SyntaxErrors.
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static void ValidateEarlyErrors(ProgramNode program, bool allowTopLevelReturn)
+    {
+        var ctx = new EarlyErrorContext { AllowTopLevelReturn = allowTopLevelReturn };
+        foreach (var stmt in program.Body)
+            ValidateStmt(stmt, ctx);
+    }
+
+    private sealed class EarlyErrorContext
+    {
+        public bool InFunction;
+        public bool AllowTopLevelReturn;
+        public int IterationDepth;
+        public int SwitchDepth;
+        /// <summary>All enclosing labels — valid break targets (§12.12).</summary>
+        public readonly List<string> Labels = new();
+        /// <summary>Per enclosing loop, the label chain attached to that loop
+        /// — the union is the set of valid labelled continue targets (§12.7).
+        /// A label only counts when the labels attach DIRECTLY to an
+        /// iteration (outer: for(;;) { for(;;) continue outer; } is legal,
+        /// but outer: { for(;;) continue outer; } is not).</summary>
+        public readonly List<List<string>> ActiveLoops = new();
+    }
+
+    private static void ValidateStmt(Stmt stmt, EarlyErrorContext ctx)
+    {
+        switch (stmt)
+        {
+            case BreakStatement br:
+                if (br.Label == null)
+                {
+                    // §12.11: an unlabeled break also exits a switch case
+                    if (ctx.IterationDepth == 0 && ctx.SwitchDepth == 0)
+                        throw new JsParserException("Illegal break: not inside an iteration, switch, or labeled statement", 0, 0);
+                }
+                else if (!ctx.Labels.Contains(br.Label))
+                {
+                    throw new JsParserException($"Illegal break: no enclosing label '{br.Label}'", 0, 0);
+                }
+                break;
+
+            case ContinueStatement co:
+                if (co.Label == null)
+                {
+                    if (ctx.IterationDepth == 0)
+                        throw new JsParserException("Illegal continue: not inside an iteration statement", 0, 0);
+                }
+                else if (!ctx.ActiveLoops.Any(loop => loop.Contains(co.Label)))
+                {
+                    throw new JsParserException($"Illegal continue: '{co.Label}' is not an enclosing iteration label", 0, 0);
+                }
+                break;
+
+            case ReturnStatement:
+                // inline DOM handlers (onclick="…; return false") are parsed
+                // as top-level programs by the shell — keep them working
+                if (!ctx.InFunction && !ctx.AllowTopLevelReturn)
+                    throw new JsParserException("Illegal return: not inside a function", 0, 0);
+                break;
+
+            case LabeledStatement:
+            {
+                // collapse consecutive labels: a: b: for(;;) …
+                var chain = new List<string>();
+                Stmt body = stmt;
+                while (body is LabeledStatement l2)
+                {
+                    chain.Add(l2.Label);
+                    body = l2.Body;
+                }
+                ctx.Labels.AddRange(chain);
+                switch (body)
+                {
+                    case WhileStatement w:
+                        PushIteration(ctx, chain, w.Body);
+                        break;
+                    case DoWhileStatement dw:
+                        PushIteration(ctx, chain, dw.Body);
+                        break;
+                    case ForStatement f:
+                        if (f.Init is Stmt initStmt) ValidateStmt(initStmt, ctx);
+                        PushIteration(ctx, chain, f.Body);
+                        break;
+                    case ForInStatement fi:
+                        PushIteration(ctx, chain, fi.Body);
+                        break;
+                    default:
+                        // the labels name a non-iteration statement: they are
+                        // break targets only, not continue targets
+                        ValidateStmt(body, ctx);
+                        break;
+                }
+                foreach (var _ in chain) ctx.Labels.RemoveAt(ctx.Labels.Count - 1);
+                break;
+            }
+
+            case BlockStatement block:
+                foreach (var s in block.Body) ValidateStmt(s, ctx);
+                break;
+
+            case IfStatement iff:
+                ValidateStmt(iff.Consequent, ctx);
+                if (iff.Alternate != null) ValidateStmt(iff.Alternate, ctx);
+                break;
+
+            case WhileStatement w:
+                PushIteration(ctx, new List<string>(), w.Body);
+                break;
+
+            case DoWhileStatement dw:
+                PushIteration(ctx, new List<string>(), dw.Body);
+                break;
+
+            case ForStatement f:
+                if (f.Init is Stmt initStmt2) ValidateStmt(initStmt2, ctx);
+                PushIteration(ctx, new List<string>(), f.Body);
+                break;
+
+            case ForInStatement fi:
+                PushIteration(ctx, new List<string>(), fi.Body);
+                break;
+
+            case SwitchStatement sw:
+                ctx.SwitchDepth++;
+                foreach (var c in sw.Cases)
+                    foreach (var s in c.Consequent) ValidateStmt(s, ctx);
+                ctx.SwitchDepth--;
+                break;
+
+            case TryStatement tr:
+                ValidateStmt(tr.Block, ctx);
+                if (tr.Handler != null) ValidateStmt(tr.Handler.Body, ctx);
+                if (tr.Finalizer != null) ValidateStmt(tr.Finalizer, ctx);
+                break;
+
+            case WithStatement with:
+                ValidateStmt(with.Body, ctx);
+                break;
+
+            // function bodies reset the iteration/label context
+            case FunctionDeclaration fn:
+                ValidateFunction(fn.Body.Body);
+                break;
+        }
+    }
+
+    private static void PushIteration(EarlyErrorContext ctx, List<string> directLabels, Stmt body)
+    {
+        ctx.IterationDepth++;
+        ctx.ActiveLoops.Add(directLabels);
+        ValidateStmt(body, ctx);
+        ctx.ActiveLoops.RemoveAt(ctx.ActiveLoops.Count - 1);
+        ctx.IterationDepth--;
+    }
+
+    private static void ValidateFunction(IReadOnlyList<Stmt> body)
+    {
+        var fnCtx = new EarlyErrorContext { InFunction = true };
+        foreach (var stmt in body)
+            ValidateStmt(stmt, fnCtx);
     }
 
     private Stmt ParseStatement()

@@ -461,10 +461,13 @@ public static class JsRuntime
 
             if (args.Length == 1 && args[0].Type == JsType.Number)
             {
+                // §15.4.2.2: a single Number argument is the array length;
+                // it must be a Uint32 (0 … 4294967295) or it's a RangeError.
                 double n = args[0].ToNumber();
-                if (double.IsNaN(n) || double.IsInfinity(n) || n < 0 || n != Math.Truncate(n) || n > int.MaxValue)
-                    throw new JsRangeErrorException("Invalid array length");
-                length = (int)n;
+                if (double.IsNaN(n) || double.IsInfinity(n) || n < 0 || n != Math.Truncate(n) || n > 4294967295)
+                    throw new JsRangeErrorException("invalid array length");
+                newArr.Set("length", JsValue.From(n));
+                return JsValue.FromObject(newArr);
             }
             else
             {
@@ -472,9 +475,9 @@ public static class JsRuntime
                 {
                     newArr.Set((length++).ToString(), arg);
                 }
+                newArr.Set("length", JsValue.From(length));
             }
 
-            newArr.Set("length", JsValue.From(length));
             return JsValue.FromObject(newArr);
         }, scope, "Array", length: 1);
         arrayCtor.Set("prototype", JsValue.FromObject(arrProto));
@@ -1904,7 +1907,7 @@ public static class JsRuntime
             foreach (char c in flags)
             {
                 if (c is not ('g' or 'i' or 'm') || valid.ToString().Contains(c))
-                    throw new JsInterpreterException("Invalid or duplicate RegExp flag");
+                    throw new JsSyntaxErrorException($"invalid regular expression flag {c}");
                 valid.Append(c);
             }
 
@@ -1921,8 +1924,15 @@ public static class JsRuntime
 
         var regexpCtor = new JsFunction((self, args) =>
         {
+            // §15.10.3.1/§15.10.4.1: a RegExp argument with no flags
+            // argument (or an explicit undefined) returns that object
+            bool flagsUndefined = args.Length < 2 || args[1].Type == JsType.Undefined;
+            if (args.Length > 0 && args[0].Type is (JsType.Object or JsType.Function) &&
+                args[0].GetObjectOrFunction().Class == "RegExp" && flagsUndefined)
+                return args[0];
+
             string pattern;
-            string flags = args.Length > 1 ? args[1].ToJsString() : "";
+            string flags = flagsUndefined ? "" : args[1].ToJsString();
 
             if (args.Length > 0 && args[0].Type is (JsType.Object or JsType.Function) &&
                 args[0].GetObjectOrFunction().Class == "RegExp")
@@ -1944,7 +1954,7 @@ public static class JsRuntime
             foreach (char c in flags)
             {
                 if (c is not ('g' or 'i' or 'm') || valid.ToString().Contains(c))
-                    throw new JsInterpreterException("Invalid or duplicate RegExp flag");
+                    throw new JsSyntaxErrorException($"invalid regular expression flag {c}");
                 valid.Append(c);
             }
 

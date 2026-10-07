@@ -57,6 +57,11 @@ public sealed class JsRangeErrorException : JsInterpreterException
     public JsRangeErrorException(string message) : base(message) { }
 }
 
+public sealed class JsSyntaxErrorException : JsInterpreterException
+{
+    public JsSyntaxErrorException(string message) : base(message) { }
+}
+
 public sealed class JsUriErrorException : JsInterpreterException
 {
     public JsUriErrorException(string message) : base(message) { }
@@ -480,7 +485,7 @@ public class JsInterpreter
                     : null;
             var error = new JsObject { Class = "Error", Prototype = prototype };
             error.Set("name", JsValue.From("SyntaxError"));
-            error.Set("message", JsValue.From(ex.Message));
+            error.Set("message", JsValue.From(ex.RawMessage));
             throw new JsThrownException(JsValue.FromObject(error));
         }
         var old = _currentScope;
@@ -775,7 +780,9 @@ public class JsInterpreter
 
         try
         {
-            var program = JsParser.Parse(handlerSource);
+            // Inline handler attributes are compiled as top-level programs
+            // (era behaviour) — `onclick="…; return false"` must parse.
+            var program = JsParser.Parse(handlerSource, allowTopLevelReturn: true);
             // Inline DOM event attributes are compiled in the page's global
             // event scope, not whichever function/timer scope happened to be
             // current when the event arrived.  This matters in frames: a
@@ -1206,7 +1213,7 @@ public class JsInterpreter
             SwitchStatement sw => ExecuteSwitch(sw),
             ThrowStatement th => ExecuteThrow(th),
             TryStatement tr => ExecuteTry(tr),
-            LabeledStatement lab => ExecuteStatement(lab.Body, ConcatLabel(labels, lab.Label)),
+            LabeledStatement lab => ExecuteLabeled(lab, labels),
             WithStatement with => ExecuteWith(with),
             FunctionDeclaration => JsValue.Undefined,   // hoisted
             EmptyStatement => JsValue.Undefined,
@@ -1219,6 +1226,22 @@ public class JsInterpreter
         if (labels == null) return new[] { label };
         var list = new List<string>(labels) { label };
         return list;
+    }
+
+    private JsValue ExecuteLabeled(LabeledStatement lab, IReadOnlyList<string>? outerLabels)
+    {
+        var labels = ConcatLabel(outerLabels, lab.Label);
+        try
+        {
+            return ExecuteStatement(lab.Body, labels);
+        }
+        catch (JsBreakException bex)
+        {
+            // §12.12: break with this label exits the labeled statement;
+            // a different label's break belongs to an enclosing statement
+            if (bex.Label == lab.Label) return JsValue.Undefined;
+            throw;
+        }
     }
 
     private JsValue ExecuteBlock(BlockStatement block)
@@ -1366,23 +1389,25 @@ public class JsInterpreter
 
         var obj = objVal.GetObjectOrFunction();
 
-        // Arrays enumerate their indices only — "length" and other
-        // internal slots were never enumerable in the era's for-in
+        // Arrays enumerate their indices in ascending order, then any other
+        // enumerable own properties ("length" is never enumerable);
+        // non-index properties (e.g. "4294967294.5") are NOT dropped —
+        // for-in covers every enumerable property (§12.6.4)
         IEnumerable<string> keys;
         if (obj.Class == "Array")
         {
             var indices = new List<string>();
-            long len = 0;
+            var others = new List<string>();
             foreach (var k in obj.OwnEnumerableKeys())
             {
                 if (k == "length") continue;
                 if (long.TryParse(k, out var idx) && idx >= 0)
-                {
                     indices.Add(k);
-                    if (idx + 1 > len) len = idx + 1;
-                }
+                else
+                    others.Add(k);
             }
             indices.Sort((x, y) => long.Parse(x).CompareTo(long.Parse(y)));
+            indices.AddRange(others);
             keys = indices;
         }
         else
@@ -1522,6 +1547,7 @@ public class JsInterpreter
                     JsReferenceErrorException => "ReferenceError",
                     JsRangeErrorException => "RangeError",
                     JsUriErrorException => "URIError",
+                    JsSyntaxErrorException => "SyntaxError",
                     _ => "Error"
                 };
                 JsValue constructor = _currentScope.Get(errorName);

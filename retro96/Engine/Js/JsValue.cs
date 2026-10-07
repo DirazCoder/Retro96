@@ -463,7 +463,7 @@ public class JsObject
                 if (double.IsNaN(newLength) || double.IsInfinity(newLength) ||
                     newLength < 0 || newLength > uint.MaxValue ||
                     newLength != Math.Truncate(newLength))
-                    throw new JsRangeErrorException("Invalid array length");
+                    throw new JsRangeErrorException("invalid array length");
 
                 uint length = (uint)newLength;
                 if (Properties.TryGetValue("length", out var currentLength) &&

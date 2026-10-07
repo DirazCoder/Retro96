@@ -134,6 +134,12 @@ public class JsLexer
         if (char.IsLetter(current) || current is '_' or '$')
             return Reset(LexIdentifierOrKeyword());
 
+        // \uXXXX escape starting an identifier (§7.6: escapes are part of
+        // identifier names)
+        if (current == '\\' && _pos + 1 < _source.Length && _source[_pos + 1] == 'u' &&
+            LooksLikeUnicodeEscape(at: _pos))
+            return Reset(LexIdentifierOrKeyword());
+
         // Regex must be checked BEFORE the punctuator — '/' would otherwise
         // always win and regex literals could never start
         if (current == '/' && _pos + 1 < _source.Length &&
@@ -455,17 +461,59 @@ public class JsLexer
         return new JsNumberToken(numVal, 0, 0, 0, false);
     }
 
+    /// <summary>True when <paramref name="at"/> starts a \uXXXX sequence
+    /// whose decoded char can continue an identifier (letter/underscore/$).</summary>
+    private bool LooksLikeUnicodeEscape(int at) =>
+        at + 5 < _source.Length &&
+        Uri.IsHexDigit(_source[at + 2]) && Uri.IsHexDigit(_source[at + 3]) &&
+        Uri.IsHexDigit(_source[at + 4]) && Uri.IsHexDigit(_source[at + 5]) &&
+        DecodedEscapeAt(at) is char c && (char.IsLetter(c) || c is '_' or '$');
+
+    private char? DecodedEscapeAt(int at)
+    {
+        if (at + 5 >= _source.Length) return null;
+        int value = 0;
+        for (int i = 2; i <= 5; i++)
+        {
+            char h = _source[at + i];
+            int d = h switch
+            {
+                >= '0' and <= '9' => h - '0',
+                >= 'a' and <= 'f' => h - 'a' + 10,
+                >= 'A' and <= 'F' => h - 'A' + 10,
+                _ => -1
+            };
+            if (d < 0) return null;
+            value = value * 16 + d;
+        }
+        return (char)value;
+    }
+
     private JsToken LexIdentifierOrKeyword()
     {
         int start = _pos;
-        while (_pos < _source.Length &&
-               (char.IsLetterOrDigit(_source[_pos]) || _source[_pos] is '_' or '$'))
+        var sb = new System.Text.StringBuilder();
+        while (_pos < _source.Length)
         {
-            _pos++;
-            _column++;
+            char c = _source[_pos];
+            if (char.IsLetterOrDigit(c) || c is '_' or '$')
+            {
+                sb.Append(c);
+                _pos++;
+                _column++;
+            }
+            else if (c == '\\' && _pos + 1 < _source.Length && _source[_pos + 1] == 'u' &&
+                     DecodedEscapeAt(_pos) is char decoded)
+            {
+                // §7.6: \uXXXX inside an identifier name
+                sb.Append(decoded);
+                _pos += 6;
+                _column += 6;
+            }
+            else break;
         }
 
-        string name = _source[start.._pos];
+        string name = sb.Length > 0 ? sb.ToString() : _source[start.._pos];
         return _keywords.Contains(name)
             ? new JsKeywordToken(name, 0, 0, 0, false)
             : new JsIdentifierToken(name, 0, 0, 0, false);
@@ -569,12 +617,20 @@ public class JsLexer
             char f = _source[_pos];
             if (f is 'g' or 'i' or 'm')
             {
+                // duplicate literal flags are a SyntaxError (era message)
+                for (int j = 0; j < flagsSb.Length; j++)
+                    if (flagsSb[j] == f)
+                        throw new JsLexerException($"invalid regular expression flag {f}");
                 flagsSb.Append(f);
                 _pos++;
                 _column++;
             }
             else
             {
+                // a contiguous letter that is not a flag is a bad flag
+                // (/bar/a); punctuation/operators legitimately stop the loop
+                if (char.IsLetter(f))
+                    throw new JsLexerException($"invalid regular expression flag {f}");
                 break;
             }
         }

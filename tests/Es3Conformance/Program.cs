@@ -349,6 +349,7 @@ public static class Program
             JsReferenceErrorException => "ReferenceError",
             JsRangeErrorException => "RangeError",
             JsUriErrorException => "URIError",
+            JsSyntaxErrorException => "SyntaxError",
             _ => "InternalError",
         };
 
