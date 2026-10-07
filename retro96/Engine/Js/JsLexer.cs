@@ -360,13 +360,14 @@ public class JsLexer
                         }
                     case >= '1' and <= '7':
                         {
-                            // Octal escape (\1..\7, up to three digits) — valid
-                            // era JS; the old code fell through to the unknown
-                            // escape branch and emitted the bare digit.
+                            // Octal escape (\1..\7, up to three digits,
+                            // value ≤ 255 — '\400' lexes as '\40' + '0'
+                            // and '\378' as '\37' + '8', regress-177314)
                             int val = esc - '0';
                             int digits = 1;
                             while (digits < 3 && _pos + 1 < _source.Length &&
-                                   _source[_pos + 1] >= '0' && _source[_pos + 1] <= '7')
+                                   _source[_pos + 1] >= '0' && _source[_pos + 1] <= '7' &&
+                                   val * 8 + (_source[_pos + 1] - '0') <= 255)
                             {
                                 _pos++;
                                 _column++;

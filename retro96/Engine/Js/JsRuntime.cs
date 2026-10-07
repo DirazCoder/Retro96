@@ -197,6 +197,15 @@ public static class JsRuntime
                         case 'S': sb.Append("[^").Append(spaceSet).Append(']'); i++; continue;
                         case 'w': sb.Append('[').Append(wordSet).Append(']'); i++; continue;
                         case 'W': sb.Append("[^").Append(wordSet).Append(']'); i++; continue;
+                        // JS \b/\B are ASCII-word boundaries; .NET's use the
+                        // Unicode \w (regress-247179: ñ is NOT a word char)
+                        case 'b':
+                            sb.Append(multiline ? "(?:(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?=[A-Za-z0-9_]))"
+                                                : "(?:(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?=[A-Za-z0-9_]))");
+                            i++; continue;
+                        case 'B':
+                            sb.Append("(?:(?<=[A-Za-z0-9_])(?=[A-Za-z0-9_])|(?<![A-Za-z0-9_])(?![A-Za-z0-9_]))");
+                            i++; continue;
                     }
                 }
                 else
@@ -1181,7 +1190,14 @@ public static class JsRuntime
                 while (q != str.Length && elements.Count < limit)
                 {
                     var m = re.Match(str, q);
-                    if (!m.Success) break;
+                    // §15.5.4.14 SplitMatch tries the separator AT q only —
+                    // a match found further on does not split here; advance
+                    // (regress-247179: "m매nd".split(/\b/) must try each q)
+                    if (!m.Success || m.Index != q)
+                    {
+                        q++;
+                        continue;
+                    }
                     int e = m.Index + m.Length;
                     if (e == p)
                     {

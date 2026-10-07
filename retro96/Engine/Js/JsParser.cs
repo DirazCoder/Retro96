@@ -557,8 +557,10 @@ public class JsParser
     {
         ExpectKeyword("return");
 
-        // Restricted production: a newline after 'return' ends the statement
-        if (CheckPunct(";") || IsAtEnd() || NewlineBeforeNext())
+        // Restricted production: a newline after 'return' ends the statement;
+        // §7.9.1 rule 1 also inserts a semicolon before a '}' even on the
+        // SAME line (regress-238945: do;while(0)return})
+        if (CheckPunct(";") || CheckPunct("}") || IsAtEnd() || NewlineBeforeNext())
         {
             ConsumeStatementEnd("return");
             return new ReturnStatement(null);

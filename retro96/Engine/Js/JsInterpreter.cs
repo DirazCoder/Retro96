@@ -1000,18 +1000,27 @@ public class JsInterpreter
     /// The engine historically kept the built-in prototypes in static fields,
     /// which means creating an event from a frame could accidentally chain the
     /// event object to the parent page's most recently installed Object.prototype.
-    /// Use the realm's Object constructor first and keep the static field only as
-    /// a compatibility fallback for hosts that do not expose Object yet.</summary>
+    /// Capture the realm's ORIGINAL Object prototype once — §10.1.8 requires
+    /// arguments (and by extension all engine-made objects) to keep chaining
+    /// to the ORIGINAL prototype even after a script rebinds `Object`
+    /// (regress-334807: `Object = Array` must not give arguments a join).</summary>
+    private JsObject? _realmObjectPrototype;
+
     private JsObject? GetRealmObjectPrototype()
     {
+        if (_realmObjectPrototype != null) return _realmObjectPrototype;
         var objectCtor = _globalScope.Get("Object");
         if (objectCtor.Type is JsType.Object or JsType.Function)
         {
             var proto = objectCtor.GetObjectOrFunction().Get("prototype");
             if (proto.Type == JsType.Object)
-                return proto.GetObject();
+            {
+                _realmObjectPrototype = proto.GetObject();
+                return _realmObjectPrototype;
+            }
         }
-        return ObjectPrototype;
+        _realmObjectPrototype = ObjectPrototype;
+        return _realmObjectPrototype;
     }
 
     /// <summary>Build the legacy IE mouse event object used by window.event.</summary>
@@ -2859,12 +2868,26 @@ public class JsInterpreter
     /// (this.eval(s), [eval][0](s)) which run in the global scope (§15.1.2.1).</summary>
     private JsFunction? _globalEvalFunction;
 
+    private readonly Dictionary<string, JsObject?> _realmErrorPrototypes = new(StringComparer.Ordinal);
+
     private JsObject? GetRealmErrorPrototype(string name)
     {
+        if (_realmErrorPrototypes.TryGetValue(name, out var cached)) return cached;
         var ctor = _globalScope.Get(name);
-        return ctor.Type == JsType.Function &&
+        JsObject? result = ctor.Type == JsType.Function &&
             ctor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } pv
                 ? pv.GetObject() : null;
+        // Non-ES3 error names (InternalError) still need a working prototype
+        // so `ex + ''` resolves toString — chain them to Error.prototype
+        if (result == null && name != "Error")
+        {
+            var errCtor = _globalScope.Get("Error");
+            if (errCtor.Type == JsType.Function &&
+                errCtor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } epv)
+                result = epv.GetObject();
+        }
+        _realmErrorPrototypes[name] = result;
+        return result;
     }
 
     private void CheckTimeout()
