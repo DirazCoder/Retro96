@@ -35,6 +35,10 @@ public class JsScope
     private int _count;
     private bool _spilled;
     private Dictionary<string, JsValue>? _overflow;
+    /// <summary>Names declared via Define (var/function/params) — these
+    /// carry DontDelete (§10.5.3/§11.4.1); implicit globals created by bare
+    /// assignment do not and can be deleted.</summary>
+    private HashSet<string>? _declared;
 
     public JsScope(JsScope? parent = null)
     {
@@ -172,6 +176,7 @@ public class JsScope
     public void Define(string name, JsValue value)
     {
         Put(name, value);
+        (_declared ??= new HashSet<string>()).Add(name);
         if (Parent == null)
             GlobalFallback?.Set(name, value);
     }
@@ -209,9 +214,12 @@ public class JsScope
         }
     }
 
-    /// <summary>Delete from this scope only (JS 1.1: delete on vars fails).</summary>
+    /// <summary>Delete from this scope only. Declared bindings (var,
+    /// function declarations, params) carry DontDelete and refuse; implicit
+    /// globals created by bare assignment delete (§11.4.1).</summary>
     public bool Delete(string name)
     {
+        if (_declared != null && _declared.Contains(name)) return false;
         bool removed = RemoveOwn(name);
         if (Parent == null && GlobalFallback != null)
             removed |= GlobalFallback.Delete(name);

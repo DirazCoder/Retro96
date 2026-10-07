@@ -1404,6 +1404,7 @@ public class JsInterpreter
             keys = names;
         }
 
+        var completion = JsValue.Undefined;
         foreach (var key in keys)
         {
             CheckTimeout();
@@ -1417,7 +1418,9 @@ public class JsInterpreter
 
             try
             {
-                ExecuteStatement(forInStmt.Body);
+                // era completion semantics: the loop's value is the last
+                // body statement's value (eval("for (p in o) delete p") → true)
+                completion = ExecuteStatement(forInStmt.Body);
             }
             catch (JsBreakException bex)
             {
@@ -1430,7 +1433,7 @@ public class JsInterpreter
                 throw;
             }
         }
-        return JsValue.Undefined;
+        return completion;
     }
 
     private JsValue ExecuteReturn(ReturnStatement ret)
@@ -1707,7 +1710,7 @@ public class JsInterpreter
         throw new JsInterpreterException("Invalid left side in assignment");
     }
 
-    private static JsValue ApplyCompound(JsValue left, JsValue right, string op) => op switch
+    private JsValue ApplyCompound(JsValue left, JsValue right, string op) => op switch
     {
         "+=" => Add(left, right),
         "-=" => JsValue.From(left.ToNumber() - right.ToNumber()),
@@ -1752,10 +1755,10 @@ public class JsInterpreter
             "!=" => JsValue.From(!left.AbstractEquals(right)),
             "===" => JsValue.From(left.StrictEquals(right)),
             "!==" => JsValue.From(!left.StrictEquals(right)),
-            "<" => JsValue.From(LessThan(left, right)),
-            ">" => JsValue.From(LessThan(right, left)),
-            "<=" => JsValue.From(!LessThan(right, left)),
-            ">=" => JsValue.From(!LessThan(left, right)),
+            "<" => JsValue.From(LessThan3(left, right) == Cmp3.True),
+            ">" => JsValue.From(LessThan3(right, left) == Cmp3.True),
+            "<=" => JsValue.From(LessThan3(right, left) == Cmp3.False),
+            ">=" => JsValue.From(LessThan3(left, right) == Cmp3.False),
             _ => throw new JsInterpreterException($"Unknown binary operator: {b.Operator}")
         };
     }
@@ -1798,7 +1801,8 @@ public class JsInterpreter
             JsValue oldVal = _currentScope.Get(ident.Name);
             JsValue newVal = JsValue.From(oldVal.ToNumber() + delta);
             _currentScope.Set(ident.Name, newVal);
-            return up.Prefix ? newVal : oldVal;
+            // §11.3.1/§11.3.2: the postfix result is the ToNumber'ed old value
+            return up.Prefix ? newVal : JsValue.From(oldVal.ToNumber());
         }
 
         if (up.Argument is MemberExpr member)
@@ -1974,10 +1978,14 @@ public class JsInterpreter
         return JsValue.From(Typeof(ExecuteExpression(t.Argument)));
     }
 
-        private JsValue ExecuteDelete(DeleteExpr d)
+    private JsValue ExecuteDelete(DeleteExpr d)
     {
-        if (d.Argument is Identifier)
-            return JsValue.From(false);   // JS 1.1: cannot delete variables
+        if (d.Argument is Identifier ident)
+        {
+            // §11.4.1: a declared var/param carries DontDelete and refuses;
+            // an implicit global (created by bare assignment) deletes.
+            return JsValue.From(_currentScope.Delete(ident.Name));
+        }
 
         if (d.Argument is MemberExpr member)
         {
@@ -2071,7 +2079,10 @@ public class JsInterpreter
             for (int i = 0; i < func.Params.Count; i++)
                 funcScope.Define(func.Params[i],
                     i < args.Length ? args[i] : JsValue.Undefined);
-            funcScope.Define("this", thisValue);
+            // §10.2.3: a bare call (or an explicit null/undefined thisArg via
+            // call/apply) receives the global object as `this`
+            funcScope.Define("this", thisValue.Type is (JsType.Undefined or JsType.Null)
+                ? GlobalThis() : thisValue);
 
             var body = func.Body ?? throw new JsInterpreterException("Function body is missing");
             ApplyHoistPlan(GetHoistPlan(body), funcScope);
@@ -2184,6 +2195,10 @@ public class JsInterpreter
     private JsValue GlobalThis()
     {
         var w = _globalScope.Get("window");
+        if (w.Type == JsType.Object) return w;
+        // the shell surface: the harness's `this` is the global object
+        var g = _globalScope.Get("global");
+        if (g.Type is (JsType.Object or JsType.Function)) return g;
         return w.Type == JsType.Object ? w : JsValue.Undefined;
     }
 
@@ -2196,19 +2211,40 @@ public class JsInterpreter
         v.GetObjectOrFunction().Properties.TryGetValue("value", out var val) &&
         val.Type == JsType.Number;
 
-    private static JsValue Add(JsValue left, JsValue right)
+    /// <summary>ECMA-262 §8.6.2.6 ToPrimitive with a hint — invokes the
+    /// receiver's own valueOf/toString methods in the spec order, unlike the
+    /// engine-level JsValue.ToPrimitive shortcut (which exists for paths
+    /// outside the interpreter).</summary>
+    private JsValue ToPrimitiveV(JsValue v, bool preferString)
     {
-        // valueOf-first for numeric objects: `date + 86400000` stays
-        // numeric instead of concatenating the formatted date string.
-        if (IsNumericObject(left) && right.Type == JsType.Number)
-            return JsValue.From(left.ToNumber() + right.GetNumber());
-        if (left.Type == JsType.Number && IsNumericObject(right))
-            return JsValue.From(left.GetNumber() + right.ToNumber());
+        if (v.Type is not (JsType.Object or JsType.Function)) return v;
+        var obj = v.GetObjectOrFunction();
+        foreach (var name in preferString
+                 ? new[] { "toString", "valueOf" }
+                 : new[] { "valueOf", "toString" })
+        {
+            var fn = obj.Get(name);
+            if (fn.Type == JsType.Function)
+            {
+                var result = CallFunction(fn.GetFunction(), v, Array.Empty<JsValue>());
+                if (result.Type is not (JsType.Object or JsType.Function))
+                    return result;
+            }
+        }
+        throw new JsTypeErrorException("Cannot convert object to primitive value");
+    }
 
-        // ToPrimitive both sides first — object + object used to fall
-        // straight to numbers and produce NaN ("[1,2]" + "[3]" must join).
-        JsValue l = left.ToPrimitive();
-        JsValue r = right.ToPrimitive();
+    private JsValue Add(JsValue left, JsValue right)
+    {
+        // §11.6.1: ToPrimitive with no hint — a Date prefers its string form
+        // (so date + 0 is string concatenation, the era suite's pinned
+        // behaviour), everything else goes valueOf-first.
+        bool lDate = left.Type is (JsType.Object or JsType.Function) &&
+                     left.GetObjectOrFunction().Class == "Date";
+        bool rDate = right.Type is (JsType.Object or JsType.Function) &&
+                     right.GetObjectOrFunction().Class == "Date";
+        JsValue l = ToPrimitiveV(left, preferString: lDate);
+        JsValue r = ToPrimitiveV(right, preferString: rDate);
 
         // String + anything → string; the era's document.write glue
         if (l.Type == JsType.String || r.Type == JsType.String)
@@ -2229,21 +2265,26 @@ public class JsInterpreter
     }
 
     /// <summary>
-    /// JS relational comparison: both strings → lexicographic; otherwise
-    /// numeric via ToNumber (valueOf-first, so date &lt; date compares
-    /// milliseconds — the old ToPrimitive path stringified dates first and
-    /// every such comparison was NaN/false), and any NaN makes every
-    /// comparison false.
+    /// §11.8.5 Abstract Relational Comparison with its three-valued result:
+    /// True / False / Undefined (either operand NaN after ToPrimitive).
+    /// The comparison operators map Undefined per their own sections
+    /// (&lt; and &gt; → false, &lt;= and &gt;= → false as well).
     /// </summary>
-    private static bool LessThan(JsValue a, JsValue b)
-    {
-        if (a.Type == JsType.String && b.Type == JsType.String)
-            return string.CompareOrdinal(a.GetString(), b.GetString()) < 0;
+    private enum Cmp3 { True, False, Undefined }
 
-        double an = a.ToNumber();
-        double bn = b.ToNumber();
-        if (double.IsNaN(an) || double.IsNaN(bn)) return false;
-        return an < bn;
+    private Cmp3 LessThan3(JsValue a, JsValue b)
+    {
+        // §11.8.5: ToPrimitive with hint Number (valueOf first — a Date
+        // compares numerically here, unlike +)
+        var pa = ToPrimitiveV(a, preferString: false);
+        var pb = ToPrimitiveV(b, preferString: false);
+        if (pa.Type == JsType.String && pb.Type == JsType.String)
+            return string.CompareOrdinal(pa.GetString(), pb.GetString()) < 0
+                ? Cmp3.True : Cmp3.False;
+        double an = pa.ToNumber();
+        double bn = pb.ToNumber();
+        if (double.IsNaN(an) || double.IsNaN(bn)) return Cmp3.Undefined;
+        return an < bn ? Cmp3.True : Cmp3.False;
     }
 
     private static string Typeof(JsValue value) => value.Type switch
@@ -2285,12 +2326,7 @@ public class JsInterpreter
             case "Date":
                 {
                     double ms = obj.Get("value") is { Type: JsType.Number } v ? v.GetNumber() : double.NaN;
-                    if (double.IsNaN(ms)) return "Invalid Date";
-                    // LOCAL time — Date.prototype.toString() prints local, and
-                    // "" + date must agree with it (this used to print UTC).
-                    var d = (DateTime1970 + TimeSpan.FromMilliseconds(ms)).ToLocalTime();
-                    return d.ToString("ddd MMM dd HH:mm:ss yyyy",
-                        System.Globalization.CultureInfo.InvariantCulture);
+                    return JsRuntime.DateToStringForStringify(ms);
                 }
 
             case "Error":
@@ -2318,7 +2354,10 @@ public class JsInterpreter
                     return fn.Name is { Length: > 0 }
                         ? $"function {fn.Name}() {{ ... }}"
                         : "function() { ... }}";
-                return "[object Object]";
+                // §15.2.4.2: the default tag is the object's [[Class]]
+                return obj.Class.Length > 0
+                    ? $"[object {obj.Class}]"
+                    : "[object Object]";
         }
     }
 
@@ -2557,7 +2596,7 @@ public class JsInterpreter
                 var thisArg = args.Length > 0 ? args[0] : GlobalThis();
                 var rest = args.Length > 1 ? args[1..] : Array.Empty<JsValue>();
                 return CallFunction(self.GetFunction(), thisArg, rest);
-            }, "call"));
+            }, "call", length: 1));
 
             funcProto.Set("apply", Native((self, args) =>
             {
@@ -2573,7 +2612,7 @@ public class JsInterpreter
                         callArgs.Add(arr.Get(i.ToString()));
                 }
                 return CallFunction(self.GetFunction(), thisArg, callArgs.ToArray());
-            }, "apply"));
+            }, "apply", length: 2));
         }
 
         // Timers on window + global
@@ -2607,7 +2646,7 @@ public class JsInterpreter
         if (!BrowserRuntime.IsInternetExplorer3 && ArrayPrototype != null)
         {
             ArrayPrototype.Set("sort", Native((self, args) =>
-                SortArray(self, args), "sort"));
+                SortArray(self, args), "sort", length: 1));
 
             ArrayPrototype.Set("forEach", Native((self, args) =>
                 IterateCallbackArray(self, args, "forEach"), "forEach"));
@@ -2618,12 +2657,18 @@ public class JsInterpreter
             ArrayPrototype.Set("filter", Native((self, args) =>
                 FilterArray(self, args), "filter"));
         }
+
+        // These were added after the §15 freeze pass in JsRuntime, so give
+        // them the builtin attribute defaults now (for-in over a function or
+        // array must not see call/apply/sort).
+        FunctionPrototype?.MarkAll(JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete);
+        ArrayPrototype?.MarkAll(JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete);
     }
 
     private JsValue Native(Func<JsValue, JsValue[], JsValue> impl, string name,
-                          bool global = false)
+                          bool global = false, int length = 0)
     {
-        var value = JsValue.FromFunction(new JsFunction(impl, _globalScope, name));
+        var value = JsValue.FromFunction(new JsFunction(impl, _globalScope, name, length: length));
         if (global)
         {
             _globalScope.Define(name, value);

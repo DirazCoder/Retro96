@@ -46,6 +46,38 @@ public static class JsRuntime
         JsInterpreter.BooleanPrototype = boolProto;
         JsInterpreter.ArrayPrototype    = arrayProto;
         JsInterpreter.ObjectPrototype   = objectProto;
+
+        // ECMA-262 §15: builtin properties carry attribute defaults. Per the
+        // corpus's verified era behaviour: prototype METHOD properties are
+        // { DontEnum, DontDelete } but assignable (Boolean.prototype.toString
+        // = Object.prototype.toString must take effect), while constructor /
+        // Math objects and built-in method functions themselves (length,
+        // name) are { ReadOnly, DontEnum, DontDelete }. Properties added to
+        // these objects LATER (era scripts patching prototypes) are ordinary.
+        foreach (string builtin in new[]
+        {
+            "Object", "Function", "Array", "String", "Number", "Boolean",
+            "Date", "RegExp", "Math", "Error", "TypeError", "RangeError",
+            "EvalError", "ReferenceError", "SyntaxError", "URIError"
+        })
+        {
+            if (globalScope.Get(builtin) is not { Type: JsType.Object or JsType.Function } bv)
+                continue;
+            var ctor = bv.GetObjectOrFunction();
+            ctor.FreezeBuiltins();                                    // full builtin attrs
+            if (ctor.Get("prototype") is { Type: JsType.Object or JsType.Function } pv)
+            {
+                var proto = pv.GetObjectOrFunction();
+                proto.MarkAll(JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete);
+                foreach (var method in proto.Properties.Values)
+                    if (method.Type is (JsType.Object or JsType.Function))
+                        method.GetObjectOrFunction().FreezeBuiltins();
+            }
+        }
+        functionProto.MarkAll(JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete);
+        foreach (var method in functionProto.Properties.Values)
+            if (method.Type is (JsType.Object or JsType.Function))
+                method.GetObjectOrFunction().FreezeBuiltins();
     }
 
     private static JsValue Fn(JsScope scope, string name,
@@ -121,7 +153,7 @@ public static class JsRuntime
 
         objProto.Set("valueOf", Fn(scope, "valueOf", (self, args) => self));
 
-        objProto.Set("hasOwnProperty", Fn(scope, "hasOwnProperty", (self, args) =>
+        objProto.Set("hasOwnProperty", Fn(scope, "hasOwnProperty", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(false);
             if (self.Type is not (JsType.Object or JsType.Function)) return JsValue.From(false);
@@ -130,14 +162,14 @@ public static class JsRuntime
             return JsValue.From(key is not ("length" or "name" or "prototype" or "constructor"));
         }));
 
-        objProto.Set("propertyIsEnumerable", Fn(scope, "propertyIsEnumerable", (self, args) =>
+        objProto.Set("propertyIsEnumerable", Fn(scope, "propertyIsEnumerable", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(false);
             if (self.Type is not (JsType.Object or JsType.Function)) return JsValue.From(false);
             return JsValue.From(self.GetObjectOrFunction().HasOwn(args[0].ToJsString()));
         }));
 
-        objProto.Set("isPrototypeOf", Fn(scope, "isPrototypeOf", (self, args) =>
+        objProto.Set("isPrototypeOf", Fn(scope, "isPrototypeOf", 1, (self, args) =>
         {
             if (args.Length == 0 ||
                 self.Type is not (JsType.Object or JsType.Function) ||
@@ -154,11 +186,15 @@ public static class JsRuntime
 
         var objectCtor = new JsFunction((self, args) =>
         {
-            if (args.Length > 0 && args[0].Type == JsType.Object)
+            // §15.2.2.1: objects/functions pass through untouched
+            if (args.Length > 0 && args[0].Type is (JsType.Object or JsType.Function))
                 return args[0];
             var o = new JsObject { Prototype = objProto };
             if (args.Length > 0)
             {
+                // §15.2.2.1: a primitive value becomes a wrapper whose
+                // [[Prototype]] is the corresponding primitive prototype, so
+                // Object(true).valueOf finds Boolean.prototype.valueOf.
                 o.Class = args[0].Type switch
                 {
                     JsType.String => "String",
@@ -167,9 +203,25 @@ public static class JsRuntime
                     _ => "Object"
                 };
                 o.Set("value", args[0]);
+                o.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                o.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+                o.Prototype = args[0].Type switch
+                {
+                    JsType.String   => JsInterpreter.StringPrototype,
+                    JsType.Number   => JsInterpreter.NumberPrototype,
+                    JsType.Boolean  => JsInterpreter.BooleanPrototype,
+                    _ => objProto
+                };
+                if (args[0].Type == JsType.String)
+                {
+                    // ToObject(string) carries a read-only length (§15.5.5.1)
+                    o.SetWritable("length", JsValue.From(args[0].GetString().Length));
+                    o.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                    o.Attrs["length"] = JsObject.PropAttr.Builtin;
+                }
             }
             return JsValue.FromObject(o);
-        }, scope, "Object");
+        }, scope, "Object", length: 1);
         objectCtor.Set("prototype", JsValue.FromObject(objProto));
         objProto.Set("constructor", JsValue.FromFunction(objectCtor));
         scope.Define("Object", JsValue.FromFunction(objectCtor));
@@ -194,7 +246,7 @@ public static class JsRuntime
             var parameterNames = declaration.Params.Select(parameter => parameter.Name).ToArray();
             return JsValue.FromFunction(new JsFunction(
                 functionBody, parameterNames, scope, "anonymous"));
-        }, scope, "Function");
+        }, scope, "Function", length: 1);
         constructor.Prototype = functionProto;
         constructor.Set("prototype", JsValue.FromFunction((JsFunction)functionProto));
         functionProto.Set("constructor", JsValue.FromFunction(constructor));
@@ -211,7 +263,7 @@ public static class JsRuntime
         // hasOwnProperty/valueOf like everything else
         var arrProto = new JsObject { Class = "Array", Prototype = objectProto };
 
-        arrProto.Set("push", Fn(scope, "push", (self, args) =>
+        arrProto.Set("push", Fn(scope, "push", 1, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -246,7 +298,7 @@ public static class JsRuntime
             return first;
         }));
 
-        arrProto.Set("unshift", Fn(scope, "unshift", (self, args) =>
+        arrProto.Set("unshift", Fn(scope, "unshift", 1, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -272,7 +324,7 @@ public static class JsRuntime
             return self;
         }));
 
-        arrProto.Set("join", Fn(scope, "join", (self, args) =>
+        arrProto.Set("join", Fn(scope, "join", 1, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -293,7 +345,7 @@ public static class JsRuntime
                 ? arrProto.Get("join").GetFunction().Native!(self, Array.Empty<JsValue>())
                 : self));
 
-        arrProto.Set("slice", Fn(scope, "slice", (self, args) =>
+        arrProto.Set("slice", Fn(scope, "slice", 2, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -313,7 +365,7 @@ public static class JsRuntime
             return JsValue.FromObject(newArr);
         }));
 
-        arrProto.Set("concat", Fn(scope, "concat", (self, args) =>
+        arrProto.Set("concat", Fn(scope, "concat", 1, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -343,7 +395,7 @@ public static class JsRuntime
             return JsValue.FromObject(newArr);
         }));
 
-        arrProto.Set("splice", Fn(scope, "splice", (self, args) =>
+        arrProto.Set("splice", Fn(scope, "splice", 2, (self, args) =>
         {
             var arr = self.GetObjectOrFunction();
             int length = LengthOf(self);
@@ -380,7 +432,7 @@ public static class JsRuntime
             return JsValue.FromObject(removed);
         }));
 
-        arrProto.Set("indexOf", Fn(scope, "indexOf", (self, args) =>
+        arrProto.Set("indexOf", Fn(scope, "indexOf", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(-1);
             var arr = self.GetObjectOrFunction();
@@ -424,7 +476,7 @@ public static class JsRuntime
 
             newArr.Set("length", JsValue.From(length));
             return JsValue.FromObject(newArr);
-        }, scope, "Array");
+        }, scope, "Array", length: 1);
         arrayCtor.Set("prototype", JsValue.FromObject(arrProto));
         scope.Define("Array", JsValue.FromFunction(arrayCtor));
 
@@ -439,23 +491,25 @@ public static class JsRuntime
     {
         var strProto = new JsObject { Class = "String", Prototype = objectProto };
 
-        strProto.Set("charAt", Fn(scope, "charAt", (self, args) =>
+        strProto.Set("charAt", Fn(scope, "charAt", 1, (self, args) =>
         {
             var str = self.ToJsString();
-            int index = args.Length > 0 && !double.IsNaN(args[0].ToNumber()) ? (int)args[0].ToNumber() : 0;
+            // §15.5.4.4: ToInteger(position); out of range yields ""
+            double index = args.Length > 0 ? ToIntegerD(args[0].ToNumber()) : 0;
             if (index < 0 || index >= str.Length) return JsValue.From("");
-            return JsValue.From(str[index].ToString());
+            return JsValue.From(str[(int)index].ToString());
         }));
 
-        strProto.Set("charCodeAt", Fn(scope, "charCodeAt", (self, args) =>
+        strProto.Set("charCodeAt", Fn(scope, "charCodeAt", 1, (self, args) =>
         {
             var str = self.ToJsString();
-            int index = args.Length > 0 && !double.IsNaN(args[0].ToNumber()) ? (int)args[0].ToNumber() : 0;
+            // §15.5.4.5: ToInteger(position); out of range yields NaN
+            double index = args.Length > 0 ? ToIntegerD(args[0].ToNumber()) : 0;
             if (index < 0 || index >= str.Length) return JsValue.From(double.NaN);
-            return JsValue.From((double)str[index]);
+            return JsValue.From((double)str[(int)index]);
         }));
 
-        strProto.Set("indexOf", Fn(scope, "indexOf", (self, args) =>
+        strProto.Set("indexOf", Fn(scope, "indexOf", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(-1);
             var str = self.ToJsString();
@@ -464,26 +518,39 @@ public static class JsRuntime
             return JsValue.From(str.IndexOf(search, from, StringComparison.Ordinal));
         }));
 
-        strProto.Set("lastIndexOf", Fn(scope, "lastIndexOf", (self, args) =>
+        strProto.Set("lastIndexOf", Fn(scope, "lastIndexOf", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(-1);
             var str = self.ToJsString();
             var search = args[0].ToJsString();
-            return JsValue.From(str.LastIndexOf(search, StringComparison.Ordinal));
+            // §15.5.4.8: greatest index ≤ position where the search starts;
+            // a missing position is +∞, NaN is 0
+            double raw = args.Length > 1 ? args[1].ToNumber() : double.PositiveInfinity;
+            double pos = args.Length > 1
+                ? (double.IsNaN(raw) ? double.PositiveInfinity : ToIntegerD(raw))
+                : double.PositiveInfinity;
+            double clamped = Math.Clamp(pos, 0, str.Length);
+            int start = (int)Math.Min(clamped, str.Length - search.Length);
+            for (int i = start; i >= 0; i--)
+                if (string.CompareOrdinal(str, i, search, 0, search.Length) == 0)
+                    return JsValue.From(i);
+            return JsValue.From(-1);
         }));
 
-        strProto.Set("substring", Fn(scope, "substring", (self, args) =>
+        strProto.Set("substring", Fn(scope, "substring", 2, (self, args) =>
         {
             var str = self.ToJsString();
-            int start = args.Length > 0 && !double.IsNaN(args[0].ToNumber()) ? (int)args[0].ToNumber() : 0;
-            int end = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
-                ? (int)args[1].ToNumber() : str.Length;
+            // §15.5.4.15: ToInteger both bounds; a missing end is +∞, NaN is 0
+            double start = args.Length > 0
+                ? ToIntegerD(args[0].ToNumber()) : 0;
+            double end = args.Length > 1
+                ? ToIntegerD(args[1].ToNumber()) : double.PositiveInfinity;
 
             start = Math.Clamp(start, 0, str.Length);
             end   = Math.Clamp(end, 0, str.Length);
             if (start > end) (start, end) = (end, start);
 
-            return JsValue.From(str[start..end]);
+            return JsValue.From(str[(int)start..(int)end]);
         }));
 
         strProto.Set("substr", Fn(scope, "substr", (self, args) =>
@@ -501,7 +568,7 @@ public static class JsRuntime
             return JsValue.From(str.Substring(start, length));
         }));
 
-        strProto.Set("slice", Fn(scope, "slice", (self, args) =>
+        strProto.Set("slice", Fn(scope, "slice", 2, (self, args) =>
         {
             var str = self.ToJsString();
             int start = args.Length > 0 && !double.IsNaN(args[0].ToNumber()) ? (int)args[0].ToNumber() : 0;
@@ -518,11 +585,11 @@ public static class JsRuntime
         }));
 
         strProto.Set("toLowerCase", Fn(scope, "toLowerCase", (self, args) =>
-            JsValue.From(self.ToJsString().ToLowerInvariant())));
+            JsValue.From(EraMapCase(self.ToJsString(), toUpper: false))));
         strProto.Set("toUpperCase", Fn(scope, "toUpperCase", (self, args) =>
-            JsValue.From(self.ToJsString().ToUpperInvariant())));
+            JsValue.From(EraMapCase(self.ToJsString(), toUpper: true))));
 
-        strProto.Set("split", Fn(scope, "split", (self, args) =>
+        strProto.Set("split", Fn(scope, "split", 2, (self, args) =>
         {
             var str = self.ToJsString();
             var result = NewArray(scope);
@@ -533,6 +600,15 @@ public static class JsRuntime
             if (limit < 1)
             {
                 result.Set("length", JsValue.From(0));
+                return JsValue.FromObject(result);
+            }
+
+            if (args.Length == 0 || args[0].Type == JsType.Undefined)
+            {
+                // §15.5.4.14: an undefined separator yields the whole string
+                // as the single element (split(void 0) is NOT split("undefined"))
+                result.Set("0", JsValue.From(str));
+                result.Set("length", JsValue.From(1));
                 return JsValue.FromObject(result);
             }
 
@@ -570,14 +646,14 @@ public static class JsRuntime
             return JsValue.FromObject(result);
         }));
 
-        strProto.Set("concat", Fn(scope, "concat", (self, args) =>
+        strProto.Set("concat", Fn(scope, "concat", 1, (self, args) =>
         {
             var sb = new StringBuilder(self.ToJsString());
             foreach (var arg in args) sb.Append(arg.ToJsString());
             return JsValue.From(sb.ToString());
         }));
 
-        strProto.Set("match", Fn(scope, "match", (self, args) =>
+        strProto.Set("match", Fn(scope, "match", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.Null;
             var str = self.ToJsString();
@@ -600,7 +676,7 @@ public static class JsRuntime
             return JsValue.FromObject(result);
         }));
 
-        strProto.Set("replace", Fn(scope, "replace", (self, args) =>
+        strProto.Set("replace", Fn(scope, "replace", 2, (self, args) =>
         {
             if (args.Length < 2) return self;
             var str = self.ToJsString();
@@ -624,7 +700,7 @@ public static class JsRuntime
                 str[..index] + replacement + str[(index + searchStr.Length)..]);
         }));
 
-        strProto.Set("search", Fn(scope, "search", (self, args) =>
+        strProto.Set("search", Fn(scope, "search", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(-1);
             var str = self.ToJsString();
@@ -634,17 +710,27 @@ public static class JsRuntime
         }));
 
         strProto.Set("toString", Fn(scope, "toString", (self, args) =>
-            self.Type is JsType.Object or JsType.Function &&
-            self.GetObjectOrFunction().Class == "String"
-                ? self.GetObjectOrFunction().Get("value")
-                : self));
+        {
+            // §15.5.4.2: requires a String value or a String wrapper
+            if (self.Type == JsType.String) return self;
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                self.GetObjectOrFunction().Class == "String")
+                return self.GetObjectOrFunction().Get("value") is { Type: JsType.String } s
+                    ? s : JsValue.From("");       // String.prototype's [[Value]] is ""
+            throw new JsTypeErrorException("String.prototype.toString is not generic");
+        }));
         strProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
-            self.Type is JsType.Object or JsType.Function &&
-            self.GetObjectOrFunction().Class == "String"
-                ? self.GetObjectOrFunction().Get("value")
-                : self));
+        {
+            // §15.5.4.3: same receiver rule as toString
+            if (self.Type == JsType.String) return self;
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                self.GetObjectOrFunction().Class == "String")
+                return self.GetObjectOrFunction().Get("value") is { Type: JsType.String } s
+                    ? s : JsValue.From("");
+            throw new JsTypeErrorException("String.prototype.valueOf is not generic");
+        }));
 
-        strProto.Set("localeCompare", Fn(scope, "localeCompare", (self, args) =>
+        strProto.Set("localeCompare", Fn(scope, "localeCompare", 1, (self, args) =>
             JsValue.From(args.Length == 0
                 ? 0
                 : string.Compare(self.ToJsString(), args[0].ToJsString(),
@@ -687,9 +773,14 @@ public static class JsRuntime
         {
             var sb = new StringBuilder();
             foreach (var arg in args)
-                sb.Append((char)(int)arg.ToNumber());
+            {
+                // §15.5.3.2: each argument is ToUint16'ed
+                double d = ToIntegerD(arg.ToNumber());
+                if (double.IsNaN(d) || double.IsInfinity(d)) { sb.Append('\0'); continue; }
+                sb.Append((char)(unchecked((int)(long)d) & 0xFFFF));
+            }
             return JsValue.From(sb.ToString());
-        }, scope, "fromCharCode");
+        }, scope, "fromCharCode", length: 1);
 
         var stringCtor = new JsFunction((self, args) =>
         {
@@ -705,13 +796,22 @@ public static class JsRuntime
                 var strObj = self.GetObjectOrFunction();
                 strObj.Class = "String";
                 strObj.Set("value", JsValue.From(text));
-                strObj.Set("length", JsValue.From(text.Length));
+                strObj.SetWritable("length", JsValue.From(text.Length));
+                strObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                strObj.Attrs["length"] = JsObject.PropAttr.Builtin;   // §15.5.5.1: length is { ReadOnly, DontEnum, DontDelete }
+                strObj.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
                 return self;
             }
             return JsValue.From(text);
-        }, scope, "String");
+        }, scope, "String", length: 1);
         stringCtor.Set("prototype", JsValue.FromObject(strProto));
         stringCtor.Set("fromCharCode", JsValue.FromFunction(fromCharCode));
+        // §15.5.4.1: String.prototype.constructor is the String constructor.
+        // String.prototype is itself a String (length 0, §15.5.4).
+        strProto.Set("constructor", JsValue.FromFunction(stringCtor));
+        strProto.SetWritable("length", JsValue.From(0));
+        strProto.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+        strProto.Attrs["length"] = JsObject.PropAttr.Builtin;
         scope.Define("String", JsValue.FromFunction(stringCtor));
 
         return strProto;
@@ -782,7 +882,9 @@ public static class JsRuntime
         numProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
             self.Type is JsType.Object or JsType.Function &&
             self.GetObjectOrFunction().Class == "Number"
-                ? self.GetObjectOrFunction().Get("value")
+                // Number.prototype's own [[Value]] is +0 (§15.7.4)
+                ? self.GetObjectOrFunction().Get("value") is { Type: JsType.Number } n
+                    ? n : JsValue.From(0)
                 : self));
 
         // ── ES3 / JScript 5.0 number formatting (checklist §12) ──
@@ -790,7 +892,7 @@ public static class JsRuntime
         // double's true binary value (so 1.005.toFixed(2) === "1.00", the
         // classic binary-representation behaviour both JScript 5 and
         // ECMAScript implementations exhibit).
-        numProto.Set("toFixed", Fn(scope, "toFixed", (self, args) =>
+        numProto.Set("toFixed", Fn(scope, "toFixed", 1, (self, args) =>
         {
             double num = self.ToNumber();
             if (double.IsNaN(num)) return JsValue.From("NaN");
@@ -812,7 +914,7 @@ public static class JsRuntime
             return JsValue.From(FixedString(num, digits));
         }));
 
-        numProto.Set("toExponential", Fn(scope, "toExponential", (self, args) =>
+        numProto.Set("toExponential", Fn(scope, "toExponential", 1, (self, args) =>
         {
             double num = self.ToNumber();
             if (double.IsNaN(num)) return JsValue.From("NaN");
@@ -850,7 +952,7 @@ public static class JsRuntime
             return JsValue.From(s);
         }));
 
-        numProto.Set("toPrecision", Fn(scope, "toPrecision", (self, args) =>
+        numProto.Set("toPrecision", Fn(scope, "toPrecision", 1, (self, args) =>
         {
             double num = self.ToNumber();
             if (double.IsNaN(num)) return JsValue.From("NaN");
@@ -888,10 +990,12 @@ public static class JsRuntime
                 var numObj = self.GetObjectOrFunction();
                 numObj.Class = "Number";
                 numObj.Set("value", JsValue.From(value));
+                numObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                numObj.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
                 return self;
             }
             return JsValue.From(value);
-        }, scope, "Number");
+        }, scope, "Number", length: 1);
         numberCtor.Set("prototype", JsValue.FromObject(numProto));
         numberCtor.Set("MAX_VALUE", JsValue.From(double.MaxValue));
         numberCtor.Set("MIN_VALUE", JsValue.From(double.Epsilon));
@@ -1036,12 +1140,29 @@ public static class JsRuntime
         var boolProto = new JsObject { Class = "Boolean", Prototype = objectProto };
 
         boolProto.Set("toString", Fn(scope, "toString", (self, args) =>
-            JsValue.From(self.ToBoolean() ? "true" : "false")));
+        {
+            // §15.6.4.2: requires a Boolean value or a Boolean wrapper
+            if (self.Type == JsType.Boolean) return JsValue.From(self.GetBool() ? "true" : "false");
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                self.GetObjectOrFunction().Class == "Boolean")
+            {
+                bool b = self.GetObjectOrFunction().Get("value") is { Type: JsType.Boolean } bv
+                    ? bv.GetBool()
+                    : false;                     // Boolean.prototype's [[Value]] is false
+                return JsValue.From(b ? "true" : "false");
+            }
+            throw new JsTypeErrorException("Boolean.prototype.toString is not generic");
+        }));
         boolProto.Set("valueOf", Fn(scope, "valueOf", (self, args) =>
-            self.Type is JsType.Object or JsType.Function &&
-            self.GetObjectOrFunction().Class == "Boolean"
-                ? self.GetObjectOrFunction().Get("value")
-                : self));
+        {
+            // §15.6.4.3: same receiver rule as toString
+            if (self.Type == JsType.Boolean) return self;
+            if (self.Type is (JsType.Object or JsType.Function) &&
+                self.GetObjectOrFunction().Class == "Boolean")
+                return self.GetObjectOrFunction().Get("value") is { Type: JsType.Boolean } b
+                    ? b : JsValue.False;
+            throw new JsTypeErrorException("Boolean.prototype.valueOf is not generic");
+        }));
 
         var boolCtor = new JsFunction((self, args) =>
         {
@@ -1054,11 +1175,15 @@ public static class JsRuntime
                 var boolObj = self.GetObjectOrFunction();
                 boolObj.Class = "Boolean";
                 boolObj.Set("value", JsValue.From(value));
+                boolObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                boolObj.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
                 return self;
             }
             return JsValue.From(value);
-        }, scope, "Boolean");
+        }, scope, "Boolean", length: 1);
         boolCtor.Set("prototype", JsValue.FromObject(boolProto));
+        // §15.6.4.1: Boolean.prototype.constructor is the Boolean constructor.
+        boolProto.Set("constructor", JsValue.FromFunction(boolCtor));
         scope.Define("Boolean", JsValue.FromFunction(boolCtor));
 
         return boolProto;
@@ -1070,7 +1195,9 @@ public static class JsRuntime
 
     private static void RegisterMath(JsScope scope)
     {
-        var math = new JsObject();
+        // §15.8: Math's [[Class]] is "Math" (Object.prototype.toString
+        // reports "[object Math]")
+        var math = new JsObject { Class = "Math" };
 
         math.Set("E",       JsValue.From(Math.E));
         math.Set("PI",      JsValue.From(Math.PI));
@@ -1081,38 +1208,38 @@ public static class JsRuntime
         math.Set("SQRT2",   JsValue.From(Math.Sqrt(2)));
         math.Set("SQRT1_2", JsValue.From(Math.Sqrt(0.5)));
 
-        math.Set("abs",   Fn(scope, "abs",   (s, a) => JsValue.From(Math.Abs(Arg(a, 0)))));
-        math.Set("ceil",  Fn(scope, "ceil",  (s, a) => JsValue.From(Math.Ceiling(Arg(a, 0)))));
-        math.Set("floor", Fn(scope, "floor", (s, a) => JsValue.From(Math.Floor(Arg(a, 0)))));
-        math.Set("round", Fn(scope, "round", (s, a) =>
+        math.Set("abs",   Fn(scope, "abs", 1,   (s, a) => JsValue.From(Math.Abs(Arg(a, 0)))));
+        math.Set("ceil",  Fn(scope, "ceil", 1,  (s, a) => JsValue.From(Math.Ceiling(Arg(a, 0)))));
+        math.Set("floor", Fn(scope, "floor", 1, (s, a) => JsValue.From(Math.Floor(Arg(a, 0)))));
+        math.Set("round", Fn(scope, "round", 1, (s, a) =>
         {
             double v = Arg(a, 0);
             // JS rounds .5 up (toward +Infinity), unlike .NET's banker's rounding
             return JsValue.From(Math.Floor(v + 0.5));
         }));
-        math.Set("min",   Fn(scope, "min",   (s, a) =>
+        math.Set("min",   Fn(scope, "min", 2,   (s, a) =>
         {
             double min = double.PositiveInfinity;
             foreach (var v in a) if (v.ToNumber() < min) min = v.ToNumber();
             return JsValue.From(min);
         }));
-        math.Set("max",   Fn(scope, "max",   (s, a) =>
+        math.Set("max",   Fn(scope, "max", 2,   (s, a) =>
         {
             double max = double.NegativeInfinity;
             foreach (var v in a) if (v.ToNumber() > max) max = v.ToNumber();
             return JsValue.From(max);
         }));
-        math.Set("pow",   Fn(scope, "pow",   (s, a) => JsValue.From(Math.Pow(Arg(a, 0), Arg(a, 1)))));
-        math.Set("sqrt",  Fn(scope, "sqrt",  (s, a) => JsValue.From(Math.Sqrt(Arg(a, 0)))));
-        math.Set("log",   Fn(scope, "log",   (s, a) => JsValue.From(Math.Log(Arg(a, 0)))));
-        math.Set("exp",   Fn(scope, "exp",   (s, a) => JsValue.From(Math.Exp(Arg(a, 0)))));
-        math.Set("sin",   Fn(scope, "sin",   (s, a) => JsValue.From(Math.Sin(Arg(a, 0)))));
-        math.Set("cos",   Fn(scope, "cos",   (s, a) => JsValue.From(Math.Cos(Arg(a, 0)))));
-        math.Set("tan",   Fn(scope, "tan",   (s, a) => JsValue.From(Math.Tan(Arg(a, 0)))));
-        math.Set("asin",  Fn(scope, "asin",  (s, a) => JsValue.From(Math.Asin(Arg(a, 0)))));
-        math.Set("acos",  Fn(scope, "acos",  (s, a) => JsValue.From(Math.Acos(Arg(a, 0)))));
-        math.Set("atan",  Fn(scope, "atan",  (s, a) => JsValue.From(Math.Atan(Arg(a, 0)))));
-        math.Set("atan2", Fn(scope, "atan2", (s, a) => JsValue.From(Math.Atan2(Arg(a, 0), Arg(a, 1)))));
+        math.Set("pow",   Fn(scope, "pow", 2,   (s, a) => JsValue.From(Math.Pow(Arg(a, 0), Arg(a, 1)))));
+        math.Set("sqrt",  Fn(scope, "sqrt", 1,  (s, a) => JsValue.From(Math.Sqrt(Arg(a, 0)))));
+        math.Set("log",   Fn(scope, "log", 1,   (s, a) => JsValue.From(Math.Log(Arg(a, 0)))));
+        math.Set("exp",   Fn(scope, "exp", 1,   (s, a) => JsValue.From(Math.Exp(Arg(a, 0)))));
+        math.Set("sin",   Fn(scope, "sin", 1,   (s, a) => JsValue.From(Math.Sin(Arg(a, 0)))));
+        math.Set("cos",   Fn(scope, "cos", 1,   (s, a) => JsValue.From(Math.Cos(Arg(a, 0)))));
+        math.Set("tan",   Fn(scope, "tan", 1,   (s, a) => JsValue.From(Math.Tan(Arg(a, 0)))));
+        math.Set("asin",  Fn(scope, "asin", 1,  (s, a) => JsValue.From(Math.Asin(Arg(a, 0)))));
+        math.Set("acos",  Fn(scope, "acos", 1,  (s, a) => JsValue.From(Math.Acos(Arg(a, 0)))));
+        math.Set("atan",  Fn(scope, "atan", 1,  (s, a) => JsValue.From(Math.Atan(Arg(a, 0)))));
+        math.Set("atan2", Fn(scope, "atan2", 2, (s, a) => JsValue.From(Math.Atan2(Arg(a, 0), Arg(a, 1)))));
         math.Set("random", Fn(scope, "random", (s, a) =>
             JsValue.From(_sharedRandom.NextDouble())));
 
@@ -1176,6 +1303,28 @@ public static class JsRuntime
         if (double.IsNaN(x)) return 0;
         if (double.IsInfinity(x)) return x;
         return Math.Truncate(x);
+    }
+
+    /// <summary>Era (Unicode 2.1) case mapping: U+0130 (İ) lowercases to
+    /// plain "i", and the Georgian letters are caseless — the modern .NET
+    /// tables differ on both, and the corpus pins the era behaviour.</summary>
+    private static string EraMapCase(string s, bool toUpper)
+    {
+        if (s.Length == 0) return s;
+        bool ascii = true;
+        foreach (char c in s)
+            if (c >= 128) { ascii = false; break; }
+        if (ascii)
+            return toUpper ? s.ToUpperInvariant() : s.ToLowerInvariant();
+
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (char ch in s)
+        {
+            if (!toUpper && ch == '\u0130') { sb.Append('i'); continue; }
+            if (ch >= '\u10D0' && ch <= '\u10FF') { sb.Append(ch); continue; }
+            sb.Append(toUpper ? char.ToUpperInvariant(ch) : char.ToLowerInvariant(ch));
+        }
+        return sb.ToString();
     }
 
     // §15.9.1.2 Day Number and Time within Day
@@ -1324,6 +1473,12 @@ public static class JsRuntime
         $"{DateDayNames[(int)WeekDay(localMs)]} {DateMonthNames[(int)MonthFromTime(localMs)]} " +
         $"{TwoDigits(DateFromTime(localMs))} {DateYearString(YearFromTime(localMs))}";
 
+    /// <summary>Date.prototype.toString for the object stringifier ("" + date
+    /// must agree with the method, §9.8) — overflow-safe on extreme values.</summary>
+    internal static string DateToStringForStringify(double ms) =>
+        double.IsNaN(ms) ? "Invalid Date"
+            : DateToStringStyle(LocalTime(ms), utcStyle: false);
+
     private static void RegisterDate(JsScope scope, JsObject objectProto)
     {
         var dateProto = new JsObject { Class = "Date", Prototype = objectProto };
@@ -1342,6 +1497,21 @@ public static class JsRuntime
         dateProto.Set("getMilliseconds", Fn(scope, "getMilliseconds", (s, a) => JsValue.From(MsFromTime(LocalTime(MsOf(s))))));
         dateProto.Set("getTimezoneOffset", Fn(scope, "getTimezoneOffset", (s, a) =>
             JsValue.From((MsOf(s) - LocalTime(MsOf(s))) / MsPerMinute)));
+
+        // setYear — Annex B.2.5: like setFullYear but with the two-digit
+        // 1900 rule applied, and a NaN year makes the date NaN.
+        dateProto.Set("setYear", Fn(scope, "setYear", (self, args) =>
+        {
+            double tv = MsOf(self);
+            if (double.IsNaN(tv)) tv = 0;
+            double t = LocalTime(tv);
+            double year = Arg(args, 0);
+            if (double.IsNaN(year))
+                return StoreTime(self, double.NaN);
+            if (year is >= 0 and <= 99) year += 1900;
+            double day = MakeDay(year, MonthFromTime(t), DateFromTime(t));
+            return StoreTime(self, TimeClip(UtcFromLocal(MakeDate(day, TimeWithinDay(t)))));
+        }));
 
         // getYear — the era's method: year minus 1900 (Annex B.2.5 behaviour)
         dateProto.Set("getYear", Fn(scope, "getYear", (s, a) =>
@@ -1571,21 +1741,22 @@ public static class JsRuntime
             // Genuine `new Date(...)` only mutates self. A plain Date() call
             // receives the GLOBAL object as this and used to write
             // value/Prototype/Class onto it — after one Date() the window
-            // stringified as a Date. Per spec, plain Date() returns the
-            // current date/time as a STRING and ignores all arguments.
+            // stringified as a Date. Per §15.9.2.1 (and the suite's pinned
+            // era behaviour) a plain call accepts but IGNORES any arguments
+            // and returns the current time as a string.
             if (self.Type is (JsType.Object or JsType.Function) &&
                 ReferenceEquals(self.GetObjectOrFunction().Prototype, dateProto))
             {
                 var dateObj = self.GetObjectOrFunction();
                 dateObj.Class = "Date";
                 dateObj.Set("value", JsValue.From(ms));
+                dateObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+                dateObj.Attrs["value"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
                 return self;
             }
 
-            var now = Math.Truncate((DateTime.UtcNow - Epoch).TotalMilliseconds);
-            return JsValue.From(
-                Epoch.AddMilliseconds(now).ToLocalTime().ToString(
-                    "ddd MMM dd HH:mm:ss yyyy", CultureInfo.InvariantCulture));
+            double plain = Math.Truncate((DateTime.UtcNow - Epoch).TotalMilliseconds);
+            return JsValue.From(DateToStringForStringify(plain));
         }, scope, "Date", length: 7);
 
         dateCtor.Set("prototype", JsValue.FromObject(dateProto));
@@ -1653,7 +1824,7 @@ public static class JsRuntime
     {
         var regexProto = new JsObject { Class = "RegExp", Prototype = objectProto };
 
-        regexProto.Set("test", Fn(scope, "test", (self, args) =>
+        regexProto.Set("test", Fn(scope, "test", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(false);
             var o = self.GetObjectOrFunction();
@@ -1673,7 +1844,7 @@ public static class JsRuntime
             return JsValue.From(false);
         }));
 
-        regexProto.Set("exec", Fn(scope, "exec", (self, args) =>
+        regexProto.Set("exec", Fn(scope, "exec", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.Null;
             var o = self.GetObjectOrFunction();
@@ -1795,7 +1966,7 @@ public static class JsRuntime
                 return self;
             }
             return JsValue.FromObject(Build(new JsObject()));
-        }, scope, "RegExp");
+        }, scope, "RegExp", length: 2);
         regexpCtor.Set("prototype", JsValue.FromObject(regexProto));
         scope.Define("RegExp", JsValue.FromFunction(regexpCtor));
     }
@@ -1862,7 +2033,7 @@ public static class JsRuntime
     {
         // parseInt: scans the valid prefix ("12abc" → 12), honours radix,
         // hex prefix, and octal-style strings exactly like JS 1.1
-        scope.Define("parseInt", Fn(scope, "parseInt", (self, args) =>
+        scope.Define("parseInt", Fn(scope, "parseInt", 2, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(double.NaN);
             string s = args[0].ToJsString().Trim();
@@ -1902,7 +2073,9 @@ public static class JsRuntime
             }
             if (radix < 2 || radix > 36) return JsValue.From(double.NaN);
 
-            long val = 0;
+            // Accumulate as a double so absurd digit runs saturate to ±∞
+            // (§15.1.2.2: the math is on the mathematical integer value)
+            double val = 0;
             int digits = 0;
             while (i < s.Length)
             {
@@ -1915,6 +2088,7 @@ public static class JsRuntime
                 };
                 if (d < 0 || d >= radix) break;
                 val = val * radix + d;
+                if (double.IsInfinity(val)) break;
                 digits++;
                 i++;
             }
@@ -1924,7 +2098,7 @@ public static class JsRuntime
         }));
 
         // parseFloat: scans the valid numeric prefix ("3.14abc" → 3.14)
-        scope.Define("parseFloat", Fn(scope, "parseFloat", (self, args) =>
+        scope.Define("parseFloat", Fn(scope, "parseFloat", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(double.NaN);
             string s = args[0].ToJsString().Trim();
@@ -1968,10 +2142,10 @@ public static class JsRuntime
             return JsValue.From(double.NaN);
         }));
 
-        scope.Define("isNaN", Fn(scope, "isNaN", (self, args) =>
+        scope.Define("isNaN", Fn(scope, "isNaN", 1, (self, args) =>
             JsValue.From(double.IsNaN(args.Length > 0 ? args[0].ToNumber() : double.NaN))));
 
-        scope.Define("isFinite", Fn(scope, "isFinite", (self, args) =>
+        scope.Define("isFinite", Fn(scope, "isFinite", 1, (self, args) =>
         {
             double n = args.Length > 0 ? args[0].ToNumber() : double.NaN;
             return JsValue.From(!double.IsNaN(n) && !double.IsInfinity(n));
@@ -1980,7 +2154,7 @@ public static class JsRuntime
         // escape/unescape — JS 1.1 semantics: alphanumeric plus @*+-./_
         // pass through, everything else becomes %XX (Latin-1); unescape
         // also understands %uXXXX
-        scope.Define("escape", Fn(scope, "escape", (self, args) =>
+        scope.Define("escape", Fn(scope, "escape", 1, (self, args) =>
         {
             var s = args.Length > 0 ? args[0].ToJsString() : "";
             var sb = new StringBuilder(s.Length + 16);
@@ -1997,7 +2171,7 @@ public static class JsRuntime
             return JsValue.From(sb.ToString());
         }));
 
-        scope.Define("unescape", Fn(scope, "unescape", (self, args) =>
+        scope.Define("unescape", Fn(scope, "unescape", 1, (self, args) =>
         {
             var s = args.Length > 0 ? args[0].ToJsString() : "";
             var sb = new StringBuilder(s.Length);

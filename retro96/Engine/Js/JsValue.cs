@@ -58,12 +58,14 @@ public class JsValue
     public static JsValue From(bool v)      => v ? True : False;
     public static JsValue From(double v)
     {
+        // −0 keeps its own instance so 1/x keeps the sign (it falls through
+        // the small-int cache because (long)(−0.0) == 0 == −0.0)
+        if (v == 0.0 && double.IsNegativeInfinity(1 / v)) return NegativeZero;
         if (v is >= -64.0 and <= 1039.0)
         {
             long iv = (long)v;
             if (iv == v) return SmallInts[(int)iv + 64];
         }
-        if (v == 0.0 && double.IsNegativeInfinity(1 / v)) return NegativeZero;
         return new JsValue { Type = JsType.Number, _numberValue = v };
     }
     public static JsValue From(int v) =>
@@ -149,7 +151,11 @@ public class JsValue
             return this;
 
         var obj = GetObjectOrFunction();
-        if (obj.TryConvertToPrimitive(preferString || obj.Class == "Date", out var primitive))
+        // This engine-level shortcut is used for STRING/NUMBER hinted
+        // conversions only. The no-hint Date-prefers-string rule (§11.6.1)
+        // lives in the interpreter's Add, not here — a bare ToPrimitive must
+        // be valueOf-first (ms for a Date, so d2 - dateObject stays numeric).
+        if (obj.TryConvertToPrimitive(preferString, out var primitive))
             return primitive;
         if (JsObject.Stringifier != null)
             return JsValue.From(JsObject.Stringifier(obj));
@@ -246,16 +252,16 @@ public class JsValue
         {
             // Integral — print as plain digits (decimal keeps every digit
             // of a double integral value exactly up to ~7.9e28).
-            string digits = ((decimal)a).ToString(CultureInfo.InvariantCulture);
-            return neg ? "-" + digits : digits;
+            string intDigits = ((decimal)a).ToString(CultureInfo.InvariantCulture);
+            return neg ? "-" + intDigits : intDigits;
         }
 
-        // Round-trip shortest representation, normalised to JS exponent form
+        // Round-trip shortest representation, normalised per §9.8.1
         string s = a.ToString("R", CultureInfo.InvariantCulture);
         if (!s.Contains('E'))
             return neg ? "-" + s : s;
 
-        // "1.05E+21" → "1.05e+21", "1E-07" → "1e-7"
+        // "1.05E+21" → digits "105", leading-digit exponent E=21
         int e = s.IndexOf('E');
         string mantissa = s[..e];
         string expRaw   = s[(e + 1)..];
@@ -263,8 +269,32 @@ public class JsValue
         string expDigits = expRaw.TrimStart('-', '+').TrimStart('0');
         if (expDigits.Length == 0) expDigits = "0";
 
-        string result = mantissa + "e" + (expNeg ? "-" : "+") + expDigits;
-        return neg ? "-" + result : result;
+        string digits = mantissa.Replace(".", "");
+        int k = digits.Length;                       // significant digits
+        int bigE = (expNeg ? -1 : 1) * int.Parse(expDigits, CultureInfo.InvariantCulture);
+        int pointPos = bigE + 1;                     // decimal-point position (§9.8.1)
+
+        // §9.8.1: decimal forms when the decimal point sits within (−6, 21]
+        if (k <= pointPos && pointPos <= 21)
+        {
+            string dec = digits + new string('0', pointPos - k);
+            return neg ? "-" + dec : dec;
+        }
+        if (0 < pointPos && pointPos <= 21)
+        {
+            string dec = digits[..pointPos] + "." + digits[pointPos..];
+            return neg ? "-" + dec : dec;
+        }
+        if (-6 < pointPos && pointPos <= 0)
+        {
+            string dec = "0." + new string('0', -pointPos) + digits;
+            return neg ? "-" + dec : dec;
+        }
+
+        // Exponential form: d[.ddd]e±X with the exponent (n−1)
+        string exp = "e" + (pointPos - 1 >= 0 ? "+" : "-") + Math.Abs(pointPos - 1).ToString(CultureInfo.InvariantCulture);
+        string sci = k == 1 ? digits + exp : digits[..1] + "." + digits[1..] + exp;
+        return neg ? "-" + sci : sci;
     }
 
     /// <summary>
@@ -303,22 +333,9 @@ public class JsValue
         if (t == "Infinity" || t == "+Infinity") return double.PositiveInfinity;
         if (t == "-Infinity") return double.NegativeInfinity;
 
-        // Octal: "0..." all digits. "08"/"09" were decimal in Navigator.
-        if (t.Length > 1 && t[0] == '0' && AllDigits(t))
-        {
-            bool has89 = false;
-            foreach (char c in t)
-                if (c == '8' || c == '9') { has89 = true; break; }
-
-            if (!has89)
-            {
-                long val = 0;
-                foreach (char c in t[1..]) val = val * 8 + (c - '0');
-                return val;
-            }
-            // 8/9 present → fall through to decimal parse
-        }
-
+        // §9.3.1: leading-zero digit runs are DECIMAL here (Math.abs('077')
+        // is 77 — octal parsing belongs to parseInt and to the lexer's
+        // integer-literal grammar, not ToNumber).
         if (double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out double num))
             return num;
 
@@ -341,6 +358,39 @@ public class JsValue
 /// </summary>
 public class JsObject
 {
+    /// <summary>ECMA-262 property attributes (§8.6.1). Only populated for
+    /// properties whose attributes differ from the plain-object default
+    /// (writable, enumerable, deletable) — i.e. builtins.</summary>
+    [System.Flags]
+    internal enum PropAttr : byte
+    {
+        None = 0,
+        ReadOnly = 1,
+        DontEnum = 2,
+        DontDelete = 4,
+        Builtin = ReadOnly | DontEnum | DontDelete   // §15 prelude default for builtins
+    }
+
+    internal System.Collections.Generic.Dictionary<string, PropAttr>? Attrs;
+
+    internal bool HasAttr(string name, PropAttr attr) =>
+        Attrs != null && Attrs.TryGetValue(name, out var a) && (a & attr) != 0;
+
+    /// <summary>Marks the object's current own properties with the given
+    /// attribute set (see <see cref="PropAttr.Builtin"/> for the §15
+    /// built-in defaults).</summary>
+    internal void FreezeBuiltins() =>
+        MarkAll(PropAttr.Builtin);
+
+    /// <summary>Marks the object's current own properties with the given
+    /// attribute set.</summary>
+    internal void MarkAll(PropAttr attrs)
+    {
+        Attrs ??= new System.Collections.Generic.Dictionary<string, PropAttr>();
+        foreach (var key in Properties.Keys)
+            Attrs[key] = attrs;
+    }
+
     /// <summary>
     /// Internal class tag ("Array", "Date", "Error", "" for plain) used by
     /// stringification and type checks.
@@ -350,6 +400,9 @@ public class JsObject
     public Dictionary<string, JsValue> Properties { get; } = new(StringComparer.Ordinal);
     public JsObject? Prototype { get; set; }
     internal Func<JsObject, bool, JsValue>? PrimitiveConverter { get; set; }
+
+    /// <summary>Unconditional write used by the engine for its own bookkeeping.</summary>
+    internal void SetWritable(string name, JsValue value) => Properties[name] = value;
 
     /// <summary>
     /// Hook the interpreter installs so arrays join and dates stringify
@@ -399,6 +452,9 @@ public class JsObject
 
     public virtual void Set(string name, JsValue value)
     {
+        // §8.6.2.2: a plain assignment to a ReadOnly property changes nothing
+        if (Attrs != null && Attrs.TryGetValue(name, out var attr) && (attr & PropAttr.ReadOnly) != 0)
+            return;
         if (Class == "Array")
         {
             if (name == "length")
@@ -451,14 +507,23 @@ public class JsObject
 
     public bool HasOwn(string name) => Properties.ContainsKey(name);
 
-    public virtual bool Delete(string name) => Properties.Remove(name);
+    /// <summary>Delete honouring the DontDelete attribute (§8.6.2.5).</summary>
+    public virtual bool Delete(string name)
+    {
+        if (HasAttr(name, PropAttr.DontDelete)) return false;
+        return Properties.Remove(name);
+    }
 
     /// <summary>
     /// Snapshot of the own enumerable keys — for-in bodies may DELETE
     /// properties while iterating, which threw InvalidOperationException
     /// when this was a live Dictionary view.
     /// </summary>
-    public IEnumerable<string> OwnEnumerableKeys() => Properties.Keys.ToArray();
+    public IEnumerable<string> OwnEnumerableKeys()
+    {
+        if (Attrs == null) return Properties.Keys.ToArray();
+        return Properties.Keys.Where(k => !HasAttr(k, PropAttr.DontEnum)).ToArray();
+    }
 }
 
 /// <summary>A JavaScript function — either native C# or interpreted AST.</summary>
@@ -494,6 +559,7 @@ public class JsFunction : JsObject
         Class = "Function";
         Set("length", JsValue.From(length ?? Params.Count));
         if (name != null) Set("name", JsValue.From(name));
+        MarkInstancePropsDontEnum();
     }
 
     public JsFunction(FunctionExpr body, IReadOnlyList<string> @params, JsScope closureScope, string? name = null)
@@ -514,5 +580,16 @@ public class JsFunction : JsObject
         };
         instancePrototype.Set("constructor", JsValue.FromFunction(this));
         Set("prototype", JsValue.FromObject(instancePrototype));
+        MarkInstancePropsDontEnum();
+    }
+
+    /// <summary>for-in over a function enumerates nothing: the instance's
+    /// length/name/prototype properties are DontEnum (§13/§15.3.5).</summary>
+    private void MarkInstancePropsDontEnum()
+    {
+        Attrs ??= new System.Collections.Generic.Dictionary<string, PropAttr>();
+        Attrs["length"] = PropAttr.DontEnum;
+        Attrs["name"] = PropAttr.DontEnum;
+        Attrs["prototype"] = PropAttr.DontEnum;
     }
 }

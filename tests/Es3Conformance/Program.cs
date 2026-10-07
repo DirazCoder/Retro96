@@ -289,6 +289,19 @@ public static class Program
 
         private void InstallHostFunctions(JsScope scope, JsInterpreter interpreter, StringBuilder output)
         {
+            // The shell's global object: `this` at the top level (and in bare
+            // function calls, §10.2.3) is an object, not undefined. It chains
+            // to Object.prototype like the real global object.
+            var globalObj = new JsObject { Class = "global", Prototype = JsInterpreter.ObjectPrototype };
+            scope.GlobalFallback = globalObj;
+            scope.Define("global", JsValue.FromObject(globalObj));
+            // The engine scope was populated before the fallback existed —
+            // mirror its bindings (NaN, Infinity, builtins…) so property
+            // reads through `this` find them.
+            foreach (string key in scope.OwnKeys())
+                if (key != "this")
+                    globalObj.SetWritable(key, scope.Get(key));
+
             // print(...) — SpiderMonkey shell: args joined by spaces.
             scope.Define("print", JsValue.FromFunction(new JsFunction((self, args) =>
             {
