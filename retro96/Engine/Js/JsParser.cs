@@ -105,12 +105,24 @@ public class JsParser
 
     private Identifier ExpectIdentifier(string what)
     {
+        // §7.5: every keyword and future reserved word is rejected in
+        // binding positions (var/function/params/catch/labels)
         if (Peek() is JsIdentifierToken id) { Advance(); return new Identifier(id.Name); }
-        // Keywords were reserved, but accepting them as property names /
-        // labels keeps sloppy era pages running
+        var t = Peek();
+        throw new JsParserException(
+            $"Expected {what} but found '{Describe(t)}'", t.Line, t.Column);
+    }
+
+    /// <summary>
+    /// IdentifierName after '.' — §11.2 allows keywords AND future
+    /// reserved words as member names (document.defaultStatus etc.).
+    /// </summary>
+    private Identifier ExpectIdentifierName(string what)
+    {
+        if (Peek() is JsIdentifierToken id) { Advance(); return new Identifier(id.Name); }
         if (Peek() is JsKeywordToken kw) { Advance(); return new Identifier(kw.Keyword); }
         var t = Peek();
-        throw new JsParserException($"Expected {what}", t.Line, t.Column);
+        throw new JsParserException($"Expected {what} but found '{Describe(t)}'", t.Line, t.Column);
     }
 
     /// <summary>True when the NEXT token is separated by a line terminator.</summary>
@@ -913,7 +925,7 @@ public class JsParser
             if (CheckPunct("."))
             {
                 Advance();
-                var id = ExpectIdentifier("identifier after '.'");
+                var id = ExpectIdentifierName("identifier after '.'");
                 expr = new MemberExpr(expr, id, Computed: false);
             }
             else if (CheckPunct("["))
@@ -992,7 +1004,7 @@ public class JsParser
             if (CheckPunct("."))
             {
                 Advance();
-                var id = ExpectIdentifier("identifier after '.'");
+                var id = ExpectIdentifierName("identifier after '.'");
                 callee = new MemberExpr(callee, id, Computed: false);
             }
             else if (CheckPunct("["))

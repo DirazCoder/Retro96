@@ -1434,6 +1434,9 @@ public class JsInterpreter
         {
             CheckTimeout();
 
+            // §12.6.4: a property deleted before its turn is not visited
+            if (!obj.Has(key)) continue;
+
             if (forInStmt.Left is VarDeclaration varDecl)
                 _currentScope.Define(varDecl.Declarations[0].Id.Name, JsValue.From(key));
             else if (forInStmt.Left is ExpressionStatement es && es.Expression is Identifier ident)
@@ -1594,17 +1597,10 @@ public class JsInterpreter
         if (objVal.Type is not (JsType.Object or JsType.Function))
             return ExecuteStatement(with.Body);
 
-        var obj = objVal.GetObjectOrFunction();
-        var withScope = _currentScope.NewChild();
-
-        // Snapshot of own + inherited properties, shadowing outer variables
-        JsObject? current = obj;
-        while (current != null)
-        {
-            foreach (var key in current.OwnEnumerableKeys())
-                withScope.Define(key, current.Get(key));
-            current = current.Prototype;
-        }
+        // §12.10/§10.2.3: object environment — lookups walk the object's
+        // property chain (DontEnum builtins like Date.prototype methods are
+        // visible), writes land on the object, var binds in the outer scope.
+        var withScope = new JsWithScope(_currentScope, objVal.GetObjectOrFunction());
 
         var old = _currentScope;
         _currentScope = withScope;
@@ -1866,6 +1862,10 @@ public class JsInterpreter
         else
         {
             thisValue = GlobalThis();
+            // §10.2.3: a bare name found on a with-object is called with
+            // that object as `this` (with(d){ getUTCMonth() } — receiver d)
+            if (call.Callee is Identifier idc && _currentScope.ThisFor(idc.Name) is { } owner)
+                thisValue = JsValue.FromObject(owner);
             callee = ExecuteExpression(call.Callee);
         }
 
@@ -1977,12 +1977,7 @@ public class JsInterpreter
     private JsValue ExecuteRegex(RegexLiteral rx)
     {
         var regexObj = new JsObject { Class = "RegExp" };
-        regexObj.Set("source", JsValue.From(rx.Pattern));
-        regexObj.Set("flags", JsValue.From(rx.Flags));
-        regexObj.Set("global", JsValue.From(rx.Flags.Contains('g')));
-        regexObj.Set("ignoreCase", JsValue.From(rx.Flags.Contains('i')));
-        regexObj.Set("multiline", JsValue.From(rx.Flags.Contains('m')));
-        regexObj.Set("lastIndex", JsValue.From(0));
+        JsRuntime.ApplyRegExpShape(regexObj, rx.Pattern, rx.Flags);
         // RegExp prototype is installed by JsRuntime
         regexObj.Prototype = _globalScope.Get("RegExp") is { Type: JsType.Function } re
             && re.GetFunction().Get("prototype") is { Type: JsType.Object or JsType.Function } proto
@@ -2024,6 +2019,9 @@ public class JsInterpreter
                 GetMemberPropertyName(member)));
         }
 
+        // §11.4.1 step 1: the operand is still EVALUATED (delete ++o.a
+        // increments before yielding true), then true — not a Reference.
+        ExecuteExpression(d.Argument);
         return JsValue.From(true);
     }
 

@@ -54,6 +54,19 @@ public class JsLexer
         "while", "with"
     };
 
+    /// <summary>
+    /// ES3 §7.5.3 FutureReservedWords — reserved in every identifier
+    /// position (var/function/param/label) but still legal as IdentifierName
+    /// after '.' and in object literal keys.
+    /// </summary>
+    private static readonly HashSet<string> _futureReserved = new(StringComparer.Ordinal)
+    {
+        "abstract", "boolean", "byte", "char", "class", "const", "debugger", "double",
+        "enum", "export", "extends", "final", "float", "goto", "implements", "import",
+        "int", "interface", "long", "native", "package", "private", "protected", "public",
+        "short", "static", "super", "synchronized", "throws", "transient", "volatile"
+    };
+
     public JsLexer(string source)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
@@ -291,6 +304,7 @@ public class JsLexer
                     case 't': sb.Append('\t'); _pos++; _column++; break;
                     case 'b': sb.Append('\b'); _pos++; _column++; break;
                     case 'f': sb.Append('\f'); _pos++; _column++; break;
+                    case 'v': sb.Append('\v'); _pos++; _column++; break;   // §7.8.4 \v — vertical tab
                     case '0': sb.Append('\0'); _pos++; _column++; break;
                     case '\\': sb.Append('\\'); _pos++; _column++; break;
                     case '\'': sb.Append('\''); _pos++; _column++; break;
@@ -371,24 +385,37 @@ public class JsLexer
     {
         int start = _pos;
 
-        // Hex — accumulated in a double (exact to 2^53); the old long
-        // accumulator made 0xFFFFFFFF lex as -1.
+        // Hex — §7.7.3: derive the exact mathematical value first, then
+        // round to the nearest double (a naive double accumulate truncates
+        // on values that pass through unrepresentable intermediates).
         if (_source[_pos] == '0' && _pos + 1 < _source.Length &&
             (_source[_pos + 1] is 'x' or 'X'))
         {
             _pos += 2;
             _column += 2;
-            double val = 0;
-            int digits = 0;
+            int startDigits = _pos;
             while (_pos < _source.Length && IsHexDigit(_source[_pos]))
             {
-                val = val * 16 + HexValue(_source[_pos]);
-                digits++;
                 _pos++;
                 _column++;
             }
+            int digits = _pos - startDigits;
             if (digits == 0)
                 throw new JsLexerException("Invalid hex number");
+            string hexRun = _source.Substring(startDigits, digits);
+            double val;
+            if (digits <= 15)
+            {
+                // ≤ 60 bits — exact in a ulong; the cast rounds to nearest
+                val = (double)Convert.ToUInt64(hexRun, 16);
+            }
+            else
+            {
+                var bi = System.Numerics.BigInteger.Zero;
+                foreach (char c in hexRun)
+                    bi = bi * 16 + HexValue(c);
+                val = (double)bi;   // BigInteger→double is round-to-nearest-even
+            }
             return new JsNumberToken(val, 0, 0, 0, false);
         }
 
@@ -514,7 +541,7 @@ public class JsLexer
         }
 
         string name = sb.Length > 0 ? sb.ToString() : _source[start.._pos];
-        return _keywords.Contains(name)
+        return _keywords.Contains(name) || _futureReserved.Contains(name)
             ? new JsKeywordToken(name, 0, 0, 0, false)
             : new JsIdentifierToken(name, 0, 0, 0, false);
     }

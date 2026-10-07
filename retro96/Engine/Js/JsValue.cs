@@ -248,15 +248,9 @@ public class JsValue
         bool neg = n < 0;
         double a = Math.Abs(n);
 
-        if (a < 1e21 && a == Math.Floor(a))
-        {
-            // Integral — print as plain digits (decimal keeps every digit
-            // of a double integral value exactly up to ~7.9e28).
-            string intDigits = ((decimal)a).ToString(CultureInfo.InvariantCulture);
-            return neg ? "-" + intDigits : intDigits;
-        }
-
-        // Round-trip shortest representation, normalised per §9.8.1
+        // §9.8.1: print the SHORTEST decimal digits that round-trip —
+        // ToString(123456789012345664) is "123456789012345660", not the
+        // exact double digits. "R" on .NET Core is shortest round-trip.
         string s = a.ToString("R", CultureInfo.InvariantCulture);
         if (!s.Contains('E'))
             return neg ? "-" + s : s;
@@ -305,7 +299,7 @@ public class JsValue
     public static double StringToNumber(string s)
     {
         if (string.IsNullOrEmpty(s)) return 0.0;
-        string t = s.Trim();
+        string t = s.Trim().Trim('\uFEFF');   // §7.2: the BOM is whitespace
         if (t.Length == 0) return 0.0;
 
         if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ||
@@ -313,7 +307,25 @@ public class JsValue
         {
             string hex = t[2..];
             if (hex.Length == 0) return double.NaN;
-            long val = 0;
+            // §9.3.1: derive the exact mathematical value, then round once
+            if (hex.Length <= 15)
+            {
+                long val = 0;
+                foreach (char c in hex)
+                {
+                    int d = c switch
+                    {
+                        >= '0' and <= '9' => c - '0',
+                        >= 'a' and <= 'f' => c - 'a' + 10,
+                        >= 'A' and <= 'F' => c - 'A' + 10,
+                        _ => -1
+                    };
+                    if (d < 0) return double.NaN;
+                    val = val * 16 + d;
+                }
+                return val;
+            }
+            var bi = System.Numerics.BigInteger.Zero;
             foreach (char c in hex)
             {
                 int d = c switch
@@ -324,10 +336,9 @@ public class JsValue
                     _ => -1
                 };
                 if (d < 0) return double.NaN;
-                val = val * 16 + d;
-                if (val > 0xFFFFFFFFFFFFL) return double.NaN;  // absurd for era scripts
+                bi = bi * 16 + d;
             }
-            return val;
+            return (double)bi;   // round-to-nearest; > DBL_MAX saturates to ∞
         }
 
         if (t == "Infinity" || t == "+Infinity") return double.PositiveInfinity;
@@ -583,12 +594,13 @@ public class JsFunction : JsObject
         MarkInstancePropsDontEnum();
     }
 
-    /// <summary>for-in over a function enumerates nothing: the instance's
-    /// length/name/prototype properties are DontEnum (§13/§15.3.5).</summary>
+    /// <summary>length/name/prototype properties are DontEnum (§13/§15.3.5);
+    /// length is additionally ReadOnly+DontDelete (§15.3.5.1) — assigning
+    /// fn.length = 0 changes nothing.</summary>
     private void MarkInstancePropsDontEnum()
     {
         Attrs ??= new System.Collections.Generic.Dictionary<string, PropAttr>();
-        Attrs["length"] = PropAttr.DontEnum;
+        Attrs["length"] = PropAttr.Builtin;
         Attrs["name"] = PropAttr.DontEnum;
         Attrs["prototype"] = PropAttr.DontEnum;
     }

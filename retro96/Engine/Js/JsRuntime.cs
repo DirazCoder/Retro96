@@ -92,11 +92,56 @@ public static class JsRuntime
     private static double Num(JsValue v) => v.ToNumber();
     private static string Str(JsValue v) => v.ToJsString();
     private static double Arg(JsValue[] a, int i) => i < a.Length ? a[i].ToNumber() : double.NaN;
+
+    private static bool IsNegZero(double d) =>
+        d == 0.0 && System.BitConverter.DoubleToInt64Bits(d) < 0;
     private static string ArgStr(JsValue[] a, int i, string def = "") =>
         i < a.Length ? a[i].ToJsString() : def;
 
     private static Regex CreateJsRegex(string source, RegexOptions options) =>
-        new(source, options, TimeSpan.FromSeconds(1));
+        new(TranslateToNet(source), options, TimeSpan.FromSeconds(1));
+
+    /// <summary>
+    /// ES3 stores the pattern with '/' escaped ("\\/") and an empty pattern
+    /// as "(?:)" (§15.10.6.4/§15.10.7.1). .NET rejects the \/ escape, so
+    /// translate it back to a bare '/' before compiling — it is a legal
+    /// IdentityEscape in JS semantics and matches the same character.
+    /// </summary>
+    private static string TranslateToNet(string source) =>
+        source.Replace("\\\\/", "/");
+
+    /// <summary>
+    /// Normalised ES3 RegExp instance shape (§15.10.7): source carries the
+    /// '/'-escaped pattern (empty → "(?:)"), the four descriptive flags are
+    /// ReadOnly+DontEnum+DontDelete, lastIndex is DontEnum+DontDelete, and
+    /// the internal "flags" string is hidden from for-in.
+    /// </summary>
+    public static void ApplyRegExpShape(JsObject o, string pattern, string flags)
+    {
+        string stored = pattern.Length == 0 ? "(?:)" : pattern.Replace("/", "\\/");
+        // §15.10.6.4: flags print in canonical g,i,m order regardless of how
+        // the RegExp was constructed (/test2/ig .toString() is "/test2/gi")
+        string canon =
+            (flags.Contains('g') ? "g" : "") +
+            (flags.Contains('i') ? "i" : "") +
+            (flags.Contains('m') ? "m" : "");
+        flags = canon;
+        o.Attrs?.Remove("source"); o.Attrs?.Remove("flags"); o.Attrs?.Remove("global");
+        o.Attrs?.Remove("ignoreCase"); o.Attrs?.Remove("multiline"); o.Attrs?.Remove("lastIndex");
+        o.Set("source", JsValue.From(stored));
+        o.Set("flags", JsValue.From(flags));
+        o.Set("global", JsValue.From(flags.Contains('g')));
+        o.Set("ignoreCase", JsValue.From(flags.Contains('i')));
+        o.Set("multiline", JsValue.From(flags.Contains('m')));
+        o.Set("lastIndex", JsValue.From(0));
+        o.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+        o.Attrs["source"] = JsObject.PropAttr.Builtin;
+        o.Attrs["flags"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+        o.Attrs["global"] = JsObject.PropAttr.Builtin;
+        o.Attrs["ignoreCase"] = JsObject.PropAttr.Builtin;
+        o.Attrs["multiline"] = JsObject.PropAttr.Builtin;
+        o.Attrs["lastIndex"] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
+    }
 
     private static int LengthOf(JsValue self) =>
         self.Type is JsType.Object or JsType.Function &&
@@ -1227,13 +1272,29 @@ public static class JsRuntime
         math.Set("min",   Fn(scope, "min", 2,   (s, a) =>
         {
             double min = double.PositiveInfinity;
-            foreach (var v in a) if (v.ToNumber() < min) min = v.ToNumber();
+            foreach (var v in a)
+            {
+                double x = v.ToNumber();
+                if (double.IsNaN(x)) return JsValue.From(double.NaN);   // §15.8.2.12
+                if (x < min) { min = x; continue; }
+                // min(-0, +0) is -0 (§15.8.2.12): a negative zero wins ties
+                if (x == min && x == 0 && IsNegZero(x))
+                    min = x;   // -0 wins zero ties
+            }
             return JsValue.From(min);
         }));
         math.Set("max",   Fn(scope, "max", 2,   (s, a) =>
         {
             double max = double.NegativeInfinity;
-            foreach (var v in a) if (v.ToNumber() > max) max = v.ToNumber();
+            foreach (var v in a)
+            {
+                double x = v.ToNumber();
+                if (double.IsNaN(x)) return JsValue.From(double.NaN);   // §15.8.2.11
+                if (x > max) { max = x; continue; }
+                // max(+0, -0) is +0 (§15.8.2.11): a positive zero wins ties
+                if (x == max && x == 0 && !IsNegZero(x))
+                    max = x;   // +0 wins zero ties
+            }
             return JsValue.From(max);
         }));
         math.Set("pow",   Fn(scope, "pow", 2,   (s, a) => JsValue.From(Math.Pow(Arg(a, 0), Arg(a, 1)))));
@@ -1246,7 +1307,19 @@ public static class JsRuntime
         math.Set("asin",  Fn(scope, "asin", 1,  (s, a) => JsValue.From(Math.Asin(Arg(a, 0)))));
         math.Set("acos",  Fn(scope, "acos", 1,  (s, a) => JsValue.From(Math.Acos(Arg(a, 0)))));
         math.Set("atan",  Fn(scope, "atan", 1,  (s, a) => JsValue.From(Math.Atan(Arg(a, 0)))));
-        math.Set("atan2", Fn(scope, "atan2", 2, (s, a) => JsValue.From(Math.Atan2(Arg(a, 0), Arg(a, 1)))));
+        math.Set("atan2", Fn(scope, "atan2", 2, (s, a) =>
+        {
+            double y = Arg(a, 0), x = Arg(a, 1);
+            // §15.8.2.5 zero-argument table — do not rely on libm for ±0 signs
+            if (double.IsNaN(y) || double.IsNaN(x)) return JsValue.From(double.NaN);
+            if (y == 0 && x == 0)
+            {
+                bool yNeg = IsNegZero(y), xNeg = IsNegZero(x);
+                if (!yNeg) return JsValue.From(xNeg ? Math.PI : 0.0);
+                return JsValue.From(xNeg ? -Math.PI : -0.0);
+            }
+            return JsValue.From(Math.Atan2(y, x));
+        }));
         math.Set("random", Fn(scope, "random", (s, a) =>
             JsValue.From(_sharedRandom.NextDouble())));
 
@@ -1834,6 +1907,7 @@ public static class JsRuntime
         regexProto.Set("test", Fn(scope, "test", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(false);
+            RequireRegExp(self, "RegExp.prototype.test");
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
             int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
@@ -1854,6 +1928,7 @@ public static class JsRuntime
         regexProto.Set("exec", Fn(scope, "exec", 1, (self, args) =>
         {
             if (args.Length == 0) return JsValue.Null;
+            RequireRegExp(self, "RegExp.prototype.exec");
             var o = self.GetObjectOrFunction();
             var (source, flags) = (o.Get("source").ToJsString(), o.Get("flags").ToJsString());
             int lastIndex = NormalizeLastIndex(o.Get("lastIndex"));
@@ -1875,9 +1950,19 @@ public static class JsRuntime
 
         regexProto.Set("toString", Fn(scope, "toString", (self, args) =>
         {
+            // §15.10.6.4: TypeError on anything without RegExp shape
+            RequireRegExp(self, "RegExp.prototype.toString");
             var o = self.GetObjectOrFunction();
             return JsValue.From($"/{o.Get("source").ToJsString()}/{o.Get("flags").ToJsString()}");
         }));
+
+        /// §15.10.6 builtins demand a real RegExp receiver
+        static void RequireRegExp(JsValue self, string who)
+        {
+            if (self.Type is not (JsType.Object or JsType.Function) ||
+                self.GetObjectOrFunction().Class != "RegExp")
+                throw new JsTypeErrorException($"{who} called on a non-RegExp");
+        }
 
         // compile(pattern, flags) — the JScript-era recompile-in-place API.
         // JScript 5 returns the recompiled RegExp object itself.
@@ -1885,6 +1970,7 @@ public static class JsRuntime
         {
             if (self.Type is not (JsType.Object or JsType.Function))
                 return JsValue.Undefined;
+            RequireRegExp(self, "RegExp.prototype.compile");
             var o = self.GetObjectOrFunction();
 
             string pattern;
@@ -1912,12 +1998,8 @@ public static class JsRuntime
             }
 
             o.Class = "RegExp";
-            o.Set("source", JsValue.From(pattern));
-            o.Set("flags", JsValue.From(valid.ToString()));
-            o.Set("global", JsValue.From(valid.ToString().Contains('g')));
-            o.Set("ignoreCase", JsValue.From(valid.ToString().Contains('i')));
-            o.Set("multiline", JsValue.From(valid.ToString().Contains('m')));
-            o.Set("lastIndex", JsValue.From(0));
+            // stored source is '/'-escaped — unescape before reshaping
+            ApplyRegExpShape(o, TranslateToNet(pattern), valid.ToString());
             o.Prototype = regexProto;
             return self;
         }));
@@ -1944,6 +2026,7 @@ public static class JsRuntime
                 var srcFlags = src.Get("flags").ToJsString();
                 foreach (char f in srcFlags)
                     if (!flags.Contains(f)) flags += f;
+                pattern = TranslateToNet(pattern);   // stored source is '/'-escaped
             }
             else
             {
@@ -1961,12 +2044,7 @@ public static class JsRuntime
             JsObject Build(JsObject regexObj)
             {
                 regexObj.Class = "RegExp";
-                regexObj.Set("source", JsValue.From(pattern));
-                regexObj.Set("flags", JsValue.From(valid.ToString()));
-                regexObj.Set("global", JsValue.From(valid.ToString().Contains('g')));
-                regexObj.Set("ignoreCase", JsValue.From(valid.ToString().Contains('i')));
-                regexObj.Set("multiline", JsValue.From(valid.ToString().Contains('m')));
-                regexObj.Set("lastIndex", JsValue.From(0));
+                ApplyRegExpShape(regexObj, pattern, valid.ToString());
                 regexObj.Prototype = regexProto;
                 return regexObj;
             }
@@ -2050,7 +2128,8 @@ public static class JsRuntime
         scope.Define("parseInt", Fn(scope, "parseInt", 2, (self, args) =>
         {
             if (args.Length == 0) return JsValue.From(double.NaN);
-            string s = args[0].ToJsString().Trim();
+            // §9.0/§7.2: TRIM whitespace including the BOM
+            string s = args[0].ToJsString().Trim().Trim('\uFEFF');
             if (s.Length == 0) return JsValue.From(double.NaN);
 
             int radix = args.Length > 1 && !double.IsNaN(args[1].ToNumber())
@@ -2072,24 +2151,19 @@ public static class JsRuntime
             }
             if (radix == 0)
             {
-                // JS 1.1 treated 0-prefixed digit runs as octal
+                // §15.1.2.2: radix 0 means 10 — unless an 0x prefix says 16.
+                // (The JS1.1 octal reading is gone: the suite and JScript 5
+                // both treat "077" as decimal 77.)
                 radix = 10;
-                if (i < s.Length && s[i] == '0')
-                {
-                    int j = i;
-                    while (j < s.Length && char.IsDigit(s[j])) j++;
-                    if (j > i + 1 && s.AsSpan(i, j - i).IndexOfAny('8', '9') < 0)
-                    {
-                        radix = 8;
-                        i++;   // skip the 0
-                    }
-                }
             }
             if (radix < 2 || radix > 36) return JsValue.From(double.NaN);
 
-            // Accumulate as a double so absurd digit runs saturate to ±∞
-            // (§15.1.2.2: the math is on the mathematical integer value)
-            double val = 0;
+            // §15.1.2.2: the math is on the MATHEMATICAL integer value —
+            // accumulate exactly (ulong, spilling to BigInteger), then a
+            // single round-to-nearest conversion to double
+            ulong acc = 0;
+            bool big = false;
+            var bi = System.Numerics.BigInteger.Zero;
             int digits = 0;
             while (i < s.Length)
             {
@@ -2101,13 +2175,25 @@ public static class JsRuntime
                     _ => -1
                 };
                 if (d < 0 || d >= radix) break;
-                val = val * radix + d;
-                if (double.IsInfinity(val)) break;
+                if (!big)
+                {
+                    if (acc <= (ulong.MaxValue - 35UL) / (ulong)radix)
+                        acc = acc * (ulong)radix + (ulong)d;
+                    else
+                    {
+                        big = true;
+                        bi = acc;
+                        bi = bi * radix + d;
+                    }
+                }
+                else
+                    bi = bi * radix + d;
                 digits++;
                 i++;
             }
 
             if (digits == 0) return JsValue.From(double.NaN);
+            double val = big ? (double)bi : (double)acc;   // absurd runs saturate to ±∞
             return JsValue.From(neg ? -val : val);
         }));
 
@@ -2219,7 +2305,7 @@ public static class JsRuntime
             JsValue.From(EncodeUri(args.Length > 0 ? args[0].ToJsString() : "", component: true))));
 
         scope.Define("decodeURI", Fn(scope, "decodeURI", (self, args) =>
-            JsValue.From(DecodeUri(args.Length > 0 ? args[0].ToJsString() : ""))));
+            JsValue.From(DecodeUri(args.Length > 0 ? args[0].ToJsString() : "", component: false))));
 
         scope.Define("decodeURIComponent", Fn(scope, "decodeURIComponent", (self, args) =>
             JsValue.From(DecodeUri(args.Length > 0 ? args[0].ToJsString() : ""))));
@@ -2247,24 +2333,78 @@ public static class JsRuntime
         return result.ToString();
     }
 
-    private static string DecodeUri(string value)
-    {
-        for (int i = 0; i < value.Length; i++)
-        {
-            if (value[i] != '%') continue;
-            if (!TryHex(value, i + 1, 2, out _))
-                throw new JsUriErrorException("Malformed URI sequence");
-            i += 2;
-        }
+    private static string DecodeUri(string value) => DecodeUri(value, component: true);
 
-        try
+    /// <summary>
+    /// ES3 §15.1.3 decode — the shared algorithm behind decodeURI and
+    /// decodeURIComponent. Malformed sequences, overlong UTF-8 forms and
+    /// surrogate halves throw URIError; decodeURI additionally leaves the
+    /// uriReserved characters (§15.1.3.1: ";/?:@&=+$,#") percent-encoded.
+    /// </summary>
+    private static string DecodeUri(string value, bool component)
+    {
+        const string reserved = ";/?:@&=+$,#";
+        var result = new StringBuilder(value.Length);
+        int k = 0;
+        while (k < value.Length)
         {
-            return Uri.UnescapeDataString(value);
+            char c = value[k];
+            if (c != '%') { result.Append(c); k++; continue; }
+
+            if (!TryHex(value, k + 1, 2, out int b0))
+                throw new JsUriErrorException("Malformed URI sequence");
+
+            if (b0 < 0x80)
+            {
+                char dec = (char)b0;
+                if (component || reserved.IndexOf(dec) < 0)
+                    result.Append(dec);
+                else
+                    result.Append(value, k, 3);   // keep %XX for reserved chars
+                k += 3;
+                continue;
+            }
+
+            // Multi-byte UTF-8: determine the leading-byte class
+            int n = b0 switch
+            {
+                >= 0xC2 and <= 0xDF => 1,
+                >= 0xE0 and <= 0xEF => 2,
+                >= 0xF0 and <= 0xF4 => 3,
+                _ => -1
+            };
+            if (n < 0)
+                throw new JsUriErrorException("Malformed URI sequence");   // continuation/C0/C1/F5+ lead
+
+            int cp = b0 & (0x3F >> n);           // mask off the leading 1-bits
+            for (int j = 0; j < n; j++)
+            {
+                int at = k + 3 + 3 * j;
+                if (at >= value.Length || value[at] != '%' ||
+                    !TryHex(value, at + 1, 2, out int cont) ||
+                    (cont & 0xC0) != 0x80)
+                    throw new JsUriErrorException("Malformed URI sequence");
+                cp = (cp << 6) | (cont & 0x3F);
+            }
+
+            // Overlong forms are rejected: each class has a minimum code point
+            int min = n == 1 ? 0x80 : n == 2 ? 0x800 : 0x10000;
+            if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+                throw new JsUriErrorException("Malformed URI sequence");
+
+            if (cp < 0x10000)
+            {
+                result.Append((char)cp);
+            }
+            else
+            {
+                cp -= 0x10000;
+                result.Append((char)(0xD800 + (cp >> 10)))
+                      .Append((char)(0xDC00 + (cp & 0x3FF)));
+            }
+            k += 3 + 3 * n;
         }
-        catch (UriFormatException ex)
-        {
-            throw new JsUriErrorException(ex.Message);
-        }
+        return result.ToString();
     }
 
     private static bool TryHex(string s, int start, int count, out int value)

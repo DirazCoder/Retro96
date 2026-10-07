@@ -20,6 +20,9 @@ namespace Retro96.Engine.Js;
 /// identifier strings are reused per parse, so hot names hit the same
 /// instance) and only spill to a dictionary past SmallCapacity entries.
 /// This keeps per-call scope setup out of the allocator.
+///
+/// TryGetOwn/Put/Define/Delete are virtual so object environments (the
+/// with statement, §12.10) can delegate to their object's property chain.
 /// </summary>
 public class JsScope
 {
@@ -54,7 +57,27 @@ public class JsScope
         return -1;
     }
 
-    private void Put(string name, JsValue value)
+    /// <summary>Own-binding lookup — virtual so object scopes (with) can
+    /// delegate to their object's property chain (§10.2.3, §12.10).</summary>
+    protected virtual bool TryGetOwn(string name, out JsValue value)
+    {
+        if (!_spilled)
+        {
+            int idx = IndexOf(name);
+            if (idx >= 0) { value = _values[idx]; return true; }
+            value = null!;
+            return false;
+        }
+        return _overflow!.TryGetValue(name, out value!);
+    }
+
+    private bool HasOwn(string name) => TryGetOwn(name, out _);
+
+    /// <summary>Own-binding write — virtual so object scopes (with) can
+    /// route assignment to their object instead of a local slot.</summary>
+    protected virtual void Put(string name, JsValue value) => PutLocal(name, value);
+
+    private void PutLocal(string name, JsValue value)
     {
         if (!_spilled)
         {
@@ -80,20 +103,6 @@ public class JsScope
         }
         _overflow![name] = value;
     }
-
-    private bool TryGetOwn(string name, out JsValue value)
-    {
-        if (!_spilled)
-        {
-            int idx = IndexOf(name);
-            if (idx >= 0) { value = _values[idx]; return true; }
-            value = null!;
-            return false;
-        }
-        return _overflow!.TryGetValue(name, out value!);
-    }
-
-    private bool HasOwn(string name) => TryGetOwn(name, out _);
 
     private bool RemoveOwn(string name)
     {
@@ -172,10 +181,12 @@ public class JsScope
         }
     }
 
-    /// <summary>Define a variable in THIS scope (var declarations, params).</summary>
-    public void Define(string name, JsValue value)
+    /// <summary>Define a variable in THIS scope (var declarations, params).
+    /// Virtual: var/function declarations inside a with body bind in the
+    /// enclosing variable environment (§10.2.2/§12.10), never the object.</summary>
+    public virtual void Define(string name, JsValue value)
     {
-        Put(name, value);
+        PutLocal(name, value);
         (_declared ??= new HashSet<string>()).Add(name);
         if (Parent == null)
             GlobalFallback?.Set(name, value);
@@ -199,6 +210,14 @@ public class JsScope
 
     public JsScope NewChild() => new(this);
 
+    /// <summary>
+    /// Receiver for a bare-name call (§10.2.3): the object of the first
+    /// with-environment that has the name — null when the name resolves as
+    /// a plain binding (or not at all), where `this` is the global.
+    /// </summary>
+    public virtual JsObject? ThisFor(string name) =>
+        HasOwn(name) ? null : Parent?.ThisFor(name);
+
     /// <summary>Own variable names of this scope (introspection).</summary>
     public IEnumerable<string> OwnKeys()
     {
@@ -217,7 +236,7 @@ public class JsScope
     /// <summary>Delete from this scope only. Declared bindings (var,
     /// function declarations, params) carry DontDelete and refuse; implicit
     /// globals created by bare assignment delete (§11.4.1).</summary>
-    public bool Delete(string name)
+    public virtual bool Delete(string name)
     {
         if (_declared != null && _declared.Contains(name)) return false;
         bool removed = RemoveOwn(name);
@@ -225,4 +244,49 @@ public class JsScope
             removed |= GlobalFallback.Delete(name);
         return removed;
     }
+}
+
+/// <summary>
+/// Object environment for the with statement (§12.10). Identifier lookup
+/// walks the with object's PROPERTY chain — including DontEnum builtins
+/// like Date.prototype.getUTCMonth — instead of snapshotting enumerable
+/// keys at entry. var/function declarations still bind in the enclosing
+/// scope (§10.2.2), and assignment to names visible on the object writes
+/// to the object itself.
+/// </summary>
+public sealed class JsWithScope : JsScope
+{
+    public JsObject Object { get; }
+
+    public JsWithScope(JsScope parent, JsObject obj) : base(parent)
+    {
+        Object = obj ?? throw new ArgumentNullException(nameof(obj));
+    }
+
+    protected override bool TryGetOwn(string name, out JsValue value)
+    {
+        // HasProperty walks the object's prototype chain (§8.6.1.2)
+        if (Object.Has(name))
+        {
+            value = Object.Get(name);
+            return true;
+        }
+        value = null!;
+        return false;
+    }
+
+    protected override void Put(string name, JsValue value)
+    {
+        // Assignment through the with scope lands on the object (§10.2.3)
+        Object.Set(name, value);
+    }
+
+    public override void Define(string name, JsValue value) =>
+        Parent!.Define(name, value);   // §10.2.2: var binds in the variable environment
+
+    public override bool Delete(string name) =>
+        Object.Has(name) ? Object.Delete(name) : base.Delete(name);
+
+    public override JsObject? ThisFor(string name) =>
+        Object.Has(name) ? Object : Parent?.ThisFor(name);
 }

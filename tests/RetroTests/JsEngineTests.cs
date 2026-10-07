@@ -284,8 +284,12 @@ public class JsEngineTests
     }
 
     [Fact]
-    public void FutureReservedWordsCanBeUsedAsFunctionNames()
+    public void FutureReservedWordsAreRejectedAsFunctionNames()
     {
+        // ES3 §7.5.3: long/short are FutureReservedWords — IE5 and NS4.7
+        // both rejected them as identifiers, and the ES3 conformance suite
+        // (ecma/LexicalConventions/7.4.3-*) requires the SyntaxError. The
+        // whole script block aborts, so the binding never happens.
         var page = new PageHarness();
         page.LoadHtml(
             "<html><body><script>" +
@@ -294,9 +298,12 @@ public class JsEngineTests
             "window.duration = long(12) + ' ' + short(3);" +
             "</script></body></html>");
 
-        Check.That(page.EvalString("window.duration") == "12ms 3s",
-            "sloppy JavaScript allows the webchat bundle's long() and short() helper names",
-            page.EvalString("window.duration"));
+        Check.That(page.Eval("typeof duration").ToJsString() == "undefined",
+            "future-reserved function names are a SyntaxError; the script aborts",
+            page.Eval("typeof duration").ToJsString());
+        Check.That(page.EvalString("typeof long") == "undefined",
+            "'long' stays unbound after the rejected declaration",
+            page.EvalString("typeof long"));
         Check.Done();
     }
 
