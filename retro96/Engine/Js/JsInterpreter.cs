@@ -300,6 +300,18 @@ public class JsInterpreter
     /// </summary>
     internal Func<DomElement, JsObject>? ElementWrapperHook { get; set; }
 
+    /// <summary>
+    /// Shell-runner opt-in (conformance harness): when true, uncaught
+    /// top-level exceptions — thrown JS values, engine runtime errors,
+    /// parse errors, timeouts and heap exhaustion — propagate out of
+    /// Execute/ExecuteString instead of being reported to the host and
+    /// swallowed. This mirrors SpiderMonkey shell semantics, where an
+    /// uncaught exception aborts the script with a nonzero exit status.
+    /// The browser default (false) is unchanged: a page script error is
+    /// reported and the page keeps running.
+    /// </summary>
+    public bool PropagateTopLevelExceptions { get; set; }
+
     private static string DescribeJsObject(JsObject obj)
     {
         if (obj is DomBindings.ElementWrapper elementWrapper)
@@ -387,6 +399,7 @@ public class JsInterpreter
         }
         catch (JsTimeoutException)
         {
+            if (PropagateTopLevelExceptions) throw;
             const string message = "Script execution timed out";
             _setStatus(message);
             PublishConsole("error", message);
@@ -394,6 +407,7 @@ public class JsInterpreter
         }
         catch (JsOutOfMemoryException)
         {
+            if (PropagateTopLevelExceptions) throw;
             const string message = "Script ran out of memory";
             _setStatus(message);
             PublishConsole("error", message);
@@ -404,6 +418,7 @@ public class JsInterpreter
             // Top-level throw — report and stop THIS script only.  This used
             // to update only the status bar, so an uncaught JS error was
             // invisible in Inspector > Console.
+            if (PropagateTopLevelExceptions) throw;
             string message = $"Uncaught {ex.Value.ToJsString()}";
             if (ReportWindowOnError(message)) return JsValue.Undefined;
             _setStatus($"Script error: {ex.Value.ToJsString()}");
@@ -412,6 +427,7 @@ public class JsInterpreter
         }
         catch (JsInterpreterException ex)
         {
+            if (PropagateTopLevelExceptions) throw;
             Retro96.DebugLog.JsWrite($"SCRIPT_ERROR {ex.GetType().Name}: {ex.Message}");
             string message = $"Uncaught {ex.Message}";
             if (ReportWindowOnError(message)) return JsValue.Undefined;
@@ -419,9 +435,9 @@ public class JsInterpreter
             PublishConsole("error", message);
             return JsValue.Undefined;
         }
-        catch (JsBreakException) { return JsValue.Undefined; }
-        catch (JsContinueException) { return JsValue.Undefined; }
-        catch (JsReturnException) { return JsValue.Undefined; }
+        catch (JsBreakException) { if (PropagateTopLevelExceptions) throw; return JsValue.Undefined; }
+        catch (JsContinueException) { if (PropagateTopLevelExceptions) throw; return JsValue.Undefined; }
+        catch (JsReturnException) { if (PropagateTopLevelExceptions) throw; return JsValue.Undefined; }
         finally
         {
             CompleteExecution(isOutermost);
@@ -438,6 +454,7 @@ public class JsInterpreter
         }
         catch (JsParserException ex)
         {
+            if (PropagateTopLevelExceptions) throw;
             Retro96.DebugLog.JsWrite($"SCRIPT_PARSE_ERROR line={ex.Line} column={ex.Column}: {ex.Message}");
             string message = $"Syntax error at line {ex.Line}, column {ex.Column}: {ex.Message}";
             if (!ReportWindowOnError(message))
@@ -2057,7 +2074,7 @@ public class JsInterpreter
             funcScope.Define("this", thisValue);
 
             var body = func.Body ?? throw new JsInterpreterException("Function body is missing");
-            Hoist(body.Body.Body, funcScope);
+            ApplyHoistPlan(GetHoistPlan(body), funcScope);
 
             var old = _currentScope;
             _currentScope = funcScope;
@@ -2318,6 +2335,93 @@ public class JsInterpreter
             HoistOne(stmt, targetScope);
     }
 
+    // ── Hoist plan cache ──
+    // Hoisting used to walk the function body's AST on EVERY call, which
+    // dominated call-heavy scripts (the mozilla harness date helpers make
+    // hundreds of nested calls per assertion). The walk's result depends
+    // only on the AST, so the plan is computed once per FunctionExpr node
+    // and replayed per call; closure creation still happens per call.
+    private sealed class HoistPlan
+    {
+        public readonly List<object> Items = new();   // FunctionDeclaration or var-name string
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<FunctionExpr, HoistPlan> HoistPlans = new();
+
+    private static HoistPlan GetHoistPlan(FunctionExpr fn)
+    {
+        if (!HoistPlans.TryGetValue(fn, out var plan))
+        {
+            plan = new HoistPlan();
+            CollectHoist(fn.Body.Body, plan);
+            HoistPlans.Add(fn, plan);
+        }
+        return plan;
+    }
+
+    private static void CollectHoist(IReadOnlyList<Stmt> stmts, HoistPlan plan)
+    {
+        foreach (var stmt in stmts)
+            CollectHoistOne(stmt, plan);
+    }
+
+    private static void CollectHoistOne(Stmt stmt, HoistPlan plan)
+    {
+        switch (stmt)
+        {
+            case FunctionDeclaration: plan.Items.Add(stmt); break;
+            case VarDeclaration varDecl:
+                foreach (var d in varDecl.Declarations) plan.Items.Add(d.Id.Name);
+                break;
+            case BlockStatement block:
+                foreach (var s in block.Body) CollectHoistOne(s, plan); break;
+            case IfStatement i:
+                CollectHoistOne(i.Consequent, plan);
+                if (i.Alternate != null) CollectHoistOne(i.Alternate, plan);
+                break;
+            case WhileStatement w: CollectHoistOne(w.Body, plan); break;
+            case DoWhileStatement dw: CollectHoistOne(dw.Body, plan); break;
+            case ForStatement f:
+                if (f.Init is VarDeclaration vd) CollectHoistOne(vd, plan);
+                CollectHoistOne(f.Body, plan);
+                break;
+            case ForInStatement fi: CollectHoistOne(fi.Body, plan); break;
+            case SwitchStatement sw:
+                foreach (var c in sw.Cases)
+                    foreach (var s in c.Consequent) CollectHoistOne(s, plan);
+                break;
+            case TryStatement t:
+                CollectHoistOne(t.Block, plan);
+                if (t.Handler != null) CollectHoistOne(t.Handler.Body, plan);
+                if (t.Finalizer != null) CollectHoistOne(t.Finalizer, plan);
+                break;
+            case LabeledStatement ls: CollectHoistOne(ls.Body, plan); break;
+            case WithStatement ws: CollectHoistOne(ws.Body, plan); break;
+        }
+    }
+
+    private void ApplyHoistPlan(HoistPlan plan, JsScope targetScope)
+    {
+        foreach (var item in plan.Items)
+        {
+            if (item is FunctionDeclaration fn)
+            {
+                var paramNames = new string[fn.Params.Count];
+                for (int i = 0; i < paramNames.Length; i++)
+                    paramNames[i] = fn.Params[i].Name;
+                var func = new JsFunction(
+                    new FunctionExpr(fn.Id, fn.Params, fn.Body), paramNames, targetScope);
+                targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
+            }
+            else
+            {
+                var name = (string)item;
+                if (!targetScope.Has(name))
+                    targetScope.Define(name, JsValue.Undefined);
+            }
+        }
+    }
+
     private void HoistOne(Stmt stmt, JsScope targetScope)
     {
         switch (stmt)
@@ -2376,8 +2480,15 @@ public class JsInterpreter
     // Resource guards
     // ─────────────────────────────────────────────────────────────────────
 
+    private int _timeoutCheckCountdown = 64;
+
     private void CheckTimeout()
     {
+        // Sampled: the stopwatch read dominated hot expression loops, and
+        // sub-millisecond timeout precision serves no purpose on a 5-10s
+        // budget. Check the clock every 64th node instead of every node.
+        if (--_timeoutCheckCountdown > 0) return;
+        _timeoutCheckCountdown = 64;
         if (_stopwatch.ElapsedMilliseconds > _timeLimitMs)
             throw new JsTimeoutException();
     }
