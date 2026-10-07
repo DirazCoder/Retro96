@@ -301,6 +301,10 @@ public static class Program
             foreach (string key in scope.OwnKeys())
                 if (key != "this")
                     globalObj.SetWritable(key, scope.Get(key));
+            // §15.1.1: undefined, NaN and Infinity are DontEnum globals
+            globalObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+            foreach (string k in new[] { "undefined", "NaN", "Infinity" })
+                globalObj.Attrs[k] = JsObject.PropAttr.DontEnum | JsObject.PropAttr.DontDelete;
 
             // print(...) — SpiderMonkey shell: args joined by spaces.
             scope.Define("print", JsValue.FromFunction(new JsFunction((self, args) =>

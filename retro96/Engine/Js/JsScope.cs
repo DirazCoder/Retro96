@@ -33,6 +33,11 @@ public class JsScope
     /// <summary>Set on the root scope only — the global object (window).</summary>
     public JsObject? GlobalFallback { get; set; }
 
+    /// <summary>§10.2: var and function declarations bind in the nearest
+    /// VARIABLE environment (function/program scope) — with and catch
+    /// introduce only lexical object environments in between.</summary>
+    public bool IsVariableEnvironment { get; set; } = true;
+
     private string[] _names = System.Array.Empty<string>();
     private JsValue[] _values = System.Array.Empty<JsValue>();
     private int _count;
@@ -71,7 +76,7 @@ public class JsScope
         return _overflow!.TryGetValue(name, out value!);
     }
 
-    private bool HasOwn(string name) => TryGetOwn(name, out _);
+    internal bool HasOwn(string name) => TryGetOwn(name, out _);
 
     /// <summary>Own-binding write — virtual so object scopes (with) can
     /// route assignment to their object instead of a local slot.</summary>
@@ -192,6 +197,29 @@ public class JsScope
             GlobalFallback?.Set(name, value);
     }
 
+    /// <summary>§10.1.3/§12.2: route var (and for-in var) bindings past
+    /// with/catch scopes into the enclosing variable environment.</summary>
+    public void DefineInVariableEnv(string name, JsValue value)
+    {
+        var scope = this;
+        while (scope != null && !scope.IsVariableEnvironment)
+            scope = scope.Parent;
+        (scope ?? this).Define(name, value);
+    }
+
+    /// <summary>Declare a var WITHOUT clobbering an existing binding —
+    /// the hoist already pre-bound the name; only absent names are
+    /// introduced (as undefined, carrying DontDelete).</summary>
+    public void DeclareInVariableEnv(string name)
+    {
+        var scope = this;
+        while (scope != null && !scope.IsVariableEnvironment)
+            scope = scope.Parent;
+        scope = scope ?? this;
+        if (!scope.HasOwn(name))
+            scope.Define(name, JsValue.Undefined);
+    }
+
     /// <summary>True if the name is visible from this scope (own, ancestor,
     /// or — at the root — the global fallback object).</summary>
     public bool Has(string name)
@@ -261,6 +289,7 @@ public sealed class JsWithScope : JsScope
     public JsWithScope(JsScope parent, JsObject obj) : base(parent)
     {
         Object = obj ?? throw new ArgumentNullException(nameof(obj));
+        IsVariableEnvironment = false;   // §12.10: object environment
     }
 
     protected override bool TryGetOwn(string name, out JsValue value)

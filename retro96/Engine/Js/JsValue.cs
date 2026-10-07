@@ -546,6 +546,9 @@ public class JsFunction : JsObject
     public Func<JsValue, JsValue[], JsValue>? Native { get; }
     public JsScope ClosureScope { get; }
 
+    /// <summary>Original source text (§15.3.4.2) — null for builtins.</summary>
+    public string? SourceText { get; }
+
     /// <summary>
     /// Some legacy host callables are themselves callable collection objects.
     /// Old IE treated document.all(...) / element.all(...) as invoking the
@@ -567,6 +570,7 @@ public class JsFunction : JsObject
         Body = null;
         Name = name;
         UseFunctionObjectAsThis = useFunctionObjectAsThis;
+        SourceText = null;
         Class = "Function";
         Set("length", JsValue.From(length ?? Params.Count));
         if (name != null) Set("name", JsValue.From(name));
@@ -581,6 +585,7 @@ public class JsFunction : JsObject
         Prototype = JsInterpreter.FunctionPrototype;
         Native = null;
         Name = name ?? body.Id?.Name;
+        SourceText = body.SourceText;
         Class = "Function";
         Set("length", JsValue.From(Params.Count));
         Set("name", JsValue.From(Name ?? ""));

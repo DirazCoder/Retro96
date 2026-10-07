@@ -493,7 +493,11 @@ public static class JsRuntime
         {
             if (args.Length == 0) return JsValue.From(false);
             if (self.Type is not (JsType.Object or JsType.Function)) return JsValue.From(false);
-            return JsValue.From(self.GetObjectOrFunction().HasOwn(args[0].ToJsString()));
+            var target = self.GetObjectOrFunction();
+            string key = args[0].ToJsString();
+            // §15.2.4.7: an OWN, ENUMERABLE property — the DontEnum attribute
+            // decides (undefined/NaN/Infinity on the global are not enumerable)
+            return JsValue.From(target.HasOwn(key) && !target.HasAttr(key, JsObject.PropAttr.DontEnum));
         }));
 
         objProto.Set("isPrototypeOf", Fn(scope, "isPrototypeOf", 1, (self, args) =>
@@ -591,7 +595,9 @@ public static class JsRuntime
                 throw new JsThrownException(JsValue.FromObject(error));
             }
             var functionBody = new FunctionExpr(
-                declaration.Id, declaration.Params, declaration.Body);
+                declaration.Id, declaration.Params, declaration.Body,
+                // era form: exactly the text the constructor assembled
+                $"function anonymous({parameters})\n{{{body}\n}}");
             var parameterNames = declaration.Params.Select(parameter => parameter.Name).ToArray();
             return JsValue.FromFunction(new JsFunction(
                 functionBody, parameterNames, scope, "anonymous"));
@@ -599,6 +605,20 @@ public static class JsRuntime
         constructor.Prototype = functionProto;
         constructor.Set("prototype", JsValue.FromFunction((JsFunction)functionProto));
         functionProto.Set("constructor", JsValue.FromFunction(constructor));
+
+        // §15.3.4.2: an implementation-dependent source representation —
+        // the original text for script functions, [native code] otherwise
+        functionProto.Set("toString", Fn(scope, "toString", (self, args) =>
+        {
+            if (self.Type != JsType.Function)
+                throw new JsTypeErrorException("Function.prototype.toString called on a non-function");
+            var fn = self.GetFunction();
+            return JsValue.From(fn.SourceText is { Length: > 0 } src
+                ? src
+                : fn.Name is { Length: > 0 }
+                    ? $"function {fn.Name}() {{\n    [native code]\n}}"
+                    : "function() {{\n    [native code]\n}}");
+        }));
         scope.Define("Function", JsValue.FromFunction(constructor));
     }
 

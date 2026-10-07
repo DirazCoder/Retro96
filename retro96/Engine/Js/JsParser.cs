@@ -61,13 +61,16 @@ public class JsParser
             // only expect JsParserException from Parse
             throw new JsParserException(ex.Message, 0, 0);
         }
-        var parser = new JsParser(tokens);
+        var parser = new JsParser(tokens, source);
         return parser.ParseProgram(allowTopLevelReturn);
     }
 
-    public JsParser(IReadOnlyList<JsToken> tokens)
+    private readonly string _source;
+
+    public JsParser(IReadOnlyList<JsToken> tokens, string? source = null)
     {
         _tokens = tokens ?? throw new ArgumentNullException(nameof(tokens));
+        _source = source ?? "";
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -669,11 +672,19 @@ public class JsParser
 
     private FunctionDeclaration ParseFunctionDeclaration()
     {
+        var startTok = Peek();
         ExpectKeyword("function");
         var name = ExpectIdentifier("function name");
         var parameters = ParseParameterList();
         var body = ParseBlock();
-        return new FunctionDeclaration(name, parameters, body);
+        // §15.3.4.2: toString returns the ORIGINAL source text of the
+        // function, from the 'function' keyword through the closing brace
+        int end = _position > 0 && _position - 1 < _tokens.Count
+            ? _tokens[_position - 1].Position + 1 : _source.Length;
+        string src = end > startTok.Position && startTok.Position <= _source.Length
+            ? _source.Substring(startTok.Position, Math.Min(end, _source.Length) - startTok.Position)
+            : "";
+        return new FunctionDeclaration(name, parameters, body, src);
     }
 
     private List<Identifier> ParseParameterList()
@@ -1125,13 +1136,19 @@ public class JsParser
 
     private Expr ParseFunctionExpression()
     {
+        var startTok = Peek();
         ExpectKeyword("function");
         Identifier? name = null;
         if (CheckIdentifier())
             name = new Identifier(((JsIdentifierToken)Advance()).Name);
         var parameters = ParseParameterList();
         var body = ParseBlock();
-        return new FunctionExpr(name, parameters, body);
+        int end = _position > 0 && _position - 1 < _tokens.Count
+            ? _tokens[_position - 1].Position + 1 : _source.Length;
+        string src = end > startTok.Position && startTok.Position <= _source.Length
+            ? _source.Substring(startTok.Position, Math.Min(end, _source.Length) - startTok.Position)
+            : "";
+        return new FunctionExpr(name, parameters, body, src);
     }
 
     private Expr ParseArrayLiteral()

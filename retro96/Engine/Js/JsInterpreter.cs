@@ -1215,7 +1215,7 @@ public class JsInterpreter
             TryStatement tr => ExecuteTry(tr),
             LabeledStatement lab => ExecuteLabeled(lab, labels),
             WithStatement with => ExecuteWith(with),
-            FunctionDeclaration => JsValue.Undefined,   // hoisted
+            FunctionDeclaration fnDecl => ExecuteFunctionDeclaration(fnDecl),
             EmptyStatement => JsValue.Undefined,
             _ => throw new JsInterpreterException($"Unknown statement: {stmt.GetType().Name}")
         };
@@ -1257,12 +1257,37 @@ public class JsInterpreter
     {
         foreach (var d in varDecl.Declarations)
         {
-            JsValue value = d.Init != null
-                ? ExecuteExpression(d.Init)
-                : JsValue.Undefined;
-            _currentScope.Define(d.Id.Name, value);
-            DebugVariableWrite(d.Id.Name, value);
+            // §12.2: the DECLARATION binds in the variable environment...
+            _currentScope.DeclareInVariableEnv(d.Id.Name);
+            if (d.Init != null)
+            {
+                // ...but the initialiser is an ASSIGNMENT — §12.10: a
+                // with-object exposing the name captures it
+                // (with(x){var f=2} writes x.f when x has an f — 185485)
+                JsValue value = ExecuteExpression(d.Init);
+                _currentScope.Set(d.Id.Name, value);
+                DebugVariableWrite(d.Id.Name, value);
+            }
         }
+        return JsValue.Undefined;
+    }
+
+    /// <summary>
+    /// §12.10 + the era-documented behaviour (bug 184107): the hoist
+    /// pre-binds the name, but the statement itself RE-CREATES the function
+    /// with the CURRENT scope as closure — a function declared inside
+    /// with(obj) closes over obj (f's `y` keeps resolving there even
+    /// after the with block ends).
+    /// </summary>
+    private JsValue ExecuteFunctionDeclaration(FunctionDeclaration fnDecl)
+    {
+        var paramNames = new string[fnDecl.Params.Count];
+        for (int i = 0; i < paramNames.Length; i++)
+            paramNames[i] = fnDecl.Params[i].Name;
+        var func = new JsFunction(
+            new FunctionExpr(fnDecl.Id, fnDecl.Params, fnDecl.Body, fnDecl.SourceText),
+            paramNames, _currentScope);
+        _currentScope.DefineInVariableEnv(fnDecl.Id.Name, JsValue.FromFunction(func));
         return JsValue.Undefined;
     }
 
@@ -1438,7 +1463,10 @@ public class JsInterpreter
             if (!obj.Has(key)) continue;
 
             if (forInStmt.Left is VarDeclaration varDecl)
-                _currentScope.Define(varDecl.Declarations[0].Id.Name, JsValue.From(key));
+            {
+                _currentScope.DeclareInVariableEnv(varDecl.Declarations[0].Id.Name);
+                _currentScope.Set(varDecl.Declarations[0].Id.Name, JsValue.From(key));
+            }
             else if (forInStmt.Left is ExpressionStatement es && es.Expression is Identifier ident)
                 _currentScope.Set(ident.Name, JsValue.From(key));
             else if (forInStmt.Left is Identifier ident2)
@@ -1580,6 +1608,7 @@ public class JsInterpreter
     {
         var old = _currentScope;
         _currentScope = _currentScope.NewChild();
+        _currentScope.IsVariableEnvironment = false;   // §12.14: lexical catch binding
         try
         {
             _currentScope.Define(handler.Param.Name, bound);
@@ -1673,6 +1702,8 @@ public class JsInterpreter
     {
         if (a.Left is Identifier ident)
         {
+            if (a.Operator != "=" && !_currentScope.Has(ident.Name))
+                throw new JsReferenceErrorException($"{ident.Name} is not defined");   // §11.13.2
             JsValue oldValue = a.Operator == "="
                 ? JsValue.Undefined
                 : _currentScope.Get(ident.Name);
@@ -1873,11 +1904,10 @@ public class JsInterpreter
         {
             string what = call.Callee switch
             {
-                Identifier id => $"'{id.Name}'",
-                MemberExpr m => $"'{GetMemberPropertyName(m)}'",
+                Identifier or MemberExpr => RenderCalleeName(call.Callee),
                 _ => "expression"
             };
-            throw new JsInterpreterException($"{what} is not a function");
+            throw new JsTypeErrorException($"{what} is not a function");   // §11.2.3
         }
 
         var args = new JsValue[call.Arguments.Count];
@@ -1885,6 +1915,19 @@ public class JsInterpreter
             args[i] = ExecuteExpression(call.Arguments[i]);
 
         var callable = callee.GetFunction();
+
+        // §15.1.2.1: eval invoked through any reference other than a bare
+        // `eval(` is INDIRECT — the program evaluates in the GLOBAL scope
+        // (this.eval(s) must define globals, not function locals)
+        if (ReferenceEquals(callable, _globalEvalFunction) &&
+            call.Callee is not Identifier { Name: "eval" } &&
+            args.Length > 0 && args[0].Type == JsType.String)
+        {
+            _callDepth++;
+            try { return EvalString(args[0].GetString(), _globalScope); }
+            finally { _callDepth--; }
+        }
+
         if (callable.UseFunctionObjectAsThis)
             thisValue = callee;
 
@@ -1895,7 +1938,14 @@ public class JsInterpreter
     {
         JsValue callee = ExecuteExpression(newExpr.Callee);
         if (callee.Type != JsType.Function)
-            throw new JsInterpreterException("Constructor is not a function");
+        {
+            string what = newExpr.Callee switch
+            {
+                Identifier or MemberExpr => RenderCalleeName(newExpr.Callee),
+                _ => "expression"
+            };
+            throw new JsTypeErrorException($"{what} is not a constructor");   // §11.2.2
+        }
 
         var args = new JsValue[newExpr.Arguments.Count];
         for (int i = 0; i < args.Length; i++)
@@ -1926,7 +1976,7 @@ public class JsInterpreter
     private JsValue ReadIdentifierWithDebug(string name)
     {
         if (!_currentScope.Has(name))
-            throw new JsReferenceErrorException($"'{name}' is not defined");
+            throw new JsReferenceErrorException($"{name} is not defined");   // era message text
         var value = _currentScope.Get(name);
         DebugVariableRead(name, value);
         return value;
@@ -2038,8 +2088,11 @@ public class JsInterpreter
     {
         JsValue left = ExecuteExpression(ins.Left);
         JsValue right = ExecuteExpression(ins.Right);
-        if (left.Type is not (JsType.Object or JsType.Function) ||
-            right.Type != JsType.Function)
+        // §11.8.6 step 5: a right operand without [[HasInstance]] throws
+        if (right.Type != JsType.Function)
+            throw new JsTypeErrorException(
+                $"invalid 'instanceof' operand {DescribeJsValue(right)}");
+        if (left.Type is not (JsType.Object or JsType.Function))
             return JsValue.From(false);
 
         var obj = left.GetObjectOrFunction();
@@ -2088,17 +2141,28 @@ public class JsInterpreter
         if (++_callDepth > _maxCallDepth)
         {
             _callDepth--;
-            throw new JsInterpreterException("Maximum call depth exceeded");
+            // era engines surfaced runaway recursion as a catchable
+            // InternalError: too much recursion (regress-234389)
+            var err = new JsObject { Class = "Error", Prototype = GetRealmErrorPrototype("InternalError") };
+            err.Set("name", JsValue.From("InternalError"));
+            err.Set("message", JsValue.From("too much recursion"));
+            throw new JsThrownException(JsValue.FromObject(err));
         }
 
         try
         {
             var funcScope = func.ClosureScope.NewChild();
-            var argsObj = new JsObject { Class = "arguments" };
+            // §10.1.8: the arguments object has [[Class]] "Arguments" and
+            // the standard Object.prototype (with(this) coercion used to
+            // hit a prototype-less object and die on ToString)
+            var argsObj = new JsObject { Class = "Arguments", Prototype = GetRealmObjectPrototype() };
             for (int i = 0; i < args.Length; i++)
                 argsObj.Set(i.ToString(), args[i]);
             argsObj.Set("length", JsValue.From(args.Length));
             argsObj.Set("callee", JsValue.FromFunction(func));
+            argsObj.Attrs ??= new System.Collections.Generic.Dictionary<string, JsObject.PropAttr>();
+            argsObj.Attrs["length"] = JsObject.PropAttr.DontEnum;
+            argsObj.Attrs["callee"] = JsObject.PropAttr.DontEnum;
             funcScope.Define("arguments", JsValue.FromObject(argsObj));
             for (int i = 0; i < func.Params.Count; i++)
                 funcScope.Define(func.Params[i],
@@ -2137,6 +2201,16 @@ public class JsInterpreter
     // ─────────────────────────────────────────────────────────────────────
     // Property access (strings/numbers/booleans get their prototypes)
     // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>Source-like name path of a callee (Error.prototype, f) —
+    /// the era message text names the whole reference, not the last link.</summary>
+    private static string RenderCalleeName(Expr e) => e switch
+    {
+        Identifier id => id.Name,
+        MemberExpr m when !m.Computed => RenderCalleeName(m.Object) + "." + ((Identifier)m.Property).Name,
+        MemberExpr => "expression",
+        _ => "expression"
+    };
 
     private string GetMemberPropertyName(MemberExpr member)
     {
@@ -2385,9 +2459,14 @@ public class JsInterpreter
 
             default:
                 if (obj is JsFunction fn)
+                {
+                    // §15.3.4.2: the ORIGINAL source text; builtins render
+                    // in the era's [native code] form
+                    if (fn.SourceText is { Length: > 0 } src) return src;
                     return fn.Name is { Length: > 0 }
-                        ? $"function {fn.Name}() {{ ... }}"
-                        : "function() { ... }}";
+                        ? $"function {fn.Name}() {{\n    [native code]\n}}"
+                        : "function() {{\n    [native code]\n}}";
+                }
                 // §15.2.4.2: the default tag is the object's [[Class]]
                 return obj.Class.Length > 0
                     ? $"[object {obj.Class}]"
@@ -2483,7 +2562,7 @@ public class JsInterpreter
                 for (int i = 0; i < paramNames.Length; i++)
                     paramNames[i] = fn.Params[i].Name;
                 var func = new JsFunction(
-                    new FunctionExpr(fn.Id, fn.Params, fn.Body), paramNames, targetScope);
+                    new FunctionExpr(fn.Id, fn.Params, fn.Body, fn.SourceText), paramNames, targetScope);
                 targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
             }
             else
@@ -2504,7 +2583,7 @@ public class JsInterpreter
                 for (int i = 0; i < paramNames.Length; i++)
                     paramNames[i] = fn.Params[i].Name;
                 var func = new JsFunction(
-                    new FunctionExpr(fn.Id, fn.Params, fn.Body), paramNames, targetScope);
+                    new FunctionExpr(fn.Id, fn.Params, fn.Body, fn.SourceText), paramNames, targetScope);
                 targetScope.Define(fn.Id.Name, JsValue.FromFunction(func));
                 break;
 
@@ -2554,6 +2633,18 @@ public class JsInterpreter
     // ─────────────────────────────────────────────────────────────────────
 
     private int _timeoutCheckCountdown = 64;
+
+    /// <summary>The global eval — needed to detect INDIRECT eval calls
+    /// (this.eval(s), [eval][0](s)) which run in the global scope (§15.1.2.1).</summary>
+    private JsFunction? _globalEvalFunction;
+
+    private JsObject? GetRealmErrorPrototype(string name)
+    {
+        var ctor = _globalScope.Get(name);
+        return ctor.Type == JsType.Function &&
+            ctor.GetObjectOrFunction().Get("prototype") is { Type: JsType.Object } pv
+                ? pv.GetObject() : null;
+    }
 
     private void CheckTimeout()
     {
@@ -2607,12 +2698,13 @@ public class JsInterpreter
 
         if (BrowserRuntime.JavaScriptEvalEnabled)
         {
-            Native((self, args) =>
+            var evalValue = Native((self, args) =>
             {
                 if (args.Length == 0) return JsValue.Undefined;
                 if (args[0].Type != JsType.String) return args[0];
                 return EvalString(args[0].GetString(), _currentScope);
             }, "eval", global: true);
+            _globalEvalFunction = evalValue.GetFunction();
         }
 
         // Function.prototype.call / apply are hidden only in strict IE3 mode;
@@ -2652,7 +2744,8 @@ public class JsInterpreter
         // Timers on window + global
         Native((self, args) =>
         {
-            if (args.Length == 0) return JsValue.From(0);
+            if (args.Length == 0)
+                throw new JsTypeErrorException("missing argument 0 when calling function setTimeout");
             int delay = args.Length > 1 ? (int)args[1].ToNumber() : 0;
             return JsValue.From(SetTimeout(args[0], delay, repeat: false));
         }, "setTimeout", global: true);

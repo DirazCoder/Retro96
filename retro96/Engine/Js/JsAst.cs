@@ -40,7 +40,7 @@ public record ThrowStatement(Expr Argument) : Stmt;
 public record CatchClause(Identifier Param, Stmt Body) : Node;
 public record TryStatement(Stmt Block, CatchClause? Handler, Stmt? Finalizer) : Stmt;
 public record WithStatement(Expr Object, Stmt Body) : Stmt;
-public record FunctionDeclaration(Identifier Id, IReadOnlyList<Identifier> Params, BlockStatement Body) : Stmt;
+public record FunctionDeclaration(Identifier Id, IReadOnlyList<Identifier> Params, BlockStatement Body, string? SourceText = null) : Stmt;
 public record EmptyStatement() : Stmt;
 
 // ── Expressions ──────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ public record TernaryExpr(Expr Test, Expr Consequent, Expr Alternate) : Expr;
 public record CallExpr(Expr Callee, IReadOnlyList<Expr> Arguments) : Expr;
 public record NewExpr(Expr Callee, IReadOnlyList<Expr> Arguments) : Expr;
 public record MemberExpr(Expr Object, Expr Property, bool Computed) : Expr;
-public record FunctionExpr(Identifier? Id, IReadOnlyList<Identifier> Params, BlockStatement Body) : Expr;
+public record FunctionExpr(Identifier? Id, IReadOnlyList<Identifier> Params, BlockStatement Body, string? SourceText = null) : Expr;
 public record ArrayExpr(IReadOnlyList<Expr?> Elements) : Expr;
 public record PropertyExpr(Expr Key, Expr Value) : Node;
 public record ObjectExpr(IReadOnlyList<PropertyExpr> Properties) : Expr;
