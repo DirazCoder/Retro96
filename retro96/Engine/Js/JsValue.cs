@@ -36,10 +36,39 @@ public class JsValue
 
     public static JsValue Undefined { get; } = new() { Type = JsType.Undefined };
     public static JsValue Null      { get; } = new() { Type = JsType.Null };
+    public static JsValue True      { get; } = new() { Type = JsType.Boolean, _boolValue = true };
+    public static JsValue False     { get; } = new() { Type = JsType.Boolean, _boolValue = false };
+    private static readonly JsValue NegativeZero = new() { Type = JsType.Number, _numberValue = -0.0 };
 
-    public static JsValue From(bool v)      => new() { Type = JsType.Boolean, _boolValue = v };
-    public static JsValue From(double v)    => new() { Type = JsType.Number,   _numberValue = v };
-    public static JsValue From(int v)       => new() { Type = JsType.Number,   _numberValue = v };
+    // Instance cache — JsValue is immutable after construction and the
+    // tree-walking interpreter churns small integers (loop counters, array
+    // indices) millions of times per script. Sharing boxed instances keeps
+    // arithmetic out of the allocator. Identity of a JsValue is never
+    // observable (only JsObject identity is), so this is semantically
+    // transparent; −0 keeps its own instance so 1/x keeps the sign.
+    private static readonly JsValue[] SmallInts = CreateSmallInts();
+    private static JsValue[] CreateSmallInts()
+    {
+        var a = new JsValue[1104];                       // covers −64 … 1039
+        for (int i = 0; i < a.Length; i++)
+            a[i] = new JsValue { Type = JsType.Number, _numberValue = i - 64 };
+        return a;
+    }
+
+    public static JsValue From(bool v)      => v ? True : False;
+    public static JsValue From(double v)
+    {
+        if (v is >= -64.0 and <= 1039.0)
+        {
+            long iv = (long)v;
+            if (iv == v) return SmallInts[(int)iv + 64];
+        }
+        if (v == 0.0 && double.IsNegativeInfinity(1 / v)) return NegativeZero;
+        return new JsValue { Type = JsType.Number, _numberValue = v };
+    }
+    public static JsValue From(int v) =>
+        v is >= -64 and <= 1039 ? SmallInts[v + 64]
+                                : new JsValue { Type = JsType.Number, _numberValue = v };
     public static JsValue From(string v)    => new() { Type = JsType.String,   _stringValue = v ?? "" };
     public static JsValue FromObject(JsObject o)    => new() { Type = JsType.Object,   _objectValue = o ?? throw new ArgumentNullException(nameof(o)) };
     public static JsValue FromFunction(JsFunction f) => new() { Type = JsType.Function, _functionValue = f ?? throw new ArgumentNullException(nameof(f)) };
@@ -452,7 +481,8 @@ public class JsFunction : JsObject
     public bool UseFunctionObjectAsThis { get; }
 
     public JsFunction(Func<JsValue, JsValue[], JsValue> native, JsScope closureScope,
-                      string? name = null, bool useFunctionObjectAsThis = false)
+                      string? name = null, bool useFunctionObjectAsThis = false,
+                      int? length = null)
     {
         Native = native ?? throw new ArgumentNullException(nameof(native));
         ClosureScope = closureScope ?? throw new ArgumentNullException(nameof(closureScope));
@@ -462,7 +492,7 @@ public class JsFunction : JsObject
         Name = name;
         UseFunctionObjectAsThis = useFunctionObjectAsThis;
         Class = "Function";
-        Set("length", JsValue.From(Params.Count));
+        Set("length", JsValue.From(length ?? Params.Count));
         if (name != null) Set("name", JsValue.From(name));
     }
 
