@@ -14,19 +14,100 @@ namespace Retro96.Engine.Js;
 /// implicit global writes (status = "…") land on it where both window.status
 /// and bare reads find them. The interpreter distinguishes missing bindings
 /// from declared bindings whose value is undefined when evaluating identifiers.
+///
+/// Storage: most scopes hold a handful of names (params, this, arguments),
+/// so lookups use a linear array scan with reference-equality first (AST
+/// identifier strings are reused per parse, so hot names hit the same
+/// instance) and only spill to a dictionary past SmallCapacity entries.
+/// This keeps per-call scope setup out of the allocator.
 /// </summary>
 public class JsScope
 {
+    private const int SmallCapacity = 6;
+
     public JsScope? Parent { get; }
 
     /// <summary>Set on the root scope only — the global object (window).</summary>
     public JsObject? GlobalFallback { get; set; }
 
-    private readonly Dictionary<string, JsValue> _vars = new(StringComparer.Ordinal);
+    private string[] _names = System.Array.Empty<string>();
+    private JsValue[] _values = System.Array.Empty<JsValue>();
+    private int _count;
+    private bool _spilled;
+    private Dictionary<string, JsValue>? _overflow;
 
     public JsScope(JsScope? parent = null)
     {
         Parent = parent;
+    }
+
+    private int IndexOf(string name)
+    {
+        var names = _names;
+        for (int i = 0; i < _count; i++)
+            if (ReferenceEquals(names[i], name) || string.Equals(names[i], name))
+                return i;
+        return -1;
+    }
+
+    private void Put(string name, JsValue value)
+    {
+        if (!_spilled)
+        {
+            int idx = IndexOf(name);
+            if (idx >= 0) { _values[idx] = value; return; }
+            if (_count < SmallCapacity)
+            {
+                if (_names.Length == 0)
+                {
+                    _names = new string[SmallCapacity];
+                    _values = new JsValue[SmallCapacity];
+                }
+                _names[_count] = name;
+                _values[_count] = value;
+                _count++;
+                return;
+            }
+            // spill the inline entries into a dictionary, once
+            _overflow = new Dictionary<string, JsValue>(StringComparer.Ordinal);
+            for (int i = 0; i < _count; i++)
+                _overflow[_names[i]] = _values[i];
+            _spilled = true;
+        }
+        _overflow![name] = value;
+    }
+
+    private bool TryGetOwn(string name, out JsValue value)
+    {
+        if (!_spilled)
+        {
+            int idx = IndexOf(name);
+            if (idx >= 0) { value = _values[idx]; return true; }
+            value = null!;
+            return false;
+        }
+        return _overflow!.TryGetValue(name, out value!);
+    }
+
+    private bool HasOwn(string name) => TryGetOwn(name, out _);
+
+    private bool RemoveOwn(string name)
+    {
+        if (!_spilled)
+        {
+            int idx = IndexOf(name);
+            if (idx < 0) return false;
+            for (int i = idx; i < _count - 1; i++)
+            {
+                _names[i] = _names[i + 1];
+                _values[i] = _values[i + 1];
+            }
+            _count--;
+            _names[_count] = null!;
+            _values[_count] = null!;
+            return true;
+        }
+        return _overflow!.Remove(name);
     }
 
     /// <summary>
@@ -46,7 +127,7 @@ public class JsScope
         {
             if (scope.Parent == null && scope.GlobalFallback != null && scope.GlobalFallback.Has(name))
                 return scope.GlobalFallback.Get(name);
-            if (scope._vars.TryGetValue(name, out var value))
+            if (scope.TryGetOwn(name, out var value))
                 return value;
             if (scope.Parent == null)
                 return JsValue.Undefined;
@@ -65,9 +146,9 @@ public class JsScope
         var scope = this;
         while (scope != null)
         {
-            if (scope._vars.ContainsKey(name))
+            if (scope.HasOwn(name))
             {
-                scope._vars[name] = value;
+                scope.Put(name, value);
                 // The root scope and the window/global object represent the
                 // same global binding in legacy JavaScript.  Keep the
                 // fallback synchronized when a global `var` is reassigned;
@@ -79,7 +160,7 @@ public class JsScope
             }
             if (scope.Parent == null)
             {
-                scope._vars[name] = value;
+                scope.Put(name, value);
                 scope.GlobalFallback?.Set(name, value);       // root global and window share bindings
                 return;
             }
@@ -90,7 +171,7 @@ public class JsScope
     /// <summary>Define a variable in THIS scope (var declarations, params).</summary>
     public void Define(string name, JsValue value)
     {
-        _vars[name] = value;
+        Put(name, value);
         if (Parent == null)
             GlobalFallback?.Set(name, value);
     }
@@ -102,7 +183,7 @@ public class JsScope
         var scope = this;
         while (scope != null)
         {
-            if (scope._vars.ContainsKey(name))
+            if (scope.HasOwn(name))
                 return true;
             if (scope.Parent == null)
                 return scope.GlobalFallback != null && scope.GlobalFallback.Has(name);
@@ -114,12 +195,24 @@ public class JsScope
     public JsScope NewChild() => new(this);
 
     /// <summary>Own variable names of this scope (introspection).</summary>
-    public IEnumerable<string> OwnKeys() => _vars.Keys;
+    public IEnumerable<string> OwnKeys()
+    {
+        if (!_spilled)
+        {
+            for (int i = 0; i < _count; i++)
+                yield return _names[i];
+        }
+        else
+        {
+            foreach (var k in _overflow!.Keys)
+                yield return k;
+        }
+    }
 
     /// <summary>Delete from this scope only (JS 1.1: delete on vars fails).</summary>
     public bool Delete(string name)
     {
-        bool removed = _vars.Remove(name);
+        bool removed = RemoveOwn(name);
         if (Parent == null && GlobalFallback != null)
             removed |= GlobalFallback.Delete(name);
         return removed;
