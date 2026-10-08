@@ -26,6 +26,199 @@ using EngineHttpClient = Retro96.Engine.Network.HttpClient;
 
 namespace RetroTests;
 
+public class HttpLinkHeaderTests
+{
+    [Fact]
+    public void DefaultStyleMetaSelectsOnlyCaseMatchingPreferredStylesheet()
+    {
+        var document = HtmlParser.Parse(
+            "<html><head>" +
+            "<meta http-equiv='Default-Style' content='Ignored3'>" +
+            "<meta http-equiv='Default-Style' content='preferred'>" +
+            "<link rel='stylesheet' title='Ignored1' href='ignored1.css'>" +
+            "<link rel='stylesheet' title='Ignored3' href='ignored3.css'>" +
+            "<link rel='stylesheet' title='Preferred' href='preferred.css'>" +
+            "<link rel='stylesheet' title='Ignored2' href='ignored2.css'>" +
+            "<link rel='stylesheet' href='common.css'>" +
+            "</head><body></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+
+        var selected = StylesheetLinkSelection.SelectForDocument(document)
+            .Select(link => link.GetAttr("href"))
+            .ToArray();
+        Check.That(selected.SequenceEqual(new[] { "common.css" }),
+            "last Default-Style value wins and its title comparison is case-sensitive",
+            string.Join(", ", selected));
+        Check.Done();
+    }
+
+    [Fact]
+    public void FirstPreferredTitleIsSelectedWithoutDefaultStyleMeta()
+    {
+        var document = HtmlParser.Parse(
+            "<html><head>" +
+            "<link rel='stylesheet' title='First' href='first.css'>" +
+            "<link rel='stylesheet' title='Second' href='second.css'>" +
+            "<link rel='alternate stylesheet' title='Alternative' href='alternate.css'>" +
+            "<link rel='stylesheet' title='First' href='first-extra.css'>" +
+            "<link rel='stylesheet' href='common.css'>" +
+            "</head><body></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+
+        var selected = StylesheetLinkSelection.SelectForDocument(document)
+            .Select(link => link.GetAttr("href"))
+            .ToArray();
+        Check.That(selected.SequenceEqual(new[] { "first.css", "first-extra.css", "common.css" }),
+            "first preferred title, same-title sheets and persistent untitled sheet are selected",
+            string.Join(", ", selected));
+        Check.Done();
+    }
+
+    [Fact]
+    public void ExplicitlySelectedAlternateStylesheetsLoadTogether()
+    {
+        var document = HtmlParser.Parse(
+            "<html><head>" +
+            "<link rel='alternate stylesheet' title='SelectMe' href='group1.css'>" +
+            "<link rel='alternate stylesheet' title='SelectMe' href='group2.css'>" +
+            "<link rel='stylesheet' title='Preferred' href='preferred.css'>" +
+            "<link rel='stylesheet' href='common.css'>" +
+            "</head><body><p class='alternate'>alternate text</p></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+
+        var selected = StylesheetLinkSelection.SelectForDocument(document, "SelectMe")
+            .Select(link => link.GetAttr("href")!)
+            .ToArray();
+        Check.That(selected.SequenceEqual(new[] { "group1.css", "group2.css", "common.css" }),
+            "selecting an alternate title loads every matching sheet plus persistent untitled sheets",
+            string.Join(", ", selected));
+        var cssByHref = new Dictionary<string, string>
+        {
+            ["group1.css"] = ".alternate { color: red; }",
+            ["group2.css"] = ".alternate { text-decoration: underline; }"
+        };
+        foreach (string href in selected)
+        {
+            var style = new DomElement("style");
+            style.AppendChild(new DomText
+            {
+                Data = cssByHref.TryGetValue(href, out string? css) ? css : string.Empty
+            });
+            document.AppendChild(style);
+        }
+        StyleResolver.Resolve(document, 800);
+        var text = document.ElementDescendants()
+            .FirstOrDefault(element => element.GetAttr("class") == "alternate");
+        Check.That(text?.Style is { } computed &&
+                   computed.Color == Color.FromArgb(255, 0, 0) &&
+                   computed.TextDecoration.HasFlag(TextDecoration.Underline),
+            "the selected alternate sheet set makes the test text red and underlined");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LinkedStylesheetKeepsItsDocumentOrderRelativeToEmbeddedStyle()
+    {
+        var document = HtmlParser.Parse(
+            "<html><head><link rel='stylesheet' href='common.css'>" +
+            "<style>a:link, a:visited { color: yellow; }</style></head>" +
+            "<body><a href='#target'>styled link</a></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+        var link = document.AllTags("link").Single();
+        StylesheetLinkSelection.InsertLoadedStylesheet(
+            document, link, "a:link, a:active, a:visited { color: blue; }");
+
+        StyleResolver.Resolve(document, 800);
+        var anchor = document.AllTags("a").Single();
+        Check.That(anchor.Style?.Color == Color.Yellow,
+            "the later embedded rule wins over the earlier linked stylesheet");
+        Check.Done();
+    }
+
+    [Fact]
+    public void NoStyleDisablesEmbeddedLinkedAndInlineAuthorCss()
+    {
+        var document = HtmlParser.Parse(
+            "<html><head><style>" +
+            ".embedded { color: red; } a { color: yellow; }" +
+            "</style><link rel='stylesheet' href='external.css'></head>" +
+            "<body><p class='embedded'>embedded rule</p>" +
+            "<p id='inline' style='color: red'>inline style</p>" +
+            "<a href='#target'>embedded link rule</a></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+        var externalSheet = new DomElement("style");
+        externalSheet.AppendChild(new DomText(
+            "#external { color: blue; text-decoration: underline; }"));
+        document.AppendChild(externalSheet);
+        var externalText = new DomElement("p");
+        externalText.SetAttr("id", "external");
+        externalText.AppendChild(new DomText("external rule"));
+        document.FirstTag("body")!.AppendChild(externalText);
+
+        StyleResolver.Resolve(document, 800);
+        var embedded = document.ElementDescendants()
+            .First(element => element.GetAttr("class") == "embedded");
+        var inline = document.ElementDescendants()
+            .First(element => element.GetAttr("id") == "inline");
+        var link = document.ElementDescendants()
+            .First(element => element.TagName == "a");
+        var external = document.ElementDescendants()
+            .First(element => element.GetAttr("id") == "external");
+        Check.That(embedded.Style?.Color == Color.Red &&
+                   inline.Style?.Color == Color.Red &&
+                   link.Style?.Color == Color.Yellow &&
+                   external.Style?.Color == Color.Blue,
+            "author CSS sources are active before selecting No Style");
+
+        document.AuthorStylesDisabled = true;
+        StyleResolver.Resolve(document, 800);
+        Check.That(embedded.Style?.Color != Color.Red &&
+                   inline.Style?.Color != Color.Red &&
+                   link.Style?.Color != Color.Yellow &&
+                   external.Style?.Color != Color.Blue &&
+                   external.Style?.TextDecoration == TextDecoration.None,
+            "No Style disables embedded, linked, inline, and pseudo-independent author declarations");
+
+        document.AuthorStylesDisabled = false;
+        StyleResolver.Resolve(document, 800);
+        Check.That(embedded.Style?.Color == Color.Red &&
+                   inline.Style?.Color == Color.Red &&
+                   link.Style?.Color == Color.Yellow &&
+                   external.Style?.Color == Color.Blue,
+            "author CSS is restored after leaving No Style");
+        Check.Done();
+    }
+
+    [Fact]
+    public void StylesheetLinkHeaderAcceptsValidFormsAndRejectsMalformedForms()
+    {
+        string header =
+            "<first.css>; rel=stylesheet, <quoted.css>; rel = \"stylesheet\", " +
+            "<comma.css>; title=\"a,b\"; rel=\"alternate stylesheet\", " +
+            "<wrong-order.css>; title=x <wrong-order.css>; rel=stylesheet, " +
+            "<single-quoted.css>; rel='stylesheet', " +
+            "<unclosed.css>; rel=\"stylesheet";
+
+        var hrefs = HttpLinkHeaderParser.ParseStylesheetHrefs(header);
+        Check.That(hrefs.SequenceEqual(new[]
+            { "first.css", "quoted.css", "comma.css" }),
+            "HTTP Link header accepts valid stylesheet links but rejects malformed syntax",
+            string.Join(", ", hrefs));
+
+        var doc = HtmlParser.Parse(
+            "<html><head><title>Header styles</title></head><body></body></html>",
+            ParsedUrl.Parse("http://example.test/page.html"), new CookieStore());
+        HttpLinkHeaderParser.AddStylesheetLinks(doc, header);
+        var links = doc.AllTags("link");
+        Check.That(links.Count == 3 &&
+                   links.Select(link => link.GetAttr("href"))
+                       .SequenceEqual(new[] { "first.css", "quoted.css", "comma.css" }),
+            "valid response-header stylesheets become regular link elements",
+            string.Join(", ", links.Select(link => link.GetAttr("href"))));
+        Check.Done();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Loopback origin with deterministic routes
 // ─────────────────────────────────────────────────────────────────────
@@ -35,6 +228,7 @@ public static class TestOrigin
     // route → (hitCount) => (status, contentType, body)
     private static readonly ConcurrentDictionary<string, Func<int, (int, string, byte[])>> Routes = new();
     private static readonly ConcurrentDictionary<string, int> Hits = new();
+    private static readonly ConcurrentDictionary<string, string> ResponseHeaders = new();
     private static HttpListener? _listener;
     private static string _base = "";
 
@@ -67,6 +261,9 @@ public static class TestOrigin
     public static void Map(string path, Func<int, (int, string, byte[])> handler) =>
         Routes[path] = handler;
 
+    public static void SetResponseHeader(string path, string name, string value) =>
+        ResponseHeaders[$"{path}\n{name}"] = value;
+
     public static void MapOk(string path, string contentType = "image/gif", byte[]? body = null) =>
         Map(path, _ => (200, contentType, body ?? Gif1x1));
 
@@ -90,6 +287,10 @@ public static class TestOrigin
                     : (404, "text/plain", Encoding.ASCII.GetBytes("not found"));
                 ctx.Response.StatusCode = code;
                 ctx.Response.ContentType = type;
+                foreach (var header in ResponseHeaders.Where(header =>
+                             header.Key.StartsWith(path + "\n", StringComparison.Ordinal)))
+                    ctx.Response.AppendHeader(
+                        header.Key[(path.Length + 1)..], header.Value);
                 if (code >= 300 && code < 400)
                     ctx.Response.RedirectLocation = "/target.gif";
                 ctx.Response.KeepAlive = false;
@@ -1332,6 +1533,82 @@ public class NamedBugHeadlessTests
                 string bodyText = httpContent.Document.FirstTag("body")?.InnerText ?? "";
                 Check.That(bodyText.Contains("HTTP FRAME BODY"),
                     "the http frame document contains the served body", bodyText);
+            }
+
+            TestOrigin.Map("/styled-frame.html",
+                _ => (200, "text/html", Encoding.ASCII.GetBytes(
+                    "<html><head><link rel='stylesheet' href='/frame-style.css'></head>" +
+                    "<body><p id='styled-frame-text'>styled frame</p></body></html>")));
+            TestOrigin.Map("/frame-style.css",
+                _ => (200, "text/css", Encoding.ASCII.GetBytes(
+                    "#styled-frame-text { color: #ff0000; }")));
+            TestOrigin.Map("/header-styled-frame.html",
+                _ => (200, "text/html", Encoding.ASCII.GetBytes(
+                    "<html><body><p id='header-styled-frame-text'>header styled frame</p>" +
+                    "</body></html>")));
+            TestOrigin.SetResponseHeader("/header-styled-frame.html", "Link",
+                "</frame-style.css>; rel=\"stylesheet\"");
+            using (var stylesheetLoader = new ResourceLoader(cookies, http))
+            {
+                var stylesheetFetchDiagnostics = new List<string>();
+                async Task LoadFrameStylesheets(
+                    DomDocument document, ParsedUrl stylesheetBase, CancellationToken token)
+                {
+                    foreach (var link in document.ElementDescendants()
+                                 .Where(e => e.TagName == "link" &&
+                                     e.GetAttr("rel")?.Contains("stylesheet",
+                                         StringComparison.OrdinalIgnoreCase) == true &&
+                                     e.HasAttr("href"))
+                                 .ToList())
+                    {
+                        var result = await stylesheetLoader.FetchAsync(
+                            link.GetAttr("href")!, stylesheetBase, cookies);
+                        stylesheetFetchDiagnostics.Add(
+                            $"{link.GetAttr("href")}: {result.GetType().Name}" +
+                            (result is HttpSuccess ok ? $" {ok.StatusCode} bytes={ok.Body.Length}" : ""));
+                        if (result is not HttpSuccess css)
+                            continue;
+                        var style = new DomElement("style");
+                        style.AppendChild(new DomText { Data = Encoding.ASCII.GetString(css.Body) });
+                        document.AppendChild(style);
+                    }
+                }
+
+                var styledFrame = await FrameLoader.LoadAsync(
+                    httpBase + "parent.html", "/styled-frame.html", 300, 200,
+                    http, cookies, default, loadStylesheets: LoadFrameStylesheets);
+                var styledText = styledFrame?.Document.ElementDescendants()
+                    .FirstOrDefault(e => e.GetAttr("id") == "styled-frame-text");
+                Check.That(styledText?.Style?.Color == Color.FromArgb(255, 0, 0),
+                    "linked stylesheet is fetched and applied before frame layout",
+                    $"found={styledText != null}; style=" +
+                    (styledText?.Style?.Color.ToString() ?? "(no computed style)") +
+                    $"; fetch={string.Join(" | ", stylesheetFetchDiagnostics)}" +
+                    $"; sheets={string.Join(" | ", styledFrame?.Document.ElementDescendants()
+                        .Where(e => e.TagName == "style")
+                        .Select(e => string.Concat(e.Children.OfType<DomText>()
+                            .Select(text => text.Data))) ?? Array.Empty<string>())}");
+                Check.That(TestOrigin.HitCount("/frame-style.css") > 0,
+                    "frame stylesheet URL is actually requested");
+
+                var headerStyledFrame = await FrameLoader.LoadAsync(
+                    httpBase + "parent.html", "/header-styled-frame.html", 300, 200,
+                    http, cookies, default, loadStylesheets: LoadFrameStylesheets);
+                var headerStyledText = headerStyledFrame?.Document.ElementDescendants()
+                    .FirstOrDefault(e => e.GetAttr("id") == "header-styled-frame-text");
+                Check.That(headerStyledText?.Style?.Color == Color.FromArgb(255, 0, 0),
+                    "HTTP Link header stylesheets are fetched and applied inside frames",
+                    $"found={headerStyledText != null}; style=" +
+                    (headerStyledText?.Style?.Color.ToString() ?? "(no computed style)") +
+                    $"; link={string.Join(" | ", headerStyledFrame?.Document.AllTags("link")
+                        .Select(link => link.GetAttr("href")) ?? Array.Empty<string?>())}; " +
+                    $"url={headerStyledFrame?.AbsoluteUrl}; " +
+                    $"body={headerStyledFrame?.Document.FirstTag("body")?.InnerText}; " +
+                    $"fetch={string.Join(" | ", stylesheetFetchDiagnostics)}; " +
+                    $"sheets={string.Join(" | ", headerStyledFrame?.Document.ElementDescendants()
+                        .Where(e => e.TagName == "style")
+                        .Select(e => string.Concat(e.Children.OfType<DomText>()
+                            .Select(text => text.Data))) ?? Array.Empty<string>())}");
             }
 
             var errContent = await FrameLoader.LoadAsync(

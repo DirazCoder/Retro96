@@ -9,6 +9,50 @@ namespace RetroTests;
 
 public class CssParserTests
 {
+    [Fact]
+    public void MediaRulesAreParsedForTheRequestedMediaType()
+    {
+        const string css = "@media screen { .screen { color: red; } } " +
+            "@media print { .print { color: red; } } " +
+            "@media not screen { .notScreen { color: red; } }";
+
+        var (screenRules, _) = CssParser.Parse(css);
+        var (printRules, _) = CssParser.Parse(css, "print");
+
+        Check.That(screenRules.Count == 1 &&
+                   screenRules[0].Selectors[0].Parts.Any(part => part.Value == "screen"),
+            "screen applies screen but not print or not-screen rules",
+            string.Join(", ", screenRules.Select(r => string.Join("", r.Selectors[0].Parts.Select(p => p.Value)))));
+        Check.That(printRules.Count == 2 &&
+                   printRules.Any(rule => rule.Selectors[0].Parts.Any(part => part.Value == "print")) &&
+                   printRules.Any(rule => rule.Selectors[0].Parts.Any(part => part.Value == "notScreen")),
+            "print applies print and not-screen rules but not screen rules",
+            string.Join(", ", printRules.Select(r => string.Join("", r.Selectors[0].Parts.Select(p => p.Value)))));
+        Check.Done();
+    }
+
+    [Fact]
+    public void StylesheetUrlsResolveAgainstTheStylesheetAndIgnoreStringsAndComments()
+    {
+        var stylesheetUrl = ParsedUrl.Parse("https://example.test/css/theme/main.css");
+        string rewritten = CssParser.RewriteUrls(
+            "a{background-image:url('../images/tile.png')}" +
+            "/* url(comment.png) */ .x{content:'url(text.png)';background:url(data:image/png;base64,AA==)}",
+            raw => stylesheetUrl.Resolve(raw).ToAbsolute());
+
+        Check.That(rewritten.Contains(
+                "url(\"https://example.test/css/images/tile.png\")",
+                StringComparison.Ordinal),
+            "relative CSS image URLs use the external stylesheet directory", rewritten);
+        Check.That(rewritten.Contains("/* url(comment.png) */", StringComparison.Ordinal) &&
+                   rewritten.Contains("content:'url(text.png)'", StringComparison.Ordinal),
+            "url text inside comments and strings is unchanged", rewritten);
+        Check.That(rewritten.Contains(
+                "url(\"data:image/png;base64,AA==\")", StringComparison.Ordinal),
+            "data URLs remain valid while other URLs are rebased", rewritten);
+        Check.Done();
+    }
+
     private static DomDocument ParseAndResolve(string bodyHtml, string css = "")
     {
         var doc = HtmlParser.Parse(
@@ -932,6 +976,15 @@ public class CssParserTests
         Check.That(b.Color == Color.Black,
             "@media print rules are parsed but not applied on screen",
             b.Color.ToString());
+
+        doc.MediaType = "print";
+        StyleResolver.Resolve(doc, 800);
+        a = StyleById(doc, "a");
+        b = StyleById(doc, "b");
+        Check.That(a.Color == Color.FromArgb(255, 0, 0) &&
+                   b.Color == Color.FromArgb(0, 0, 255),
+            "@media rules are re-resolved for print",
+            $"a={a.Color}, b={b.Color}");
         Check.Done();
     }
 
@@ -940,16 +993,30 @@ public class CssParserTests
     {
         var doc = HtmlParser.Parse(
             "<html><head>" +
-            "<style media='print'>p { color: #0000ff }</style>" +
-            "<style media='screen, print'>p { color: #ff0000 }</style>" +
-            "</head><body><p id='p'>x</p></body></html>",
+            "<style media='print'>#print { color: #0000ff }</style>" +
+            "<style media='screen'>#screen { color: #00ff00 }</style>" +
+            "<style media='screen, print'>#both { color: #ff0000 }</style>" +
+            "</head><body><p id='print'>x</p><p id='screen'>y</p>" +
+            "<p id='both'>z</p></body></html>",
             ParsedUrl.Parse("http://x.test/"), new CookieStore());
         StyleResolver.Resolve(doc, 800);
-        var p = doc.AllTags("p")[0];
+        var print = StyleById(doc, "print");
+        var screen = StyleById(doc, "screen");
+        var both = StyleById(doc, "both");
 
-        Check.That(p.Style!.Color == Color.FromArgb(255, 0, 0),
-            "<style media> non-screen sheets are skipped, screen sheets apply",
-            p.Style.Color.ToString());
+        Check.That(print.Color == Color.Black &&
+                   screen.Color == Color.FromArgb(0, 255, 0) &&
+                   both.Color == Color.FromArgb(255, 0, 0),
+            "<style media> filters sheets for screen");
+        doc.MediaType = "print";
+        StyleResolver.Resolve(doc, 800);
+        print = StyleById(doc, "print");
+        screen = StyleById(doc, "screen");
+        both = StyleById(doc, "both");
+        Check.That(print.Color == Color.FromArgb(0, 0, 255) &&
+                   screen.Color == Color.Black &&
+                   both.Color == Color.FromArgb(255, 0, 0),
+            "<style media> filters sheets for print");
         Check.Done();
     }
 

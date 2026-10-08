@@ -88,14 +88,16 @@ public static class StyleResolver
     private static List<CssRule> ReadAuthorRules(DomDocument doc)
     {
         var rules = new List<CssRule>();
+        if (doc.AuthorStylesDisabled)
+            return rules;
         foreach (var element in doc.ElementDescendants())
         {
             if (element.TagName != "style") continue;
-            if (!MediaAppliesToScreen(element.GetAttr("media"))) continue;
+            if (!MediaAppliesTo(element.GetAttr("media"), doc.MediaType)) continue;
             foreach (var text in element.Children.OfType<DomText>())
                 if (!string.IsNullOrEmpty(text.Data))
                 {
-                    var (parsedRules, _) = CssParser.Parse(text.Data);
+                    var (parsedRules, _) = CssParser.Parse(text.Data, doc.MediaType);
                     rules.AddRange(parsedRules);
                 }
         }
@@ -108,7 +110,7 @@ public static class StyleResolver
     /// count, print-only sheets do not).  Mirrors the CssParser @media
     /// behaviour.
     /// </summary>
-    internal static bool MediaAppliesToScreen(string? media)
+    internal static bool MediaAppliesTo(string? media, string mediaType)
     {
         if (string.IsNullOrWhiteSpace(media))
             return true;
@@ -116,7 +118,7 @@ public static class StyleResolver
         {
             string token = part.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
                 .FirstOrDefault() ?? "";
-            if (token.Equals("screen", StringComparison.OrdinalIgnoreCase) ||
+            if (token.Equals(mediaType, StringComparison.OrdinalIgnoreCase) ||
                 token.Equals("all", StringComparison.OrdinalIgnoreCase))
                 return true;
         }
@@ -214,18 +216,21 @@ public static class StyleResolver
         // previously ignored entirely, so print-only <style> blocks
         // applied on screen).
         var authorRules = new List<CssRule>();
-        foreach (var styleElem in doc.ElementDescendants())
+        if (!doc.AuthorStylesDisabled)
         {
-            if (styleElem.TagName != "style")
-                continue;
-            if (!MediaAppliesToScreen(styleElem.GetAttr("media")))
-                continue;
-            foreach (var child in styleElem.Children)
+            foreach (var styleElem in doc.ElementDescendants())
             {
-                if (child is DomText t && !string.IsNullOrEmpty(t.Data))
+                if (styleElem.TagName != "style")
+                    continue;
+                if (!MediaAppliesTo(styleElem.GetAttr("media"), doc.MediaType))
+                    continue;
+                foreach (var child in styleElem.Children)
                 {
-                    var (rules, _) = CssParser.Parse(t.Data);
-                    authorRules.AddRange(rules);
+                    if (child is DomText t && !string.IsNullOrEmpty(t.Data))
+                    {
+                        var (rules, _) = CssParser.Parse(t.Data, doc.MediaType);
+                        authorRules.AddRange(rules);
+                    }
                 }
             }
         }
@@ -544,7 +549,7 @@ public static class StyleResolver
                         parentStyle?.FontWeight ?? FontWeightValue.Normal, parentStyle);
 
             // 3. Inline STYLE= — outranks non-important author rules.
-            var inlineStyle = elem.GetAttr("style");
+            var inlineStyle = doc.AuthorStylesDisabled ? null : elem.GetAttr("style");
             if (!string.IsNullOrEmpty(inlineStyle))
             {
                 foreach (var decl in CssParser.ParseInlineStyle(inlineStyle))

@@ -1942,7 +1942,17 @@ public static class LayoutEngine
         FlushInlineRun();
 
         if (!hasExplicitHeight)
+        {
             box.Height = Math.Max(0f, currentY - contentY);
+            if (box.PaddingBottom == 0f && box.BorderBottom == 0f &&
+                box.Element?.Style is
+                    { Overflow: OverflowValue.Visible } style &&
+                style.MinHeight.GetValueOrDefault() <= 0f &&
+                style.MinHeightPercent.GetValueOrDefault() <= 0f)
+            {
+                box.MarginBottom = CollapseMargins(box.MarginBottom, prevMarginBottom);
+            }
+        }
 
         // Absolutely positioned children — out of flow.  They are laid out
         // against this block's content area first (their subtree needs real

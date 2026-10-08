@@ -154,6 +154,8 @@ public class DomDocument : DomNode
     public string       BaseTarget   { get; set; } = "";
     public string       Charset      { get; set; } = "iso-8859-1";
     public string       QuirksMode   { get; set; } = "html32";
+    public bool         AuthorStylesDisabled { get; set; }
+    public string       MediaType    { get; set; } = "screen";
 
     /// <summary>True when the shell executes inline scripts for this
     /// document — gates &lt;noscript&gt; visibility (hidden with JS on,

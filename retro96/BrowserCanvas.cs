@@ -2148,7 +2148,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
 
         canvas.DrawImage(rasterized.Image,
-            SKRect.Create(0f, 0f, rasterized.Width, rasterized.Height));
+            SKRect.Create(0f, 0f, rasterized.Width, rasterized.Height),
+            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
         return true;
     }
 
@@ -11996,7 +11997,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private void PaintFrameExport(SKCanvas canvas, Renderer renderer, LayoutBox frameBox,
                                           FrameView view, RectangleF destRect,
                                           RectangleF ancestorClip, int depth,
-                                          FontCache fonts, ImageCache images)
+                                          FontCache fonts, ImageCache images,
+                                          bool printRendering = false)
     {
         if (depth > 8 || destRect.Width <= 0f || destRect.Height <= 0f) return;
         var visible = IntersectRect(destRect, ancestorClip);
@@ -12009,8 +12011,10 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             canvas.ClipRect(SKRect.Create(0, 0, frameBox.Width, frameBox.Height), SKClipOperation.Intersect);
             renderer.RenderLocalToCanvas(canvas, view.RootBox!, view.Document, fonts, images,
                 Math.Max(1f, frameBox.Width), Math.Max(1f, frameBox.Height),
-                view.Scroll.X, view.Scroll.Y, view.Document.HoveredElement, true,
-                _focusedInputFrame == view ? _focusedInput : null, _showBoxOutlines);
+                view.Scroll.X, view.Scroll.Y,
+                printRendering ? null : view.Document.HoveredElement, true,
+                printRendering || _focusedInputFrame != view ? null : _focusedInput,
+                !printRendering && _showBoxOutlines);
         }
         finally
         {
@@ -12023,7 +12027,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 destRect.Y + childBox.Y - view.Scroll.Y,
                 childBox.Width, childBox.Height);
             PaintFrameExport(canvas, renderer, childBox, childView, childDest, visible,
-                depth + 1, fonts, images);
+                depth + 1, fonts, images, printRendering);
         }
     }
 
@@ -12757,8 +12761,29 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             _fontCache == null || _imageCache == null || _resourceLoader == null)
             return null;
 
+        var mediaDocuments = new List<(DomDocument Document, string MediaType)>();
+        void AddPrintDocument(DomDocument document, float viewportWidth)
+        {
+            if (mediaDocuments.Any(item => ReferenceEquals(item.Document, document)))
+                return;
+            mediaDocuments.Add((document, document.MediaType));
+            document.MediaType = "print";
+            Engine.Css.StyleResolver.Resolve(document, Math.Max(1f, viewportWidth));
+        }
+
+        void AddFrameDocuments(IEnumerable<(LayoutBox Box, FrameView View)> frames)
+        {
+            foreach (var (box, frame) in frames)
+            {
+                AddPrintDocument(frame.Document, box.Width);
+                AddFrameDocuments(frame.ChildFrames);
+            }
+        }
+
         try
         {
+            AddPrintDocument(_document, _rootBox.Width);
+            AddFrameDocuments(_frames.Select(entry => (entry.Key, entry.Value)));
             int width = Math.Max(1, (int)Math.Ceiling(_rootBox.Width));
             int height = Math.Max(1, (int)Math.Ceiling(_rootBox.Height));
             var renderer = new Renderer(_fontCache, _imageCache, _resourceLoader)
@@ -12768,7 +12793,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 IsPrintRendering = true
             };
 
-            return renderer.Render(
+            var bitmap = renderer.Render(
                 _rootBox, _document,
                 _fontCache, _imageCache,
                 width, height,
@@ -12777,11 +12802,37 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 blinkVisible: true,
                 showBoxOutlines: false,
                 focusedElement: null);
+            if (_frames.Count == 0 || bitmap.SkBitmap is not { } skBitmap)
+                return bitmap;
+
+            using var surface = SKSurface.Create(
+                skBitmap.Info, skBitmap.GetPixels(), skBitmap.RowBytes)
+                ?? throw new InvalidOperationException("Could not create print composition surface.");
+            var canvas = surface.Canvas;
+            var pageRect = new RectangleF(0f, 0f, width, height);
+            foreach (var (frameBox, view) in _frames.ToArray())
+            {
+                var frameRect = new RectangleF(
+                    frameBox.X, frameBox.Y, frameBox.Width, frameBox.Height);
+                PaintFrameExport(canvas, renderer, frameBox, view, frameRect, pageRect,
+                    0, _fontCache, _imageCache, printRendering: true);
+            }
+            surface.Flush();
+            return bitmap;
         }
         catch (Exception ex)
         {
             Retro96.DebugLog.WriteException("CreatePrintBitmap", ex);
             return null;
+        }
+        finally
+        {
+            foreach (var (document, mediaType) in mediaDocuments)
+            {
+                document.MediaType = mediaType;
+                Engine.Css.StyleResolver.Resolve(document,
+                    Math.Max(1, (int)MathF.Ceiling(_rootBox?.Width ?? 1)));
+            }
         }
     }
 

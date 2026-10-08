@@ -15,8 +15,8 @@ public record CssRule(IReadOnlyList<CssSelector> Selectors,
 /// ("@import url(a.css) screen, print;"); null/empty means the sheet
 /// applies to ALL media per CSS2 §7.2.2.  The import-expansion layer
 /// (Form1.ExpandCssImportsAsync — outside the CSS engine's ownership)
-/// must consult AppliesTo("screen") before pulling a sheet in; as of the
-/// CSS2 upgrade it still imports print-only sheets.
+/// keeps media descriptors so the stylesheet loader can preserve them when
+/// expanding imported rules.
 /// </summary>
 public record CssImportRule(string Url, IReadOnlyList<string>? Media = null)
 {
@@ -39,7 +39,146 @@ public record CssImportRule(string Url, IReadOnlyList<string>? Media = null)
 /// </summary>
 public static class CssParser
 {
-    public static (List<CssRule> Rules, List<CssImportRule> ImportRules) Parse(string css)
+    /// <summary>
+    /// Resolves url() references in a stylesheet against that stylesheet's
+    /// own URL. Comments and quoted strings are copied unchanged.
+    /// </summary>
+    public static string RewriteUrls(string css, Func<string, string> resolveUrl)
+    {
+        ArgumentNullException.ThrowIfNull(resolveUrl);
+        if (string.IsNullOrEmpty(css))
+            return css;
+
+        var output = new StringBuilder(css.Length);
+        int pos = 0;
+        while (pos < css.Length)
+        {
+            if (pos + 1 < css.Length && css[pos] == '/' && css[pos + 1] == '*')
+            {
+                int commentEnd = css.IndexOf("*/", pos + 2, StringComparison.Ordinal);
+                int end = commentEnd < 0 ? css.Length : commentEnd + 2;
+                output.Append(css, pos, end - pos);
+                pos = end;
+                continue;
+            }
+
+            if (css[pos] is '\'' or '"')
+            {
+                char quote = css[pos];
+                int end = pos + 1;
+                while (end < css.Length)
+                {
+                    if (css[end] == '\\' && end + 1 < css.Length)
+                        end += 2;
+                    else if (css[end++] == quote)
+                        break;
+                }
+                output.Append(css, pos, end - pos);
+                pos = end;
+                continue;
+            }
+
+            if (!IsUrlFunctionAt(css, pos, out int openParen))
+            {
+                output.Append(css[pos++]);
+                continue;
+            }
+
+            int contentStart = openParen + 1;
+            while (contentStart < css.Length && char.IsWhiteSpace(css[contentStart]))
+                contentStart++;
+
+            int contentEnd;
+            int functionEnd;
+            string rawUrl;
+            if (contentStart < css.Length && css[contentStart] is '\'' or '"')
+            {
+                char quote = css[contentStart];
+                int quoteEnd = contentStart + 1;
+                while (quoteEnd < css.Length)
+                {
+                    if (css[quoteEnd] == '\\' && quoteEnd + 1 < css.Length)
+                        quoteEnd += 2;
+                    else if (css[quoteEnd++] == quote)
+                        break;
+                }
+
+                int closeParen = quoteEnd;
+                while (closeParen < css.Length && char.IsWhiteSpace(css[closeParen]))
+                    closeParen++;
+                if (quoteEnd > css.Length || quoteEnd == css.Length ||
+                    css[quoteEnd - 1] != quote ||
+                    closeParen >= css.Length || css[closeParen] != ')')
+                {
+                    output.Append(css[pos++]);
+                    continue;
+                }
+                contentEnd = quoteEnd - 1;
+                functionEnd = closeParen + 1;
+                rawUrl = css[(contentStart + 1)..contentEnd];
+            }
+            else
+            {
+                contentEnd = contentStart;
+                while (contentEnd < css.Length &&
+                       (css[contentEnd] != ')' ||
+                        (contentEnd > contentStart && css[contentEnd - 1] == '\\')))
+                    contentEnd++;
+                if (contentEnd >= css.Length)
+                {
+                    output.Append(css[pos++]);
+                    continue;
+                }
+                rawUrl = css[contentStart..contentEnd].Trim();
+                functionEnd = contentEnd + 1;
+            }
+
+            string resolved = rawUrl.Length == 0 || HasExplicitScheme(rawUrl)
+                ? rawUrl
+                : resolveUrl(rawUrl);
+            output.Append("url(\"")
+                .Append(resolved.Replace("\\", "\\\\", StringComparison.Ordinal)
+                    .Replace("\"", "\\\"", StringComparison.Ordinal)
+                    .Replace("\r", "\\d ", StringComparison.Ordinal)
+                    .Replace("\n", "\\a ", StringComparison.Ordinal))
+                .Append("\")");
+            pos = functionEnd;
+        }
+
+        return output.ToString();
+    }
+
+    private static bool IsUrlFunctionAt(string css, int pos, out int openParen)
+    {
+        openParen = -1;
+        if (pos > 0 && (char.IsLetterOrDigit(css[pos - 1]) || css[pos - 1] is '-' or '_'))
+            return false;
+        if (pos + 3 > css.Length ||
+            !css.AsSpan(pos, 3).Equals("url", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        int cursor = pos + 3;
+        while (cursor < css.Length && char.IsWhiteSpace(css[cursor]))
+            cursor++;
+        if (cursor >= css.Length || css[cursor] != '(')
+            return false;
+        openParen = cursor;
+        return true;
+    }
+
+    private static bool HasExplicitScheme(string url)
+    {
+        int colon = url.IndexOf(':');
+        if (colon <= 0 || !char.IsAsciiLetter(url[0]))
+            return false;
+        for (int i = 1; i < colon; i++)
+            if (!char.IsAsciiLetterOrDigit(url[i]) && url[i] is not ('+' or '.' or '-'))
+                return false;
+        return true;
+    }
+
+    public static (List<CssRule> Rules, List<CssImportRule> ImportRules) Parse(
+        string css, string mediaType = "screen")
     {
         var rules = new List<CssRule>();
         var importRules = new List<CssImportRule>();
@@ -57,7 +196,7 @@ public static class CssParser
 
             if (css[pos] == '@')
             {
-                HandleAtRule(css, ref pos, rules, importRules);
+                HandleAtRule(css, ref pos, rules, importRules, mediaType);
                 continue;
             }
 
@@ -156,7 +295,7 @@ public static class CssParser
     // ─────────────────────────────────────────────────────────────────────
 
     private static void HandleAtRule(string css, ref int pos,
-        List<CssRule> rules, List<CssImportRule> importRules)
+        List<CssRule> rules, List<CssImportRule> importRules, string mediaType)
     {
         pos++; // skip '@'
 
@@ -176,9 +315,7 @@ public static class CssParser
                     SkipWhitespace(css, ref pos);
                     string url = ParseUrlOrString(css, ref pos);
                     // CSS2: optional media descriptor after the URL
-                    // ("@import url(a.css) screen, print;").  The old code
-                    // DISCARDED it — captured here so the expansion layer
-                    // can skip non-screen sheets (CssImportRule.AppliesTo).
+                    // ("@import url(a.css) screen, print;").
                     int mediaStart = pos;
                     SkipToSemicolonOrBrace(css, ref pos);
                     var media = ParseMediaList(css[mediaStart..pos]);
@@ -196,12 +333,20 @@ public static class CssParser
                     // query names this renderer; explicit `not` negates it.
                     SkipWhitespace(css, ref pos);
                     string media = ReadUntil(css, ref pos, '{').Trim().ToLowerInvariant();
-                    bool hasNot = media.Split(new[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries)
-                        .FirstOrDefault() == "not";
-                    bool apply = !hasNot && media.Split(',').Any(part =>
+                    bool apply = media.Split(',').Any(part =>
                     {
-                        string token = part.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-                        return token is "screen" or "all";
+                        var tokens = part.Trim().Split(
+                            new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        bool negate = tokens.Length > 0 &&
+                            tokens[0].Equals("not", StringComparison.OrdinalIgnoreCase);
+                        int mediaIndex = tokens.Length > 0 &&
+                            tokens[0].Equals("not", StringComparison.OrdinalIgnoreCase) ? 1 :
+                            tokens.Length > 0 &&
+                            tokens[0].Equals("only", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+                        string token = tokens.Length > mediaIndex ? tokens[mediaIndex] : "";
+                        bool matches = token.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+                            token.Equals(mediaType, StringComparison.OrdinalIgnoreCase);
+                        return negate ? !matches : matches;
                     });
 
                     if (pos < css.Length && css[pos] == '{')
@@ -220,7 +365,7 @@ public static class CssParser
 
                         if (apply)
                         {
-                            var (innerRules, innerImports) = Parse(mediaCss.ToString());
+                            var (innerRules, innerImports) = Parse(mediaCss.ToString(), mediaType);
                             rules.AddRange(innerRules);
                             importRules.AddRange(innerImports);
                         }

@@ -12,6 +12,277 @@ using Retro96.Engine.Render;
 
 namespace Retro96.Engine.Network;
 
+public static class HttpLinkHeaderParser
+{
+    public static IReadOnlyList<string> ParseStylesheetHrefs(string? header)
+    {
+        if (string.IsNullOrWhiteSpace(header))
+            return Array.Empty<string>();
+
+        var hrefs = new List<string>();
+        foreach (string entry in SplitEntries(header))
+        {
+            string candidate = entry.Trim();
+            if (candidate.Length < 3 || candidate[0] != '<')
+                continue;
+
+            int uriEnd = candidate.IndexOf('>');
+            if (uriEnd <= 1)
+                continue;
+            string href = candidate[1..uriEnd].Trim();
+            if (href.Length == 0)
+                continue;
+
+            string parameters = candidate[(uriEnd + 1)..];
+            if (!TryReadParameters(parameters, out var relValues))
+                continue;
+            if (relValues.Any(value => value.Split(
+                    (char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                .Any(rel => rel.Equals("stylesheet", StringComparison.OrdinalIgnoreCase))))
+                hrefs.Add(href);
+        }
+
+        return hrefs;
+    }
+
+    public static void AddStylesheetLinks(DomDocument document, string? header)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        var links = ParseStylesheetHrefs(header);
+        if (links.Count == 0)
+            return;
+
+        DomElement? head = document.ElementDescendants()
+            .FirstOrDefault(element => element.TagName == "head");
+        foreach (string href in links)
+        {
+            var link = new DomElement("link");
+            link.SetAttr("rel", "stylesheet");
+            link.SetAttr("href", href);
+            if (head != null)
+                head.AppendChild(link);
+            else
+                document.AppendChild(link);
+        }
+    }
+
+    private static IEnumerable<string> SplitEntries(string header)
+    {
+        int start = 0;
+        bool inUri = false;
+        bool inQuotedString = false;
+        bool escaped = false;
+        for (int i = 0; i < header.Length; i++)
+        {
+            char c = header[i];
+            if (inQuotedString)
+            {
+                if (escaped)
+                    escaped = false;
+                else if (c == '\\')
+                    escaped = true;
+                else if (c == '"')
+                    inQuotedString = false;
+                continue;
+            }
+
+            if (inUri)
+            {
+                if (c == '>')
+                    inUri = false;
+                continue;
+            }
+
+            if (c == '<')
+                inUri = true;
+            else if (c == '"')
+                inQuotedString = true;
+            else if (c == ',')
+            {
+                yield return header[start..i];
+                start = i + 1;
+            }
+        }
+
+        yield return header[start..];
+    }
+
+    private static bool TryReadParameters(string text, out List<string> relValues)
+    {
+        relValues = new List<string>();
+        int pos = 0;
+        while (pos < text.Length)
+        {
+            while (pos < text.Length && char.IsWhiteSpace(text[pos]))
+                pos++;
+            if (pos == text.Length)
+                break;
+            if (text[pos++] != ';')
+                return false;
+            while (pos < text.Length && char.IsWhiteSpace(text[pos]))
+                pos++;
+
+            int nameStart = pos;
+            while (pos < text.Length && IsTokenCharacter(text[pos]))
+                pos++;
+            if (pos == nameStart)
+                return false;
+            string name = text[nameStart..pos];
+            while (pos < text.Length && char.IsWhiteSpace(text[pos]))
+                pos++;
+            if (pos >= text.Length || text[pos++] != '=')
+                return false;
+            while (pos < text.Length && char.IsWhiteSpace(text[pos]))
+                pos++;
+
+            string value;
+            if (pos < text.Length && text[pos] == '"')
+            {
+                pos++;
+                var builder = new StringBuilder();
+                bool closed = false;
+                while (pos < text.Length)
+                {
+                    char c = text[pos++];
+                    if (c == '\\')
+                    {
+                        if (pos >= text.Length)
+                            return false;
+                        builder.Append(text[pos++]);
+                    }
+                    else if (c == '"')
+                    {
+                        closed = true;
+                        break;
+                    }
+                    else
+                    {
+                        builder.Append(c);
+                    }
+                }
+                if (!closed)
+                    return false;
+                value = builder.ToString();
+            }
+            else
+            {
+                int valueStart = pos;
+                while (pos < text.Length && IsTokenCharacter(text[pos]))
+                    pos++;
+                if (pos == valueStart)
+                    return false;
+                value = text[valueStart..pos];
+            }
+
+            if (name.Equals("rel", StringComparison.OrdinalIgnoreCase))
+                relValues.Add(value);
+        }
+
+        return true;
+    }
+
+    private static bool IsTokenCharacter(char c) =>
+        char.IsAsciiLetterOrDigit(c) || c is '!' or '#' or '$' or '%' or '&' or '\'' or
+            '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~';
+}
+
+public static class StylesheetLinkSelection
+{
+    public static DomElement InsertLoadedStylesheet(
+        DomDocument document, DomElement link, string cssText)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(link);
+        ArgumentNullException.ThrowIfNull(cssText);
+
+        var style = new DomElement("style");
+        if (link.GetAttr("media") is { Length: > 0 } media)
+            style.SetAttr("media", media);
+        style.AppendChild(new DomText { Data = cssText });
+        if (link.Parent is { } parent)
+            parent.InsertBefore(style, link.NextSibling);
+        else
+            document.AppendChild(style);
+        return style;
+    }
+
+    public static IReadOnlyList<string> GetAvailableTitles(DomDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        return document.ElementDescendants()
+            .Where(element => element.TagName == "link" &&
+                HasRelToken(element, "stylesheet") &&
+                element.HasAttr("href"))
+            .Select(element => element.GetAttr("title")?.Trim())
+            .Where(title => !string.IsNullOrEmpty(title))
+            .Select(title => title!)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<DomElement> SelectForDocument(
+        DomDocument document, string? activeTitle = null)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        var stylesheetLinks = document.ElementDescendants()
+            .Where(element => element.TagName == "link" &&
+                HasRelToken(element, "stylesheet") &&
+                element.HasAttr("href"))
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(activeTitle) &&
+            stylesheetLinks.Any(link => link.GetAttr("title")?.Trim().Equals(
+                activeTitle, StringComparison.Ordinal) == true))
+        {
+            return stylesheetLinks
+                .Where(link =>
+                {
+                    string? title = link.GetAttr("title")?.Trim();
+                    return string.IsNullOrEmpty(title) ||
+                        title.Equals(activeTitle, StringComparison.Ordinal);
+                })
+                .ToArray();
+        }
+
+        var defaultStyle = document.ElementDescendants()
+            .Where(element => element.TagName == "meta" &&
+                element.GetAttr("http-equiv")?.Equals(
+                    "Default-Style", StringComparison.OrdinalIgnoreCase) == true)
+            .Select(element => element.GetAttr("content")?.Trim())
+            .LastOrDefault();
+        if (string.IsNullOrEmpty(defaultStyle))
+            defaultStyle = null;
+
+        string? selectedTitle = defaultStyle;
+        if (selectedTitle == null)
+        {
+            selectedTitle = stylesheetLinks
+                .Where(link => !HasRelToken(link, "alternate"))
+                .Select(link => link.GetAttr("title")?.Trim())
+                .FirstOrDefault(title => !string.IsNullOrEmpty(title));
+        }
+
+        return stylesheetLinks
+            .Where(link =>
+            {
+                string? title = link.GetAttr("title")?.Trim();
+                if (string.IsNullOrEmpty(title))
+                    return true;
+                return selectedTitle != null &&
+                    !HasRelToken(link, "alternate") &&
+                    title.Equals(selectedTitle, StringComparison.Ordinal);
+            })
+            .ToArray();
+    }
+
+    private static bool HasRelToken(DomElement element, string token) =>
+        element.GetAttr("rel")?.Split(
+            (char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+        .Any(value => value.Equals(token, StringComparison.OrdinalIgnoreCase)) == true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Frame/iframe child-document loading — the ONE scheme-dispatching content
 // loader shared by the WinForms shell (Form1.LoadFramesAsync) and the
@@ -68,7 +339,8 @@ public static class FrameLoader
         int frameW, int frameH,
         HttpClient? http, CookieStore cookies, CancellationToken ct,
         InlineScriptExecutor? runScript = null,
-        ExternalScriptLoader? loadExternalScript = null)
+        ExternalScriptLoader? loadExternalScript = null,
+        Func<DomDocument, ParsedUrl, CancellationToken, Task>? loadStylesheets = null)
     {
         if (string.IsNullOrWhiteSpace(src)) return null;
 
@@ -118,8 +390,8 @@ public static class FrameLoader
 
                         byte[] bytes = await File.ReadAllBytesAsync(local, ct);
                         string html = BodyDecoder.Decode(bytes, declaredCharset: null);
-                        return BuildContent(html, parsed, abs, frameW, frameH,
-                            cookies, runScript, loadExternalScript);
+                        return await BuildContentAsync(html, parsed, abs, frameW, frameH,
+                            cookies, runScript, loadExternalScript, loadStylesheets, null, ct);
                     }
 
                 case "http":
@@ -137,7 +409,8 @@ public static class FrameLoader
                         return result switch
                         {
                             HttpSuccess { StatusCode: 200 } ok =>
-                                BuildLoggedContent(ok, parsed, abs, frameW, frameH, cookies, runScript, loadExternalScript),
+                                await BuildLoggedContentAsync(ok, parsed, abs, frameW, frameH,
+                                    cookies, runScript, loadExternalScript, loadStylesheets, ct),
                             HttpSuccess err => ErrorContent(
                                 HttpStatusPage(err.StatusCode, abs), abs, frameW, frameH),
                             HttpError e => ErrorContent(
@@ -167,24 +440,39 @@ public static class FrameLoader
         }
     }
 
-    private static FrameContent BuildLoggedContent(
+    private static async Task<FrameContent> BuildLoggedContentAsync(
         HttpSuccess response, ParsedUrl parsed, string abs,
         int frameW, int frameH, CookieStore cookies, InlineScriptExecutor? runScript,
-        ExternalScriptLoader? loadExternalScript)
+        ExternalScriptLoader? loadExternalScript,
+        Func<DomDocument, ParsedUrl, CancellationToken, Task>? loadStylesheets,
+        CancellationToken ct)
     {
         string html = BodyDecoder.Decode(response.Body, response.Charset);
-        var content = BuildContent(html, parsed, abs, frameW, frameH, cookies, runScript, loadExternalScript);
+        ParsedUrl documentUrl = string.IsNullOrWhiteSpace(response.EffectiveUrl)
+            ? parsed
+            : ParsedUrl.Parse(response.EffectiveUrl);
+        string documentAbsoluteUrl = string.IsNullOrWhiteSpace(response.EffectiveUrl)
+            ? abs
+            : response.EffectiveUrl;
+        var content = await BuildContentAsync(html, documentUrl, documentAbsoluteUrl,
+            frameW, frameH, cookies, runScript, loadExternalScript, loadStylesheets,
+            response.Headers.TryGetValue("link", out string? linkHeader) ? linkHeader : null, ct);
         Retro96.DebugLog.Write($"[FRAME] parsed resolved='{abs}' title='{content.Document.Title}' " +
             $"root={content.RootBox.Width:0.#}x{content.RootBox.Height:0.#} " +
             $"frames={content.RootBox.Descendants().Count(b => b.BoxType == BoxType.Frame)}");
         return content;
     }
 
-    private static FrameContent BuildContent(
+    private static async Task<FrameContent> BuildContentAsync(
         string html, ParsedUrl url, string abs, int frameW, int frameH,
-        CookieStore cookies, InlineScriptExecutor? runScript, ExternalScriptLoader? loadExternalScript)
+        CookieStore cookies, InlineScriptExecutor? runScript, ExternalScriptLoader? loadExternalScript,
+        Func<DomDocument, ParsedUrl, CancellationToken, Task>? loadStylesheets,
+        string? linkHeader, CancellationToken ct)
     {
         var doc = HtmlParser.Parse(html, url, cookies, runScript, loadExternalScript);
+        HttpLinkHeaderParser.AddStylesheetLinks(doc, linkHeader);
+        if (loadStylesheets != null)
+            await loadStylesheets(doc, url, ct);
         StyleResolver.Resolve(doc, Math.Max(1, frameW));
         var root = LayoutEngine.BuildLayoutTree(doc, Math.Max(1, frameW), Math.Max(1, frameH));
         return new FrameContent(doc, root, abs);
@@ -192,8 +480,16 @@ public static class FrameLoader
 
     private static FrameContent ErrorContent(string errorHtml, string abs,
                                               int frameW, int frameH) =>
-        BuildContent(errorHtml, ParsedUrl.Parse("about:blank"), abs, frameW, frameH,
-            new CookieStore(), null, null);
+        BuildErrorContent(errorHtml, abs, frameW, frameH);
+
+    private static FrameContent BuildErrorContent(
+        string errorHtml, string abs, int frameW, int frameH)
+    {
+        var doc = HtmlParser.Parse(errorHtml, ParsedUrl.Parse("about:blank"), new CookieStore());
+        StyleResolver.Resolve(doc, Math.Max(1, frameW));
+        var root = LayoutEngine.BuildLayoutTree(doc, Math.Max(1, frameW), Math.Max(1, frameH));
+        return new FrameContent(doc, root, abs);
+    }
 
     /// <summary>Same status-code → error-page mapping the top-level
     /// navigation uses, so a 404 inside a frame reads identically to a

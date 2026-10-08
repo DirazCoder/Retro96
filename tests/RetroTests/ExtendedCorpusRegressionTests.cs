@@ -97,6 +97,34 @@ public class ExtendedCorpusRegressionTests
         Check.Done();
     }
 
+    [Fact]
+    public void ParagraphMarginCollapsesThroughListItemToFollowingItem()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><ol>" +
+            "<li><p>first</p></li>" +
+            "<li><p>second</p></li>" +
+            "<li><p id='third'>third</p></li>" +
+            "<li><a id='fourth' href='#'>fourth</a></li>" +
+            "</ol></body></html>");
+        var thirdParagraph = doc.ElementDescendants()
+            .First(element => element.GetAttr("id") == "third");
+        var thirdItem = thirdParagraph.Parent!;
+        var fourthItem = doc.ElementDescendants()
+            .First(element => element.TagName == "li" &&
+                element.Descendants().OfType<DomElement>()
+                    .Any(descendant => descendant.GetAttr("id") == "fourth"));
+
+        var thirdItemBox = LayoutHarness.BoxOf(root, (DomElement)thirdItem)!;
+        var fourthItemBox = LayoutHarness.BoxOf(root, fourthItem)!;
+        float actualGap = fourthItemBox.BorderRect.Y - thirdItemBox.BorderRect.Bottom;
+        float expectedGap = thirdParagraph.Style!.MarginBottom;
+        Check.That(Math.Abs(actualGap - expectedGap) < 1.5f,
+            "the final paragraph margin collapses through its list item",
+            $"gap={actualGap:0.#} expected={expectedGap:0.#}");
+        Check.Done();
+    }
+
     // AB-15 ────────────────────────────────────────────────────────────
     [Fact]
     public void Bug_DimensionlessImgUsesNaturalSize()

@@ -144,6 +144,9 @@ public partial class Form1 : Form
     private System.Windows.Forms.Timer? _metaRefreshTimer;
     private string? _currentPageUrl;
     private string? _referrerUrl;          // document.referrer for the next page
+    private string? _selectedStyleSheetTitle;
+    private string? _styleSelectionPageUrl;
+    private bool _pageStylesDisabled;
 
     // User preferences (search engine etc.); persisted per-user with a portable retro96.ini mirror
     private readonly UserSettings _settings;
@@ -784,6 +787,14 @@ public partial class Form1 : Form
             requestedUrl = localUrl;
         rawUrl = requestedUrl;
 
+        if (_styleSelectionPageUrl != null &&
+            !SamePageUrl(rawUrl, _styleSelectionPageUrl))
+        {
+            _selectedStyleSheetTitle = null;
+            _styleSelectionPageUrl = null;
+            _pageStylesDisabled = false;
+        }
+
         if (!_settings.WelcomeDismissed && IsWelcomeUrl(_currentPageUrl) && !IsWelcomeUrl(rawUrl))
         {
             _settings.WelcomeDismissed = true;
@@ -1242,8 +1253,10 @@ public partial class Form1 : Form
         state.Referrer = _referrerUrl ?? "";
 
         BeginInvoke(() => _statusLabel.Text = "Fetching stylesheets…");
-        if (BrowserRuntime.StylesheetsEnabled)
-            await FetchStylesheetsAsync(document, url, ct);
+        ApplyPageStyleSelection(document);
+        HttpLinkHeaderParser.AddStylesheetLinks(document,
+            success.Headers.TryGetValue("link", out string? linkHeader) ? linkHeader : null);
+        await FetchStylesheetsAsync(document, url, ct);
         ApplyPluginPageStyle(document);
 
         _visitedUrls.Add(url.ToAbsolute());
@@ -1561,6 +1574,11 @@ public partial class Form1 : Form
     private async Task FetchStylesheetsAsync(DomDocument document, ParsedUrl baseUrl,
                                              CancellationToken ct)
     {
+        ApplyPageStyleSelection(document);
+        if (document.AuthorStylesDisabled || !BrowserRuntime.StylesheetsEnabled)
+            return;
+
+        bool selectionApplies = SamePageUrl(_currentPageUrl, _styleSelectionPageUrl);
         ParsedUrl importBase = document.BaseUrl ?? baseUrl;
         foreach (var styleElem in document.ElementDescendants()
                      .Where(e => e.TagName == "style"))
@@ -1573,28 +1591,13 @@ public partial class Form1 : Form
             }
         }
 
-        var links = document.ElementDescendants()
-            .Where(e => e.TagName == "link" &&
-                        e.GetAttr("rel")?.Contains("stylesheet",
-                            StringComparison.OrdinalIgnoreCase) == true &&
-                        e.HasAttr("href"))
-            .ToList();
+        string? selectedTitle = selectionApplies
+            ? _selectedStyleSheetTitle
+            : null;
+        var links = StylesheetLinkSelection.SelectForDocument(document, selectedTitle);
 
         foreach (var link in links)
         {
-            // CSS2 media-scoped stylesheets: skip print/aural-only links
-            // (a blank media or "screen"/"all" applies). Same rule the
-            // @import expansion applies.
-            string? linkMedia = link.GetAttr("media");
-            if (!string.IsNullOrWhiteSpace(linkMedia))
-            {
-                bool applies = linkMedia.Split(',')
-                    .Any(m => { string t = m.Trim(); return t.Length == 0 ||
-                        t.Equals("screen", StringComparison.OrdinalIgnoreCase) ||
-                        t.Equals("all", StringComparison.OrdinalIgnoreCase); });
-                if (!applies) continue;
-            }
-
             string href = link.GetAttr("href")!;
             try
             {
@@ -1602,78 +1605,97 @@ public partial class Form1 : Form
                 // disk — the HTTP fetcher knows nothing about files.
                 if (baseUrl.Scheme == "file")
                 {
-                    string abs = ImageCache.ResolveUrl(href, baseUrl.ToAbsolute());
+                    string abs = ImageCache.ResolveUrl(href, importBase.ToAbsolute());
                     var localParsed = ParsedUrl.Parse(abs);
                     var localPath = LocalPathFromFileUrl(localParsed);
                     if (localPath != null && File.Exists(localPath))
                     {
                         string cssText = await File.ReadAllTextAsync(localPath);
                         cssText = await ExpandCssImportsAsync(cssText, localParsed, ct, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-                        var styleElem = new DomElement("style");
-                        styleElem.AppendChild(new DomText { Data = cssText });
-                        document.AppendChild(styleElem);
+                        StylesheetLinkSelection.InsertLoadedStylesheet(
+                            document, link, cssText);
                     }
                     continue;
                 }
 
-                var res = await _resourceLoader!.FetchAsync(href, baseUrl, _cookieStore);
+                var res = await _resourceLoader!.FetchAsync(href, importBase, _cookieStore);
                 if (res is HttpSuccess css)
                 {
                     string cssText = DecodeBody(css);
-                    cssText = await ExpandCssImportsAsync(cssText, baseUrl, ct, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-                    var styleElem = new DomElement("style");
-                    styleElem.AppendChild(new DomText { Data = cssText });
-                    document.AppendChild(styleElem);
+                    ParsedUrl stylesheetUrl = string.IsNullOrWhiteSpace(css.EffectiveUrl)
+                        ? importBase.Resolve(href)
+                        : ParsedUrl.Parse(css.EffectiveUrl);
+                    cssText = await ExpandCssImportsAsync(cssText, stylesheetUrl, ct, 0,
+                        new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                    StylesheetLinkSelection.InsertLoadedStylesheet(
+                        document, link, cssText);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                DebugLog.WriteException($"Fetch stylesheet '{href}'", ex);
+            }
         }
     }
+
+    private void ApplyPageStyleSelection(DomDocument document) =>
+        document.AuthorStylesDisabled =
+            SamePageUrl(_currentPageUrl, _styleSelectionPageUrl) && _pageStylesDisabled;
 
     private async Task<string> ExpandCssImportsAsync(string cssText, ParsedUrl baseUrl,
         CancellationToken ct, int depth, HashSet<string> visited)
     {
-        if (depth >= 8 || string.IsNullOrWhiteSpace(cssText)) return cssText;
-        var (_, imports) = CssParser.Parse(cssText);
-        if (imports.Count == 0) return cssText;
-
         var prefix = new StringBuilder();
-        foreach (var import in imports.Take(32))
+        if (depth < 8 && !string.IsNullOrWhiteSpace(cssText))
         {
-            try
+            var (_, imports) = CssParser.Parse(cssText);
+            foreach (var import in imports.Take(32))
             {
-                // CSS2 §7.2.2: a media-scoped @import only pulls the sheet
-                // in for the media types it declares. Print/aural-only
-                // imports are skipped for screen rendering.
-                if (!import.AppliesTo("screen"))
-                    continue;
-
-                string abs = baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
-                    ? FileUrls.Resolve(baseUrl, import.Url)
-                    : baseUrl.Resolve(import.Url).ToAbsolute();
-                if (!visited.Add(abs)) continue;
-
-                string importedText;
-                var parsed = ParsedUrl.Parse(abs);
-                if (parsed.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+                try
                 {
-                    string? path = LocalPathFromFileUrl(parsed);
-                    if (path == null || !File.Exists(path)) continue;
-                    importedText = await File.ReadAllTextAsync(path, ct);
-                }
-                else if (parsed.IsHttp)
-                {
-                    var result = await _resourceLoader!.FetchAsync(abs, baseUrl, _cookieStore);
-                    if (result is not HttpSuccess imported) continue;
-                    importedText = DecodeBody(imported);
-                }
-                else continue;
+                    string abs = baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                        ? FileUrls.Resolve(baseUrl, import.Url)
+                        : baseUrl.Resolve(import.Url).ToAbsolute();
+                    if (!visited.Add(abs)) continue;
 
-                prefix.AppendLine(await ExpandCssImportsAsync(importedText, parsed, ct, depth + 1, visited));
+                    string importedText;
+                    var parsed = ParsedUrl.Parse(abs);
+                    if (parsed.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string? path = LocalPathFromFileUrl(parsed);
+                        if (path == null || !File.Exists(path)) continue;
+                        importedText = await File.ReadAllTextAsync(path, ct);
+                    }
+                    else if (parsed.IsHttp)
+                    {
+                        var result = await _resourceLoader!.FetchAsync(abs, baseUrl, _cookieStore);
+                        if (result is not HttpSuccess imported) continue;
+                        importedText = DecodeBody(imported);
+                        if (!string.IsNullOrWhiteSpace(imported.EffectiveUrl))
+                            parsed = ParsedUrl.Parse(imported.EffectiveUrl);
+                    }
+                    else continue;
+
+                    string expanded = await ExpandCssImportsAsync(importedText, parsed,
+                        ct, depth + 1, visited);
+                    if (import.Media is { Count: > 0 })
+                        prefix.Append("@media ").Append(string.Join(", ", import.Media))
+                            .AppendLine(" {").AppendLine(expanded).AppendLine("}");
+                    else
+                        prefix.AppendLine(expanded);
+                }
+                catch (Exception ex)
+                {
+                    DebugLog.WriteException($"Expand CSS import '{import.Url}'", ex);
+                }
             }
-            catch { /* one bad import must not discard the parent stylesheet */ }
         }
-        return prefix.AppendLine(cssText).ToString();
+
+        prefix.Append(cssText);
+        return CssParser.RewriteUrls(prefix.ToString(), rawUrl =>
+            baseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
+                ? FileUrls.Resolve(baseUrl, rawUrl)
+                : baseUrl.Resolve(rawUrl).ToAbsolute());
     }
 
     private async Task PrefetchImagesAsync(DomDocument doc, ParsedUrl baseUrl,
@@ -1934,7 +1956,8 @@ public partial class Form1 : Form
                         ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, frameInterpreter, frameState)
                         : null,
                     BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
-                        ? LoadExternalScript : null);
+                        ? LoadExternalScript : null,
+                    FetchStylesheetsAsync);
                 if (gen != _navGeneration) return;
 
                 if (content != null)
@@ -2239,7 +2262,8 @@ public partial class Form1 : Form
                         ? (fdoc, scriptSrc, isVbScript) => RunFrameScript(fdoc, scriptSrc, isVbScript, interpreter, state)
                         : null,
                     BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
-                        ? LoadExternalScript : null);
+                        ? LoadExternalScript : null,
+                    FetchStylesheetsAsync);
             }
             else
             {
@@ -2257,8 +2281,8 @@ public partial class Form1 : Form
                             : null,
                         BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
                             ? LoadExternalScript : null);
-                    if (BrowserRuntime.StylesheetsEnabled)
-                        await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
+                    ApplyPageStyleSelection(doc);
+                    await FetchStylesheetsAsync(doc, parsed, CancellationToken.None);
                     doc.VisitedUrls.UnionWith(_visitedUrls);
                     ResolveDocumentStyles(doc, Math.Max(1, frameW));
                     var root = LayoutEngineApi.BuildLayoutTree(doc, frameW, frameH);
@@ -2706,8 +2730,8 @@ public partial class Form1 : Form
             // stylesheets here — the fetcher's own file:// branch used to
             // be unreachable from this render path (only the HTTP success
             // path called it), so a local page's CSS silently vanished.
-            if (BrowserRuntime.StylesheetsEnabled)
-                await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
+            ApplyPageStyleSelection(document);
+            await FetchStylesheetsAsync(document, baseUrl, CancellationToken.None);
             ApplyPluginPageStyle(document);
 
             // The visited session store must be copied onto the document
@@ -2994,8 +3018,10 @@ public partial class Form1 : Form
                 : null,
             BrowserRuntime.ScriptingEnabled && BrowserRuntime.ExternalScriptsEnabled
                 ? LoadExternalScript : null);
-        if (BrowserRuntime.StylesheetsEnabled)
-            await FetchStylesheetsAsync(doc, responseUrl, ct);
+        ApplyPageStyleSelection(doc);
+        HttpLinkHeaderParser.AddStylesheetLinks(doc,
+            response.Headers.TryGetValue("link", out string? linkHeader) ? linkHeader : null);
+        await FetchStylesheetsAsync(doc, responseUrl, ct);
 
         var content = new FrameContent(doc,
             LayoutEngineApi.BuildLayoutTree(doc, Math.Max(1, frameW), Math.Max(1, frameH)),
