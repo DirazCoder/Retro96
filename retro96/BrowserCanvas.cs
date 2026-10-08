@@ -2368,6 +2368,11 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                             zoom, ref _rootRasterizedDisplayList))
                         canvas.DrawPicture(picture);
                 }
+                if (_rootBox != null)
+                {
+                    Renderer.PaintLegacyTableBorders(canvas, _rootBox);
+                    Renderer.PaintNativeControlBorders(canvas, _rootBox, _pressedControl);
+                }
                 var rootContentViewport = new RectangleF(
                     scrollX, scrollY, logicalVw, logicalVh);
                 if (_rootBox != null)
@@ -2520,6 +2525,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                         canvas.DrawPicture(picture);
                     }
                 }
+                if (view.RootBox != null)
+                {
+                    Renderer.PaintLegacyTableBorders(canvas, view.RootBox);
+                    Renderer.PaintNativeControlBorders(canvas, view.RootBox, _pressedControl);
+                }
+
                 var frameContentViewport = new RectangleF(
                     view.Scroll.X, view.Scroll.Y, frameBox.Width, frameBox.Height);
                 if (view.RootBox != null)
@@ -11865,7 +11876,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         // old raw document coordinate.
         DomElement? anchorElement = null;
         float anchorFracX = 0f, anchorFracY = 0f;
-        if (anchorClient.HasValue && _rootBox != null)
+        if (_rootBox != null)
         {
             var anchorHit = HitTestDeepestBox(_rootBox, docX, docY);
             LayoutBox? anchorBox = anchorHit;

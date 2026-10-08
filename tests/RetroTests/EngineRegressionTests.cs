@@ -2659,6 +2659,170 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void LegacyTableBevelKeepsContrastAcrossItsCorners()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body bgcolor='#123456'><table id='counter' align='left' " +
+            "bgcolor='grey' cellpadding='3' cellspacing='0' border='2'>" +
+            "<tr><td bgcolor='black'>7,690,934 Visitors</td></tr></table></body></html>");
+        var table = doc.ElementDescendants().First(element =>
+            element.GetAttr("id") == "counter");
+        var box = LayoutHarness.BoxOf(root, table)!;
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        static float Luminance(Color color)
+        {
+            static float Channel(int value)
+            {
+                float s = value / 255f;
+                return s <= 0.04045f ? s / 12.92f : MathF.Pow((s + 0.055f) / 1.055f, 2.4f);
+            }
+
+            return 0.2126f * Channel(color.R) +
+                   0.7152f * Channel(color.G) +
+                   0.0722f * Channel(color.B);
+        }
+
+        var rect = box.BorderRect;
+        var cornerPixels = new[]
+        {
+            bitmap.GetPixel((int)MathF.Floor(rect.Left), (int)MathF.Floor(rect.Top)),
+            bitmap.GetPixel((int)MathF.Ceiling(rect.Right) - 1, (int)MathF.Floor(rect.Top)),
+            bitmap.GetPixel((int)MathF.Floor(rect.Left), (int)MathF.Ceiling(rect.Bottom) - 1),
+            bitmap.GetPixel((int)MathF.Ceiling(rect.Right) - 1, (int)MathF.Ceiling(rect.Bottom) - 1)
+        };
+        float faceLuminance = Luminance(Color.FromArgb(0x80, 0x80, 0x80));
+        Check.That(cornerPixels.All(pixel =>
+                MathF.Abs(Luminance(pixel) - faceLuminance) >= 0.18f),
+            "each outer table corner is covered by a contrast-adjusted bevel edge",
+            $"rect={rect}; corners={string.Join(", ", cornerPixels)}");
+        int topX = (int)(rect.Left + rect.Width / 2f);
+        var topBandPixels = new[]
+        {
+            bitmap.GetPixel(topX, (int)rect.Top),
+            bitmap.GetPixel(topX, (int)rect.Top + 1)
+        };
+        Check.That(topBandPixels.All(pixel =>
+                Luminance(pixel) - faceLuminance >= 0.18f),
+            "the top bevel is adapted against the surrounding page, not lost on white",
+            $"top={string.Join(", ", topBandPixels)}");
+
+        using var recorder = new SkiaSharp.SKPictureRecorder();
+        var displayListCanvas = recorder.BeginRecording(
+            SkiaSharp.SKRect.Create(0, 0, 800, 600));
+        new Renderer(LayoutHarness.Fonts, images, loader).RenderToCanvas(
+            displayListCanvas, root, doc, LayoutHarness.Fonts, images,
+            800, 600, 0, 0, null, true);
+        using var displayList = recorder.EndRecording();
+        foreach (var (zoom, scrollX, scrollY) in new[]
+                 {
+                     (1.25f, 0f, 0f),
+                     (1.5f, 2.35f, 3.4f),
+                     (1.5f, 7.2f, 9.65f)
+                 })
+        {
+            using var scaledBitmap = new SkiaSharp.SKBitmap(
+                new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                    SkiaSharp.SKAlphaType.Premul));
+            using var scaledCanvas = new SkiaSharp.SKCanvas(scaledBitmap);
+            scaledCanvas.Scale(zoom, zoom);
+            scaledCanvas.Translate(-scrollX, -scrollY);
+            scaledCanvas.DrawPicture(displayList);
+            Renderer.PaintLegacyTableBorders(scaledCanvas, root);
+            int scaledX = (int)MathF.Round((topX - scrollX) * zoom);
+            int scaledY = (int)MathF.Round((rect.Top - scrollY) * zoom);
+            var scaledTop = scaledBitmap.GetPixel(scaledX, scaledY);
+            var scaledTopColor = Color.FromArgb(scaledTop.Alpha,
+                scaledTop.Red, scaledTop.Green, scaledTop.Blue);
+            Check.That(Luminance(scaledTopColor) - faceLuminance >= 0.18f,
+                $"the top bevel remains aligned and contrast-visible at {zoom:P0} zoom " +
+                $"with scroll ({scrollX:0.##},{scrollY:0.##})",
+                $"pixel=({scaledX},{scaledY}), color={scaledTop}");
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void NativeControlBevelsStayAlignedWhenZoomedAndScrolled()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><input id='text' value='Doom'>" +
+            "<textarea id='area'>notes</textarea>" +
+            "<select id='select'><option>Archives</option></select>" +
+            "<button id='button'>Search</button>" +
+            "<input id='submit' type='submit' value='Go'>" +
+            "<input id='file' type='file'></body></html>");
+        var controls = doc.ElementDescendants()
+            .Where(element => element.GetAttr("id") is
+                "text" or "area" or "select" or "button" or "submit" or "file")
+            .ToDictionary(element => element.GetAttr("id")!);
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var recorder = new SkiaSharp.SKPictureRecorder();
+        var displayListCanvas = recorder.BeginRecording(
+            SkiaSharp.SKRect.Create(0, 0, 800, 600));
+        new Renderer(LayoutHarness.Fonts, images, loader).RenderToCanvas(
+            displayListCanvas, root, doc, LayoutHarness.Fonts, images,
+            800, 600, 0, 0, null, true);
+        using var displayList = recorder.EndRecording();
+
+        foreach (var (zoom, scrollX, scrollY) in new[]
+                 {
+                     (1.25f, 0f, 0f),
+                     (1.5f, 2.35f, 3.4f),
+                     (1.5f, 7.2f, 9.65f)
+                 })
+        {
+            using var bitmap = new SkiaSharp.SKBitmap(
+                new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                    SkiaSharp.SKAlphaType.Premul));
+            using var canvas = new SkiaSharp.SKCanvas(bitmap);
+            canvas.Scale(zoom, zoom);
+            canvas.Translate(-scrollX, -scrollY);
+            canvas.DrawPicture(displayList);
+            Renderer.PaintNativeControlBorders(canvas, root);
+
+            foreach (var (id, element) in controls)
+            {
+                var box = LayoutHarness.BoxOf(root, element)!;
+                int x = (int)MathF.Round(
+                    (box.BorderRect.Left + box.BorderRect.Width / 2f - scrollX) * zoom);
+                int y = (int)MathF.Round((box.BorderRect.Top - scrollY) * zoom);
+                var pixel = bitmap.GetPixel(x, y);
+                var color = Color.FromArgb(pixel.Alpha, pixel.Red, pixel.Green, pixel.Blue);
+                bool isRaised = id is "button" or "submit";
+                float faceLuminance = id is "button" or "submit"
+                    ? LuminanceForBevelTest(Color.FromArgb(0xC0, 0xC0, 0xC0))
+                    : LuminanceForBevelTest(Color.White);
+                float bevelLuminance = LuminanceForBevelTest(color);
+                float contrast = isRaised
+                    ? bevelLuminance - faceLuminance
+                    : faceLuminance - bevelLuminance;
+                Check.That(contrast >= 0.18f,
+                    $"{id} keeps a continuous top bevel at {zoom:P0} zoom and " +
+                    $"scroll ({scrollX:0.##},{scrollY:0.##})",
+                    $"pixel=({x},{y}), color={color}, contrast={contrast:0.###}");
+            }
+        }
+        Check.Done();
+    }
+
+    private static float LuminanceForBevelTest(Color color)
+    {
+        static float Channel(int value)
+        {
+            float s = value / 255f;
+            return s <= 0.04045f ? s / 12.92f : MathF.Pow((s + 0.055f) / 1.055f, 2.4f);
+        }
+
+        return 0.2126f * Channel(color.R) +
+               0.7152f * Channel(color.G) +
+               0.0722f * Channel(color.B);
+    }
+
+    [Fact]
     public void ButtonRichChildrenRetainTheirStyles()
     {
         var (doc, root) = LayoutHarness.Parse(

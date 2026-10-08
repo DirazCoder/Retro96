@@ -1951,28 +1951,166 @@ public class Renderer
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         float w = Math.Max(1, box.BorderTop);
+        var matrix = g.Canvas.TotalMatrix;
+        float scaleX = MathF.Abs(matrix.ScaleX);
+        float scaleY = MathF.Abs(matrix.ScaleY);
+        if (!float.IsFinite(scaleX) || scaleX < 0.01f) scaleX = 1f;
+        if (!float.IsFinite(scaleY) || scaleY < 0.01f) scaleY = 1f;
+        float offsetX = matrix.TransX;
+        float offsetY = matrix.TransY;
+        float left = (MathF.Round(rect.Left * scaleX + offsetX) - offsetX) / scaleX;
+        float top = (MathF.Round(rect.Top * scaleY + offsetY) - offsetY) / scaleY;
+        float right = (MathF.Round(rect.Right * scaleX + offsetX) - offsetX) / scaleX;
+        float bottom = (MathF.Round(rect.Bottom * scaleY + offsetY) - offsetY) / scaleY;
+        rect = new RectangleF(left, top, Math.Max(0f, right - left),
+            Math.Max(0f, bottom - top));
+        int borderPixelsX = Math.Max(1, (int)MathF.Round(w * scaleX));
+        int borderPixelsY = Math.Max(1, (int)MathF.Round(w * scaleY));
+        float pixelWidth = 1f / scaleX;
+        float pixelHeight = 1f / scaleY;
         Color background = ResolveLocalBackground(box.Element, Color.White);
-        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
+        Color surroundingBackground = ResolveLocalBackground(
+            box.Element?.Parent as DomElement, Color.White);
+        Color light = EnsureBevelContrast(
+            Color.White, surroundingBackground, preferLighter: true);
         Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
-        using var penDark = CreateStrokePaint(dark, 1);
-        using var penLight = CreateStrokePaint(light, 1);
+        using var brushDark = CreateFillPaint(dark, antialias: false);
+        using var brushLight = CreateFillPaint(light, antialias: false);
         if (NeedsStrongBevelOutline(background))
         {
             using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
             g.DrawRectangle(outline, rect.X, rect.Y, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
         }
 
-        // Outset: light top/left, dark bottom/right
-        for (int i = 0; i < w; i++)
+        // Paint in device-pixel-sized bands on snapped edges so zoom does not
+        // leave fractional antialiased seams between neighboring border lines.
+        for (int inset = 0; inset < Math.Max(borderPixelsX, borderPixelsY); inset++)
         {
-            float x0 = rect.X + i, y0 = rect.Y + i;
-            float x1 = rect.Right - i - 1, y1 = rect.Bottom - i - 1;
-            if (x1 < x0 || y1 < y0) break;
+            float insetX = inset * pixelWidth;
+            float insetY = inset * pixelHeight;
+            float ringLeft = rect.Left + insetX;
+            float ringTop = rect.Top + insetY;
+            float ringRight = rect.Right - insetX;
+            float ringBottom = rect.Bottom - insetY;
+            if (ringRight <= ringLeft || ringBottom <= ringTop) break;
 
-            g.DrawLine(penLight, x0, y0, x1, y0);
-            g.DrawLine(penLight, x0, y0, x0, y1);
-            g.DrawLine(penDark, x0, y1, x1, y1);
-            g.DrawLine(penDark, x1, y0, x1, y1);
+            if (inset < borderPixelsY)
+            {
+                g.FillRectangle(brushLight, ringLeft, ringTop,
+                    ringRight - ringLeft, pixelHeight);
+                g.FillRectangle(brushDark, ringLeft, ringBottom - pixelHeight,
+                    ringRight - ringLeft, pixelHeight);
+            }
+            if (inset < borderPixelsX)
+            {
+                g.FillRectangle(brushLight, ringLeft, ringTop,
+                    pixelWidth, ringBottom - ringTop);
+                g.FillRectangle(brushDark, ringRight - pixelWidth, ringTop,
+                    pixelWidth, ringBottom - ringTop);
+            }
+        }
+    }
+
+    internal static void PaintLegacyTableBorders(SKCanvas canvas, LayoutBox root)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(root);
+
+        using var context = new SkiaRenderContext(canvas);
+        foreach (var box in root.Descendants().Prepend(root))
+        {
+            if (box.Element is { TagName: "table" } table &&
+                table.HasAttr("border") && box.BorderTop > 0)
+                PaintTableOuterBorder(context, box);
+        }
+    }
+
+    internal static void PaintNativeControlBorders(
+        SKCanvas canvas, LayoutBox root, DomElement? pressedElement = null)
+    {
+        ArgumentNullException.ThrowIfNull(canvas);
+        ArgumentNullException.ThrowIfNull(root);
+
+        using var context = new SkiaRenderContext(canvas);
+        foreach (var box in root.Descendants().Prepend(root))
+        {
+            var element = box.Element;
+            if (element == null || !ReferenceEquals(element.LayoutBox, box))
+                continue;
+
+            string type = element.TagName == "input"
+                ? element.GetAttrOrDefault("type", "text").Trim().ToLowerInvariant()
+                : "";
+            var style = element.Style ?? new ComputedStyle();
+            bool disabled = element.HasAttr("disabled");
+            var rect = box.BorderRect;
+
+            if (element.TagName == "button" ||
+                element.TagName == "input" &&
+                type is "submit" or "reset" or "button")
+            {
+                Color face = disabled
+                    ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+                    : Color.FromArgb(0xC0, 0xC0, 0xC0);
+                if (ReferenceEquals(element, pressedElement))
+                    PaintSunkenRect(context, rect, 2, face);
+                else
+                    PaintRaisedRect(context, rect, 2, face);
+                continue;
+            }
+
+            if (element.TagName == "select")
+            {
+                PaintSunkenRect(context, rect, 2, disabled
+                    ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+                    : Color.White);
+                continue;
+            }
+
+            if (element.TagName == "textarea")
+            {
+                Color face = disabled ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+                    : style.OwnBackground && style.BackgroundColor != Color.Transparent
+                        ? style.BackgroundColor
+                        : Color.White;
+                PaintSunkenRect(context, rect, 2, face);
+                PaintAuthoredControlBorder(context, box, style, face);
+                continue;
+            }
+
+            if (element.TagName != "input")
+                continue;
+
+            if (type == "file")
+            {
+                Color outer = disabled
+                    ? Color.FromArgb(0xD0, 0xD0, 0xD0)
+                    : Color.FromArgb(0xC0, 0xC0, 0xC0);
+                PaintSunkenRect(context, rect, 1, outer);
+                var face = box.ContentRect;
+                float buttonWidth = Math.Min(92f, Math.Max(34f, rect.Width - 8f));
+                var buttonRect = new RectangleF(
+                    face.X + 2, face.Y + 2,
+                    buttonWidth, Math.Max(1f, face.Height - 4));
+                Color buttonFace = disabled
+                    ? Color.FromArgb(0xD8, 0xD8, 0xD8)
+                    : Color.FromArgb(0xE0, 0xE0, 0xE0);
+                if (ReferenceEquals(element, pressedElement))
+                    PaintSunkenRect(context, buttonRect, 2, buttonFace);
+                else
+                    PaintRaisedRect(context, buttonRect, 2, buttonFace);
+                continue;
+            }
+
+            if (type is "checkbox" or "radio" or "hidden" or "image")
+                continue;
+
+            Color inputFace = disabled ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+                : style.OwnBackground && style.BackgroundColor != Color.Transparent
+                    ? style.BackgroundColor
+                    : Color.White;
+            PaintSunkenRect(context, rect, 2, inputFace);
+            PaintAuthoredControlBorder(context, box, style, inputFace);
         }
     }
 
@@ -3423,30 +3561,9 @@ public class Renderer
     }
 
     /// <summary>2-tone sunken (inset) rectangle frame, `size` px thick.</summary>
-    private static void PaintSunkenRect(SkiaRenderContext g, RectangleF rect, int size, Color background = default)
-    {
-        if (background == Color.Empty || background == Color.Transparent)
-            background = Color.White;
-        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
-        Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
-        using var penDark = CreateStrokePaint(dark, 1);
-        using var penLight = CreateStrokePaint(light, 1);
-        if (NeedsStrongBevelOutline(background))
-        {
-            using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
-            g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
-        }
-        for (int i = 0; i < size; i++)
-        {
-            float x0 = rect.Left + i, y0 = rect.Top + i;
-            float x1 = rect.Right - i - 1, y1 = rect.Bottom - i - 1;
-            if (x1 < x0 || y1 < y0) break;
-            g.DrawLine(penDark, x0, y0, x1, y0);
-            g.DrawLine(penDark, x0, y0, x0, y1);
-            g.DrawLine(penLight, x0, y1, x1, y1);
-            g.DrawLine(penLight, x1, y0, x1, y1);
-        }
-    }
+    private static void PaintSunkenRect(
+        SkiaRenderContext g, RectangleF rect, int size, Color background = default) =>
+        PaintAdaptiveBevel(g, rect, size, background, sunken: true);
 
     internal static void PaintSunkenRect(Graphics g, RectangleF rect, int size, Color background = default)
     {
@@ -3475,28 +3592,76 @@ public class Renderer
     }
 
     /// <summary>2-tone raised (outset) rectangle frame, `size` px thick.</summary>
-    private static void PaintRaisedRect(SkiaRenderContext g, RectangleF rect, int size, Color background = default)
+    private static void PaintRaisedRect(
+        SkiaRenderContext g, RectangleF rect, int size, Color background = default) =>
+        PaintAdaptiveBevel(g, rect, size, background, sunken: false);
+
+    private static void PaintAdaptiveBevel(
+        SkiaRenderContext g, RectangleF rect, int size, Color background, bool sunken)
     {
+        if (rect.Width <= 0f || rect.Height <= 0f || size <= 0)
+            return;
         if (background == Color.Empty || background == Color.Transparent)
             background = Color.White;
+
+        var matrix = g.Canvas.TotalMatrix;
+        float scaleX = MathF.Abs(matrix.ScaleX);
+        float scaleY = MathF.Abs(matrix.ScaleY);
+        if (!float.IsFinite(scaleX) || scaleX < 0.01f) scaleX = 1f;
+        if (!float.IsFinite(scaleY) || scaleY < 0.01f) scaleY = 1f;
+        float offsetX = matrix.TransX;
+        float offsetY = matrix.TransY;
+        float left = (MathF.Round(rect.Left * scaleX + offsetX) - offsetX) / scaleX;
+        float top = (MathF.Round(rect.Top * scaleY + offsetY) - offsetY) / scaleY;
+        float right = (MathF.Round(rect.Right * scaleX + offsetX) - offsetX) / scaleX;
+        float bottom = (MathF.Round(rect.Bottom * scaleY + offsetY) - offsetY) / scaleY;
+        rect = new RectangleF(left, top, Math.Max(0f, right - left),
+            Math.Max(0f, bottom - top));
+
+        int borderPixelsX = Math.Max(1, (int)MathF.Round(size * scaleX));
+        int borderPixelsY = Math.Max(1, (int)MathF.Round(size * scaleY));
+        float pixelWidth = 1f / scaleX;
+        float pixelHeight = 1f / scaleY;
         Color light = EnsureBevelContrast(Color.White, background, preferLighter: true);
-        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80), background, preferLighter: false);
-        using var penLight = CreateStrokePaint(light, 1);
-        using var penDark = CreateStrokePaint(dark, 1);
+        Color dark = EnsureBevelContrast(Color.FromArgb(0x80, 0x80, 0x80),
+            background, preferLighter: false);
+        Color topLeft = sunken ? dark : light;
+        Color bottomRight = sunken ? light : dark;
+        using var brushTopLeft = CreateFillPaint(topLeft, antialias: false);
+        using var brushBottomRight = CreateFillPaint(bottomRight, antialias: false);
         if (NeedsStrongBevelOutline(background))
         {
             using var outline = CreateStrokePaint(BevelOutlineColor(background), 1);
-            g.DrawRectangle(outline, rect.Left, rect.Top, Math.Max(0, rect.Width - 1), Math.Max(0, rect.Height - 1));
+            g.DrawRectangle(outline, rect.Left, rect.Top,
+                Math.Max(0f, rect.Width - pixelWidth),
+                Math.Max(0f, rect.Height - pixelHeight));
         }
-        for (int i = 0; i < size; i++)
+
+        for (int inset = 0; inset < Math.Max(borderPixelsX, borderPixelsY); inset++)
         {
-            float x0 = rect.Left + i, y0 = rect.Top + i;
-            float x1 = rect.Right - i - 1, y1 = rect.Bottom - i - 1;
-            if (x1 < x0 || y1 < y0) break;
-            g.DrawLine(penLight, x0, y0, x1, y0);
-            g.DrawLine(penLight, x0, y0, x0, y1);
-            g.DrawLine(penDark, x0, y1, x1, y1);
-            g.DrawLine(penDark, x1, y0, x1, y1);
+            float insetX = inset * pixelWidth;
+            float insetY = inset * pixelHeight;
+            float ringLeft = rect.Left + insetX;
+            float ringTop = rect.Top + insetY;
+            float ringRight = rect.Right - insetX;
+            float ringBottom = rect.Bottom - insetY;
+            if (ringRight <= ringLeft || ringBottom <= ringTop)
+                break;
+
+            if (inset < borderPixelsY)
+            {
+                g.FillRectangle(brushTopLeft, ringLeft, ringTop,
+                    ringRight - ringLeft, pixelHeight);
+                g.FillRectangle(brushBottomRight, ringLeft, ringBottom - pixelHeight,
+                    ringRight - ringLeft, pixelHeight);
+            }
+            if (inset < borderPixelsX)
+            {
+                g.FillRectangle(brushTopLeft, ringLeft, ringTop,
+                    pixelWidth, ringBottom - ringTop);
+                g.FillRectangle(brushBottomRight, ringRight - pixelWidth, ringTop,
+                    pixelWidth, ringBottom - ringTop);
+            }
         }
     }
 
