@@ -66,7 +66,7 @@ public class CssParserTests
     public void VisitedPseudoClassUsesSessionHistoryAndStillAllowsHoverToWin()
     {
         const string css = "a:link { color: #0000EE; } a:visited { color: #551A8B; } a:hover { color: #FF0000; }";
-        var doc = ParseAndResolve("<a id='go' href='#anchor-alpha'>alpha</a>", css);
+        var doc = ParseAndResolve("<a id='go' href='other-page.html'>alpha</a>", css);
         var link = doc.AllTags("a")[0];
         var visited = CssSelector.ParseSelector("a:visited")[0];
         var unvisited = CssSelector.ParseSelector("a:link")[0];
@@ -74,7 +74,7 @@ public class CssParserTests
         Check.That(!visited.Matches(link), "fresh href is not visited");
         Check.That(unvisited.Matches(link), "fresh href matches :link");
 
-        doc.VisitedUrls.Add("http://x.test/#anchor-alpha");
+        doc.VisitedUrls.Add("http://x.test/other-page.html");
         StyleResolver.Resolve(doc, 800);
         Check.That(visited.Matches(link), "session history makes the fragment :visited");
         Check.That(!unvisited.Matches(link), "visited href no longer matches :link");
@@ -85,6 +85,29 @@ public class CssParserTests
         StyleResolver.Resolve(doc, 800);
         Check.That(link.Style != null && link.Style.Color == Retro96.Drawing.Color.FromArgb(0xFF, 0x00, 0x00),
             "a:hover still outranks a:visited while hovering", link.Style?.Color.ToString() ?? "(no style)");
+        Check.Done();
+    }
+
+    [Fact]
+    public void SameDocumentAndFragmentLinksAreVisited()
+    {
+        var doc = HtmlParser.Parse(
+            "<html><head><style>" +
+            "a:link { color: green; } a:visited { color: #ff00ff; }" +
+            "</style></head><body>" +
+            "<a id='fragment' href='#here'>fragment</a>" +
+            "<a id='same-page' href='link.html'>same page</a>" +
+            "<a id='other-page' href='other.html'>other page</a>" +
+            "</body></html>",
+            ParsedUrl.Parse("http://x.test/path/link.html"), new CookieStore());
+        StyleResolver.Resolve(doc, 800);
+
+        Check.That(StyleById(doc, "fragment").Color == Color.FromArgb(255, 0, 255),
+            "a same-document fragment link matches :visited");
+        Check.That(StyleById(doc, "same-page").Color == Color.FromArgb(255, 0, 255),
+            "a link to the current document matches :visited");
+        Check.That(StyleById(doc, "other-page").Color == Color.FromArgb(0, 128, 0),
+            "a different unvisited document still matches :link");
         Check.Done();
     }
 
@@ -1021,6 +1044,37 @@ public class CssParserTests
     }
 
     [Fact]
+    public void MediaAttributesTruncateAtTheFirstInvalidMediaNameCharacter()
+    {
+        var doc = HtmlParser.Parse(
+            "<html><head>" +
+            "<style media='all or nothing'>#all { color: #ff0000 }</style>" +
+            "<style media='screen 49327409 invalid'>#long { color: #ff0000 }</style>" +
+            "<style media='screen%'>#percent { color: #ff0000 }</style>" +
+            "<style media='print%'>#print { color: #ff0000 }</style>" +
+            "<link rel='stylesheet' media='screen%' href='linked.css'>" +
+            "</head><body><p id='all'>a</p><p id='long'>b</p>" +
+            "<p id='percent'>c</p><p id='print'>d</p><p id='linked'>e</p></body></html>",
+            ParsedUrl.Parse("http://x.test/"), new CookieStore());
+        var link = doc.AllTags("link").Single();
+        StylesheetLinkSelection.InsertLoadedStylesheet(
+            doc, link, "#linked { color: #ff0000 }");
+        StyleResolver.Resolve(doc, 800);
+
+        Check.That(StyleById(doc, "all").Color == Color.FromArgb(255, 0, 0),
+            "media='all or nothing' selects the initial all media type");
+        Check.That(StyleById(doc, "long").Color == Color.FromArgb(255, 0, 0),
+            "a valid screen token before whitespace applies");
+        Check.That(StyleById(doc, "percent").Color == Color.FromArgb(255, 0, 0),
+            "media='screen%' truncates to screen in a STYLE attribute");
+        Check.That(StyleById(doc, "linked").Color == Color.FromArgb(255, 0, 0),
+            "media='screen%' truncates to screen in a loaded LINK stylesheet");
+        Check.That(StyleById(doc, "print").Color == Color.Black,
+            "media='print%' remains excluded from the screen renderer");
+        Check.Done();
+    }
+
+    [Fact]
     public void ImportMediaDescriptorIsSurfaced()
     {
         var (_, imports) = CssParser.Parse(
@@ -1039,6 +1093,126 @@ public class CssParserTests
         Check.That(imports[1].Url == "b.css", "quoted import URL still parses", imports[1].Url);
         Check.That(imports[2].Media == null && imports[2].AppliesTo("screen"),
             "an import without a media descriptor applies to all media");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ImportKeywordMayBeImmediatelyFollowedByQuotedUrl()
+    {
+        var (_, imports) = CssParser.Parse(
+            "@import\"nospace.css\"; @importurl(invalid.css);");
+
+        Check.That(imports.Count == 1 && imports[0].Url == "nospace.css",
+            "a quoted URL immediately following the @import keyword is recognized",
+            string.Join(", ", imports.Select(import => import.Url)));
+        Check.Done();
+    }
+
+    [Fact]
+    public void InvalidClassSelectorIdentifiersDoNotMatch()
+    {
+        var doc = ParseAndResolve(
+            "<p id='digit' class='1number'>digit</p>" +
+            "<p id='punctuation' class=\"b'\">punctuation</p>" +
+            "<p id='leading-hyphen' class='-hyphen'>hyphen</p>" +
+            "<p id='following' class='any'>following</p>",
+            ".1number { color: red; } " +
+            ".b' { color: red; } " +
+            ".-hyphen { color: red; } " +
+            ".any { color: red; }");
+
+        Check.That(StyleById(doc, "digit").Color == Color.Black,
+            "a class selector beginning with a digit is invalid");
+        Check.That(StyleById(doc, "punctuation").Color == Color.Black,
+            "a class selector containing an unescaped apostrophe is invalid");
+        Check.That(StyleById(doc, "leading-hyphen").Color == Color.FromArgb(255, 0, 0),
+            "a leading hyphen followed by a valid identifier start is allowed");
+        Check.That(StyleById(doc, "following").Color == Color.FromArgb(255, 0, 0),
+            "a later valid rule remains effective after an invalid selector");
+        Check.Done();
+    }
+
+    [Fact]
+    public void AttributeSelectorPreservesWhitespaceInsideQuotedValue()
+    {
+        var doc = ParseAndResolve(
+            "<p id='exact' title='dogged'>exact</p>" +
+            "<p id='space' title='dogged '>space</p>" +
+            "<p id='unquoted' title='doggedly'>unquoted</p>",
+            "[title=\"dogged \"] { color: red; } " +
+            "[title=doggedly ] { color: green; }");
+
+        Check.That(StyleById(doc, "exact").Color == Color.Black,
+            "quoted trailing whitespace is significant and does not match a value without it");
+        Check.That(StyleById(doc, "space").Color == Color.FromArgb(255, 0, 0),
+            "quoted trailing whitespace is preserved when it is present");
+        Check.That(StyleById(doc, "unquoted").Color == Color.FromArgb(0, 128, 0),
+            "unquoted whitespace around an attribute value is ignored");
+        Check.Done();
+    }
+
+    [Fact]
+    public void HtmlTypeSelectorColorInheritsThroughBody()
+    {
+        var doc = HtmlParser.Parse(
+            "<html><head><style>" +
+            "html { color: blue; background: white; } " +
+            "address { color: red; }" +
+            "</style></head><body><p id='text'>blue text</p>" +
+            "<address id='address'>red address</address>" +
+            "</body></html>",
+            ParsedUrl.Parse("http://x.test/"), new CookieStore());
+        StyleResolver.Resolve(doc, 800);
+
+        Check.That(doc.FirstTag("body")?.Style?.Color == Color.FromArgb(0, 0, 255),
+            "body inherits the author color from the HTML element");
+        Check.That(StyleById(doc, "text").Color == Color.FromArgb(0, 0, 255),
+            "ordinary document text inherits the HTML selector color");
+        Check.That(StyleById(doc, "address").Color == Color.FromArgb(255, 0, 0),
+            "a more specific element type rule still overrides inherited HTML color");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ImportsAfterRulesAreIgnored()
+    {
+        var (rules, imports) = CssParser.Parse(
+            "@charset \"utf-8\"; " +
+            "@import url(early.css); " +
+            ".dummy { color: black; } " +
+            "@import url(late.css); " +
+            "@media screen { @import url(nested.css); }");
+
+        Check.That(imports.Count == 1 && imports[0].Url == "early.css",
+            "only imports before rulesets or other at-rules are expanded",
+            string.Join(", ", imports.Select(import => import.Url)));
+        Check.That(rules.Count == 1,
+            "ignoring late imports preserves the normal ruleset",
+            rules.Count.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void ImportsInsideLegacyStyleCommentWrappersAreParsed()
+    {
+        const string css = "<!--\n" +
+            "@import url(import-validfour.css);\n" +
+            "@import url('import-validfive.css');\n" +
+            "@import url(\"import-validsix.css\");\n" +
+            "@import 'import-validseven.css';\n" +
+            "@import \"import-valideight.css\";\n" +
+            ".notred { color: red; }\n" +
+            "-->";
+
+        var (rules, imports) = CssParser.Parse(css);
+
+        Check.That(imports.Count == 5,
+            "legacy HTML comment wrappers do not hide @import rules",
+            imports.Count.ToString());
+        Check.That(rules.Count == 1 &&
+                   rules[0].Selectors[0].Parts.Any(part => part.Value == "notred"),
+            "rules following @imports inside wrappers remain parseable",
+            rules.Count.ToString());
         Check.Done();
     }
 

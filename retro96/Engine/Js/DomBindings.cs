@@ -2274,6 +2274,9 @@ public static class DomBindings
                 _state.JavaAppletScriptMemberResolver?.Invoke(_element, name, interpreter) is { } appletMember)
                 return appletMember;
 
+            if (name == "className")
+                return JsValue.From(_element.GetAttr("class") ?? "");
+
             if (_element.TagName.Equals("embed", StringComparison.OrdinalIgnoreCase) &&
                 _state?.EmbeddedScriptInfoResolver?.Invoke(_element) is { } scriptInfo &&
                 scriptInfo.ScriptName.Length > 0 && string.Equals(name, scriptInfo.ScriptName, StringComparison.Ordinal))
@@ -2825,6 +2828,13 @@ public static class DomBindings
             if (BrowserRuntime.IsInternetExplorer3 &&
                 name is "innerHTML" or "innerText" or "outerHTML" or "outerText")
                 return;
+
+            if (name == "className")
+            {
+                _element.SetAttr("class", value.ToJsString());
+                RequestReflow();
+                return;
+            }
 
             if (name == "innerHTML")
             {

@@ -116,8 +116,13 @@ public static class StyleResolver
             return true;
         foreach (var part in media.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
-            string token = part.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
-                .FirstOrDefault() ?? "";
+            string descriptor = part.TrimStart();
+            int tokenLength = 0;
+            while (tokenLength < descriptor.Length &&
+                   (char.IsAsciiLetterOrDigit(descriptor[tokenLength]) ||
+                    descriptor[tokenLength] == '-'))
+                tokenLength++;
+            string token = descriptor[..tokenLength];
             if (token.Equals(mediaType, StringComparison.OrdinalIgnoreCase) ||
                 token.Equals("all", StringComparison.OrdinalIgnoreCase))
                 return true;
@@ -694,7 +699,6 @@ public static class StyleResolver
                 style.MarginTop = style.MarginBottom = ieBodyMargins ? 15f : 8f;
                 style.MarginLeft = style.MarginRight = ieBodyMargins ? 10f : 8f;
                 style.BackgroundColor = Color.White;
-                style.Color = Color.Black;
                 break;
 
             // Headings

@@ -1,6 +1,7 @@
 // Step 4 unit tests — JavaScript engine contracts (via the PageHarness
 // rig: real parser + real DomBindings + canvas stub).
 using Retro96;
+using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Js;
 using Retro96.Engine.Network;
@@ -1115,6 +1116,33 @@ public class JsEngineTests
             "cloneNode copies attributes");
         Check.That(page.EvalString("src.getElementsByTagName('b').length") == "1",
             "the source subtree is untouched");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ClassNameReflectsClassAttributeAndRecalculatesStyles()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><head><style>.live { position: absolute; }</style></head><body>" +
+            "<div id='target' class='old'></div></body></html>");
+
+        page.Eval("var target = document.getElementById('target');" +
+                  "window.originalClass = target.className;" +
+                  "target.className = 'live';");
+
+        Check.That(page.EvalString("window.originalClass") == "old",
+            "className reads the class attribute");
+        Check.That(page.EvalString("target.className") == "live" &&
+                   page.EvalString("target.getAttribute('class')") == "live",
+            "className writes the class attribute");
+
+        StyleResolver.Resolve(page.Document, 800);
+        var targetElement = page.Document.ElementDescendants()
+            .Single(element => element.GetAttr("id") == "target");
+        Check.That(targetElement.Style?.Position == PositionValue.Absolute,
+            "className changes take effect in matched CSS rules");
+        Check.That(page.Canvas.Log.Reflows > 0,
+            "className changes request a document reflow");
         Check.Done();
     }
 

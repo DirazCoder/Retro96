@@ -70,8 +70,23 @@ public static class HtmlTokenizer
                     break;
                 }
 
-                // In raw text mode: accumulate until </tagname (case-insensitive),
-                // allowing whitespace/attributes inside the end tag.
+                // HTML 4 STYLE content ends at the first "</" sequence, even
+                // when it is not followed by "style".
+                if (rawTextTag == "style" && html[pos] == '<' &&
+                    pos + 1 < html.Length && html[pos + 1] == '/')
+                {
+                    string rawText = sb.ToString();
+                    if (rawText.Length > 0)
+                        yield return new TextToken(rawText);
+                    sb.Clear();
+                    yield return new EndTag(rawTextTag);
+                    rawTextTag = null;
+                    isRcdata = false;
+                    continue;
+                }
+
+                // Other raw-text elements accumulate until </tagname
+                // (case-insensitive), allowing whitespace before '>'.
                 if (html[pos] == '<' && pos + 1 < html.Length && html[pos + 1] == '/' &&
                     TryMatchRawEndTag(html, pos, rawTextTag, out int afterEnd))
                 {

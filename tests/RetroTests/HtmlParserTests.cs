@@ -908,6 +908,24 @@ public class HtmlParserTests
         Check.Done();
     }
 
+    [Fact]
+    public void StyleRawTextEndsAtFirstEndTagOpenDelimiter()
+    {
+        var tokens = HtmlTokenizer.Tokenize(
+            "<style>.red { color: red; }</hello>.ineffective { color: red; }</style>")
+            .ToList();
+
+        int styleEnd = tokens.FindIndex(token => token is EndTag { Name: "style" });
+        int strayEnd = tokens.FindIndex(token => token is EndTag { Name: "hello" });
+        Check.That(styleEnd > 0 && strayEnd > styleEnd,
+            "a literal </ sequence terminates STYLE before the unmatched end tag");
+        Check.That(tokens.Take(styleEnd)
+                .OfType<TextToken>()
+                .All(text => !text.Data.Contains(".ineffective", StringComparison.Ordinal)),
+            "CSS after the first </ sequence is not part of STYLE raw text");
+        Check.Done();
+    }
+
     // ── textarea wrap / basefont color (§5, §14a) ────────────────────
 
     [Fact]

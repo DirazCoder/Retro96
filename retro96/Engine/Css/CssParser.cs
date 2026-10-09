@@ -188,6 +188,7 @@ public static class CssParser
         css = RemoveComments(css);
 
         int pos = 0;
+        bool importsAllowed = true;
         while (pos < css.Length)
         {
             SkipWhitespace(css, ref pos);
@@ -196,7 +197,8 @@ public static class CssParser
 
             if (css[pos] == '@')
             {
-                HandleAtRule(css, ref pos, rules, importRules, mediaType);
+                importsAllowed = HandleAtRule(
+                    css, ref pos, rules, importRules, mediaType, importsAllowed);
                 continue;
             }
 
@@ -219,6 +221,7 @@ public static class CssParser
                 continue;
             }
 
+            importsAllowed = false;
             var declarations = ParseDeclarationBlock(css, ref pos);
             // Declarations may be empty (harmless); still register the rule so
             // the selector count matches author expectations.
@@ -275,6 +278,17 @@ public static class CssParser
                 }
                 // Unterminated comment: rest of the sheet is comment (rare).
             }
+            else if (pos + 3 < css.Length &&
+                     css[pos] == '<' && css[pos + 1] == '!' &&
+                     css[pos + 2] == '-' && css[pos + 3] == '-')
+            {
+                pos += 4;
+            }
+            else if (pos + 2 < css.Length &&
+                     css[pos] == '-' && css[pos + 1] == '-' && css[pos + 2] == '>')
+            {
+                pos += 3;
+            }
             else
             {
                 sb.Append(css[pos]);
@@ -294,14 +308,16 @@ public static class CssParser
     // @-rules
     // ─────────────────────────────────────────────────────────────────────
 
-    private static void HandleAtRule(string css, ref int pos,
-        List<CssRule> rules, List<CssImportRule> importRules, string mediaType)
+    private static bool HandleAtRule(string css, ref int pos,
+        List<CssRule> rules, List<CssImportRule> importRules, string mediaType,
+        bool importsAllowed)
     {
         pos++; // skip '@'
 
         var nameSb = new StringBuilder();
         while (pos < css.Length && !char.IsWhiteSpace(css[pos]) &&
-               css[pos] != '(' && css[pos] != ';' && css[pos] != '{')
+               css[pos] != '(' && css[pos] != ';' && css[pos] != '{' &&
+               css[pos] is not ('\'' or '"'))
         {
             nameSb.Append(char.ToLowerInvariant(css[pos]));
             pos++;
@@ -319,13 +335,14 @@ public static class CssParser
                     int mediaStart = pos;
                     SkipToSemicolonOrBrace(css, ref pos);
                     var media = ParseMediaList(css[mediaStart..pos]);
-                    importRules.Add(new CssImportRule(url, media));
-                    break;
+                    if (importsAllowed)
+                        importRules.Add(new CssImportRule(url, media));
+                    return importsAllowed;
                 }
 
             case "charset":
                 SkipToSemicolon(css, ref pos);
-                break;
+                return importsAllowed;
 
             case "media":
                 {
@@ -365,19 +382,18 @@ public static class CssParser
 
                         if (apply)
                         {
-                            var (innerRules, innerImports) = Parse(mediaCss.ToString(), mediaType);
+                            var (innerRules, _) = Parse(mediaCss.ToString(), mediaType);
                             rules.AddRange(innerRules);
-                            importRules.AddRange(innerImports);
                         }
                     }
-                    break;
+                    return false;
                 }
 
             default:
                 // Unknown @rule (@font-face, @page, …) — skip its block if
                 // it has one.
                 SkipToMatchingBrace(css, ref pos);
-                break;
+                return false;
         }
     }
 

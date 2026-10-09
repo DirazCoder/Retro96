@@ -1552,22 +1552,21 @@ public static class LayoutEngine
     /// </summary>
     private static void ResolveAutoWidth(LayoutBox box, float containingWidth)
     {
+        bool hasCssPercentageWidth = box.StyleWidthPercent.HasValue;
+
         // CSS percentage width first — the real containing width is known
         // only here (the generation pass would have had to guess at the
         // ancestor chain).
         if (box.StyleWidthPercent is { } pct)
         {
-            float resolved = containingWidth * pct / 100f
-                           - box.MarginLeft - box.MarginRight
-                           - box.BorderLeft - box.BorderRight
-                           - box.PaddingLeft - box.PaddingRight;
-            if (resolved > 0f) box.Width = Math.Min(resolved, MaxAttrLength);
+            float resolved = containingWidth * pct / 100f;
+            box.Width = Math.Min(Math.Max(0f, resolved), MaxAttrLength);
             box.StyleWidthPercent = null;   // consumed
         }
 
         ResolvePercentWidth(box, containingWidth);
 
-        if (box.Width <= 0f)
+        if (box.Width <= 0f && !hasCssPercentageWidth)
         {
             box.Width = Math.Max(0f,
                 containingWidth

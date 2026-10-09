@@ -58,6 +58,7 @@
     <Compile Include="../../retro96/Engine/Js/JsDialogGeometry.cs" />
     <Compile Include="../../retro96/Engine/NavigationHistory.cs" />
     <Compile Include="../../retro96/Engine/Forms/FormSubmitter.cs" />
+    <Compile Include="../../retro96/Engine/Forms/TabNavigation.cs" />
     <Compile Include="../../retro96/Engine/Forms/HitTester.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginApi.cs" />
     <Compile Include="../../retro96/Engine/Plugins/PluginPermissionCatalog.cs" />

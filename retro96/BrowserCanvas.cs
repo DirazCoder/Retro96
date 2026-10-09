@@ -14,6 +14,7 @@ using SkiaSharp.Views.Desktop;
 using Retro96.Drawing;
 using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Forms;
 using Retro96.Engine.Js;
 using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
@@ -621,6 +622,18 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                      or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown)
             return true;
         return base.IsInputKey(keyData);
+    }
+
+    protected override bool ProcessDialogKey(Keys keyData)
+    {
+        Keys key = keyData & Keys.KeyCode;
+        if (key == Keys.Tab)
+        {
+            MoveFocusToNextControl((keyData & Keys.Shift) == Keys.Shift ? -1 : 1);
+            return true;
+        }
+
+        return base.ProcessDialogKey(keyData);
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -2147,9 +2160,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
             }
         }
 
+        // The cached image is already rasterized at this zoom. Linear sampling
+        // during fractional scroll blends adjacent high-contrast edges and can
+        // leave hairline fringes around legacy table-cell backgrounds.
         canvas.DrawImage(rasterized.Image,
             SKRect.Create(0f, 0f, rasterized.Width, rasterized.Height),
-            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+            new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
         return true;
     }
 
@@ -5232,9 +5248,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     }
 
     /// <summary>
-    /// Scrolling immediately discards any open dropdown / context menu —
-    /// the menu is anchored to a DOCUMENT position, so letting it float at
-    /// a fixed screen spot while the page moves under it is wrong.
+    /// Scrolling or zooming immediately discards any open dropdown / context
+    /// menu because it is anchored to a document position.
     /// </summary>
     private void CloseMenusOnScroll()
     {
@@ -5806,6 +5821,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 e.Handled = true;
                 e.SuppressKeyPress = true;
             }
+        }
+        else if (e.KeyCode == Keys.Enter &&
+                 _document?.FocusedElement is { } focusedElement &&
+                 !ReferenceEquals(focusedElement, _focusedInput))
+        {
+            HandleElementClick(focusedElement, _document, _jsInterpreter, 0, 0, false);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
         }
         else if (_focusedInput != null && IsEditableField(_focusedInput) &&
                  (e.KeyCode is Keys.Left or Keys.Right or Keys.Up or Keys.Down
@@ -7537,6 +7560,8 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     return;
                 return;
             }
+
+            FocusTabStop(el);
 
             // Paint the native-looking Win95 press immediately.  The chrome is
             // recorded into the cached display list, so merely invalidating the
@@ -10944,19 +10969,18 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     {
         if (_document == null || _rootBox == null) return;
 
-        var controls = _document.ElementDescendants()
-            .Where(c => IsEditableField(c) &&
-                        !c.HasAttr("disabled"))
+        var controls = TabNavigation.GetSequentialFocusOrder(_document)
+            .Where(IsTabStopRendered)
             .ToList();
         if (controls.Count == 0) return;
 
-        int idx = _focusedInput != null ? controls.IndexOf(_focusedInput) : -1;
-        int next = (idx + direction) % controls.Count;
-        if (next < 0) next += controls.Count;
+        int idx = _document.FocusedElement != null
+            ? controls.IndexOf(_document.FocusedElement)
+            : -1;
+        int next = TabNavigation.GetNextIndex(idx, controls.Count, direction);
 
         var target = controls[next];
-        // FIX: tabbing fired no onblur/onfocus at all.
-        FocusControl(target, GetFieldText(target).Length);
+        FocusTabStop(target);
 
         var box = FindBoxForElement(_rootBox, target);
         if (box != null)
@@ -10968,6 +10992,42 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
 
         Invalidate();
+    }
+
+    private bool IsTabStopRendered(DomElement element)
+    {
+        if (FindBoxForElement(_rootBox!, element) == null) return false;
+
+        for (DomNode? node = element; node is DomElement current; node = node.Parent)
+        {
+            if (current.Style is { Display: DisplayValue.None })
+                return false;
+        }
+        return element.Style?.Visibility != VisibilityValue.Hidden;
+    }
+
+    private void FocusTabStop(DomElement target)
+    {
+        var document = _document;
+        if (document == null || ReferenceEquals(document.FocusedElement, target)) return;
+
+        var previous = document.FocusedElement;
+        if (IsEditableField(target))
+        {
+            if (previous != null && !ReferenceEquals(previous, _focusedInput))
+                _jsInterpreter?.FireEvent(previous, "onblur");
+            FocusControl(target, GetFieldText(target).Length);
+            return;
+        }
+
+        if (_focusedInput != null)
+            BlurField();
+        else if (previous != null)
+            _jsInterpreter?.FireEvent(previous, "onblur");
+
+        UpdateCssInteractionState(document, document.HoveredElement,
+            document.ActiveElement, target, relayout: false);
+        _jsInterpreter?.FireEvent(target, "onfocus");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -11972,6 +12032,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         float target = Math.Clamp(float.IsFinite(value) ? value : current, baseline, 4f);
         if (Math.Abs(target - current) <= 0.0005f) return;
 
+        CloseMenusOnScroll();
         float docX = _scrollOffset.X + clientPoint.X / Math.Max(0.0001f, current);
         float docY = _scrollOffset.Y + clientPoint.Y / Math.Max(0.0001f, current);
 

@@ -82,28 +82,22 @@ public static class Program
     }
 
     /// <summary>
-    /// The error-page shell must pin its own alignment: the dialog-centring
-    /// outer cell's align=center must NOT leak into the body content (the
-    /// "text overflows the frame / [Reload] clipped" batch).
+    /// Error pages use the shared HTML 4.01/CSS 2 presentation shell.
     /// </summary>
     private static void TestErrorPageShell()
     {
-        Console.WriteLine("— Error page shell: alignment pinned, footer unbreakable —");
+        Console.WriteLine("— Error page shell: HTML 4.01 and CSS 2 —");
 
         string html = Retro96.Engine.ErrorPage.NetworkError("http://x.test/", "boom");
-        Check(html.Contains("cellpadding=\"14\" cellspacing=\"0\" align=\"left\""),
-              "shell: content table declares align=left");
-        Check(html.Contains("<tr><td align=\"left\">"), "shell: content cell declares align=left");
-        Check(html.Contains("<td align=\"left\"><font color=\"#ffffff\""),
-              "shell: title-bar cell left-aligned");
-
-        // The footer bracket groups are glued with &#160; only — no
-        // breakable plain spaces inside a group.
-        int start = html.IndexOf("[<a href=\"retro96://home\">", StringComparison.Ordinal);
-        int end = html.IndexOf("[<a href=\"retro96://reload\">", StringComparison.Ordinal);
-        string seg = html[start..(end + 40)];
-        Check(seg.Contains("]&#160;&#160;["), "footer: bracket groups glued with nbsp", seg);
-        Check(!seg.Contains("] &nbsp;"), "footer: no breakable space+nbs mixture");
+        Check(html.StartsWith("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\""),
+              "shell: declares HTML 4.01 Strict");
+        Check(html.Contains("<style type=\"text/css\">"),
+              "shell: uses a CSS stylesheet");
+        Check(html.Contains("<div class=\"page\">") &&
+              html.Contains("<div class=\"titlebar\">"),
+              "shell: uses standard structural elements");
+        Check(html.Contains("<a href=\"retro96://home\">Home</a>"),
+              "footer: provides the browser home link");
 
         foreach (var (name, page) in new[] {
             ("NotFound", Retro96.Engine.ErrorPage.NotFound("http://x.test/404")),
@@ -111,7 +105,8 @@ public static class Program
             ("Timeout",  Retro96.Engine.ErrorPage.Timeout("http://x.test/")),
         })
         {
-            Check(page.Contains("align=\"left\""), $"{name}: shell pins left alignment");
+            Check(page.StartsWith("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\""),
+                $"{name}: uses HTML 4.01 Strict");
         }
 
         // The certificate page's button contract: onsubmit must call the
@@ -123,7 +118,7 @@ public static class Program
     }
 
     /// <summary>
-    /// Glyph substitution: chars the 1996 core fonts lack collapse to
+    /// Glyph substitution: chars the period core fonts lack collapse to
     /// era-safe ASCII; Latin-1/typographic punctuation passes through.
     /// </summary>
     private static void TestGlyphSubstitution()

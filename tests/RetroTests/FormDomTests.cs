@@ -29,6 +29,47 @@ public class FormDomTests
     }
 
     [Fact]
+    public void SequentialFocusOrderIncludesLinksAndControlsAndHonorsTabIndex()
+    {
+        var doc = Parse("<body>" +
+                        "<a id=natural href='#x'>link</a>" +
+                        "<input id=late tabindex=3>" +
+                        "<button id=early tabindex=1>button</button>" +
+                        "<input id=disabled disabled>" +
+                        "<input id=hidden type=hidden tabindex=0>" +
+                        "<select id=select><option>One</option></select>" +
+                        "<textarea id=textarea></textarea>" +
+                        "<div id=custom tabindex=0></div>" +
+                        "<div id=excluded tabindex=-1></div>" +
+                        "<a id=nohref>not a stop</a>" +
+                        "</body>");
+
+        var order = TabNavigation.GetSequentialFocusOrder(doc)
+            .Select(element => element.GetAttr("id"))
+            .ToList();
+        Check.That(order.SequenceEqual(new[]
+        {
+            "early", "late", "natural", "select", "textarea", "custom"
+        }), "positive tabindex sorts first, then native and explicit-zero stops follow document order",
+            string.Join(",", order));
+        Check.Done();
+    }
+
+    [Fact]
+    public void SequentialFocusIndexStartsAtCorrectEndAndWrapsInBothDirections()
+    {
+        Check.That(TabNavigation.GetNextIndex(-1, 4, 1) == 0,
+            "forward tab from no focus starts at the first item");
+        Check.That(TabNavigation.GetNextIndex(-1, 4, -1) == 3,
+            "reverse tab from no focus starts at the last item");
+        Check.That(TabNavigation.GetNextIndex(3, 4, 1) == 0,
+            "forward tab wraps at the end");
+        Check.That(TabNavigation.GetNextIndex(0, 4, -1) == 3,
+            "reverse tab wraps at the beginning");
+        Check.Done();
+    }
+
+    [Fact]
     public void PasswordAndHiddenSubmit()
     {
         var pairs = PairsOf("<form><input type=password name=pw value=secret><input type=hidden name=h value=x></form>");

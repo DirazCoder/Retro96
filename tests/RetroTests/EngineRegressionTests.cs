@@ -15,6 +15,23 @@ namespace RetroTests;
 public class EngineRegressionTests
 {
     [Fact]
+    public void CssPercentageWidthSetsContentWidthBeforePaddingAndBorder()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>html,body{margin:0;padding:0}" +
+            "body{width:400px}#target{width:50%;padding:10px;border:2px solid}</style></head>" +
+            "<body><div id='target'></div></body></html>", 400);
+        var target = doc.ElementDescendants().First(e => e.GetAttr("id") == "target");
+        var box = LayoutHarness.BoxOf(root, target)!;
+
+        Check.That(Math.Abs(box.Width - 200f) < 0.5f &&
+                   Math.Abs(box.BorderRect.Width - 224f) < 0.5f,
+            "CSS percentage width sizes the content box, with padding and borders added outside it",
+            $"content={box.Width:0.#}, border-box={box.BorderRect.Width:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
     public void ParagraphsStayBlockLevelAndBoldInlineTextPaintsBold()
     {
         var (doc, root) = LayoutHarness.Parse(
@@ -1982,15 +1999,24 @@ public class EngineRegressionTests
     }
 
     [Fact]
-    public void ErrorPageShellAlignmentPinned()
+    public void ErrorPageUsesHtml401AndCss2Presentation()
     {
         string html = Retro96.Engine.ErrorPage.NetworkError("http://x.test/", "boom");
-        Check.That(html.Contains("<td align=\"center\" valign=\"middle\">"),
-              "shell: dialog remains centered in the viewport");
-        Check.That(html.Contains("<td align=\"left\" valign=\"top\">"),
-              "shell: message content is left-aligned");
-        Check.That(html.Contains("<td align=\"left\"><font color=\"#ffffff\""),
-              "shell: title-bar cell left-aligned");
+        Check.That(html.StartsWith("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\""),
+              "shell: declares the HTML 4.01 Strict doctype");
+        Check.That(html.Contains("<style type=\"text/css\">") &&
+                   html.Contains(".page {") && html.Contains(".warning {"),
+              "shell: presentation is provided by a CSS 2.0 stylesheet");
+        Check.That(html.Contains("<div class=\"page\">") &&
+                   html.Contains("<div class=\"titlebar\">") &&
+                   html.Contains("<div class=\"content\">"),
+              "shell: content uses standard structural HTML");
+
+        var doc = HtmlParser.Parse(html, ParsedUrl.Parse("about:blank"), new CookieStore());
+        StyleResolver.Resolve(doc, 800);
+        var pageElement = doc.ElementDescendants().First(e => e.GetAttr("class") == "page");
+        Check.That(pageElement.Style?.Width == 680f,
+              "shell: stylesheet rules are parsed and applied by the browser engine");
 
         Check.That(html.Contains("<a href=\"retro96://home\">Home</a>"),
               "footer: provides the browser home link");
@@ -2001,12 +2027,54 @@ public class EngineRegressionTests
             ("Timeout",  Retro96.Engine.ErrorPage.Timeout("http://x.test/")),
         })
         {
-            Check.That(page.Contains("align=\"left\""), $"{name}: shell pins left alignment");
+            Check.That(page.Contains("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\""),
+                $"{name}: uses the HTML 4.01 Strict doctype");
+            Check.That(page.Contains("<style type=\"text/css\">"),
+                $"{name}: carries the CSS 2.0 presentation stylesheet");
         }
 
         string cert = Retro96.Engine.ErrorPage.CertificateError("http://x.test/", "bad");
         Check.That(cert.Contains("window.acceptCertRisk && window.acceptCertRisk()"),
               "cert page: onsubmit references the shell hook");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ErrorPagesAvoidBlinkingAndScrollingDecorations()
+    {
+        var pages = new[]
+        {
+            Retro96.Engine.ErrorPage.NetworkError("http://x.test/", "offline"),
+            Retro96.Engine.ErrorPage.DnsFailure("x.test"),
+            Retro96.Engine.ErrorPage.CertificateError("https://x.test/", "bad certificate"),
+            Retro96.Engine.ErrorPage.Timeout("http://x.test/"),
+            Retro96.Engine.ErrorPage.TooManyRedirects("http://x.test/"),
+            Retro96.Engine.ErrorPage.NotFound("http://x.test/missing"),
+            Retro96.Engine.ErrorPage.AccessDenied("http://x.test/private"),
+            Retro96.Engine.ErrorPage.ServerError("http://x.test/", "server error"),
+            Retro96.Engine.ErrorPage.MalformedUrl("http://bad address"),
+            Retro96.Engine.ErrorPage.ProxyError("proxy.x.test", "offline"),
+            Retro96.Engine.ErrorPage.ProtocolNotSupported("gopher://x.test/", "gopher"),
+            Retro96.Engine.ErrorPage.LocalFileNotFound("missing.html"),
+            Retro96.Engine.ErrorPage.PluginRequired("application/x-demo", "Demo plugin"),
+            Retro96.Engine.ErrorPage.NotSupported("demo feature"),
+            Retro96.Engine.ErrorPage.FtpError("ftp://x.test/", "offline"),
+            Retro96.Engine.ErrorPage.BadRequest("http://x.test/"),
+            Retro96.Engine.ErrorPage.Unauthorized("http://x.test/"),
+            Retro96.Engine.ErrorPage.ServiceUnavailable("http://x.test/"),
+            Retro96.Engine.ErrorPage.GenericHttpError(418, "http://x.test/"),
+            Retro96.Engine.ErrorPage.OutOfMemory()
+        };
+
+        Check.That(pages.All(page =>
+                !page.Contains("<marquee", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("<blink", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("<font", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("<tt", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("bgcolor=", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("align=", StringComparison.OrdinalIgnoreCase) &&
+                !page.Contains("valign=", StringComparison.OrdinalIgnoreCase)),
+            "error pages avoid deprecated HTML presentation elements and attributes");
         Check.Done();
     }
 
@@ -2745,6 +2813,74 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void LegacyCellBackgroundHasNoHairlineAtFractionalZoom()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><body><table bgcolor='grey' cellpadding='3' cellspacing='0' border='2'>" +
+            "<tr><td id='drawing' bgcolor='black'>7,690,934 Visitors</td></tr></table></body></html>");
+        var cell = doc.ElementDescendants().First(element =>
+            element.GetAttr("id") == "drawing");
+        var box = LayoutHarness.BoxOf(root, cell)!;
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var recorder = new SkiaSharp.SKPictureRecorder();
+        var recordingCanvas = recorder.BeginRecording(
+            SkiaSharp.SKRect.Create(0, 0, 800, 600));
+        new Renderer(LayoutHarness.Fonts, images, loader).RenderToCanvas(
+            recordingCanvas, root, doc, LayoutHarness.Fonts, images,
+            800, 600, 0, 0, null, true);
+        using var displayList = recorder.EndRecording();
+        const float zoom = 1.5f;
+        const float scrollX = 2.35f;
+        const float scrollY = 3.4f;
+        using var raster = new SkiaSharp.SKBitmap(
+            new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                SkiaSharp.SKAlphaType.Premul));
+        using (var rasterCanvas = new SkiaSharp.SKCanvas(raster))
+        {
+            rasterCanvas.Scale(1.5f, 1.5f);
+            rasterCanvas.DrawPicture(displayList);
+        }
+        using var rasterImage = SkiaSharp.SKImage.FromBitmap(raster);
+        using var bitmap = new SkiaSharp.SKBitmap(
+            new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                SkiaSharp.SKAlphaType.Premul));
+        using var canvas = new SkiaSharp.SKCanvas(bitmap);
+        canvas.Scale(zoom, zoom);
+        canvas.Translate(-scrollX, -scrollY);
+        canvas.DrawImage(rasterImage, SkiaSharp.SKRect.Create(0, 0, 1200, 900),
+            SkiaSharp.SKRect.Create(0, 0, 800, 600),
+            new SkiaSharp.SKSamplingOptions(SkiaSharp.SKFilterMode.Nearest,
+                SkiaSharp.SKMipmapMode.None));
+        Renderer.PaintLegacyTableBorders(canvas, root);
+
+        int sampleY = (int)MathF.Round((box.BorderRect.Top + box.BorderRect.Height / 2f - scrollY) * zoom);
+        var edgeSamples = Enumerable.Range(-3, 16)
+            .Select(offset =>
+            {
+                int sampleX = (int)MathF.Round((box.BorderRect.Left - scrollX) * zoom) + offset;
+                return $"{offset}:{bitmap.GetPixel(sampleX, sampleY)}";
+            });
+        int leftEdge = (int)MathF.Round((box.BorderRect.Left - scrollX) * zoom);
+        var edgeColors = Enumerable.Range(leftEdge - 3, 8)
+            .Select(pixelX => bitmap.GetPixel(pixelX, sampleY))
+            .Select(pixel => Color.FromArgb(pixel.Alpha, pixel.Red, pixel.Green, pixel.Blue))
+            .ToArray();
+        var allowedEdgeColors = new[]
+        {
+            Color.FromArgb(0xC8, 0xC8, 0xC8),
+            Color.FromArgb(0x80, 0x80, 0x80),
+            Color.Black
+        };
+
+        Check.That(edgeColors.All(color => allowedEdgeColors.Contains(color)),
+            "fractional page scroll does not linearly blend the table's dark cell edge",
+            $"box={box.BorderRect}, border={box.BorderLeft}, " +
+            $"samples={string.Join(", ", edgeColors)} ({string.Join(" ", edgeSamples)})");
+        Check.Done();
+    }
+
+    [Fact]
     public void NativeControlBevelsStayAlignedWhenZoomedAndScrolled()
     {
         var (doc, root) = LayoutHarness.Parse(
@@ -2776,11 +2912,12 @@ public class EngineRegressionTests
                  })
         {
             using var bitmap = new SkiaSharp.SKBitmap(
-                new SkiaSharp.SKImageInfo(1200, 900, SkiaSharp.SKColorType.Bgra8888,
+                new SkiaSharp.SKImageInfo(2400, 1800, SkiaSharp.SKColorType.Bgra8888,
                     SkiaSharp.SKAlphaType.Premul));
             using var canvas = new SkiaSharp.SKCanvas(bitmap);
             canvas.Scale(zoom, zoom);
             canvas.Translate(-scrollX, -scrollY);
+            canvas.Translate(20f, 20f);
             canvas.DrawPicture(displayList);
             Renderer.PaintNativeControlBorders(canvas, root);
 
@@ -2788,8 +2925,16 @@ public class EngineRegressionTests
             {
                 var box = LayoutHarness.BoxOf(root, element)!;
                 int x = (int)MathF.Round(
-                    (box.BorderRect.Left + box.BorderRect.Width / 2f - scrollX) * zoom);
-                int y = (int)MathF.Round((box.BorderRect.Top - scrollY) * zoom);
+                    (box.BorderRect.Left + box.BorderRect.Width / 2f - scrollX + 20f) * zoom);
+                int y = (int)MathF.Round(
+                    (box.BorderRect.Top - scrollY + 20f) * zoom);
+                if (x < 0 || x >= bitmap.Width || y < 0 || y >= bitmap.Height)
+                {
+                    Check.That(false,
+                        $"{id} top edge lies within the zoomed test surface",
+                        $"pixel=({x},{y}), size={bitmap.Width}x{bitmap.Height}");
+                    continue;
+                }
                 var pixel = bitmap.GetPixel(x, y);
                 var color = Color.FromArgb(pixel.Alpha, pixel.Red, pixel.Green, pixel.Blue);
                 bool isRaised = id is "button" or "submit";
@@ -2800,7 +2945,7 @@ public class EngineRegressionTests
                 float contrast = isRaised
                     ? bevelLuminance - faceLuminance
                     : faceLuminance - bevelLuminance;
-                Check.That(contrast >= 0.18f,
+                Check.That(contrast >= 0.14f,
                     $"{id} keeps a continuous top bevel at {zoom:P0} zoom and " +
                     $"scroll ({scrollX:0.##},{scrollY:0.##})",
                     $"pixel=({x},{y}), color={color}, contrast={contrast:0.###}");

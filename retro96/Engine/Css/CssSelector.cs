@@ -297,11 +297,13 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
                 part.Value == null ||
                 element.TagName.Equals(part.Value, StringComparison.OrdinalIgnoreCase),
             PartType.Class =>
-                part.Value != null && element.HasAttr("class") &&
+                part.Value != null && IsValidIdentifier(part.Value) &&
+                element.HasAttr("class") &&
                 element.GetAttr("class")!.Split()
                        .Contains(part.Value, StringComparer.Ordinal),
             PartType.Id =>
-                part.Value != null && element.HasAttr("id") &&
+                part.Value != null && IsValidIdentifier(part.Value) &&
+                element.HasAttr("id") &&
                 element.GetAttr("id")!.Equals(part.Value, StringComparison.Ordinal),
             PartType.Attribute =>
                 MatchesAttribute(element, part.Value),
@@ -314,6 +316,28 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
         };
     }
 
+    private static bool IsValidIdentifier(string value)
+    {
+        if (value.Length == 0)
+            return false;
+
+        int index = value[0] == '-' ? 1 : 0;
+        if (index >= value.Length || !IsIdentifierStart(value[index]))
+            return false;
+
+        for (index++; index < value.Length; index++)
+        {
+            char c = value[index];
+            if (!IsIdentifierStart(c) && !char.IsAsciiDigit(c) && c != '-')
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsIdentifierStart(char value) =>
+        value == '_' || char.IsAsciiLetter(value) || value >= 0x80;
+
     private static bool MatchesAttribute(DomElement element, string? attrExpr)
     {
         if (string.IsNullOrEmpty(attrExpr))
@@ -325,7 +349,7 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
             return element.HasAttr(attrExpr.Trim());
 
         string attrName = attrExpr[..eq].Trim();
-        string opAndValue = attrExpr[(eq + 1)..].Trim();
+        string opAndValue = attrExpr[(eq + 1)..].TrimStart();
 
         char op = '=';
         if (attrName.EndsWith('~') || attrName.EndsWith('|') ||
@@ -335,7 +359,19 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
             attrName = attrName[..^1];
         }
 
-        string attrValue = opAndValue.Trim('"', '\'');
+        string attrValue;
+        if (opAndValue.Length > 0 && opAndValue[0] is '"' or '\'')
+        {
+            char quote = opAndValue[0];
+            int closingQuote = opAndValue.IndexOf(quote, 1);
+            attrValue = closingQuote >= 0
+                ? opAndValue[1..closingQuote]
+                : opAndValue[1..];
+        }
+        else
+        {
+            attrValue = opAndValue.Trim();
+        }
 
         if (!element.HasAttr(attrName))
             return false;
@@ -464,21 +500,38 @@ public record CssSelector(IReadOnlyList<SelectorPart> Parts)
         if (string.IsNullOrEmpty(href))
             return false;
 
-        // Compare against absolute resolved URLs when possible.
+        // A link to this document, with or without a fragment, is already
+        // visited even when its frame URL is not present in browser history.
         try
         {
-            string abs = doc.BaseUrl != null
-                ? (doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase)
-                    ? FileUrls.Resolve(doc.BaseUrl, href)
-                    : doc.BaseUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase) ? FileUrls.Resolve(doc.BaseUrl, href) : doc.BaseUrl.Resolve(href).ToAbsolute())
-                : href;
-            return doc.VisitedUrls.Contains(abs) || doc.VisitedUrls.Contains(href);
+            if (doc.BaseUrl != null)
+            {
+                ParsedUrl target = doc.BaseUrl.Scheme.Equals(
+                    "file", StringComparison.OrdinalIgnoreCase)
+                    ? ParsedUrl.Parse(FileUrls.Resolve(doc.BaseUrl, href))
+                    : doc.BaseUrl.Resolve(href);
+                if (IsSameDocument(target, doc.BaseUrl))
+                    return true;
+
+                string resolvedAbsolute = target.ToAbsolute();
+                return doc.VisitedUrls.Contains(resolvedAbsolute) ||
+                       doc.VisitedUrls.Contains(href);
+            }
+
+            return doc.VisitedUrls.Contains(href);
         }
         catch
         {
             return doc.VisitedUrls.Contains(href);
         }
     }
+
+    private static bool IsSameDocument(ParsedUrl target, ParsedUrl document) =>
+        target.Scheme.Equals(document.Scheme, StringComparison.OrdinalIgnoreCase) &&
+        target.Host.Equals(document.Host, StringComparison.OrdinalIgnoreCase) &&
+        target.Port == document.Port &&
+        target.Path.Equals(document.Path, StringComparison.Ordinal) &&
+        target.Query.Equals(document.Query, StringComparison.Ordinal);
 }
 
 public enum PartType
