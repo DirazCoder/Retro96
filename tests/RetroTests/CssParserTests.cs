@@ -201,6 +201,9 @@ public class CssParserTests
             "the hovered link matches its author rule");
         Check.That(!StyleResolver.HasLayoutAffectingHoverRule(doc),
             "color and background hover changes can repaint without relayout");
+        StyleResolver.ResolveInteractionStyles(doc, 800);
+        Check.That(link.Style?.Color == Color.Red,
+            "interaction style resolution applies the cached hover color");
 
         doc.AllTags("style")[0].Children.OfType<DomText>().First().Data =
             "a:hover { color: red; padding-left: 8px; }";

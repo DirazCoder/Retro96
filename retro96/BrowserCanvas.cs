@@ -753,6 +753,12 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     private static void CollectAnimatedSubtreesCore(LayoutBox box, bool ancestorAnimated,
                                                      List<LayoutBox> result)
     {
+        if (box.Element?.IsCompositedLayer == true)
+        {
+            result.Add(box);
+            return;
+        }
+
         bool animated = ancestorAnimated || IsEnabledAnimatedElement(box.Element);
         if (animated && !ancestorAnimated)
             result.Add(box);
@@ -975,8 +981,335 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
     public void ReflowDocument()
     {
         if (_document == null || _rootBox == null) return;
+        foreach (var element in _document.ElementDescendants())
+            element.IsCompositedLayer = false;
         ReflowDocumentToStableViewport();
     }
+
+    public bool TryApplyCompositedLayerUpdates(
+        DomDocument document,
+        IReadOnlyList<KeyValuePair<DomElement,
+            DocumentBindingsState.CompositedStyleUpdate>> updates)
+    {
+        if (!ReferenceEquals(document, _document) || _rootBox == null ||
+            updates.Count == 0)
+            return false;
+
+        float viewportWidth = _lastLayoutWidth > 0
+            ? _lastLayoutWidth
+            : GetLayoutViewportSize().Width;
+        var compositedPaintRoots = new HashSet<DomElement>();
+
+        foreach (var (element, update) in updates)
+        {
+            var box = element.LayoutBox ?? element.Box;
+            var style = element.Style;
+            if (box == null || style == null ||
+                FindCompositedPaintRoot(box) is not { } paintRoot)
+                return false;
+            compositedPaintRoots.Add(paintRoot);
+            if (update.ResolveStyle &&
+                !StyleResolver.TryResolveElement(element, document, viewportWidth))
+                return false;
+
+            style = element.Style;
+            if (style == null)
+                return false;
+            if (!update.ResolveStyle)
+            {
+                if (update.Left is float left) style.Left = left;
+                if (update.Top is float top) style.Top = top;
+                if (update.Width is float width) style.Width = width;
+                if (update.Height is float height) style.Height = height;
+            }
+
+            if (!CanUpdateCompositedGeometry(box, update.Original, style))
+                return false;
+            if (update.ResolveStyle &&
+                (!SameNullable(update.Left ?? update.Original.Left, style.Left) ||
+                 !SameNullable(update.Top ?? update.Original.Top, style.Top) ||
+                 !SameNullable(update.Width ?? update.Original.Width, style.Width) ||
+                 !SameNullable(update.Height ?? update.Original.Height, style.Height)))
+                return false;
+        }
+
+        foreach (var (element, update) in updates)
+        {
+            var box = element.LayoutBox ?? element.Box!;
+            var style = element.Style!;
+            if (update.Left is float left)
+                style.Left = left;
+            if (update.Top is float top)
+                style.Top = top;
+
+            var containingBlock = FindAbsoluteContainingBlock(box);
+            float originX = containingBlock.X + containingBlock.BorderLeft;
+            float originY = containingBlock.Y + containingBlock.BorderTop;
+            float oldX = update.Original.Left is float oldLeft
+                ? originX + oldLeft + box.MarginLeft
+                : box.X;
+            float oldY = update.Original.Top is float oldTop
+                ? originY + oldTop + box.MarginTop
+                : box.Y;
+            float newX = style.Left is float newLeft
+                ? originX + newLeft + box.MarginLeft
+                : box.X;
+            float newY = style.Top is float newTop
+                ? originY + newTop + box.MarginTop
+                : box.Y;
+            box.X += newX - oldX;
+            box.Y += newY - oldY;
+            box.Width = style.Width!.Value;
+            box.Height = style.Height!.Value;
+        }
+
+        bool promotedAny = false;
+        foreach (var paintRoot in compositedPaintRoots)
+        {
+            if (paintRoot.IsCompositedLayer)
+                continue;
+            paintRoot.IsCompositedLayer = true;
+            promotedAny = true;
+        }
+
+        if (promotedAny)
+            RequestRerender();
+        else
+            Invalidate();
+        return true;
+    }
+
+    public bool TryApplyPaintOnlyClassUpdates(
+        DomDocument document,
+        IReadOnlyList<KeyValuePair<DomElement,
+            DocumentBindingsState.CompositedStyleSnapshot>> updates)
+    {
+        if (!ReferenceEquals(document, _document) || _rootBox == null ||
+            updates.Count == 0)
+            return false;
+
+        float viewportWidth = _lastLayoutWidth > 0
+            ? _lastLayoutWidth
+            : GetLayoutViewportSize().Width;
+        foreach (var (element, original) in updates)
+        {
+            var box = element.LayoutBox ?? element.Box;
+            if (box == null || element.Style == null ||
+                element.Children.Count != 0 || box.Children.Count != 0 ||
+                !StyleResolver.TryResolveElement(element, document, viewportWidth) ||
+                element.Style is not { } style ||
+                !CanUpdateCompositedGeometry(box, original, style))
+                return false;
+        }
+
+        RequestRerender();
+        return true;
+    }
+
+    private static DomElement? FindCompositedPaintRoot(LayoutBox box)
+    {
+        for (var parent = box.Parent; parent != null; parent = parent.Parent)
+        {
+            var style = parent.Element?.Style;
+            if (style?.Position == PositionValue.Relative &&
+                style.Overflow == OverflowValue.Hidden)
+                return parent.Element;
+        }
+        return null;
+    }
+
+    private static LayoutBox FindAbsoluteContainingBlock(LayoutBox box)
+    {
+        var current = box.Parent;
+        LayoutBox root = box;
+        while (current != null)
+        {
+            root = current;
+            var position = current.Element?.Style?.Position;
+            if (position is PositionValue.Relative or PositionValue.Absolute or PositionValue.Fixed)
+                return current;
+            current = current.Parent;
+        }
+        return root;
+    }
+
+    private static DomElement? FindCompositedPaintRoot(DomElement element)
+    {
+        for (var parent = element.Parent as DomElement;
+             parent != null;
+             parent = parent.Parent as DomElement)
+        {
+            if (parent.Style is
+                { Position: PositionValue.Relative, Overflow: OverflowValue.Hidden })
+                return parent;
+        }
+        return null;
+    }
+
+    public bool TryUpdateFixedWidthText(
+        DomElement element, DomText textNode, string newText, bool awaitingPromotion)
+    {
+        if (_document == null || _rootBox == null ||
+            !ReferenceEquals(element.OwnerDocument(), _document) ||
+            element.Style is not { TextTransform: TextTransform.None } style ||
+            element.Children.Count != 1 ||
+            !ReferenceEquals(element.Children[0], textNode) ||
+            textNode.Data.Length != newText.Length ||
+            newText.Length == 0 ||
+            textNode.Data.Any(character => character < '!' || character > '~') ||
+            newText.Any(character => character < '!' || character > '~') ||
+            !style.FontFamily.Any(family =>
+                family.Contains("mono", StringComparison.OrdinalIgnoreCase) ||
+                family.Contains("courier", StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        bool insideCompositedLayer = element.IsCompositedLayer;
+        for (DomNode? node = element; node != null; node = node.Parent)
+        {
+            if (node is DomElement ancestor && ancestor.IsCompositedLayer)
+            {
+                insideCompositedLayer = true;
+                break;
+            }
+        }
+        insideCompositedLayer |= awaitingPromotion;
+
+        var textBoxes = EnumerateLayoutBoxes(_rootBox)
+            .Where(box => ReferenceEquals(box.Element, element) && box.TextRun != null)
+            .Take(2)
+            .ToArray();
+        if (textBoxes.Length != 1 ||
+            !string.Equals(textBoxes[0].TextRun, textNode.Data, StringComparison.Ordinal))
+            return false;
+
+        var textBox = textBoxes[0];
+        textBox.TextRun = newText;
+        if (!insideCompositedLayer && CanPromoteFixedWidthText(element, textBox))
+        {
+            element.IsCompositedLayer = true;
+            RequestRerender();
+        }
+        else if (!insideCompositedLayer)
+            RequestRerender();
+        else
+            Invalidate();
+        return true;
+    }
+
+    private bool CanPromoteFixedWidthText(DomElement element, LayoutBox textBox)
+    {
+        var style = element.Style;
+        if (style == null ||
+            style.Position != PositionValue.Static ||
+            style.Float != FloatValue.None ||
+            style.ZIndex != 0 ||
+            style.BackgroundColor.A != 0 ||
+            style.BackgroundImage != null ||
+            style.BorderTopWidth != 0 || style.BorderRightWidth != 0 ||
+            style.BorderBottomWidth != 0 || style.BorderLeftWidth != 0 ||
+            style.OutlineStyle != BorderStyleValue.None ||
+            style.GeneratedBefore != null || style.GeneratedAfter != null)
+            return false;
+
+        foreach (var other in EnumerateLayoutBoxes(_rootBox!))
+        {
+            if (ReferenceEquals(other, textBox) ||
+                IsLayoutAncestor(other, textBox) ||
+                IsLayoutAncestor(textBox, other) ||
+                other.Width <= 0 || other.Height <= 0)
+                continue;
+
+            bool overlaps = textBox.X < other.X + other.Width &&
+                textBox.X + textBox.Width > other.X &&
+                textBox.Y < other.Y + other.Height &&
+                textBox.Y + textBox.Height > other.Y;
+            if (overlaps)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsLayoutAncestor(LayoutBox ancestor, LayoutBox box)
+    {
+        for (var parent = box.Parent; parent != null; parent = parent.Parent)
+            if (ReferenceEquals(parent, ancestor))
+                return true;
+        return false;
+    }
+
+    private static IEnumerable<LayoutBox> EnumerateLayoutBoxes(LayoutBox root)
+    {
+        yield return root;
+        foreach (var child in root.Children)
+            foreach (var descendant in EnumerateLayoutBoxes(child))
+                yield return descendant;
+    }
+
+    private static bool CanUpdateCompositedGeometry(
+        LayoutBox box, DocumentBindingsState.CompositedStyleSnapshot previous,
+        ComputedStyle current)
+    {
+        const float epsilon = 0.01f;
+        static bool Same(float a, float b) => Math.Abs(a - b) <= epsilon;
+
+        return box.IsAbsolutelyPositioned &&
+               box.Children.Count == 0 &&
+               previous.Position == current.Position &&
+               previous.Position == PositionValue.Absolute &&
+               previous.Display == current.Display &&
+               previous.Float == current.Float &&
+               previous.Clear == current.Clear &&
+               previous.LeftPercent == null && current.LeftPercent == null &&
+               previous.TopPercent == null && current.TopPercent == null &&
+               previous.Right == null && current.Right == null &&
+               previous.RightPercent == null && current.RightPercent == null &&
+               previous.Bottom == null && current.Bottom == null &&
+               previous.BottomPercent == null && current.BottomPercent == null &&
+               (!previous.Left.HasValue || current.Left.HasValue) &&
+               (!previous.Top.HasValue || current.Top.HasValue) &&
+               previous.WidthPercent == null && current.WidthPercent == null &&
+               previous.HeightPercent == null && current.HeightPercent == null &&
+               previous.Width.HasValue && current.Width.HasValue &&
+               previous.Height.HasValue && current.Height.HasValue &&
+               Same(box.Width, previous.Width.Value) &&
+               Same(box.Height, previous.Height.Value) &&
+               float.IsFinite(current.Width.Value) && current.Width.Value >= 0f &&
+               float.IsFinite(current.Height.Value) && current.Height.Value >= 0f &&
+               Same(previous.MarginLeft, current.MarginLeft) &&
+               Same(previous.MarginRight, current.MarginRight) &&
+               Same(previous.MarginTop, current.MarginTop) &&
+               Same(previous.MarginBottom, current.MarginBottom) &&
+               Same(previous.PaddingLeft, current.PaddingLeft) &&
+               Same(previous.PaddingRight, current.PaddingRight) &&
+               Same(previous.PaddingTop, current.PaddingTop) &&
+               Same(previous.PaddingBottom, current.PaddingBottom) &&
+               Same(previous.BorderLeftWidth, current.BorderLeftWidth) &&
+               Same(previous.BorderRightWidth, current.BorderRightWidth) &&
+               Same(previous.BorderTopWidth, current.BorderTopWidth) &&
+               Same(previous.BorderBottomWidth, current.BorderBottomWidth) &&
+               previous.MinWidth == null && current.MinWidth == null &&
+               previous.MaxWidth == null && current.MaxWidth == null &&
+               previous.MinHeight == null && current.MinHeight == null &&
+               previous.MaxHeight == null && current.MaxHeight == null &&
+               previous.MinWidthPercent == null && current.MinWidthPercent == null &&
+               previous.MaxWidthPercent == null && current.MaxWidthPercent == null &&
+               previous.MinHeightPercent == null && current.MinHeightPercent == null &&
+               previous.MaxHeightPercent == null && current.MaxHeightPercent == null &&
+               previous.ZIndex == current.ZIndex &&
+               previous.Overflow == current.Overflow &&
+               previous.Visibility == current.Visibility &&
+               !previous.HasGeneratedBefore && current.GeneratedBefore == null &&
+               !previous.HasGeneratedAfter && current.GeneratedAfter == null &&
+               !previous.HasCounterReset &&
+               current.CounterReset is not { Count: > 0 } &&
+               !previous.HasCounterIncrement &&
+               current.CounterIncrement is not { Count: > 0 };
+    }
+
+    private static bool SameNullable(float? left, float? right) =>
+        left.HasValue == right.HasValue &&
+        (!left.HasValue || Math.Abs(left.Value - right.GetValueOrDefault()) <= 0.01f);
 
     /// <summary>
     /// Forces styles and layout to reflect the supplied document before a
@@ -2210,6 +2543,23 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
     }
 
+    public float PageScrollX => PaintScrollX;
+    public float PageScrollY => PaintScrollY;
+
+    public void SetPageScrollOffset(float x, float y)
+    {
+        if (_rootBox == null) return;
+        CloseMenusOnScroll();
+        var viewport = GetViewportSize();
+        float zoom = Math.Max(0.25f, EffectiveZoom);
+        var content = GetDocumentContentSize();
+        float maxX = Math.Max(0f, content.Width - viewport.Width / zoom);
+        float maxY = Math.Max(0f, content.Height - viewport.Height / zoom);
+        _scrollOffset.X = Math.Clamp(float.IsFinite(x) ? x : _scrollOffset.X, 0f, maxX);
+        _scrollOffset.Y = Math.Clamp(float.IsFinite(y) ? y : _scrollOffset.Y, 0f, maxY);
+        Invalidate();
+    }
+
     private void PaintDynamicEmbeddedContent(
         SKCanvas canvas, IReadOnlyList<LayoutBox> boxes, RectangleF viewport)
     {
@@ -2280,14 +2630,37 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         foreach (var box in boxes)
         {
             if (box.Width <= 0f || box.Height <= 0f) continue;
+            int layerState = -1;
             try
             {
+                if (box.Element?.IsCompositedLayer == true)
+                {
+                    layerState = canvas.Save();
+                    for (var ancestor = box.Parent; ancestor != null; ancestor = ancestor.Parent)
+                    {
+                        if (ancestor.Element?.Style?.Overflow != OverflowValue.Hidden)
+                            continue;
+
+                        canvas.ClipRect(SKRect.Create(
+                            ancestor.X + ancestor.BorderLeft,
+                            ancestor.Y + ancestor.BorderTop,
+                            Math.Max(0f, ancestor.Width + ancestor.PaddingLeft + ancestor.PaddingRight),
+                            Math.Max(0f, ancestor.Height + ancestor.PaddingTop + ancestor.PaddingBottom)),
+                            SKClipOperation.Intersect);
+                    }
+                }
+
                 renderer.RenderAnimatedBoxToCanvas(canvas, box, document, _fontCache!, _imageCache!,
                     hoveredElement, blinkVisible, focusedElement, gpuContext);
             }
             catch (Exception ex)
             {
                 Retro96.DebugLog.WriteException("PaintAnimatedSubtrees", ex);
+            }
+            finally
+            {
+                if (layerState >= 0)
+                    canvas.RestoreToCount(layerState);
             }
         }
     }
@@ -2387,7 +2760,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (_rootBox != null)
                 {
                     Renderer.PaintLegacyTableBorders(canvas, _rootBox);
-                    Renderer.PaintNativeControlBorders(canvas, _rootBox, _pressedControl);
+                    Renderer.PaintNativeControlBorders(canvas, _rootBox, _pressedControl,
+                        redrawAuthoredBorders: IsGestureZoomActive,
+                        focusedElement: _focusedInputFrame == null ? _focusedInput : null);
                 }
                 var rootContentViewport = new RectangleF(
                     scrollX, scrollY, logicalVw, logicalVh);
@@ -2544,7 +2919,9 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 if (view.RootBox != null)
                 {
                     Renderer.PaintLegacyTableBorders(canvas, view.RootBox);
-                    Renderer.PaintNativeControlBorders(canvas, view.RootBox, _pressedControl);
+                    Renderer.PaintNativeControlBorders(canvas, view.RootBox, _pressedControl,
+                        redrawAuthoredBorders: IsGestureZoomActive,
+                        focusedElement: _focusedInputFrame == view ? _focusedInput : null);
                 }
 
                 var frameContentViewport = new RectangleF(
@@ -4212,17 +4589,6 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
         }
         g.Restore(oldClip);
 
-        if (paintLiveFieldText && el.TagName == "input")
-        {
-            var screenBorder = new RectangleF(
-                box.BorderRect.X - scrollX, box.BorderRect.Y - scrollY,
-                box.BorderRect.Width, box.BorderRect.Height);
-            Renderer.PaintSunkenRect(g, screenBorder, 2, fieldBackground);
-        }
-
-        using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
-        g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
-            face.Width - 1, face.Height - 1);
     }
 
     private bool IsFocusedFieldSuppressedByPageSelection()
@@ -4656,9 +5022,14 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 scrollbarTrack);
         }
 
-        using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
-        g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
-            face.Width - 1, face.Height - 1);
+        if (el.Style is not { } focusStyle ||
+            !(focusStyle.OwnBorderTopStyle || focusStyle.OwnBorderRightStyle ||
+              focusStyle.OwnBorderBottomStyle || focusStyle.OwnBorderLeftStyle))
+        {
+            using var focusPen = new Pen(Color.FromArgb(0, 0, 128), 1);
+            g.DrawRectangle(focusPen, face.X - scrollX, face.Y - scrollY,
+                face.Width - 1, face.Height - 1);
+        }
     }
 
     private bool EmbeddedMidiUiAllowed()
@@ -7095,7 +7466,7 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                     // just the legacy BODY ALINK paint color. Re-resolve styles
                     // without rebuilding layout when the changes only affect
                     // painting.
-                    StyleResolver.Resolve(doc, styleViewportWidth);
+                    StyleResolver.ResolveInteractionStyles(doc, styleViewportWidth);
                 }
                 catch (Exception ex)
                 {
@@ -8248,6 +8619,22 @@ public class BrowserCanvas : SKGLControl, IVbsScriptHost
                 frameHit = cursorHit;
                 doc = cursorFrame.Document;
             }
+        }
+
+        var moveInterpreter = hoverFrame?.Interpreter ?? _jsInterpreter;
+        var moveTarget = element ??
+            doc.ElementDescendants().FirstOrDefault(candidate => candidate.TagName == "body") ??
+            doc.ElementDescendants().FirstOrDefault();
+        if (moveInterpreter != null && moveTarget != null)
+        {
+            int clientX = hoverFrame != null
+                ? (int)Math.Round(frameHit.ViewX)
+                : (int)Math.Round(e.X / EffectiveZoom);
+            int clientY = hoverFrame != null
+                ? (int)Math.Round(frameHit.ViewY)
+                : (int)Math.Round(e.Y / EffectiveZoom);
+            moveInterpreter.FireEvent(moveTarget, "onmousemove",
+                moveInterpreter.CreateMouseEvent("onmousemove", clientX, clientY, 0));
         }
 
         // Gesture zoom changes only the temporary visual transform. Do not let

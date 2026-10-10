@@ -168,6 +168,13 @@ public class FloatContext
     }
 
     public bool HasFloats => _floats.Count > 0;
+    public int FloatCount => _floats.Count;
+
+    public IEnumerable<float> FloatBottomsFrom(int firstFloatIndex)
+    {
+        for (int i = Math.Max(0, firstFloatIndex); i < _floats.Count; i++)
+            yield return OuterBottom(_floats[i]);
+    }
 
     /// <summary>DEBUG-ONLY: dumps every registered float's raw geometry, in
     /// registration order, so a Y/edge query can be checked against what was
@@ -667,12 +674,45 @@ public static class InlineLayout
         bool lastWasSpace = true;   // stream start: no leading space
         foreach (var box in source)
         {
+            if (box.StyleWidthPercent is { } widthPercent &&
+                box.Element is { } sizedElement &&
+                box.BoxType is BoxType.Replaced or BoxType.Frame)
+            {
+                float resolvedWidth = containerWidth * widthPercent / 100f;
+                if (sizedElement.TagName is "input" or "select" or "textarea" or "button")
+                    resolvedWidth = LayoutEngine.ResolveCssContentWidth(box, resolvedWidth);
+                box.Width = Math.Min(Math.Max(0f, resolvedWidth), 32768f);
+                box.StyleWidthPercent = null;
+            }
+
             foreach (var prepared in ApplyFirstLetter(box, firstLetterApplied))
             {
                 if (prepared.IsFloated)
                 {
                     MeasureBox(prepared, out float floatWidth, out float floatHeight,
-                        out _, out _, out _, prepared.StyleOverride);
+                        out _, out float floatContentHeight, out _, prepared.StyleOverride);
+                    float floatOuterWidth = floatWidth;
+                    if (prepared.StyleOverride is { } floatStyle &&
+                        ReferenceEquals(prepared.Element?.Style?.FirstLetterStyle, floatStyle))
+                    {
+                        prepared.PaddingTop = ResolveInlinePadding(
+                            floatStyle.PaddingTop, floatStyle.PaddingTopPercent, containerWidth);
+                        prepared.PaddingRight = ResolveInlinePadding(
+                            floatStyle.PaddingRight, floatStyle.PaddingRightPercent, containerWidth);
+                        prepared.PaddingBottom = ResolveInlinePadding(
+                            floatStyle.PaddingBottom, floatStyle.PaddingBottomPercent, containerWidth);
+                        prepared.PaddingLeft = ResolveInlinePadding(
+                            floatStyle.PaddingLeft, floatStyle.PaddingLeftPercent, containerWidth);
+                        prepared.BorderTop = Math.Max(0f, floatStyle.BorderTopWidth);
+                        prepared.BorderRight = Math.Max(0f, floatStyle.BorderRightWidth);
+                        prepared.BorderBottom = Math.Max(0f, floatStyle.BorderBottomWidth);
+                        prepared.BorderLeft = Math.Max(0f, floatStyle.BorderLeftWidth);
+                        floatOuterWidth += prepared.PaddingLeft + prepared.PaddingRight
+                            + prepared.BorderLeft + prepared.BorderRight;
+                        floatHeight = Math.Max(floatHeight, floatContentHeight)
+                            + prepared.PaddingTop + prepared.PaddingBottom
+                            + prepared.BorderTop + prepared.BorderBottom;
+                    }
                     prepared.Width = floatWidth;
                     prepared.Height = floatHeight;
                     prepared.Y = startY + prepared.MarginTop;
@@ -683,7 +723,7 @@ public static class InlineLayout
                         rightEdge = containerX + containerWidth;
                     rightEdge = Math.Min(rightEdge, containerX + containerWidth);
                     prepared.X = prepared.FloatSide == FloatValue.Right
-                        ? rightEdge - floatWidth - prepared.MarginRight
+                        ? rightEdge - floatOuterWidth - prepared.MarginRight
                         : leftEdge + prepared.MarginLeft;
                     floats.AddFloat(prepared);
                     continue;
@@ -1289,7 +1329,13 @@ public static class InlineLayout
             // the baseline math is exact.
             if (!it.Atomic)
                 contentY = MathF.Round(contentY);
-            box.Y = contentY - box.BorderTop - box.PaddingTop;
+            // Atomic inline measurements and baseline ascent include the
+            // complete replaced box (border and padding included), so their
+            // computed contentY is already the border-box top. Text runs
+            // measure their content box and need the top chrome subtracted.
+            box.Y = it.Atomic
+                ? contentY
+                : contentY - box.BorderTop - box.PaddingTop;
 
             x += it.MarginL + it.W + it.MarginR;
             // Word-spacing only BETWEEN visible items — a zero-footprint
@@ -1410,7 +1456,7 @@ public static class InlineLayout
                     LineHeightMode.Absolute => (float)Math.Ceiling(Math.Max(0f, style.LineHeightPixels)),
                     _ => (float)Math.Ceiling(contentHeight)
                 };
-                leadingTop = Math.Max(0f, (height - contentHeight) / 2f);
+                leadingTop = (height - contentHeight) / 2f;
 
 
                 // FIX: guard the em-unit ratio — GetLineSpacing can return 0
@@ -1435,7 +1481,7 @@ public static class InlineLayout
                 LineHeightMode.Absolute => Math.Max(0f, style.LineHeightPixels),
                 _ => contentHeight
             };
-            leadingTop = Math.Max(0f, (height - contentHeight) / 2f);
+            leadingTop = (height - contentHeight) / 2f;
             ascent = fSize * 0.85f + leadingTop;
             return;
         }

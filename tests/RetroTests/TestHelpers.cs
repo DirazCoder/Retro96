@@ -74,7 +74,8 @@ public sealed class PageHarness
     public List<string> ScriptErrors = new();
 
     public DomDocument LoadHtml(string html, string url = "file:///C:/web/page.htm",
-                                int executionLimitMs = 5000)
+                                int executionLimitMs = 5000,
+                                CookieStore? cookieStore = null)
     {
         var parsed = ParsedUrl.Parse(url);
         JsRuntime.PopulateGlobalScope(Scope);
@@ -85,7 +86,7 @@ public sealed class PageHarness
         State = new DocumentBindingsState { Interpreter = Interpreter, Canvas = Canvas };
         Interpreter.ElementWrapperHook = e => DomBindings.WrapElement(e, State);
 
-        Document = HtmlParser.Parse(html, parsed, new CookieStore(),
+        Document = HtmlParser.Parse(html, parsed, cookieStore ?? new CookieStore(),
             (doc, src, _) => RunInlineScript(doc, src));
 
         // The shell re-registers the DOM bindings after the parse completes

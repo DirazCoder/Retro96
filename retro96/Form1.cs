@@ -42,9 +42,12 @@ public static class DebugLog
     public static readonly bool JsTraceEnabled =
         Environment.GetEnvironmentVariable("RETRO96_JS_TRACE") == "1";
 
+    private static readonly bool PerformanceDiagnosticsEnabled =
+        Environment.GetEnvironmentVariable("RETRO96_PERF_DEBUG") == "1";
     private static readonly string Path =
         System.IO.Path.Combine(AppContext.BaseDirectory, "retro96-debug.log");
     private static readonly object Lock = new();
+    private static readonly HashSet<string> PerformanceKeys = new(StringComparer.Ordinal);
 
     public static void Write(string message)
     {
@@ -60,6 +63,24 @@ public static class DebugLog
         catch
         {
             // Logging must never be the thing that crashes the app.
+        }
+    }
+
+    public static void WritePerformanceOnce(string key, string message)
+    {
+        if (!PerformanceDiagnosticsEnabled) return;
+        try
+        {
+            lock (Lock)
+            {
+                if (!PerformanceKeys.Add(key)) return;
+                File.AppendAllText(Path,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] [PERF] {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // Performance diagnostics must not interfere with page execution.
         }
     }
 

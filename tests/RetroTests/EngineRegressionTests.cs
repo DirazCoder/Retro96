@@ -15,6 +15,457 @@ namespace RetroTests;
 public class EngineRegressionTests
 {
     [Fact]
+    public void InlineFloatsKeepTheirBoxAndOverflowContainerIncludesTheirHeight()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#wrap{width:200px;overflow:hidden}" +
+            "#float{float:left;width:50px;height:30px}</style></head><body>" +
+            "<div id='wrap'><span id='float'>badge</span></div></body></html>", 400);
+        var wrap = doc.ElementDescendants().First(e => e.GetAttr("id") == "wrap");
+        var floated = doc.ElementDescendants().First(e => e.GetAttr("id") == "float");
+        var wrapBox = LayoutHarness.BoxOf(root, wrap)!;
+        var floatBox = LayoutHarness.BoxOf(root, floated)!;
+
+        Check.That(floatBox.BoxType == BoxType.Block && floatBox.IsFloated,
+            "a floated inline element becomes a real block-level float");
+        Check.That(wrapBox.Height >= floatBox.BorderRect.Bottom - wrapBox.ContentRect.Top,
+            "overflow:hidden establishes a formatting context that contains its float",
+            $"wrapper={wrapBox.Height:0.#}, floatBottom={floatBox.BorderRect.Bottom:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void InlineBlockAutoWidthShrinksToItsContents()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#stamp{display:inline-block;" +
+            "padding:4px;border:1px solid}</style></head><body>" +
+            "<div style='width:400px'><span id='stamp'>TOUCH</span></div></body></html>", 400);
+        var stamp = doc.ElementDescendants().First(e => e.GetAttr("id") == "stamp");
+        var box = LayoutHarness.BoxOf(root, stamp)!;
+
+        Check.That(box.Width > 0f && box.BorderRect.Width < 100f,
+            "an auto-width inline-block shrink-fits instead of stretching across its containing block",
+            $"content={box.Width:0.#}, border-box={box.BorderRect.Width:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ShrinkToFitIncludesAuthoredBlockChildWidthAndLetterSpacing()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#float{float:left}" +
+            "#badge{display:block;width:88px;height:20px}" +
+            "#tracked{float:right;font:10px monospace;letter-spacing:4px}" +
+            "</style></head><body><div id='float'><div id='badge'>BADGE</div></div>" +
+            "<span id='tracked'>ABC DEF</span></body></html>", 300);
+        LayoutBox Box(string id)
+        {
+            var element = doc.ElementDescendants().First(e => e.GetAttr("id") == id);
+            return LayoutHarness.BoxOf(root, element)!;
+        }
+
+        var floatBox = Box("float");
+        var badgeBox = Box("badge");
+        var trackedBox = Box("tracked");
+        var trackedStyle = doc.ElementDescendants().First(e =>
+            e.GetAttr("id") == "tracked").Style!;
+        float trackedTextWidth = InlineLayout.MeasureTextWidth("ABC DEF", trackedStyle);
+        Check.That(floatBox.BorderRect.Width >= badgeBox.BorderRect.Width - 0.5f,
+            "a shrink-to-fit float preserves the authored width of its block child",
+            $"float={floatBox.BorderRect.Width:0.#}, badge={badgeBox.BorderRect.Width:0.#}");
+        Check.That(trackedBox.BorderRect.Width >= trackedTextWidth - 0.5f,
+            "a shrink-to-fit float reserves inherited letter-spacing",
+            $"float={trackedBox.BorderRect.Width:0.#}, text={trackedTextWidth:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void BodyOffsetParentIsNullAndElementOffsetParentChainTerminates()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><body><div id='plain'><span id='child'>X</span></div></body></html>");
+        StyleResolver.Resolve(page.Document, 800);
+        LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+
+        Check.That(page.EvalString("document.body.offsetParent === null") == "true",
+            "BODY has no offsetParent");
+        Check.That(page.EvalString(
+                "document.getElementById('child').offsetParent === document.body") == "true",
+            "an unpositioned element uses BODY as its offsetParent");
+        Check.Done();
+    }
+
+    [Fact]
+    public void AbsoluteRightBottomAutoWidthShrinkFitsBeforeAnchoring()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#cb{position:relative;width:200px;height:100px}" +
+            "#hint{position:absolute;right:10px;bottom:5px;white-space:nowrap}</style></head>" +
+            "<body><div id='cb'><div id='hint'>HINT</div></div></body></html>", 400);
+        var cb = doc.ElementDescendants().First(e => e.GetAttr("id") == "cb");
+        var hint = doc.ElementDescendants().First(e => e.GetAttr("id") == "hint");
+        var cbBox = LayoutHarness.BoxOf(root, cb)!;
+        var hintBox = LayoutHarness.BoxOf(root, hint)!;
+
+        Check.That(Math.Abs(hintBox.BorderRect.Right - cbBox.ContentRect.Right + 10f) < 0.5f,
+            "right anchoring uses the shrink-to-fit width of an auto-sized positioned box",
+            $"hintRight={hintBox.BorderRect.Right:0.#}, cbRight={cbBox.ContentRect.Right:0.#}");
+        Check.That(hintBox.BorderRect.Width < cbBox.Width,
+            "an auto-width right-positioned box does not expand to the containing block");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ReplacedButtonHonorsCssPercentageWidth()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#host{width:200px}" +
+            "#button{width:100%;padding:4px;border:1px solid}</style></head>" +
+            "<body><div id='host'><button id='button'>Go</button></div></body></html>", 400);
+        var button = doc.ElementDescendants().First(e => e.GetAttr("id") == "button");
+        var box = LayoutHarness.BoxOf(root, button)!;
+
+        Check.That(Math.Abs(box.Width - 200f) < 0.5f,
+            "a replaced button resolves CSS percentage width against its inline containing block",
+            $"button content width={box.Width:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void CollapsedTableKeepsAuthoredHorizontalRowBorders()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>table{border-collapse:collapse}th{border-bottom:2px solid}" +
+            "td{border-bottom:1px solid}</style></head><body><table><tr><th>Heading</th></tr>" +
+            "<tr><td>First</td></tr><tr><td>Second</td></tr></table></body></html>");
+        var cells = doc.ElementDescendants().Where(e => e.TagName is "th" or "td").ToList();
+        var cellBoxes = cells.Select(e => LayoutHarness.BoxOf(root, e)!).ToList();
+
+        Check.That(Math.Abs(cellBoxes[0].BorderBottom - 2f) < 0.5f &&
+                   cellBoxes.Skip(1).All(b => Math.Abs(b.BorderBottom - 1f) < 0.5f),
+            "collapsed borders retain the header separator and each authored row rule",
+            string.Join(", ", cellBoxes.Select(b => b.BorderBottom.ToString("0.#"))));
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        var headerRule = bitmap.GetPixel(
+            (int)(cellBoxes[0].BorderRect.Left + 10f),
+            (int)(cellBoxes[0].BorderRect.Bottom - 1f));
+        var rowRule = bitmap.GetPixel(
+            (int)(cellBoxes[1].BorderRect.Left + 10f),
+            (int)(cellBoxes[1].BorderRect.Bottom - 1f));
+        Check.That(headerRule.R < 160 && headerRule.G < 160 && headerRule.B < 160 &&
+                   rowRule.R < 160 && rowRule.G < 160 && rowRule.B < 160,
+            "collapsed header and row borders are actually painted",
+            $"header={headerRule}, row={rowRule}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void FieldsetLegendStraddlesAndCutsTheTopBorder()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#clip{overflow:hidden;background:#fff}" +
+            "#gbForm{float:left;width:252px}fieldset{margin:0;padding:0;width:252px;background:#fff}" +
+            "legend{font:italic 15px Georgia,serif;padding-bottom:8px}" +
+            "</style></head><body><div id='clip'><form id='gbForm'><fieldset id='box'>" +
+            "<legend>Sign the parchment</legend><div>First field</div></fieldset>" +
+            "</form></div></body></html>");
+        var fieldset = doc.ElementDescendants().First(e => e.TagName == "fieldset");
+        var legend = doc.ElementDescendants().First(e => e.TagName == "legend");
+        var clip = doc.ElementDescendants().First(e => e.GetAttr("id") == "clip");
+        var fieldsetBox = LayoutHarness.BoxOf(root, fieldset)!;
+        var legendBox = LayoutHarness.BoxOf(root, legend)!;
+        var clipBox = LayoutHarness.BoxOf(root, clip)!;
+
+        Check.That(legendBox.BorderRect.Top < fieldsetBox.BorderRect.Top &&
+                   legendBox.BorderRect.Bottom > fieldsetBox.BorderRect.Top,
+            "the legend is vertically centered across the fieldset's top border",
+            $"legend={legendBox.BorderRect}, fieldset={fieldsetBox.BorderRect}");
+        Check.That(legendBox.BorderRect.Top >= clipBox.Y + clipBox.BorderTop - 0.5f,
+            "a clipped ancestor reserves room so the straddling legend is not cut off",
+            $"legendTop={legendBox.BorderRect.Top:0.#}, clipTop={clipBox.Y + clipBox.BorderTop:0.#}");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        int gapX = (int)MathF.Floor(legendBox.BorderRect.Left + 2f);
+        int borderY = (int)MathF.Floor(fieldsetBox.BorderRect.Top + 0.5f);
+        var gapPixel = bitmap.GetPixel(gapX, borderY);
+        Check.That(gapPixel.R > 220 && gapPixel.G > 220 && gapPixel.B > 220,
+            "the fieldset's top border is interrupted under the legend",
+            $"pixel=({gapPixel.R},{gapPixel.G},{gapPixel.B})");
+        int legendInkAboveBorder = 0;
+        for (int y = (int)MathF.Floor(legendBox.BorderRect.Top);
+             y < (int)MathF.Ceiling(fieldsetBox.BorderRect.Top); y++)
+            for (int x = (int)MathF.Floor(legendBox.BorderRect.Left);
+                 x < (int)MathF.Ceiling(legendBox.BorderRect.Right); x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.R < 100 && pixel.G < 100 && pixel.B < 100)
+                    legendInkAboveBorder++;
+            }
+        Check.That(legendInkAboveBorder > 0,
+            "legend glyphs remain visible above the fieldset border",
+            $"dark pixels above border={legendInkAboveBorder}, " +
+            $"legend={legendBox.BorderRect}, fieldset={fieldsetBox.BorderRect}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void NestedPercentageWidthTableDoesNotForceItsParentToViewportWidth()
+    {
+        string path = Path.Combine(TestPaths.Testdata, "theoldnet.html");
+        var (doc, root) = LayoutHarness.Parse(File.ReadAllText(path), 800);
+        var nested = doc.ElementDescendants().First(e =>
+            e.TagName == "table" && e.GetAttr("width") == "100%");
+        var nestedBox = LayoutHarness.BoxOf(root, nested)!;
+        var parentCell = nested.Parent as DomElement;
+        var parentCellBox = parentCell != null ? LayoutHarness.BoxOf(root, parentCell) : null;
+        var containingTable = parentCell?.Parent?.Parent as DomElement;
+        var containingTableBox = containingTable != null
+            ? LayoutHarness.BoxOf(root, containingTable)
+            : null;
+
+        Check.That(parentCellBox != null && nestedBox.Width <= parentCellBox.Width + 1f,
+            "the nested 100%-width table fits its containing cell",
+            $"nested={nestedBox.Width:0.#}, cell={parentCellBox?.Width:0.#}");
+        Check.That(containingTableBox != null && containingTableBox.Width < 800f,
+            "percentage width does not make the auto-sized Old Net table fill the viewport",
+            $"table={containingTableBox?.Width:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ScriptedScrollLeftMovesOverflowHiddenContents()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#clip{position:relative;width:20px;height:20px;" +
+            "overflow:hidden;background:#fff}#mark{position:absolute;left:25px;top:2px;" +
+            "width:8px;height:8px;background:#00ff00}</style></head><body>" +
+            "<div id='clip'><div id='mark'></div></div></body></html>");
+        var clip = doc.ElementDescendants().First(e => e.GetAttr("id") == "clip");
+        var clipBox = LayoutHarness.BoxOf(root, clip)!;
+        var metrics = clipBox.GetOverflowScrollMetrics();
+        Check.That(metrics.MaxScrollX > 0f, "the hidden-overflow content is horizontally scrollable");
+
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        clipBox.ScrollOffsetX = metrics.MaxScrollX;
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        var mark = doc.ElementDescendants().First(e => e.GetAttr("id") == "mark");
+        var markBox = LayoutHarness.BoxOf(root, mark)!;
+        int sampleX = (int)(markBox.BorderRect.Left - clipBox.ScrollOffsetX + 2f);
+        int sampleY = (int)(markBox.BorderRect.Top + 2f);
+        var visiblePixel = bitmap.GetPixel(sampleX, sampleY);
+        Check.That(visiblePixel.G > 200 && visiblePixel.R < 80,
+            "the renderer translates content for script-driven overflow:hidden scrolling",
+            visiblePixel.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void AuthoredButtonColorsAndFocusedInputBorderArePainted()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}button{width:150px;height:36px;" +
+            "background:#123456;color:#fff;border:1px solid #00cc00}" +
+            "#field{width:100px;height:24px;border:1px solid #000}" +
+            "#field:focus{border:2px solid #ff0000}" +
+            "#plain{width:100px;height:24px}</style></head><body>" +
+            "<button id='button'>VISIBLE LABEL</button><input id='field'>" +
+            "<input id='plain'></body></html>");
+        var button = doc.ElementDescendants().First(e => e.GetAttr("id") == "button");
+        var field = doc.ElementDescendants().First(e => e.GetAttr("id") == "field");
+        var plainField = doc.ElementDescendants().First(e => e.GetAttr("id") == "plain");
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+
+        using var buttonBitmap = LayoutHarness.Render(doc, root, images, loader);
+        var buttonBox = LayoutHarness.BoxOf(root, button)!;
+        var facePixel = buttonBitmap.GetPixel(
+            (int)buttonBox.BorderRect.Left + 3, (int)buttonBox.BorderRect.Top + 3);
+        Check.That(facePixel == Color.FromArgb(0x12, 0x34, 0x56),
+            "button uses its authored CSS background instead of the native gray face",
+            facePixel.ToString());
+        int lightLabelPixels = 0;
+        for (int y = (int)buttonBox.BorderRect.Top + 2;
+             y < buttonBox.BorderRect.Bottom - 2; y++)
+            for (int x = (int)buttonBox.BorderRect.Left + 2;
+                 x < buttonBox.BorderRect.Right - 2; x++)
+            {
+                var pixel = buttonBitmap.GetPixel(x, y);
+                if (pixel.R > 220 && pixel.G > 220 && pixel.B > 220)
+                    lightLabelPixels++;
+            }
+        Check.That(lightLabelPixels > 20,
+            "button label uses its authored foreground color",
+            $"light pixels={lightLabelPixels}");
+        var buttonBorderPixel = buttonBitmap.GetPixel(
+            (int)(buttonBox.BorderRect.Left + buttonBox.BorderRect.Width / 2f),
+            (int)(buttonBox.BorderRect.Top + 0.5f));
+        Check.That(buttonBorderPixel == Color.FromArgb(0x00, 0xCC, 0x00),
+            "button keeps its authored border instead of painting the native bevel",
+            buttonBorderPixel.ToString());
+
+        doc.FocusedElement = field;
+        StyleResolver.Resolve(doc, 800);
+        root = LayoutEngine.BuildLayoutTree(doc, 800, 600);
+        using var focusedBitmap = LayoutHarness.Render(doc, root, images, loader);
+        var focusedBox = LayoutHarness.BoxOf(root, field)!;
+        var focusPixel = focusedBitmap.GetPixel(
+            (int)(focusedBox.BorderRect.Left + focusedBox.BorderRect.Width / 2f),
+            (int)(focusedBox.BorderRect.Top + 0.5f));
+        Check.That(focusPixel.R > 200 && focusPixel.G < 140 && focusPixel.B < 140,
+            "the CSS :focus border replaces the hard-coded focus ring",
+            focusPixel.ToString());
+
+        using var zoomedBitmap = new SkiaSharp.SKBitmap(1600, 1200);
+        using (var zoomedCanvas = new SkiaSharp.SKCanvas(zoomedBitmap))
+        {
+            zoomedCanvas.Clear(SkiaSharp.SKColors.White);
+            zoomedCanvas.Scale(2f, 2f);
+            Renderer.PaintNativeControlBorders(zoomedCanvas, root,
+                redrawAuthoredBorders: true);
+        }
+        var zoomedFocusPixel = zoomedBitmap.GetPixel(
+            (int)(focusedBox.BorderRect.Left * 2f + focusedBox.BorderRect.Width),
+            (int)(focusedBox.BorderRect.Top * 2f + 1f));
+        Check.That(zoomedFocusPixel.Red > 200 && zoomedFocusPixel.Green < 140 &&
+                   zoomedFocusPixel.Blue < 140,
+            "authored field borders are redrawn as vectors during gesture zoom",
+            zoomedFocusPixel.ToString());
+
+        doc.FocusedElement = plainField;
+        StyleResolver.Resolve(doc, 800);
+        root = LayoutEngine.BuildLayoutTree(doc, 800, 600);
+        var plainBox = LayoutHarness.BoxOf(root, plainField)!;
+        using var plainFocusBitmap = new SkiaSharp.SKBitmap(800, 600);
+        using (var plainFocusCanvas = new SkiaSharp.SKCanvas(plainFocusBitmap))
+        {
+            plainFocusCanvas.Clear(SkiaSharp.SKColors.White);
+            Renderer.PaintNativeControlBorders(plainFocusCanvas, root,
+                focusedElement: plainField);
+        }
+        var defaultFocusPixel = plainFocusBitmap.GetPixel(
+            (int)MathF.Floor(plainBox.BorderRect.Left - 1f),
+            (int)MathF.Round(plainBox.BorderRect.Top + plainBox.BorderRect.Height / 2f));
+        Check.That(defaultFocusPixel.Blue > defaultFocusPixel.Red + 40 &&
+                   defaultFocusPixel.Blue > defaultFocusPixel.Green + 40,
+            "an unstyled focused input retains the native blue focus outline",
+            defaultFocusPixel.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void OverflowHiddenClipsReplacedFormControls()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}#clip{width:120px;height:30px;" +
+            "overflow:hidden;background:#fff}#field{position:relative;top:18px;" +
+            "width:90px;height:20px;background:#00ff00;border:2px solid #ff0000}" +
+            "</style></head><body><div id='clip'><input id='field'></div></body></html>");
+        var clip = doc.ElementDescendants().First(e => e.GetAttr("id") == "clip");
+        var field = doc.ElementDescendants().First(e => e.GetAttr("id") == "field");
+        var clipBox = LayoutHarness.BoxOf(root, clip)!;
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+
+        int x = (int)clipBox.ContentRect.Left + 4;
+        int y = (int)clipBox.ContentRect.Bottom + 4;
+        var outsidePixel = bitmap.GetPixel(x, y);
+        Check.That(outsidePixel == Color.White,
+            "a control extending below an overflow:hidden parent is clipped",
+            $"pixel=({outsidePixel.R},{outsidePixel.G},{outsidePixel.B}), " +
+            $"control={LayoutHarness.BoxOf(root, field)!.BorderRect}, clip={clipBox.ContentRect}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void FormControlsRemainBelowTheirLabelsAndBeforeFollowingNotes()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}fieldset{width:280px}" +
+            "label{display:block;margin:12px 0 4px}input,textarea{width:180px;" +
+            "padding:6px;border:1px solid}textarea{height:60px}" +
+            "</style></head><body><fieldset>" +
+            "<legend>Guestbook</legend><label id='name-label'>NAME</label>" +
+            "<input id='name'><label id='message-label'>MESSAGE</label>" +
+            "<textarea id='message'></textarea><button id='submit'>SIGN</button>" +
+            "<div id='note'>FORM NOTE</div></fieldset></body></html>");
+        LayoutBox Box(string id)
+        {
+            var element = doc.ElementDescendants().First(e => e.GetAttr("id") == id);
+            return LayoutHarness.BoxOf(root, element)!;
+        }
+
+        var nameLabel = Box("name-label");
+        var name = Box("name");
+        var messageLabel = Box("message-label");
+        var message = Box("message");
+        var submit = Box("submit");
+        var note = Box("note");
+        Check.That(name.BorderRect.Top >= nameLabel.BorderRect.Bottom - 0.5f,
+            "the name input begins below its label",
+            $"label={nameLabel.BorderRect}, input={name.BorderRect}");
+        Check.That(message.BorderRect.Top >= messageLabel.BorderRect.Bottom - 0.5f,
+            "the message textarea begins below its label",
+            $"label={messageLabel.BorderRect}, textarea={message.BorderRect}");
+        Check.That(note.BorderRect.Top >= submit.BorderRect.Bottom - 0.5f,
+            "the note begins below the submit button",
+            $"button={submit.BorderRect}, note={note.BorderRect}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void DocumentCookiesPersistAcrossPageReloads()
+    {
+        const string url = "http://retro96.test/1999.html";
+        var cookies = new CookieStore();
+        var firstLoad = new PageHarness();
+        firstLoad.LoadHtml(
+            "<html><body><script>" +
+            "var expiry=new Date();expiry.setTime(expiry.getTime()+86400000);" +
+            "document.cookie='strictly_gb=Alice%1FHello%1FToday; expires='+" +
+            "expiry.toGMTString()+'; path=/';" +
+            "</script></body></html>", url, cookieStore: cookies);
+
+        var reload = new PageHarness();
+        reload.LoadHtml(
+            "<html><body><script>window.loadedCookie=document.cookie;</script></body></html>",
+            url, cookieStore: cookies);
+
+        Check.That(reload.EvalString("window.loadedCookie")
+                .Contains("strictly_gb=Alice%1FHello%1FToday", StringComparison.Ordinal),
+            "the guestbook cookie remains available after a page reload",
+            reload.EvalString("window.loadedCookie"));
+        Check.Done();
+    }
+
+    [Fact]
+    public void FileUrlCookiesPersistButAreScopedToTheSameFile()
+    {
+        var cookies = new CookieStore();
+        var page = ParsedUrl.Parse("file:///C:/web/1999.html");
+        var otherPage = ParsedUrl.Parse("file:///C:/web/other.html");
+        cookies.Set("strictly_gb=Alice%1FHello%1FToday; path=/", page);
+
+        Check.That(cookies.Get(page).Contains(
+                "strictly_gb=Alice%1FHello%1FToday", StringComparison.Ordinal),
+            "a file page can read its own guestbook cookie after reload",
+            cookies.Get(page));
+        Check.That(!cookies.Get(otherPage).Contains(
+                "strictly_gb=", StringComparison.Ordinal),
+            "a file page's cookie is not exposed to a different local file",
+            cookies.Get(otherPage));
+        Check.Done();
+    }
+
+    [Fact]
     public void CssPercentageWidthSetsContentWidthBeforePaddingAndBorder()
     {
         var (doc, root) = LayoutHarness.Parse(
@@ -2881,6 +3332,39 @@ public class EngineRegressionTests
     }
 
     [Fact]
+    public void FormControlCssWidthsIncludePaddingAndBorder()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            "fieldset{width:252px;padding:0;border:1px solid}" +
+            "input,textarea{width:232px;padding:6px 8px;border:1px solid}" +
+            "button{width:100%;padding:8px 14px;border:1px solid}" +
+            "</style></head><body><fieldset>" +
+            "<input id='name'><textarea id='message'></textarea>" +
+            "<button id='submit'>SIGN IT</button>" +
+            "</fieldset></body></html>");
+        var fieldset = doc.ElementDescendants().First(element => element.TagName == "fieldset");
+        var fieldsetBox = LayoutHarness.BoxOf(root, fieldset)!;
+        foreach (string id in new[] { "name", "message" })
+        {
+            var element = doc.ElementDescendants()
+                .First(candidate => candidate.GetAttr("id") == id);
+            var box = LayoutHarness.BoxOf(root, element)!;
+            Check.That(Math.Abs(box.BorderRect.Width - 232f) < 0.5f,
+                $"{id} CSS width includes its padding and border",
+                $"border width={box.BorderRect.Width}");
+        }
+
+        var button = doc.ElementDescendants()
+            .First(element => element.GetAttr("id") == "submit");
+        var buttonBox = LayoutHarness.BoxOf(root, button)!;
+        Check.That(buttonBox.BorderRect.Right <= fieldsetBox.ContentRect.Right + 0.5f,
+            "100% button width includes its padding and border",
+            $"button={buttonBox.BorderRect}, fieldset content={fieldsetBox.ContentRect}");
+        Check.Done();
+    }
+
+    [Fact]
     public void NativeControlBevelsStayAlignedWhenZoomedAndScrolled()
     {
         var (doc, root) = LayoutHarness.Parse(
@@ -2950,6 +3434,75 @@ public class EngineRegressionTests
                     $"scroll ({scrollX:0.##},{scrollY:0.##})",
                     $"pixel=({x},{y}), color={color}, contrast={contrast:0.###}");
             }
+        }
+        Check.Done();
+    }
+
+    [Fact]
+    public void AuthoredControlBordersAreNotCoveredByNativeBevels()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>" +
+            "input, textarea, select, button { border: 1px solid #ff00ff; }" +
+            "</style></head><body>" +
+            "<input id='text' value='Doom'>" +
+            "<textarea id='area'>notes</textarea>" +
+            "<select id='select'><option>Archives</option></select>" +
+            "<button id='button'>Search</button>" +
+            "<input id='submit' type='submit' value='Go'>" +
+            "</body></html>");
+        var controls = doc.ElementDescendants()
+            .Where(element => element.GetAttr("id") is
+                "text" or "area" or "select" or "button" or "submit")
+            .ToDictionary(element => element.GetAttr("id")!);
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var recorder = new SkiaSharp.SKPictureRecorder();
+        var displayListCanvas = recorder.BeginRecording(
+            SkiaSharp.SKRect.Create(0, 0, 800, 600));
+        new Renderer(LayoutHarness.Fonts, images, loader).RenderToCanvas(
+            displayListCanvas, root, doc, LayoutHarness.Fonts, images,
+            800, 600, 0, 0, null, true);
+        using var displayList = recorder.EndRecording();
+        using var bitmap = new SkiaSharp.SKBitmap(
+            new SkiaSharp.SKImageInfo(800, 600, SkiaSharp.SKColorType.Bgra8888,
+                SkiaSharp.SKAlphaType.Premul));
+        using var canvas = new SkiaSharp.SKCanvas(bitmap);
+        canvas.DrawPicture(displayList);
+        Renderer.PaintNativeControlBorders(canvas, root);
+
+        var expected = Color.FromArgb(0xFF, 0x00, 0xFF);
+        foreach (var (id, element) in controls)
+        {
+            var rect = LayoutHarness.BoxOf(root, element)!.BorderRect;
+            int top = (int)MathF.Round(rect.Top);
+            int left = (int)MathF.Ceiling(rect.Left + 2f);
+            int right = (int)MathF.Floor(rect.Right - 2f);
+            bool authoredColorRemains = Enumerable.Range(left, Math.Max(0, right - left))
+                .Any(x => Enumerable.Range(Math.Max(0, top - 1), 3)
+                    .Where(y => y < bitmap.Height)
+                    .Any(y =>
+                    {
+                        var pixel = bitmap.GetPixel(x, y);
+                        var color = Color.FromArgb(pixel.Alpha, pixel.Red, pixel.Green, pixel.Blue);
+                        return color.R >= expected.R - 15 &&
+                               color.G <= expected.G + 140 &&
+                               color.B >= expected.B - 15;
+                    }));
+            string topPixels = string.Join(", ",
+                Enumerable.Range(left, Math.Max(0, right - left))
+                    .Where(x => x < bitmap.Width)
+                    .Select(x =>
+                    {
+                        var pixel = bitmap.GetPixel(x, Math.Clamp(top, 0, bitmap.Height - 1));
+                        return Color.FromArgb(pixel.Alpha, pixel.Red, pixel.Green, pixel.Blue);
+                    })
+                    .Distinct());
+            Check.That(authoredColorRemains,
+                $"{id} keeps its authored border instead of receiving a native bevel",
+                $"style={element.Style?.BorderTopStyle}/{element.Style?.BorderTopColor}, " +
+                $"authored={element.Style?.OwnBorderTopStyle}, rect={rect}, " +
+                $"top pixels={topPixels}");
         }
         Check.Done();
     }
@@ -3223,6 +3776,75 @@ public class EngineRegressionTests
             $"wordX={followingWord.X:0.#}, letterRight={letter.BorderRect.Right:0.#}");
         Check.That(resumesAtLeftBelowFloat,
             "later lines resume at the paragraph edge below the floated initial letter");
+        Check.Done();
+    }
+
+    [Fact]
+    public void FloatedFirstLetterIncludesItsGlyphAndPseudoPaddingInFloatGeometry()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}p{width:640px;margin:0;" +
+            "font:italic 15px/22px Georgia,serif}" +
+            "p:first-letter{float:left;font-size:46px;line-height:40px;" +
+            "padding:3px 8px 0 0}</style></head><body>" +
+            "<p id='dropcap'>A large floated initial should not collide with the second line " +
+            "or allow text to pass underneath its right padding.</p></body></html>");
+        var paragraph = doc.ElementDescendants()
+            .First(element => element.GetAttr("id") == "dropcap");
+        var letter = root.Descendants().First(box =>
+            box.Element == paragraph && box.TextRun == "A" && box.StyleOverride != null);
+        var followingWord = root.Descendants().First(box =>
+            box.Element == paragraph && box.TextRun == "large");
+        var fullFontHeight = LayoutHarness.Fonts.Resolve(
+            letter.StyleOverride!.FontFamily, letter.StyleOverride.FontSize,
+            (int)letter.StyleOverride.FontWeight,
+            letter.StyleOverride.FontStyle == FontStyleValue.Italic,
+            letter.StyleOverride.FontStyle == FontStyleValue.Oblique).GetHeight();
+
+        Check.That(letter.PaddingTop == 3f && letter.PaddingRight == 8f,
+            "first-letter padding participates in the floated box",
+            $"padding={letter.PaddingTop}/{letter.PaddingRight}");
+        Check.That(letter.Height >= fullFontHeight + letter.PaddingTop - 0.5f,
+            "the float exclusion height contains the enlarged glyph, not only its shorter line-height",
+            $"float={letter.Height:0.#}, glyph={fullFontHeight:0.#}");
+        Check.That(followingWord.X >= letter.BorderRect.Right - 0.5f,
+            "following text starts after the drop cap's right padding",
+            $"wordX={followingWord.X:0.#}, floatRight={letter.BorderRect.Right:0.#}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void LargeUnitlessLineHeightTitleDoesNotPaintIntoFollowingParagraph()
+    {
+        var (doc, root) = LayoutHarness.Parse(
+            "<html><head><style>body{margin:0}h1{margin:0}" +
+            "#year{display:block;font:bold 148px/0.95 Georgia,serif;color:#ff4e00}" +
+            "#stand{font:italic 15px/22px Georgia,serif}</style></head><body>" +
+            "<h1><span id='year'>1999</span></h1><p id='stand'>A hands-on museum introduction.</p>" +
+            "</body></html>");
+        var year = doc.ElementDescendants().First(e => e.GetAttr("id") == "year");
+        var stand = doc.ElementDescendants().First(e => e.GetAttr("id") == "stand");
+        var standBox = LayoutHarness.BoxOf(root, stand)!;
+        using var images = new ImageCache { CookieStore = new CookieStore() };
+        using var loader = new ResourceLoader(new CookieStore());
+        using var bitmap = LayoutHarness.Render(doc, root, images, loader);
+        int orangePixelsBelowStandfirst = 0;
+        for (int y = (int)MathF.Ceiling(standBox.BorderRect.Top); y < bitmap.Height; y++)
+            for (int x = 0; x < bitmap.Width; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.R > 180 && pixel.G < 160 && pixel.B < 100)
+                    orangePixelsBelowStandfirst++;
+            }
+
+        Check.That(year.Style?.LineHeightMode == LineHeightMode.Number &&
+                   Math.Abs(year.Style.LineHeight - 0.95f) < 0.01f,
+            "the title uses the authored unitless line-height");
+        Check.That(orangePixelsBelowStandfirst == 0,
+            "the title glyph does not overpaint the following paragraph",
+            $"orange pixels below paragraph start={orangePixelsBelowStandfirst}, " +
+            $"title={LayoutHarness.BoxOf(root, year)!.BorderRect}, " +
+            $"paragraph={standBox.BorderRect}");
         Check.Done();
     }
 

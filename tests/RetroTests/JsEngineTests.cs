@@ -4,6 +4,7 @@ using Retro96;
 using Retro96.Engine.Css;
 using Retro96.Engine.Dom;
 using Retro96.Engine.Js;
+using Retro96.Engine.Layout;
 using Retro96.Engine.Network;
 
 namespace RetroTests;
@@ -281,6 +282,285 @@ public class JsEngineTests
             canvas.Log.Reflows.ToString());
         Check.That(page.Document.AllTags("div")[0].InnerText == "99",
             "the final DOM mutation is still applied");
+        Check.Done();
+    }
+
+    [Fact]
+    public void PositionedLeafAnimationUpdatesSkipDocumentReflow()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><head><style>" +
+            ".s2 { background-color: red; }" +
+            ".s3 { width: 9px !important; }" +
+            "</style></head><body>" +
+            "<div style='position:relative;width:80px;height:50px;overflow:hidden'>" +
+            "<div id='star' class='star s1' style='position:absolute;width:2px;height:2px'></div>" +
+            "<span id='warp' style='font-family:Courier New;display:inline'>5.9</span>" +
+            "</div></body></html>");
+        InlineLayout.SetFontCache(LayoutHarness.Fonts);
+        StyleResolver.Resolve(page.Document, 800);
+        var rootBox = LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        page.Canvas.RootBox = rootBox;
+        var element = page.Document.ElementDescendants()
+            .Single(e => e.GetAttr("id") == "star");
+        var box = element.LayoutBox!;
+        var containingBlock = box.Parent!;
+        page.Canvas.Log.Reflows = 0;
+
+        page.Eval(
+            "var star = document.getElementById('star');" +
+            "star.style.left = '20px'; star.style.left = '21px'; star.style.top = '13px';" +
+            "star.style.width = '5px'; star.style.width = '6px'; star.style.height = '4px';" +
+            "star.className = 'star s2';" +
+            "document.getElementById('warp').innerHTML = '6.0';");
+
+        Check.That(page.Canvas.Log.Reflows == 0,
+            "a positioned leaf animation batch avoids a document reflow",
+            page.Canvas.Log.Reflows.ToString());
+        Check.That(page.Canvas.Log.CompositedUpdates == 1,
+            "the batch is committed as one visual update",
+            page.Canvas.Log.CompositedUpdates.ToString());
+        Check.That(Math.Abs(box.X - (containingBlock.X + containingBlock.BorderLeft + 21f +
+                                      box.MarginLeft)) < 0.01f &&
+                   Math.Abs(box.Y - (containingBlock.Y + containingBlock.BorderTop + 13f +
+                                      box.MarginTop)) < 0.01f,
+            "the positioned box follows the updated pixel coordinates",
+            $"{box.X},{box.Y}; cb={containingBlock.X},{containingBlock.Y}; " +
+            $"border={containingBlock.BorderLeft},{containingBlock.BorderTop}; " +
+            $"margin={box.MarginLeft},{box.MarginTop}; style={element.Style?.Left},{element.Style?.Top}");
+        Check.That(Math.Abs(box.Width - 6f) < 0.01f && Math.Abs(box.Height - 4f) < 0.01f,
+            "the positioned box applies updated pixel dimensions",
+            $"{box.Width},{box.Height}");
+        var warp = page.Document.ElementDescendants().Single(e => e.GetAttr("id") == "warp");
+        var warpText = Assert.IsType<DomText>(warp.Children.Single());
+        Check.That(warp.Style?.Display == DisplayValue.Inline &&
+                   warp.Style.FontFamily.Any(family =>
+                       family.Contains("mono", StringComparison.OrdinalIgnoreCase) ||
+                       family.Contains("courier", StringComparison.OrdinalIgnoreCase)),
+            "the warp span has an inline monospace style",
+            string.Join(",", warp.Style?.FontFamily ?? []));
+        Check.That(page.Document.ElementDescendants().Any(e => e.IsCompositedLayer),
+            "the starfield region is promoted");
+        var warpRuns = rootBox.Descendants()
+            .Where(b => ReferenceEquals(b.Element, warp) && b.TextRun != null)
+            .ToArray();
+        Check.That(warpRuns.Length == 1 && warpRuns[0].TextRun == warpText.Data,
+            "the warp span maps to one matching text run",
+            string.Join("|", warpRuns.Select(b => b.TextRun)));
+        Check.That(page.Canvas.Log.Reflows == 0 &&
+                   page.Canvas.Log.CompositedTextUpdates == 1,
+            "same-width monospace text inside the promoted region updates without reflow",
+            $"{page.Canvas.Log.Reflows}/{page.Canvas.Log.CompositedTextUpdates}");
+        Check.That(page.EvalString("document.getElementById('warp').innerHTML") == "6.0",
+            "the live text node still receives the new text");
+        Check.That(warpRuns[0].TextRun == "6.0",
+            "the composited display content receives the new text",
+            warpRuns[0].TextRun ?? "<null>");
+        page.Eval("document.getElementById('star').className = 'star s3';");
+        Check.That(page.Canvas.Log.Reflows == 1,
+            "a class change that alters layout falls back to full reflow",
+            page.Canvas.Log.Reflows.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void AbsoluteLeafPaintOnlyClassChangesSkipDocumentReflow()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><head><style>" +
+            ".cell { position: absolute; width: 20px; height: 20px; }" +
+            ".food { background-color: red; }" +
+            ".wide { width: 40px; }" +
+            ".snStat + .snStat { margin-right: 0; }" +
+            ".source.active + .next { margin-left: 7px; }" +
+            "</style></head><body>" +
+            "<div style='position:relative;width:80px;height:50px'>" +
+            "<div id='cell' class='cell'></div>" +
+            "</div><div id='source' class='source'></div><div class='next'></div>" +
+            "</body></html>");
+        StyleResolver.Resolve(page.Document, 800);
+        var rootBox = LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        page.Canvas.RootBox = rootBox;
+        page.Canvas.Log.Reflows = 0;
+        page.Canvas.Log.Rerenders = 0;
+
+        page.Eval("document.getElementById('cell').className = 'cell food';");
+
+        var cell = page.Document.ElementDescendants()
+            .Single(element => element.GetAttr("id") == "cell");
+        var box = cell.LayoutBox!;
+        Check.That(page.Canvas.Log.Reflows == 0,
+            "paint-only class changes on positioned leaves skip document reflow",
+            page.Canvas.Log.Reflows.ToString());
+        Check.That(cell.Style?.BackgroundColor.R == 255 &&
+                   box.Width == 20 && box.Height == 20 &&
+                   page.Canvas.Log.Rerenders == 1,
+            "the class style and existing layout box are updated for repaint",
+            $"{cell.Style?.BackgroundColor}; {box.Width}x{box.Height}; rerenders={page.Canvas.Log.Rerenders}");
+
+        page.Eval("document.getElementById('cell').className = 'cell wide';");
+        Check.That(page.Canvas.Log.Reflows == 1,
+            "class changes that alter layout still rebuild the document",
+            page.Canvas.Log.Reflows.ToString());
+
+        page.Canvas.Log.Reflows = 0;
+        page.Eval("document.getElementById('source').className = 'source active';");
+        Check.That(page.Canvas.Log.Reflows == 1,
+            "class changes that affect following siblings retain full reflow",
+            page.Canvas.Log.Reflows.ToString());
+        Check.Done();
+    }
+
+    [Fact]
+    public void PaintOnlyStyleAnimationsSkipDocumentReflow()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><head><style>#blink { visibility: visible; }</style></head>" +
+            "<body><div id='blink'>.</div></body></html>");
+        InlineLayout.SetFontCache(LayoutHarness.Fonts);
+        StyleResolver.Resolve(page.Document, 800);
+        var rootBox = LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        page.Canvas.RootBox = rootBox;
+        var element = page.Document.ElementDescendants()
+            .Single(e => e.GetAttr("id") == "blink");
+        var box = element.LayoutBox!;
+        float width = box.Width;
+        float height = box.Height;
+        page.Canvas.Log.Reflows = 0;
+        page.Canvas.Log.Rerenders = 0;
+
+        page.Eval("document.getElementById('blink').style.visibility = 'hidden';");
+
+        Check.That(page.Canvas.Log.Reflows == 0,
+            "visibility-only animation does not rebuild document layout",
+            page.Canvas.Log.Reflows.ToString());
+        Check.That(page.Canvas.Log.Rerenders == 1,
+            "visibility-only animation still requests a repaint",
+            page.Canvas.Log.Rerenders.ToString());
+        Check.That(element.Style?.Visibility == VisibilityValue.Hidden &&
+                   ReferenceEquals(element.LayoutBox, box) &&
+                   box.Width == width && box.Height == height,
+            "visibility updates paint state without changing layout geometry");
+
+        page.Eval("document.getElementById('blink').style.color = 'red';");
+        Check.That(page.Canvas.Log.Reflows == 0 &&
+                   page.Canvas.Log.Rerenders == 2,
+            "paint-only text color changes repaint without rebuilding layout",
+            $"{page.Canvas.Log.Reflows}/{page.Canvas.Log.Rerenders}");
+        Check.Done();
+    }
+
+    [Fact]
+    public void ElementScrollWritesUpdateTheOverflowBox()
+    {
+        string wireCopy = new string('W', 90);
+        var page = new PageHarness();
+        page.LoadHtml("<html><head><style>" +
+            "body{margin:0}#ticker{position:relative;width:320px;height:34px;" +
+            "overflow:hidden;white-space:nowrap;padding-left:76px}" +
+            "#tkViewport{position:absolute;left:76px;right:0;top:0;height:34px;" +
+            "overflow:hidden;white-space:nowrap}</style></head><body>" +
+            "<div id='ticker'><span>WIRE</span><div id='tkViewport'>" +
+            $"<span id='tkA'>{wireCopy}</span><span id='tkB'>{wireCopy}</span>" +
+            "</div></div></body></html>");
+        InlineLayout.SetFontCache(LayoutHarness.Fonts);
+        StyleResolver.Resolve(page.Document, 500);
+        var root = LayoutEngine.BuildLayoutTree(page.Document, 500, 100);
+        page.Canvas.RootBox = root;
+        var viewport = page.Document.ElementDescendants().First(e => e.GetAttr("id") == "tkViewport");
+        var viewportBox = LayoutHarness.BoxOf(root, viewport)!;
+        var tickerText = page.Document.ElementDescendants().First(e => e.GetAttr("id") == "tkA");
+        var tickerTextBox = LayoutHarness.BoxOf(root, tickerText)!;
+        float maxScroll = viewportBox.GetOverflowScrollMetrics().MaxScrollX;
+        Check.That(maxScroll > tickerTextBox.BorderRect.Width,
+            "the duplicated WIRE text extends beyond its positioned viewport",
+            $"maxScroll={maxScroll:0.#}, copyWidth={tickerTextBox.BorderRect.Width:0.#}");
+        page.Canvas.Log.Rerenders = 0;
+
+        page.Eval("document.getElementById('tkViewport').scrollLeft += 1;");
+        Check.That(page.EvalString("document.getElementById('tkViewport').scrollLeft") == "1" &&
+                   viewportBox.ScrollOffsetX == 1f,
+            "scrollLeft updates the rendered overflow-box offset");
+        Check.That(page.Canvas.Log.Rerenders == 1,
+            "a visual scroll requests a repaint",
+            page.Canvas.Log.Rerenders.ToString());
+
+        page.Eval("document.getElementById('tkViewport').scrollLeft += 1;");
+        Check.That(page.EvalString("document.getElementById('tkViewport').scrollLeft") == "2" &&
+                   viewportBox.ScrollOffsetX == 2f,
+            "successive ticker steps continue moving instead of sticking at the first offset");
+
+        page.Eval("document.getElementById('tkViewport').scrollLeft = 9999;");
+        Check.That(Math.Abs(viewportBox.ScrollOffsetX - maxScroll) < 0.5f,
+            "scripted scrolling clamps at the content's scrollable width",
+            viewportBox.ScrollOffsetX.ToString("0.#"));
+        Check.Done();
+    }
+
+    [Fact]
+    public void RootElementScrollOffsetsTrackThePageViewport()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><div style='height:2400px'>page</div></body></html>");
+        var root = LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        page.Canvas.RootBox = root;
+        page.Canvas.SetPageScrollOffset(17f, 230f);
+
+        Check.That(page.EvalString("document.body.scrollLeft") == "17" &&
+                   page.EvalString("document.documentElement.scrollTop") == "230",
+            "body and documentElement expose the live page scroll offset");
+
+        page.Eval("document.body.scrollLeft = 31;");
+        Check.That(page.Canvas.PageScrollX == 31f && page.Canvas.PageScrollY == 230f,
+            "root-element scroll writes update the page viewport without losing the other axis");
+        Check.Done();
+    }
+
+    [Fact]
+    public void SameWidthMonospaceTextUpdatesSkipDocumentReflow()
+    {
+        var page = new PageHarness();
+        page.LoadHtml(
+            "<html><head><style>.clock { font: 16px 'Courier New', monospace; white-space: nowrap; }</style></head>" +
+            "<body><div class='clock' id='clock'>12:34:56</div>" +
+            "<div class='clock' id='timer'>00:00:00</div></body></html>");
+        InlineLayout.SetFontCache(LayoutHarness.Fonts);
+        StyleResolver.Resolve(page.Document, 800);
+        var rootBox = LayoutEngine.BuildLayoutTree(page.Document, 800, 600);
+        page.Canvas.RootBox = rootBox;
+        page.Canvas.Log.Reflows = 0;
+        page.Canvas.Log.Rerenders = 0;
+
+        page.Eval(
+            "document.getElementById('clock').innerHTML = '12:34:57';" +
+            "document.getElementById('timer').innerHTML = '00:00:01';");
+
+        var clock = page.Document.ElementDescendants()
+            .Single(element => element.GetAttr("id") == "clock");
+        var timer = page.Document.ElementDescendants()
+            .Single(element => element.GetAttr("id") == "timer");
+        string[] updatedRuns = rootBox.Descendants()
+            .Where(box => box.TextRun != null)
+            .Select(box => box.TextRun!)
+            .ToArray();
+        Check.That(page.Canvas.Log.Reflows == 0,
+            "same-width monospace clock updates avoid a document reflow",
+            page.Canvas.Log.Reflows.ToString());
+        Check.That(clock.InnerText == "12:34:57" && timer.InnerText == "00:00:01" &&
+                   updatedRuns.Contains("12:34:57") && updatedRuns.Contains("00:00:01"),
+            "clock text and its existing layout runs update in place",
+            string.Join("|", updatedRuns));
+        Check.That(page.Canvas.Log.Rerenders == 2,
+            "each safe text update requests a repaint",
+            page.Canvas.Log.Rerenders.ToString());
+
+        page.Eval("document.getElementById('clock').innerHTML = '1:2';");
+        Check.That(page.Canvas.Log.Reflows == 1,
+            "text updates that change width still rebuild layout",
+            page.Canvas.Log.Reflows.ToString());
         Check.Done();
     }
 
@@ -1277,6 +1557,21 @@ public class JsEngineTests
         Check.That(page.EvalString("window.hits") == "I",
             "event.cancelBubble = true stops bubbling to the ancestor handler",
             page.EvalString("window.hits"));
+        Check.Done();
+    }
+
+    [Fact]
+    public void ElementEventsBubbleToDocumentHandlers()
+    {
+        var page = new PageHarness();
+        page.LoadHtml("<html><body><div id='outer'><span id='inner'>x</span></div></body></html>");
+        page.Eval("window.seen = ''; document.onmousemove = function(e) {" +
+                  "window.seen = (this === document ? 'document:' : 'wrong:') +" +
+                  "e.type + ':' + e.srcElement.id; };");
+        page.FireEvent(page.Document.AllTags("span")[0], "onmousemove");
+        Check.That(page.EvalString("window.seen") == "document:mousemove:inner",
+            "bubbling mouse events reach document with the document as this",
+            page.EvalString("window.seen"));
         Check.Done();
     }
 

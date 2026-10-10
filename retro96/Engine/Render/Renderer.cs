@@ -1033,10 +1033,10 @@ public class Renderer
         if (box.Element?.Style?.Visibility is VisibilityValue.Hidden or VisibilityValue.Collapse)
             return;
 
-        // Animation subtrees are omitted from the cached display list so the
-        // High-refresh animation path can redraw only those boxes directly on the GPU
-        // without rebuilding the entire page display list on every frame.
-        if (skipAnimatedContent && IsAnimatedSubtree(box.Element))
+        // Animated and composited subtrees are omitted from the cached display
+        // list so their current pixels can be redrawn without rebuilding the page.
+        if (skipAnimatedContent &&
+            (IsAnimatedSubtree(box.Element) || box.Element?.IsCompositedLayer == true))
             return;
         if (skipAnimatedImages && IsAnimatedImageBox(box, images))
             return;
@@ -1111,7 +1111,7 @@ public class Renderer
                 SKClipOperation.Intersect);
         }
 
-        if (overflow is OverflowValue.Scroll or OverflowValue.Auto)
+        if (overflow is OverflowValue.Hidden or OverflowValue.Auto or OverflowValue.Scroll)
             g.Canvas.Translate(-box.ScrollOffsetX, -box.ScrollOffsetY);
 
         // Overflow clipping and scrolling apply to the box's own content as
@@ -1715,6 +1715,34 @@ public class Renderer
                         BorderCornerInset(box.BorderLeft, style.BorderLeftStyle, leftColor,
                                           box.BorderBottom, style.BorderBottomStyle, bottomColor),
                         style.OwnBorderLeftStyle);
+
+        if (elem.TagName == "fieldset" &&
+            style.BorderTopStyle is not (BorderStyleValue.None or BorderStyleValue.Hidden) &&
+            FindFieldsetLegend(box) is { } legend)
+        {
+            var legendRect = legend.BorderRect;
+            var topBorderGap = new RectangleF(
+                legendRect.Left - 2f, borderRect.Top,
+                legendRect.Width + 4f, box.BorderTop);
+            g.FillRectangle(FillPaintFor(localBackground), topBorderGap);
+        }
+    }
+
+    private static LayoutBox? FindFieldsetLegend(LayoutBox fieldset)
+    {
+        foreach (var child in fieldset.Children)
+        {
+            if (child.Element?.TagName == "legend")
+                return child;
+            if (child.Element?.TagName == "fieldset")
+                continue;
+
+            var nestedLegend = FindFieldsetLegend(child);
+            if (nestedLegend != null)
+                return nestedLegend;
+        }
+
+        return null;
     }
 
     private static RectangleF GetTableGridBorderRect(LayoutBox box) =>
@@ -2026,7 +2054,8 @@ public class Renderer
     }
 
     internal static void PaintNativeControlBorders(
-        SKCanvas canvas, LayoutBox root, DomElement? pressedElement = null)
+        SKCanvas canvas, LayoutBox root, DomElement? pressedElement = null,
+        bool redrawAuthoredBorders = false, DomElement? focusedElement = null)
     {
         ArgumentNullException.ThrowIfNull(canvas);
         ArgumentNullException.ThrowIfNull(root);
@@ -2049,6 +2078,15 @@ public class Renderer
                 element.TagName == "input" &&
                 type is "submit" or "reset" or "button")
             {
+                if (HasAuthoredControlBorder(style))
+                {
+                    if (redrawAuthoredBorders)
+                        PaintAuthoredControlBorder(context, box, style,
+                            style.OwnBackground && style.BackgroundColor != Color.Transparent
+                                ? style.BackgroundColor : Color.FromArgb(0xC0, 0xC0, 0xC0));
+                    continue;
+                }
+
                 Color face = disabled
                     ? Color.FromArgb(0xE0, 0xE0, 0xE0)
                     : Color.FromArgb(0xC0, 0xC0, 0xC0);
@@ -2061,6 +2099,15 @@ public class Renderer
 
             if (element.TagName == "select")
             {
+                if (HasAuthoredControlBorder(style))
+                {
+                    if (redrawAuthoredBorders)
+                        PaintAuthoredControlBorder(context, box, style,
+                            style.OwnBackground && style.BackgroundColor != Color.Transparent
+                                ? style.BackgroundColor : Color.White);
+                    continue;
+                }
+
                 PaintSunkenRect(context, rect, 2, disabled
                     ? Color.FromArgb(0xE0, 0xE0, 0xE0)
                     : Color.White);
@@ -2069,12 +2116,20 @@ public class Renderer
 
             if (element.TagName == "textarea")
             {
+                if (HasAuthoredControlBorder(style))
+                {
+                    if (redrawAuthoredBorders)
+                        PaintAuthoredControlBorder(context, box, style,
+                            style.OwnBackground && style.BackgroundColor != Color.Transparent
+                                ? style.BackgroundColor : Color.White);
+                    continue;
+                }
+
                 Color face = disabled ? Color.FromArgb(0xE0, 0xE0, 0xE0)
                     : style.OwnBackground && style.BackgroundColor != Color.Transparent
                         ? style.BackgroundColor
                         : Color.White;
                 PaintSunkenRect(context, rect, 2, face);
-                PaintAuthoredControlBorder(context, box, style, face);
                 continue;
             }
 
@@ -2109,8 +2164,23 @@ public class Renderer
                 : style.OwnBackground && style.BackgroundColor != Color.Transparent
                     ? style.BackgroundColor
                     : Color.White;
+            if (HasAuthoredControlBorder(style))
+            {
+                if (redrawAuthoredBorders)
+                    PaintAuthoredControlBorder(context, box, style,
+                        style.OwnBackground && style.BackgroundColor != Color.Transparent
+                            ? style.BackgroundColor : Color.White);
+                continue;
+            }
+
             PaintSunkenRect(context, rect, 2, inputFace);
-            PaintAuthoredControlBorder(context, box, style, inputFace);
+            if (ReferenceEquals(element, focusedElement) &&
+                !HasAuthoredControlBorder(style))
+            {
+                using var focusOutline = CreateStrokePaint(Color.FromArgb(0, 0, 128), 1);
+                context.DrawRectangle(focusOutline, rect.X - 1f, rect.Y - 1f,
+                    rect.Width + 1f, rect.Height + 1f);
+            }
         }
     }
 
@@ -2881,7 +2951,7 @@ public class Renderer
 
         float textY = contentRect.Y;
         if (style.LineHeightMode != LineHeightMode.Normal)
-            textY += Math.Max(0f, (contentRect.Height - font.GetHeight()) / 2f);
+            textY += (contentRect.Height - font.GetHeight()) / 2f;
 
         // FIX: shared format + shared brush — a text-heavy page used to
         // allocate one Skia text options and one SKPaint per WORD BOX on
@@ -3781,16 +3851,10 @@ public class Renderer
 
         using (var faceBrush = CreateFillPaint(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2, bgColor);
-        PaintAuthoredControlBorder(g, box, style, bgColor);
-
-        // Focused fields get a dark ring just inside the bevel — otherwise
-        // there is no visual difference between focused and unfocused.
-        if (isFocused)
-        {
-            using var focusPen = CreateStrokePaint(Color.FromArgb(0, 0, 128), 1);
-            g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
-        }
+        if (HasAuthoredControlBorder(style))
+            PaintAuthoredControlBorder(g, box, style, bgColor);
+        else
+            PaintSunkenRect(g, rect, 2, bgColor);
 
         var font = ResolveFont(fonts, style);
         using var brush = CreateFillPaint(isPlaceholder ? Color.Gray : fgColor);
@@ -3947,7 +4011,10 @@ public class Renderer
             ? Color.FromArgb(0xE0, 0xE0, 0xE0) : Color.White;
         using var faceBrush = CreateFillPaint(selectFaceColor);
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2, selectFaceColor);
+        if (HasAuthoredControlBorder(style))
+            PaintAuthoredControlBorder(g, box, style, selectFaceColor);
+        else
+            PaintSunkenRect(g, rect, 2, selectFaceColor);
 
         if (isListbox && rows.Count > 0)
         {
@@ -4089,6 +4156,10 @@ public class Renderer
                 box.BorderTop, box.BorderBottom, authoredStyle: true);
     }
 
+    private static bool HasAuthoredControlBorder(ComputedStyle style) =>
+        style.OwnBorderTopStyle || style.OwnBorderRightStyle ||
+        style.OwnBorderBottomStyle || style.OwnBorderLeftStyle;
+
     private void PaintTextArea(SkiaRenderContext g, LayoutBox box, FontCache fonts,
                                bool isFocused)
     {
@@ -4107,13 +4178,10 @@ public class Renderer
 
         using (var faceBrush = CreateFillPaint(bgColor))
             g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        PaintSunkenRect(g, rect, 2, bgColor);
-
-        if (isFocused)
-        {
-            using var focusPen = CreateStrokePaint(Color.FromArgb(0, 0, 128), 1);
-            g.DrawRectangle(focusPen, face.X, face.Y, face.Width - 1, face.Height - 1);
-        }
+        if (HasAuthoredControlBorder(style))
+            PaintAuthoredControlBorder(g, box, style, bgColor);
+        else
+            PaintSunkenRect(g, rect, 2, bgColor);
 
         var font = ResolveFont(fonts, style);
         string text = elem.InnerText ?? "";
@@ -4217,17 +4285,17 @@ public class Renderer
         bool pressed = box.Element != null && ReferenceEquals(box.Element, PressedElement);
         bool disabled = box.Element?.HasAttr("disabled") == true;
 
-        using var faceBrush = CreateFillPaint(disabled
-            ? Color.FromArgb(0xE0, 0xE0, 0xE0)
-            : Color.FromArgb(0xC0, 0xC0, 0xC0));
+        bool authoredBg = style.OwnBackground && style.BackgroundColor != Color.Transparent;
+        Color face = disabled ? Color.FromArgb(0xE0, 0xE0, 0xE0)
+            : authoredBg ? style.BackgroundColor : Color.FromArgb(0xC0, 0xC0, 0xC0);
+        using var faceBrush = CreateFillPaint(face);
         g.FillRectangle(faceBrush, rect.X, rect.Y, rect.Width, rect.Height);
-        var bevelFace = disabled
-            ? Color.FromArgb(0xE0, 0xE0, 0xE0)
-            : Color.FromArgb(0xC0, 0xC0, 0xC0);
-        if (pressed)
-            PaintSunkenRect(g, rect, 2, bevelFace);
+        if (HasAuthoredControlBorder(style))
+            PaintAuthoredControlBorder(g, box, style, face);
+        else if (pressed)
+            PaintSunkenRect(g, rect, 2, face);
         else
-            PaintRaisedRect(g, rect, 2, bevelFace);
+            PaintRaisedRect(g, rect, 2, face);
 
         // MUST be GenericTypographic like InlineLayout._sf: a plain Skia text options
         // adds ~1/6em of side padding that layout never reserved, which pushed
@@ -4242,7 +4310,8 @@ public class Renderer
         else
         {
             var font = ResolveFont(fonts, style);
-            using var brush = CreateFillPaint(disabled ? Color.Gray : Color.Black);
+            using var brush = CreateFillPaint(disabled ? Color.Gray
+                : style.OwnColor ? EffectiveTextColor(style) : Color.Black);
             g.DrawString(text, font, brush, textRect, ButtonText);
         }
     }

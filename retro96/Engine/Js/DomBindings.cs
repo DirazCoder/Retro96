@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Retro96.Engine.Dom;
+using Retro96.Engine.Css;
 using Retro96.Engine.Html;
 using Retro96.Engine.Network;
 using Retro96.Plugins;
@@ -34,18 +36,123 @@ public sealed class DocumentBindingsState
 
     private JsInterpreter? _reflowInterpreter;
     private bool _reflowPending;
+    private string? _pendingReflowSource;
+    private readonly Dictionary<DomElement, CompositedStyleUpdate> _compositedStyleUpdates = new();
+    private readonly Dictionary<DomElement, CompositedStyleSnapshot> _paintOnlyClassUpdates = new();
 
-    public void RequestReflow()
+    public readonly record struct CompositedStyleSnapshot
     {
+        public PositionValue Position { get; }
+        public DisplayValue Display { get; }
+        public FloatValue Float { get; }
+        public ClearValue Clear { get; }
+        public float? Left { get; }
+        public float? Top { get; }
+        public float? Right { get; }
+        public float? Bottom { get; }
+        public float? LeftPercent { get; }
+        public float? TopPercent { get; }
+        public float? RightPercent { get; }
+        public float? BottomPercent { get; }
+        public float? Width { get; }
+        public float? Height { get; }
+        public float? WidthPercent { get; }
+        public float? HeightPercent { get; }
+        public float? MinWidth { get; }
+        public float? MaxWidth { get; }
+        public float? MinHeight { get; }
+        public float? MaxHeight { get; }
+        public float? MinWidthPercent { get; }
+        public float? MaxWidthPercent { get; }
+        public float? MinHeightPercent { get; }
+        public float? MaxHeightPercent { get; }
+        public float MarginLeft { get; }
+        public float MarginRight { get; }
+        public float MarginTop { get; }
+        public float MarginBottom { get; }
+        public float PaddingLeft { get; }
+        public float PaddingRight { get; }
+        public float PaddingTop { get; }
+        public float PaddingBottom { get; }
+        public float BorderLeftWidth { get; }
+        public float BorderRightWidth { get; }
+        public float BorderTopWidth { get; }
+        public float BorderBottomWidth { get; }
+        public int ZIndex { get; }
+        public OverflowValue Overflow { get; }
+        public VisibilityValue Visibility { get; }
+        public bool HasGeneratedBefore { get; }
+        public bool HasGeneratedAfter { get; }
+        public bool HasCounterReset { get; }
+        public bool HasCounterIncrement { get; }
+
+        public CompositedStyleSnapshot(ComputedStyle style)
+        {
+            Position = style.Position;
+            Display = style.Display;
+            Float = style.Float;
+            Clear = style.Clear;
+            Left = style.Left;
+            Top = style.Top;
+            Right = style.Right;
+            Bottom = style.Bottom;
+            LeftPercent = style.LeftPercent;
+            TopPercent = style.TopPercent;
+            RightPercent = style.RightPercent;
+            BottomPercent = style.BottomPercent;
+            Width = style.Width;
+            Height = style.Height;
+            WidthPercent = style.WidthPercent;
+            HeightPercent = style.HeightPercent;
+            MinWidth = style.MinWidth;
+            MaxWidth = style.MaxWidth;
+            MinHeight = style.MinHeight;
+            MaxHeight = style.MaxHeight;
+            MinWidthPercent = style.MinWidthPercent;
+            MaxWidthPercent = style.MaxWidthPercent;
+            MinHeightPercent = style.MinHeightPercent;
+            MaxHeightPercent = style.MaxHeightPercent;
+            MarginLeft = style.MarginLeft;
+            MarginRight = style.MarginRight;
+            MarginTop = style.MarginTop;
+            MarginBottom = style.MarginBottom;
+            PaddingLeft = style.PaddingLeft;
+            PaddingRight = style.PaddingRight;
+            PaddingTop = style.PaddingTop;
+            PaddingBottom = style.PaddingBottom;
+            BorderLeftWidth = style.BorderLeftWidth;
+            BorderRightWidth = style.BorderRightWidth;
+            BorderTopWidth = style.BorderTopWidth;
+            BorderBottomWidth = style.BorderBottomWidth;
+            ZIndex = style.ZIndex;
+            Overflow = style.Overflow;
+            Visibility = style.Visibility;
+            HasGeneratedBefore = style.GeneratedBefore != null;
+            HasGeneratedAfter = style.GeneratedAfter != null;
+            HasCounterReset = style.CounterReset is { Count: > 0 };
+            HasCounterIncrement = style.CounterIncrement is { Count: > 0 };
+        }
+    }
+
+    public sealed class CompositedStyleUpdate(ComputedStyle original)
+    {
+        public CompositedStyleSnapshot Original { get; } = new(original);
+        public float? Left { get; set; }
+        public float? Top { get; set; }
+        public float? Width { get; set; }
+        public float? Height { get; set; }
+        public bool ResolveStyle { get; set; }
+    }
+
+    public void RequestReflow(string? reason = null,
+        [CallerMemberName] string caller = "", [CallerLineNumber] int line = 0)
+    {
+        _compositedStyleUpdates.Clear();
         if (Interpreter is { IsExecuting: true } interpreter)
         {
-            if (!ReferenceEquals(_reflowInterpreter, interpreter))
-            {
-                if (_reflowInterpreter != null)
-                    _reflowInterpreter.ScriptExecutionCompleted -= FlushPendingReflow;
-                _reflowInterpreter = interpreter;
-                interpreter.ScriptExecutionCompleted += FlushPendingReflow;
-            }
+            WatchScriptCompletion(interpreter);
+            if (!_reflowPending)
+                _pendingReflowSource = reason ?? $"{caller}:{line}";
             _reflowPending = true;
             return;
         }
@@ -53,11 +160,291 @@ public sealed class DocumentBindingsState
         Canvas?.ReflowDocument();
     }
 
+    public bool RequestCompositedGeometryUpdate(
+        DomElement element, string property, float value,
+        IReadOnlyDictionary<string, string> currentDeclarations)
+    {
+        if (property is not ("left" or "top" or "width" or "height") ||
+            !IsCompositable(element) ||
+            !float.IsFinite(value) ||
+            !InlinePixelDeclarationMatchesStyle(element, property, currentDeclarations))
+            return false;
+
+        if (Interpreter is not { IsExecuting: true } interpreter)
+            return false;
+
+        WatchScriptCompletion(interpreter);
+        var update = GetOrCreateCompositedUpdate(element);
+        switch (property)
+        {
+            case "left": update.Left = value; break;
+            case "top": update.Top = value; break;
+            case "width": update.Width = value; break;
+            case "height": update.Height = value; break;
+        }
+        return true;
+    }
+
+    public bool RequestPaintOnlyClassUpdate(DomElement element, string newClass)
+    {
+        if (_reflowPending ||
+            Document is not { } document ||
+            Interpreter is not { IsExecuting: true } interpreter ||
+            element.Style is not { } style ||
+            (element.LayoutBox ?? element.Box) is not { } box ||
+            element.Children.Count != 0 ||
+            box.Children.Count != 0 ||
+            StyleResolver.HasSiblingDependentSelector(element, document, newClass))
+            return false;
+
+        WatchScriptCompletion(interpreter);
+        _paintOnlyClassUpdates.TryAdd(element, new CompositedStyleSnapshot(style));
+        return true;
+    }
+
+    public bool RequestCompositedClassUpdate(DomElement element)
+    {
+        if (!IsCompositable(element) ||
+            Interpreter is not { IsExecuting: true } interpreter)
+            return false;
+
+        WatchScriptCompletion(interpreter);
+        GetOrCreateCompositedUpdate(element).ResolveStyle = true;
+        return true;
+    }
+
+    public bool RequestPaintOnlyStyleUpdate(DomElement element, string property)
+    {
+        if (!IsPaintOnlyStyleProperty(property))
+            return false;
+
+        bool Reject(string reason)
+        {
+            if (property == "visibility")
+            {
+                string elementName =
+                    element.GetAttr("id") ?? element.GetAttr("class") ?? element.TagName;
+                Retro96.DebugLog.WritePerformanceOnce(
+                    $"paint-only-reject:visibility:{reason}",
+                    $"Paint-only visibility update rejected for {elementName}: {reason}.");
+            }
+            return false;
+        }
+
+        if (_reflowPending)
+            return Reject("reflow already pending");
+        if (Document is not { } document)
+            return Reject("document unavailable");
+        if (element.Style == null)
+            return Reject("computed style unavailable");
+        if (element.LayoutBox is not { } box)
+            return Reject("layout box unavailable");
+        if (element.ElementChildren().Any())
+            return Reject("element has element children");
+        if (StyleResolver.HasStyleAttributeSelector(element, document))
+            return Reject("style attribute selector present");
+
+        float viewportWidth = 0;
+        for (var current = box; current != null && viewportWidth <= 0; current = current.Parent)
+            viewportWidth = current.ViewportWidth;
+        if (viewportWidth <= 0)
+            return Reject("layout viewport unavailable");
+        if (!StyleResolver.TryResolveElement(element, document, viewportWidth))
+            return Reject("element style resolution unavailable");
+        if (property == "visibility" &&
+            element.Style?.Visibility == VisibilityValue.Collapse)
+            return Reject("visibility collapse changes layout");
+
+        Canvas?.RequestRerender();
+        return true;
+    }
+
+    private static bool IsPaintOnlyStyleProperty(string property) =>
+        property is "visibility" or "color" or "background-color" or
+            "background-repeat" or "background-position" or "text-decoration" or
+            "outline-color" or "outline-style" or "outline-width";
+
+    public bool TryUpdateFixedWidthText(DomElement element, DomText textNode, string newText)
+    {
+        if (_reflowPending || Interpreter is not { IsExecuting: true })
+            return false;
+
+        DomElement? paintRoot = FindCompositedPaintRoot(element);
+        bool awaitingPromotion = paintRoot != null &&
+            _compositedStyleUpdates.Keys.Any(candidate =>
+                ReferenceEquals(FindCompositedPaintRoot(candidate), paintRoot));
+        return Canvas?.TryUpdateFixedWidthText(
+            element, textNode, newText, awaitingPromotion) == true;
+    }
+
+    private static DomElement? FindCompositedPaintRoot(DomElement element)
+    {
+        for (var parent = element.Parent as DomElement;
+             parent != null;
+             parent = parent.Parent as DomElement)
+            if (parent.Style is
+                { Position: PositionValue.Relative, Overflow: OverflowValue.Hidden })
+                return parent;
+        return null;
+    }
+
+    private CompositedStyleUpdate GetOrCreateCompositedUpdate(DomElement element)
+    {
+        if (_compositedStyleUpdates.TryGetValue(element, out var update))
+            return update;
+
+        update = new CompositedStyleUpdate(element.Style!);
+        _compositedStyleUpdates.Add(element, update);
+        return update;
+    }
+
+    private void WatchScriptCompletion(JsInterpreter interpreter)
+    {
+        if (ReferenceEquals(_reflowInterpreter, interpreter))
+            return;
+
+        if (_reflowInterpreter != null)
+            _reflowInterpreter.ScriptExecutionCompleted -= FlushPendingReflow;
+        _reflowInterpreter = interpreter;
+        interpreter.ScriptExecutionCompleted += FlushPendingReflow;
+    }
+
+    private static bool IsCompositable(DomElement element)
+    {
+        var box = element.LayoutBox ?? element.Box;
+        if (box?.IsAbsolutelyPositioned != true ||
+            element.Style?.Position != PositionValue.Absolute ||
+            element.Children.Count != 0 ||
+            box.Children.Count != 0)
+            return false;
+
+        bool hasPaintRoot = false;
+        for (var parent = element.Parent as DomElement;
+             parent != null;
+             parent = parent.Parent as DomElement)
+        {
+            var style = parent.Style;
+            switch (style?.Overflow ?? OverflowValue.Visible)
+            {
+                case OverflowValue.Scroll:
+                case OverflowValue.Auto:
+                    return false;
+                case OverflowValue.Hidden:
+                    if (style?.Position == PositionValue.Relative)
+                        hasPaintRoot = true;
+                    break;
+            }
+        }
+
+        return hasPaintRoot;
+    }
+
+    private bool InlinePixelDeclarationMatchesStyle(
+        DomElement element, string property, IReadOnlyDictionary<string, string>? declarations)
+    {
+        if (Document == null ||
+            StyleResolver.HasMatchingImportantRule(element, Document, property) ||
+            element.Style == null)
+            return false;
+
+        string? value = null;
+        bool hasDeclaration = declarations?.TryGetValue(property, out value) == true;
+        if (!hasDeclaration)
+        {
+            var currentStyle = element.Style;
+            return property == "left"
+                ? currentStyle.Left == null && currentStyle.LeftPercent == null &&
+                  currentStyle.Right == null && currentStyle.RightPercent == null
+                : property == "top" &&
+                  currentStyle.Top == null && currentStyle.TopPercent == null &&
+                  currentStyle.Bottom == null && currentStyle.BottomPercent == null;
+        }
+
+        value = (value ?? "").Trim();
+        if (value.EndsWith("px", StringComparison.OrdinalIgnoreCase))
+            value = value[..^2].Trim();
+        if (!float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out float inlineValue) ||
+            !float.IsFinite(inlineValue))
+            return false;
+
+        float? computedValue = property switch
+        {
+            "left" => element.Style.Left,
+            "top" => element.Style.Top,
+            "width" => element.Style.Width,
+            "height" => element.Style.Height,
+            _ => null
+        };
+        if (_compositedStyleUpdates.TryGetValue(element, out var pendingValue))
+        {
+            float? stagedValue = property switch
+            {
+                "left" => pendingValue.Left,
+                "top" => pendingValue.Top,
+                "width" => pendingValue.Width,
+                "height" => pendingValue.Height,
+                _ => null
+            };
+            if (stagedValue.HasValue)
+                computedValue = stagedValue;
+        }
+
+        if (!computedValue.HasValue)
+            return false;
+        return Math.Abs(computedValue.Value - inlineValue) <= 0.01f;
+    }
+
     private void FlushPendingReflow()
     {
-        if (!_reflowPending) return;
-        _reflowPending = false;
-        Canvas?.ReflowDocument();
+        if (_reflowPending)
+        {
+            Retro96.DebugLog.WritePerformanceOnce(
+                $"dom-reflow:{_pendingReflowSource}",
+                $"DOM timer mutation requested full document reflow ({_pendingReflowSource}).");
+            _reflowPending = false;
+            _pendingReflowSource = null;
+            _compositedStyleUpdates.Clear();
+            _paintOnlyClassUpdates.Clear();
+            Canvas?.ReflowDocument();
+            return;
+        }
+
+        if (_paintOnlyClassUpdates.Count > 0)
+        {
+            var paintOnlyUpdates = _paintOnlyClassUpdates.ToArray();
+            _paintOnlyClassUpdates.Clear();
+            if (Document == null ||
+                Canvas?.TryApplyPaintOnlyClassUpdates(Document, paintOnlyUpdates) != true)
+            {
+                Retro96.DebugLog.WritePerformanceOnce(
+                    "paint-only-class-fallback",
+                    $"Paint-only class batch rejected ({paintOnlyUpdates.Length} updates); falling back to document reflow.");
+                _compositedStyleUpdates.Clear();
+                Canvas?.ReflowDocument();
+                return;
+            }
+        }
+
+        if (_compositedStyleUpdates.Count == 0)
+            return;
+
+        var updates = _compositedStyleUpdates.ToArray();
+        _compositedStyleUpdates.Clear();
+        if (Document == null ||
+            Canvas?.TryApplyCompositedLayerUpdates(Document, updates) != true)
+        {
+            string batch = string.Join(", ", updates.Take(8).Select(pair =>
+            {
+                var element = pair.Key;
+                var update = pair.Value;
+                string id = element.GetAttr("id") ?? element.GetAttr("class") ?? element.TagName;
+                return $"{id}[class={update.ResolveStyle}, left={update.Left}, top={update.Top}, width={update.Width}, height={update.Height}]";
+            }));
+            Retro96.DebugLog.WritePerformanceOnce(
+                "composited-update-fallback",
+                $"Composited batch rejected ({updates.Length} updates); first updates: {batch}");
+            Canvas?.ReflowDocument();
+        }
     }
 
     public DomDocument? Document;
@@ -1886,9 +2273,14 @@ public static class DomBindings
             "type", "color", "face"
         };
 
-        private void RequestReflow()
+        private void RequestReflow(
+            [CallerMemberName] string caller = "",
+            [CallerLineNumber] int line = 0)
         {
-            if (_state != null) _state.RequestReflow();
+            string elementName = _element.GetAttr("id") ??
+                _element.GetAttr("class") ?? _element.TagName;
+            string reason = $"DOM {caller}:{line} on {elementName}";
+            if (_state != null) _state.RequestReflow(reason);
             else _canvas?.ReflowDocument();
         }
 
@@ -2162,6 +2554,9 @@ public static class DomBindings
 
         private DomElement? OffsetParent()
         {
+            if (_element.TagName == "body")
+                return null;
+
             for (var ancestor = _element.Parent as DomElement;
                  ancestor != null;
                  ancestor = ancestor.Parent as DomElement)
@@ -2425,9 +2820,15 @@ public static class DomBindings
                         return JsValue.From(ClientMetrics().Height);
                     case "scrollTop":
                     case "scrollLeft":
-                        // Readback of scripted writes (the engine has no
-                        // per-element content scrolling — documented
-                        // limitation); default 0, matching an unscrolled box.
+                        if (_element.TagName is "body" or "html" &&
+                            _state?.Canvas is { } pageCanvas)
+                            return JsValue.From(name == "scrollLeft"
+                                ? pageCanvas.PageScrollX
+                                : pageCanvas.PageScrollY);
+                        if (_element.LayoutBox is { } scrollBox)
+                            return JsValue.From(name == "scrollLeft"
+                                ? scrollBox.ScrollOffsetX
+                                : scrollBox.ScrollOffsetY);
                         if (Properties.TryGetValue(name, out var stored) && stored.Type == JsType.Number)
                             return stored;
                         return JsValue.From(0);
@@ -2831,15 +3232,17 @@ public static class DomBindings
 
             if (name == "className")
             {
-                _element.SetAttr("class", value.ToJsString());
-                RequestReflow();
+                string className = value.ToJsString();
+                bool composited = _state?.RequestCompositedClassUpdate(_element) == true;
+                bool paintOnly = !composited &&
+                    _state?.RequestPaintOnlyClassUpdate(_element, className) == true;
+                _element.SetAttr("class", className);
+                if (!composited && !paintOnly) RequestReflow();
                 return;
             }
 
             if (name == "innerHTML")
             {
-                foreach (var oldChild in _element.Children.ToList())
-                    _element.RemoveChild(oldChild);
                 var doc = _element.OwnerDocument();
                 // Detached elements (document.createElement + innerHTML, the
                 // era's UI-building idiom) have no owner document yet — parse
@@ -2853,6 +3256,18 @@ public static class DomBindings
                 // did not synthesise a <body> — the old code appended
                 // NOTHING in that case, silently discarding the markup.
                 var source = body != null ? body.Children : fragment.Children;
+                if (_element.Children.Count == 1 &&
+                    _element.Children[0] is DomText oldText &&
+                    source.Count == 1 &&
+                    source[0] is DomText newText &&
+                    _state?.TryUpdateFixedWidthText(_element, oldText, newText.Data) == true)
+                {
+                    oldText.Data = newText.Data;
+                    return;
+                }
+
+                foreach (var oldChild in _element.Children.ToList())
+                    _element.RemoveChild(oldChild);
                 foreach (var child in source.ToList())
                     _element.AppendChild(child);
                 RequestReflow();
@@ -2977,15 +3392,50 @@ public static class DomBindings
                 }
             }
 
-            // IE5 element.scrollTop/scrollLeft writes — the engine has no
-            // per-element content scrolling; the value is stored for
-            // readback and a repaint is requested (documented limitation:
-            // setting scrollTop does not actually scroll clipped content).
-            if ((name == "scrollTop" || name == "scrollLeft") &&
-                BrowserRuntime.SupportsInternetExplorerLegacy)
+            // Keep element scrolling in the layout box so script reads and
+            // the renderer share the same clamped offset in every persona.
+            if (name == "scrollTop" || name == "scrollLeft")
             {
-                base.Set(name, value);
-                _canvas?.RequestRerender();
+                float requested = (float)value.ToNumber();
+                if (!float.IsFinite(requested))
+                    requested = 0f;
+
+                if (_element.TagName is "body" or "html" &&
+                    _state?.Canvas is { } pageCanvas)
+                {
+                    float x = name == "scrollLeft" ? requested : pageCanvas.PageScrollX;
+                    float y = name == "scrollTop" ? requested : pageCanvas.PageScrollY;
+                    pageCanvas.SetPageScrollOffset(x, y);
+                    return;
+                }
+
+                if (_element.LayoutBox is { } scrollBox)
+                {
+                    float max = 0f;
+                    if (_element.Style?.Overflow is
+                        OverflowValue.Hidden or OverflowValue.Auto or OverflowValue.Scroll)
+                    {
+                        var metrics = scrollBox.GetOverflowScrollMetrics();
+                        max = name == "scrollLeft"
+                            ? metrics.MaxScrollX
+                            : metrics.MaxScrollY;
+                    }
+                    float next = Math.Clamp(requested, 0f, max);
+                    float current = name == "scrollLeft"
+                        ? scrollBox.ScrollOffsetX
+                        : scrollBox.ScrollOffsetY;
+                    if (name == "scrollLeft")
+                        scrollBox.ScrollOffsetX = next;
+                    else
+                        scrollBox.ScrollOffsetY = next;
+                    Properties[name] = JsValue.From(next);
+                    if (Math.Abs(next - current) > 0.01f)
+                        _canvas?.RequestRerender();
+                }
+                else
+                {
+                    base.Set(name, JsValue.From(Math.Max(0f, requested)));
+                }
                 return;
             }
 
@@ -3048,7 +3498,7 @@ public static class DomBindings
     ///     dialog.style.display = "none"   — hides, really
     ///     dialog.style.color     = "red"  — recolours, really
     /// Reads parse the current attribute; writes update it and trigger a
-    /// full style re-resolve + re-layout through the canvas.
+    /// full style re-resolve + re-layout unless a safe visual-only update applies.
     /// </summary>
     private sealed class InlineStyleObject : JsObject
     {
@@ -3149,7 +3599,7 @@ public static class DomBindings
             if (name == "cssText")
             {
                 _element.SetAttr("style", value.ToJsString());
-                Reflow();
+                Reflow("style.cssText");
                 return;
             }
 
@@ -3176,6 +3626,10 @@ public static class DomBindings
             string v = value.ToJsString().Trim();
             var decls = ParseCurrent();
             string key = NormalizeStyleKey(name);
+            bool fastVisualUpdate =
+                (key == "left" || key == "top" || key == "width" || key == "height") &&
+                TryParsePixelLength(v, out float pixelValue) &&
+                _state?.RequestCompositedGeometryUpdate(_element, key, pixelValue, decls) == true;
             if (v.Length == 0 || v.Equals("null", StringComparison.OrdinalIgnoreCase) ||
                 v.Equals("undefined", StringComparison.OrdinalIgnoreCase))
                 decls.Remove(key);
@@ -3184,7 +3638,9 @@ public static class DomBindings
 
             _element.SetAttr("style",
                 string.Join("; ", decls.Select(kv => $"{kv.Key}: {kv.Value}")));
-            Reflow();
+            bool paintOnlyStyleUpdate =
+                _state?.RequestPaintOnlyStyleUpdate(_element, key) == true;
+            if (!fastVisualUpdate && !paintOnlyStyleUpdate) Reflow($"style.{key}");
         }
 
         /// <summary>Writes an inline declaration as "<paramref name="property"/>: Npx"
@@ -3193,19 +3649,37 @@ public static class DomBindings
         {
             double n = value.ToNumber();
             var decls = ParseCurrent();
+            bool fastVisualUpdate =
+                (property == "left" || property == "top" ||
+                 property == "width" || property == "height") &&
+                float.IsFinite((float)n) &&
+                _state?.RequestCompositedGeometryUpdate(
+                    _element, property, (float)n, decls) == true;
             decls[property] = double.IsNaN(n) ? "0px" :
                 $"{n.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}px";
             _element.SetAttr("style",
                 string.Join("; ", decls.Select(kv => $"{kv.Key}: {kv.Value}")));
-            Reflow();
+            if (!fastVisualUpdate) Reflow($"style.{property}");
         }
 
-        private void Reflow()
+        private static bool TryParsePixelLength(string value, out float pixels)
+        {
+            string text = value.Trim();
+            if (text.EndsWith("px", StringComparison.OrdinalIgnoreCase))
+                text = text[..^2].Trim();
+            if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out pixels) &&
+                float.IsFinite(pixels))
+                return true;
+            pixels = 0;
+            return false;
+        }
+
+        private void Reflow(string? reason = null)
         {
             if (_canvas == null) return;
             try
             {
-                if (_state != null) _state.RequestReflow();
+                if (_state != null) _state.RequestReflow(reason);
                 else _canvas.ReflowDocument();
             }
             catch { /* best-effort reflow */ }

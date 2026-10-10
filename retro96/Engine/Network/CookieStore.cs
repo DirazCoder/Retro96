@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Retro96.Engine.Network;
@@ -181,7 +182,8 @@ public sealed class CookieStore
         if (ContainsControlCharacter(name) || ContainsControlCharacter(value))
             return;   // CRLF must never be echoed into the outgoing Cookie header
 
-        string host = NormalizeHost(requestUrl.Host);
+        bool localFile = requestUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase);
+        string host = CookieHostFor(requestUrl);
         if (host.Length == 0) return;
 
         // Defaults derived from the request URL.
@@ -205,7 +207,7 @@ public sealed class CookieStore
                     break;
 
                 case "domain":
-                    if (!string.IsNullOrEmpty(attrValue))
+                    if (!localFile && !string.IsNullOrEmpty(attrValue))
                     {
                         string d = attrValue.Trim().Trim('.').ToLowerInvariant();
                         // Must domain-match the request host (no "notreal.com"
@@ -326,7 +328,7 @@ public sealed class CookieStore
 
         lock (_sync)
         {
-            string host = NormalizeHost(requestUrl.Host);
+            string host = CookieHostFor(requestUrl);
             if (host.Length == 0) return string.Empty;
 
             string requestPath = StripQueryAndFragment(requestUrl.Path);
@@ -599,6 +601,24 @@ public sealed class CookieStore
 
         if (h.EndsWith('.')) h = h[..^1];                   // "example.com." → "example.com"
         return h;
+    }
+
+    private static string CookieHostFor(ParsedUrl requestUrl)
+    {
+        string host = NormalizeHost(requestUrl.Host);
+        if (host.Length > 0 ||
+            !requestUrl.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+            return host;
+
+        // File URLs have no network host. Give each canonical file path its
+        // own host-only cookie bucket so an HTML guestbook can survive reloads
+        // without sharing cookies with unrelated local files.
+        string path = Uri.UnescapeDataString(requestUrl.Path).Replace('\\', '/');
+        if (OperatingSystem.IsWindows())
+            path = path.ToLowerInvariant();
+        string hash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(path))).ToLowerInvariant();
+        return "file-" + hash + ".invalid";
     }
 
     /// <summary>Default cookie path: the URL's directory, or "/" when

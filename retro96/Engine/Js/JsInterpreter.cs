@@ -708,6 +708,26 @@ public class JsInterpreter
                 break;
         }
 
+        // Legacy pages often register mouse handlers on document rather than
+        // on body or a specific element. Element bubbling ends at document.
+        if (IsBubblingEventName(normalizedEvent) &&
+            (eventObj == null || !IsCancelBubbleSet(eventObj)) &&
+            GlobalScope.Get("document") is { Type: JsType.Object } documentValue)
+        {
+            var documentObject = documentValue.GetObject();
+            if (documentObject.Get(normalizedEvent) is { Type: JsType.Function } documentHandler)
+            {
+                last = CallHandler(documentHandler,
+                    JsValue.FromObject(documentObject), eventObj, srcElementValue);
+                anyHandled = true;
+                if (last.Type == JsType.Boolean)
+                {
+                    if (last.GetBool()) keepTrue = true;
+                    else cancel = true;
+                }
+            }
+        }
+
         // event.returnValue = false cancels the default action, exactly like
         // a literal "return false" (checklist §11 IE5 model).
         if (eventObj != null)

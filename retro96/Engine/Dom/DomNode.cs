@@ -231,6 +231,7 @@ public class DomElement : DomNode
     // legacy public slot DomBindings reads today; the layout engine keeps
     // the two in sync until the bindings migrate to this property.
     public LayoutBox?    LayoutBox { get; internal set; }
+    public bool IsCompositedLayer { get; set; }
     // Inline event handlers ("onclick" -> source), set by the HTML parser.
     public Dictionary<string, string> EventHandlers { get; } = [];
 

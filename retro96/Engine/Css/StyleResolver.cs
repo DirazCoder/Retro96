@@ -30,8 +30,10 @@ public static class StyleResolver
 {
     private sealed record HoverSelectorEntry(CssSelector Selector, bool RequiresLayout);
     private sealed record HoverRuleEntry(IReadOnlyList<HoverSelectorEntry> Selectors);
+    private sealed record AuthorRuleEntry(AuthorRuleIndex Index);
 
     private static readonly ConditionalWeakTable<DomDocument, HoverRuleEntry> HoverRuleCache = new();
+    private static readonly ConditionalWeakTable<DomDocument, AuthorRuleEntry> AuthorRuleCache = new();
     private static readonly object HoverRuleCacheLock = new();
 
     /// <summary>
@@ -242,6 +244,29 @@ public static class StyleResolver
 
         CacheHoverRules(doc, authorRules);
         var ruleIndex = new AuthorRuleIndex(authorRules, doc);
+        lock (HoverRuleCacheLock)
+        {
+            AuthorRuleCache.Remove(doc);
+            AuthorRuleCache.Add(doc, new AuthorRuleEntry(ruleIndex));
+        }
+        ResolveDocument(doc, ruleIndex, viewportWidth);
+    }
+
+    internal static void ResolveInteractionStyles(DomDocument doc, float viewportWidth = 800f)
+    {
+        ArgumentNullException.ThrowIfNull(doc);
+        if (AuthorRuleCache.TryGetValue(doc, out var cached))
+        {
+            ResolveDocument(doc, cached.Index, viewportWidth);
+            return;
+        }
+
+        Resolve(doc, viewportWidth);
+    }
+
+    private static void ResolveDocument(
+        DomDocument doc, AuthorRuleIndex ruleIndex, float viewportWidth)
+    {
         int activeBaseFontSize = doc.BaseFontSize;
         ResolveNode(doc, null, ruleIndex, doc, viewportWidth, ref activeBaseFontSize);
         int quoteDepth = 0;
@@ -257,6 +282,62 @@ public static class StyleResolver
                 if (element.Style != null)
                     element.Style.FontSize *= textSizeScale;
         }
+    }
+
+    internal static bool TryResolveElement(
+        DomElement element, DomDocument document, float viewportWidth)
+    {
+        if (!AuthorRuleCache.TryGetValue(document, out var cached))
+            return false;
+
+        var parentStyle = (element.Parent as DomElement)?.Style;
+        int activeBaseFontSize = document.BaseFontSize;
+        ResolveNode(element, parentStyle, cached.Index, document,
+            viewportWidth, ref activeBaseFontSize);
+        return true;
+    }
+
+    internal static bool HasMatchingImportantRule(
+        DomElement element, DomDocument document, string property)
+    {
+        if (!AuthorRuleCache.TryGetValue(document, out var cached))
+            return true;
+        if (!cached.Index.HasImportantDeclaration(property))
+            return false;
+
+        foreach (var rule in cached.Index.ForTag(element.TagName))
+        {
+            foreach (var selector in rule.Selectors)
+            {
+                if (selector.PseudoElementName != null || !selector.Matches(element))
+                    continue;
+                if (rule.Declarations.Any(declaration =>
+                        declaration.Important &&
+                        declaration.Property.Equals(property, StringComparison.OrdinalIgnoreCase)))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    internal static bool HasStyleAttributeSelector(
+        DomElement element, DomDocument document)
+    {
+        if (!AuthorRuleCache.TryGetValue(document, out var cached))
+            return true;
+
+        return cached.Index.ForTag(element.TagName)
+            .SelectMany(rule => rule.Selectors)
+            .SelectMany(selector => selector.Parts)
+            .Any(part => part.Kind == PartType.Attribute &&
+                part.Value?.StartsWith("style", StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    internal static bool HasSiblingDependentSelector(
+        DomElement element, DomDocument document, string newClass)
+    {
+        return !AuthorRuleCache.TryGetValue(document, out var cached) ||
+            cached.Index.HasSiblingDependentSelector(element, newClass);
     }
 
     private static readonly QuotePair[] DefaultQuotes =
@@ -430,9 +511,23 @@ public static class StyleResolver
     private sealed class AuthorRuleIndex
     {
         private readonly Dictionary<string, CssRule[]> _rulesByTag;
+        private readonly HashSet<string> _importantProperties;
+        private readonly CssSelector[] _siblingSelectors;
 
         public AuthorRuleIndex(IReadOnlyList<CssRule> rules, DomDocument document)
         {
+            _siblingSelectors = rules
+                .SelectMany(rule => rule.Selectors)
+                .Where(selector => selector.Parts.Any(part =>
+                    part.Kind is PartType.AdjacentSibling or PartType.GeneralSibling))
+                .ToArray();
+
+            _importantProperties = rules
+                .SelectMany(rule => rule.Declarations)
+                .Where(declaration => declaration.Important)
+                .Select(declaration => declaration.Property)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             var tags = document.ElementDescendants()
                 .Select(element => element.TagName)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -487,8 +582,79 @@ public static class StyleResolver
                 StringComparer.OrdinalIgnoreCase);
         }
 
+        public bool HasSiblingDependentSelector(DomElement element, string newClass)
+        {
+            string? currentClass = element.GetAttr("class");
+            foreach (var selector in _siblingSelectors)
+            {
+                for (int i = 1; i < selector.Parts.Count; i++)
+                {
+                    if (selector.Parts[i].Kind is not
+                        (PartType.AdjacentSibling or PartType.GeneralSibling))
+                        continue;
+
+                    int start = i - 1;
+                    while (start > 0 &&
+                        selector.Parts[start - 1].Kind is not
+                            (PartType.Descendant or PartType.Child or
+                             PartType.AdjacentSibling or PartType.GeneralSibling))
+                        start--;
+
+                    bool tagMatches = true;
+                    for (int j = start; j < i; j++)
+                    {
+                        var part = selector.Parts[j];
+                        if (part.Kind == PartType.Type &&
+                            !string.Equals(part.Value, element.TagName,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            tagMatches = false;
+                            break;
+                        }
+                    }
+                    if (!tagMatches)
+                        continue;
+
+                    for (int j = start; j < i; j++)
+                    {
+                        var part = selector.Parts[j];
+                        if (part.Kind == PartType.Class &&
+                            (HasClass(currentClass, part.Value) ||
+                             HasClass(newClass, part.Value)))
+                            return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static bool HasClass(string? classList, string? className)
+        {
+            if (string.IsNullOrEmpty(classList) || string.IsNullOrEmpty(className))
+                return false;
+
+            int start = 0;
+            while (start < classList.Length)
+            {
+                while (start < classList.Length && char.IsWhiteSpace(classList[start]))
+                    start++;
+                int end = start;
+                while (end < classList.Length && !char.IsWhiteSpace(classList[end]))
+                    end++;
+                if (end > start &&
+                    classList.AsSpan(start, end - start).Equals(
+                        className.AsSpan(), StringComparison.Ordinal))
+                    return true;
+                start = end;
+            }
+            return false;
+        }
+
         public IReadOnlyList<CssRule> ForTag(string tag) =>
             _rulesByTag.TryGetValue(tag, out var rules) ? rules : Array.Empty<CssRule>();
+
+        public bool HasImportantDeclaration(string property) =>
+            _importantProperties.Contains(property);
     }
 
     private static void ResolveNode(DomNode node, ComputedStyle? parentStyle,
@@ -734,12 +900,9 @@ public static class StyleResolver
                     style.BorderBottomStyle = style.BorderLeftStyle = BorderStyleValue.Groove;
                 break;
             case "legend":
-                // IE5 renders the legend inset into the fieldset's top
-                // border: a block with a small left offset.
-                style.Display = DisplayValue.Block;
-                style.MarginLeft = 10f;
-                style.PaddingLeft = 2f;
-                style.PaddingRight = 2f;
+                // Legends sit across the fieldset's top border. Layout
+                // positions the shrink-to-fit inline box after measuring it.
+                style.Display = DisplayValue.InlineBlock;
                 break;
             case "center":
                 style.Display = DisplayValue.Block;

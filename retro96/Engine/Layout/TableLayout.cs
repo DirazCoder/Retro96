@@ -504,15 +504,14 @@ public static class TableLayout
                     // border-collapse: collapse (Task 9) — the era
                     // approximation: each shared edge is drawn ONCE, by the
                     // cell on its LEADING side.  Left/top borders always
-                    // paint; right/bottom borders only survive on the grid
-                    // boundary (last column / last spanned row).  No border
+                    // paint; right borders only survive on the grid boundary.
+                    // Bottom borders remain on each row so authored horizontal
+                    // rules (including the header separator) are not discarded.
+                    // No border
                     // width comparison/conflict resolution (the leading
                     // cell's border wins — documented simplification).
-                    int endRow = Math.Min(cell.RowIndex + cell.RowSpan, nRows) - 1;
                     bool atRightGridEdge = cell.ColEnd >= colCount;
-                    bool atBottomGridEdge = endRow >= nRows - 1;
                     if (!atRightGridEdge) cellBorderRight = 0f;
-                    if (!atBottomGridEdge) cellBorderBottom = 0f;
                 }
 
                 box.X = tableBox.X + colX[cell.Col];
@@ -1612,8 +1611,8 @@ public static class TableLayout
 
     internal static float MeasureShrinkToFitContentWidth(LayoutBox box, float availableWidth)
     {
-        float minimum = MeasureMin(box);
-        float preferred = MeasurePref(box);
+        float minimum = MeasureMin(box, includePercentageWidth: true);
+        float preferred = MeasurePref(box, includePercentageWidth: true);
         return Math.Min(Math.Max(minimum, Math.Max(0f, availableWidth)), preferred);
     }
 
@@ -1621,9 +1620,10 @@ public static class TableLayout
     /// Minimum width: the widest unbreakable word (SkiaSharp measurement).
     /// PRE text never wraps, so its minimum is the full line width.
     /// </summary>
-    private static float MeasureMin(LayoutBox box)
+    private static float MeasureMin(LayoutBox box, bool includePercentageWidth = false)
     {
         float m = 0f;
+        m = Math.Max(m, MeasureSpecifiedOuterWidth(box, includePercentageWidth));
 
         if (!string.IsNullOrEmpty(box.TextRun))
         {
@@ -1632,7 +1632,7 @@ public static class TableLayout
             {
                 if (style.WhiteSpace == WhiteSpaceValue.Pre)
                 {
-                    m = InlineLayout.MeasureTextWidth(box.TextRun, style);
+                    m = Math.Max(m, InlineLayout.MeasureTextWidth(box.TextRun, style));
                 }
                 else
                 {
@@ -1775,6 +1775,9 @@ public static class TableLayout
             total += InlineLayout.MeasureTextWidth(" ", style);
             i = sp + 1;
         }
+        for (int j = 1; j < n; j++)
+            if (text[j] == ' ' || text[j - 1] == ' ')
+                total += style.LetterSpacing;
         return total;
     }
 
@@ -1782,17 +1785,18 @@ public static class TableLayout
     /// Preferred width: full unconstrained content width (SkiaSharp
     /// measurement), with the same sum-inline / max-block child discipline.
     /// </summary>
-    private static float MeasurePref(LayoutBox box)
+    private static float MeasurePref(LayoutBox box, bool includePercentageWidth = false)
     {
         float p = 0f;
+        p = Math.Max(p, MeasureSpecifiedOuterWidth(box, includePercentageWidth));
 
         if (!string.IsNullOrEmpty(box.TextRun))
         {
             var style = box.Element?.Style;
             if (style != null)
-                p = MeasureFragmentedTextWidth(box.TextRun, style);
+                p = Math.Max(p, MeasureFragmentedTextWidth(box.TextRun, style));
             else
-                p = box.TextRun.Length * (16f * 0.55f);
+                p = Math.Max(p, box.TextRun.Length * (16f * 0.55f));
         }
         else if (box.BoxType is BoxType.Replaced or BoxType.InlineBlock or BoxType.Frame)
         {
@@ -1801,7 +1805,6 @@ public static class TableLayout
                 + box.BorderLeft + box.BorderRight
                 + box.PaddingLeft + box.PaddingRight);
         }
-
         if (box.BoxType == BoxType.Table)
             return Math.Max(p, EstimateTableWidth(box, min: false));
 
@@ -1907,6 +1910,26 @@ public static class TableLayout
         }
 
         return Math.Max(p, run);
+    }
+
+    private static float MeasureSpecifiedOuterWidth(LayoutBox box, bool includePercentageWidth)
+    {
+        var element = box.Element;
+        var style = element?.Style;
+        bool hasFixedHtmlWidth =
+            element?.GetAttr("width") is { } widthAttr &&
+            float.TryParse(widthAttr.Trim(), NumberStyles.Float,
+                CultureInfo.InvariantCulture, out _);
+        bool hasPercentageHtmlWidth =
+            element?.GetAttr("width")?.Trim().EndsWith('%') == true;
+        bool hasPercentageWidth = style?.WidthPercent != null || hasPercentageHtmlWidth;
+        if (box.Width <= 0f || (style?.Width == null && !hasFixedHtmlWidth &&
+            !(includePercentageWidth && hasPercentageWidth)))
+            return 0f;
+
+        return box.Width + box.MarginLeft + box.MarginRight +
+            box.BorderLeft + box.BorderRight +
+            box.PaddingLeft + box.PaddingRight;
     }
 
     private static string TrimAsciiEdgeWhitespace(string text)

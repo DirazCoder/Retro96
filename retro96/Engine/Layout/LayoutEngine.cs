@@ -334,6 +334,14 @@ public static class LayoutEngine
                             boxType = BoxType.InlineBlock;
                         }
 
+                        // CSS2 blockifies a floated or absolutely positioned
+                        // inline box. Keeping it flattened loses its children,
+                        // float side, and out-of-flow positioning altogether.
+                        if (boxType == BoxType.Inline &&
+                            (style.Float != FloatValue.None ||
+                             style.Position is PositionValue.Absolute or PositionValue.Fixed))
+                            boxType = BoxType.Block;
+
                         // ── Flatten inline containers ───────────────────────────
                         // InlineLayout only measures top-level items in the inline
                         // child list; an inline wrapper (<a>, <b>, <font>, …) has
@@ -384,12 +392,9 @@ public static class LayoutEngine
                         // styles, exactly like NN4).  Percentage widths wait for
                         // layout (StyleWidthPercent); pixel sizes apply now.
                         //
-                        // IE5 quirks box model (checklist §9, the layout idiom
-                        // 1999 pages were built around): an authored CSS pixel
-                        // width/height is the BORDER box — content = authored −
-                        // padding − border.  Percentage widths and HTML width
-                        // ATTRIBUTES stay on their existing border-box-ish
-                        // resolution paths and are never re-subtracted here.
+                        // IE5 quirks mode and native form controls use a
+                        // border-box authored CSS width/height. Percentage
+                        // widths and HTML width ATTRIBUTES are resolved later.
                         // IMG quirk: an img lays out as margin+border+width+
                         // border+margin — padding never participates at all,
                         // so it is dropped from the box itself.
@@ -1304,6 +1309,7 @@ public static class LayoutEngine
                 s.PaddingTop = 6; s.PaddingRight = 6;
                 s.PaddingBottom = 6; s.PaddingLeft = 6; break;
             case "legend":
+                s.Display = DisplayValue.InlineBlock; break;
             case "label":
                 s.Display = DisplayValue.Inline; break;
 
@@ -1448,7 +1454,11 @@ public static class LayoutEngine
 
         ResolveAutoWidth(box, containingWidth);
 
-        LayoutBlockChildren(box, containingWidth, containingHeight, inheritedFloats);
+        var childFloats = box.Element?.Style?.Overflow is
+            OverflowValue.Hidden or OverflowValue.Auto or OverflowValue.Scroll
+                ? new FloatContext()
+                : inheritedFloats;
+        LayoutBlockChildren(box, containingWidth, containingHeight, childFloats);
 
         // CSS2 min-height/max-height on the resolved (auto or explicit)
         // height — the width clamp already ran inside ResolveAutoWidth.
@@ -1464,7 +1474,11 @@ public static class LayoutEngine
         foreach (var container in inlineBoxes.Where(child =>
                      child.BoxType == BoxType.InlineBlock && child.Element != null))
         {
-            if (container.Element?.Style?.Display == DisplayValue.TableCell &&
+            var element = container.Element;
+            if (element == null) continue;
+
+            var style = element.Style;
+            if (style?.Display == DisplayValue.TableCell &&
                 container.Width <= 0f)
             {
                 float chrome = container.PaddingLeft + container.PaddingRight
@@ -1473,6 +1487,17 @@ public static class LayoutEngine
                     containerWidth - container.MarginLeft - container.MarginRight);
                 container.Width = Math.Max(0f, Math.Min(available,
                     TableLayout.MeasureInlineCellPreferredWidth(container)) - chrome);
+            }
+            else if (container.Width <= 0f &&
+                     style?.Width == null && style?.WidthPercent == null &&
+                     !element.HasAttr("width"))
+            {
+                float chrome = container.PaddingLeft + container.PaddingRight
+                    + container.BorderLeft + container.BorderRight;
+                float available = Math.Max(0f,
+                    containerWidth - container.MarginLeft - container.MarginRight - chrome);
+                container.Width = TableLayout.MeasureShrinkToFitContentWidth(
+                    container, available);
             }
 
             container.X = contentX + container.MarginLeft;
@@ -1559,7 +1584,7 @@ public static class LayoutEngine
         // ancestor chain).
         if (box.StyleWidthPercent is { } pct)
         {
-            float resolved = containingWidth * pct / 100f;
+            float resolved = ResolveCssContentWidth(box, containingWidth * pct / 100f);
             box.Width = Math.Min(Math.Max(0f, resolved), MaxAttrLength);
             box.StyleWidthPercent = null;   // consumed
         }
@@ -1585,20 +1610,31 @@ public static class LayoutEngine
     }
 
     /// <summary>
-    /// IE5 quirks-mode interpretation of an authored CSS width/height
-    /// (checklist §9): the authored extent is the BORDER box, so the content
-    /// extent is authored minus the padding and border chrome.  IMG elements
-    /// ignore padding entirely (margin+border+width+border+margin, the
-    /// classic IE image rule).  In the W3C model the authored value already
-    /// IS the content extent and passes through unchanged.
+    /// Resolves the authored CSS width/height into a content extent.
+    /// IE5 quirks mode and native form controls use border-box sizing; other
+    /// elements in standards mode use the authored value as their content
+    /// extent. IMG elements in quirks mode ignore padding.
     /// </summary>
     private static float AuthoredContentExtent(DomElement elem, float authored,
         float paddingExtent, float borderExtent)
     {
-        if (!BrowserRuntime.UsesIe5BoxModelFor(elem.OwnerDocument()))
+        if (!UsesBorderBoxSizing(elem))
             return authored;
         float pad = elem.TagName == "img" ? 0f : paddingExtent;
         return Math.Max(0f, authored - pad - borderExtent);
+    }
+
+    private static bool UsesBorderBoxSizing(DomElement? element) =>
+        element != null &&
+        (BrowserRuntime.UsesIe5BoxModelFor(element.OwnerDocument()) ||
+         element.TagName is "input" or "select" or "textarea" or "button");
+
+    internal static float ResolveCssContentWidth(LayoutBox box, float authoredWidth)
+    {
+        if (!UsesBorderBoxSizing(box.Element))
+            return authoredWidth;
+        return Math.Max(0f, authoredWidth - box.PaddingLeft - box.PaddingRight
+            - box.BorderLeft - box.BorderRight);
     }
 
     /// <summary>
@@ -1623,7 +1659,7 @@ public static class LayoutEngine
             (style.MaxWidthPercent is { } xp ? basis * xp / 100f : float.MaxValue);
         if (max < min) max = min;
 
-        if (BrowserRuntime.UsesIe5BoxModelFor(box.Element?.OwnerDocument()))
+        if (UsesBorderBoxSizing(box.Element))
         {
             float chrome = box.BorderLeft + box.BorderRight
                          + box.PaddingLeft + box.PaddingRight;
@@ -1716,6 +1752,7 @@ public static class LayoutEngine
         float prevMarginBottom = 0f;
 
         var floatCtx = inheritedFloats ?? new FloatContext();
+        int firstLocalFloat = floatCtx.FloatCount;
         var pendingInline = new List<LayoutBox>();
 
         void FlushInlineRun()
@@ -1928,6 +1965,25 @@ public static class LayoutEngine
                     OffsetBoxTree(child, deltaX, 0f);
             }
 
+            if (child.Element?.TagName == "fieldset" &&
+                FindFieldsetLegend(child) is { } fieldsetLegend)
+            {
+                float ancestorClipTop = float.NegativeInfinity;
+                for (var ancestor = box; ancestor != null; ancestor = ancestor.Parent)
+                {
+                    if (ancestor.Element?.Style?.Overflow is
+                        OverflowValue.Hidden or OverflowValue.Auto or OverflowValue.Scroll)
+                    {
+                        ancestorClipTop = Math.Max(ancestorClipTop,
+                            ancestor.Y + ancestor.BorderTop);
+                    }
+                }
+
+                float legendClipDelta = ancestorClipTop - fieldsetLegend.BorderRect.Top;
+                if (legendClipDelta > 0.01f)
+                    OffsetBoxTree(child, 0f, legendClipDelta);
+            }
+
             prevMarginBottom = child.MarginBottom;
 
             // Border-box end — the bottom margin stays pending in
@@ -1940,9 +1996,25 @@ public static class LayoutEngine
 
         FlushInlineRun();
 
+        if (box.Element?.TagName == "fieldset" &&
+            FindFieldsetLegend(box) is { } legend)
+        {
+            float legendTop = box.BorderRect.Top + box.BorderTop / 2f
+                - legend.BorderRect.Height / 2f;
+            OffsetBoxTree(legend, 0f, legendTop - legend.Y);
+        }
+
         if (!hasExplicitHeight)
         {
             box.Height = Math.Max(0f, currentY - contentY);
+            if (box.Element?.Style?.Overflow is
+                OverflowValue.Hidden or OverflowValue.Auto or OverflowValue.Scroll)
+            {
+                float floatBottom = floatCtx.FloatBottomsFrom(firstLocalFloat)
+                    .DefaultIfEmpty(contentY)
+                    .Max();
+                box.Height = Math.Max(box.Height, floatBottom - contentY);
+            }
             if (box.PaddingBottom == 0f && box.BorderBottom == 0f &&
                 box.Element?.Style is
                     { Overflow: OverflowValue.Visible } style &&
@@ -1979,6 +2051,18 @@ public static class LayoutEngine
             var positionedContainingBlock = st?.Position == PositionValue.Fixed
                 ? FindViewportContainingBlock(box)
                 : FindPositionedContainingBlock(box);
+            bool hasLeft = st?.Left.HasValue == true || st?.LeftPercent.HasValue == true;
+            bool hasRight = st?.Right.HasValue == true || st?.RightPercent.HasValue == true;
+            if (child.Width <= 0f && st?.Width == null && st?.WidthPercent == null &&
+                child.Element?.HasAttr("width") != true && hasLeft != hasRight)
+            {
+                float chrome = child.PaddingLeft + child.PaddingRight
+                    + child.BorderLeft + child.BorderRight;
+                float available = Math.Max(0f,
+                    positionedContainingBlock.Width - child.MarginLeft -
+                    child.MarginRight - chrome);
+                child.Width = TableLayout.MeasureShrinkToFitContentWidth(child, available);
+            }
             LayoutBlock(child, positionedContainingBlock.Width, positionedContainingBlock.Height);
 
             // FIX: the containing block for an absolutely positioned box is its
@@ -2007,6 +2091,23 @@ public static class LayoutEngine
             element.Style?.Position == PositionValue.Relative &&
             ReferenceEquals(element.LayoutBox, c)))
             LayoutRelative(child);
+    }
+
+    private static LayoutBox? FindFieldsetLegend(LayoutBox fieldset)
+    {
+        foreach (var child in fieldset.Children)
+        {
+            if (child.Element?.TagName == "legend")
+                return child;
+            if (child.Element?.TagName == "fieldset")
+                continue;
+
+            var nestedLegend = FindFieldsetLegend(child);
+            if (nestedLegend != null)
+                return nestedLegend;
+        }
+
+        return null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2137,6 +2238,12 @@ public static class LayoutEngine
         }
         else
         {
+            if (box.StyleWidthPercent is { } cssPercent)
+            {
+                box.Width = Math.Min(Math.Max(0f,
+                    containingWidth * cssPercent / 100f), MaxAttrLength);
+                box.StyleWidthPercent = null;
+            }
             if (box.Width <= 0f)
             {
                 float availableContentWidth = Math.Max(0f,
